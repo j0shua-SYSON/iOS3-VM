@@ -1,0 +1,32 @@
+name: core-tests
+
+# The emulator core is portable C11 — it builds and unit-tests on any host,
+# so we gate every push on it. Fast (seconds) and device-independent.
+on:
+  push:
+    paths:
+      - 'core/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/core-tests.yml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: build + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

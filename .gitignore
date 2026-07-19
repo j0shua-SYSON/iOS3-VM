@@ -1,0 +1,33 @@
+# Build output
+/build/
+**/build/
+**/dist/
+**/DerivedData/
+
+# XcodeGen output (generated from app/project.yml — never committed)
+*.xcodeproj
+*.xcworkspace
+!default.xcworkspace
+
+# Packaged app
+*.ipa
+Payload/
+
+# Firmware / user-supplied artifacts — NEVER commit copyrighted Apple firmware.
+# Users drop their own IPSW / keys here at runtime.
+/firmware/
+*.ipsw
+*.img3
+*.dmg
+*.n88ap*
+keys.json
+
+# Editor / OS cruft
+.DS_Store
+.vscode/
+.idea/
+*.o
+*.obj
+*.a
+*.exe
+compile_commands.json

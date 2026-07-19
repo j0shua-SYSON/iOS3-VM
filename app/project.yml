@@ -1,0 +1,37 @@
+# XcodeGen spec for the iOS3-VM app.
+#
+# We do NOT commit an .xcodeproj (it is a churny binary blob). CI runs
+# `xcodegen generate` on the macOS runner to produce iOS3VM.xcodeproj from
+# this file, then `xcodebuild`. To develop locally on a Mac, run the same
+# `xcodegen generate` and open the project.
+name: iOS3VM
+options:
+  bundleIdPrefix: com.j0shua
+  deploymentTarget:
+    iOS: "13.0"
+  createIntermediateGroups: true
+
+targets:
+  iOS3VM:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      # Compile the platform-independent emulator core straight into the app.
+      - path: ../core/src
+        name: core
+    settings:
+      base:
+        PRODUCT_NAME: iOS3VM
+        PRODUCT_BUNDLE_IDENTIFIER: com.j0shua.iOS3VM
+        INFOPLIST_FILE: Info.plist
+        CODE_SIGN_ENTITLEMENTS: iOS3VM.entitlements
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/../core/include
+        GCC_C_LANGUAGE_STANDARD: c11
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_BITCODE: NO
+        # Signing is handled after the build by ldid fake-signing (see CI).
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""

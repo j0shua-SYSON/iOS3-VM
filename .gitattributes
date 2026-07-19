@@ -1,0 +1,10 @@
+# Normalize all text to LF in the repo so the Linux/macOS CI runners never see
+# CRLF (which would break the bash steps in the workflow YAML).
+* text=auto eol=lf
+
+# Binaries
+*.png  binary
+*.jpg  binary
+*.ipa  binary
+*.img3 binary
+*.dmg  binary

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Entitlements for a JAILBROKEN install. No Apple Developer team is needed:
+      the .ipa is fake-signed (ad-hoc, ldid -S) and the jailbreak's AMFI patch
+      honors these. On the A9 / iPhone 6s Plus these three unlock everything the
+      emulator needs.
+    -->
+
+    <!-- Debuggable => the jailbreak marks us CS_DEBUGGED => unsigned executable
+         memory (JIT / the future dynarec) is permitted. -->
+    <key>get-task-allow</key>
+    <true/>
+
+    <!-- Request the private JIT entitlement directly; harmless if the kernel
+         instead grants JIT via the "Allow JIT in Apps" toggle. -->
+    <key>dynamic-codesigning</key>
+    <true/>
+
+    <!-- Raise the jetsam per-app memory ceiling so a whole guest OS image can
+         be held resident on a 2 GB device. -->
+    <key>com.apple.developer.kernel.increased-memory-limit</key>
+    <true/>
+</dict>
+</plist>
