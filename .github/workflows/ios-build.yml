@@ -14,15 +14,20 @@ on:
 jobs:
   build:
     name: build unsigned .ipa
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
       - name: Install XcodeGen + ldid
         run: brew install xcodegen ldid
 
-      - name: Select latest Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
+      - name: Select newest installed Xcode
+        # XcodeGen emits the Xcode 16 project format (objectVersion 77); pick the
+        # highest-versioned Xcode present so xcodebuild can read it.
+        run: |
+          latest=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$latest" ]; then sudo xcode-select -s "$latest"; fi
+          xcodebuild -version
 
       - name: Generate Xcode project
         working-directory: app
