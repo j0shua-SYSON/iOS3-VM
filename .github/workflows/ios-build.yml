@@ -18,8 +18,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install XcodeGen + ldid
-        run: brew install xcodegen ldid
+      - name: Install XcodeGen (pinned) + ldid
+        # Pin XcodeGen to a known-good release so a previously-green build can't
+        # break from Homebrew drift (a newer XcodeGen could emit a project format
+        # the runner's Xcode can't read). Bump deliberately, not implicitly.
+        run: |
+          set -euo pipefail
+          XCODEGEN_VERSION=2.46.0
+          curl -fsSL -o /tmp/xcodegen.zip \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          unzip -q /tmp/xcodegen.zip -d /tmp/xcodegen
+          sudo /tmp/xcodegen/xcodegen/install.sh
+          xcodegen --version
+          brew install ldid
 
       - name: Select newest installed Xcode
         # XcodeGen emits the Xcode 16 project format (objectVersion 77); pick the
