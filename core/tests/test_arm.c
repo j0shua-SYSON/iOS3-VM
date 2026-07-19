@@ -41,6 +41,17 @@ static void load_and_run(arm_cpu_t *c, const uint32_t *prog, size_t words, int s
     for (int i = 0; i < steps; i++) if (arm_step(c) != ARM_OK) break;
 }
 
+/* Like load_and_run but returns the status of the last step (for trap tests). */
+static arm_status_t run_status(arm_cpu_t *c, const uint32_t *prog, size_t words, int steps) {
+    memset(g_ram, 0, sizeof g_ram);
+    for (size_t i = 0; i < words; i++) m_w32(NULL, (uint32_t)(i*4), prog[i]);
+    arm_reset(c, &g_bus);
+    c->cpsr = (c->cpsr & ~0x1fu) | ARM_MODE_SYS;
+    arm_status_t st = ARM_OK;
+    for (int i = 0; i < steps; i++) { st = arm_step(c); if (st != ARM_OK) break; }
+    return st;
+}
+
 /* --------------------------------------------------------------- the tests */
 
 static void test_mov_imm(void) {
@@ -160,6 +171,31 @@ static void test_orr_bic_mvn(void) {
     CHECK(c.r[1] == 0xffffffffu, "r1=%08x expect ffffffff", c.r[1]);
 }
 
+static void test_bx_branches(void) {
+    /* MOV r1,#0x100 ; BX r1  -> PC = 0x100 (regression: BX must actually branch,
+     * not silently execute as a TEQ comparison). */
+    uint32_t p[] = { 0xe3a01c01 /*MOV r1,#0x100*/, 0xe12fff11 /*BX r1*/ };
+    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    CHECK(c.r[15] == 0x100, "pc=%08x expect 100 (BX branched)", c.r[15]);
+}
+
+static void test_ldrh_traps(void) {
+    /* LDRH r2,[r1] (0xe1d120b0) is an extra-load/store encoding not implemented
+     * in M1; it must return ARM_UNDEFINED, not corrupt r2 as data-processing. */
+    uint32_t p[] = { 0xe1d120b0 };
+    arm_cpu_t c; arm_status_t st = run_status(&c, p, 1, 1);
+    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for LDRH", (int)st);
+}
+
+static void test_imm_dp_not_trapped(void) {
+    /* Regression for the extra-load/store mask: MOV r0,#0x90 has imm8 bits 7 and
+     * 4 set, but is immediate data-processing (bit25=1) and must execute. */
+    uint32_t p[] = { 0xe3a00090 /*MOV r0,#0x90*/ };
+    arm_cpu_t c; arm_status_t st = run_status(&c, p, 1, 1);
+    CHECK(st == ARM_OK, "status=%d expect ARM_OK for MOV imm", (int)st);
+    CHECK(c.r[0] == 0x90, "r0=%08x expect 90", c.r[0]);
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -175,6 +211,9 @@ int main(void) {
     test_cond_not_taken();
     test_mul();
     test_orr_bic_mvn();
+    test_bx_branches();
+    test_ldrh_traps();
+    test_imm_dp_not_trapped();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

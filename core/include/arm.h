@@ -7,7 +7,7 @@
  * builds and unit-tests on Windows/Linux/macOS and drops unchanged into the
  * iOS app. Memory is reached through host callbacks (see arm_bus_t).
  *
- * Copyright (c) 2026 the iOS3-VM authors. MIT licensed.
+ * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #ifndef IOS3VM_ARM_H
 #define IOS3VM_ARM_H

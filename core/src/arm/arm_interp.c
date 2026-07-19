@@ -11,7 +11,7 @@
  * later reuse this interpreter as its semantic oracle. Everything here is exact
  * ARMv6 behaviour, including r15-reads-as-PC+8 pipeline semantics.
  *
- * Copyright (c) 2026 the iOS3-VM authors. MIT licensed.
+ * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "arm.h"
 
@@ -170,6 +170,23 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
     unsigned rn     = (insn >> 16) & 0xf;
     unsigned rd     = (insn >> 12) & 0xf;
 
+    /* Opcodes 0x8..0xb (TST/TEQ/CMP/CMN) are valid comparisons only when S==1.
+     * With S==0 this is the ARMv6 miscellaneous/control space (BX, BLX(reg),
+     * MRS, MSR, CLZ, ...) — it must NOT fall through to the comparison cases,
+     * or e.g. BX would silently execute as TEQ and never branch. */
+    if (opcode >= 0x8 && opcode <= 0xb && !S) {
+        if ((insn & 0x0ffffff0u) == 0x012fff10u) {          /* BX Rm */
+            *next = reg_read(c, pc, insn & 0xf) & ~1u;      /* Thumb bit ignored (ARM-only for now) */
+            return ARM_OK;
+        }
+        if ((insn & 0x0ffffff0u) == 0x012fff30u) {          /* BLX Rm */
+            c->r[14] = pc + 4;
+            *next = reg_read(c, pc, insn & 0xf) & ~1u;
+            return ARM_OK;
+        }
+        return ARM_UNDEFINED;                                /* MRS/MSR/CLZ/SWP: M1 work */
+    }
+
     bool shifter_carry = get_flag(c, ARM_CPSR_C);
     uint32_t op2 = dp_operand2(c, pc, insn, &shifter_carry);
     uint32_t a   = reg_read(c, pc, rn);
@@ -198,7 +215,7 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
 
     if (writes) {
         c->r[rd] = res;
-        if (rd == 15) *next = res & ~1u; /* PC write => branch (ignore Thumb bit for now) */
+        if (rd == 15) *next = res & ~3u; /* ARM-state ALUWritePC forces word alignment */
     }
     return ARM_OK;
 }
@@ -291,6 +308,16 @@ arm_status_t arm_step(arm_cpu_t *c) {
         st = exec_multiply(c, pc, insn);
     } else if ((insn & 0x0c000000u) == 0x04000000u) {     /* single data transfer */
         st = exec_single_transfer(c, pc, insn, &next);
+    } else if ((insn & 0x0e000000u) == 0x00000000u &&
+               (insn & 0x00000090u) == 0x00000090u) {
+        /* Extra load/store (LDRH/STRH/LDRSB/LDRSH/LDRD/STRD), SWP, and the
+         * DSP/sync extension space: bits[27:25]==000, bit7==1, bit4==1. The
+         * bit25==0 requirement (mask 0x0e000000, not 0x0c000000) is essential:
+         * immediate data-processing sets bit25 and its imm8 may itself have
+         * bits 7 and 4 set (e.g. MOV r0,#0x90), so it must NOT be trapped here.
+         * MUL/MLA are handled above; the rest are unimplemented in M1 — trap
+         * them instead of corrupting Rd. */
+        st = ARM_UNDEFINED;
     } else if ((insn & 0x0c000000u) == 0x00000000u) {     /* data processing / PSR */
         st = exec_data_processing(c, pc, insn, &next);
     } else {
