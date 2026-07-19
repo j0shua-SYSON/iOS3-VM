@@ -35,7 +35,7 @@ Then it puts that whole emulated phone **inside an app on your real iPhone.**
 
 |  | Game/app emulators | UTM (QEMU-in-app) | **iOS3-VM** |
 |---|:---:|:---:|:---:|
-| Runs a **real Apple OS** | ✗ | ✓ (Linux/Windows guests) | ✓ **(iPhone OS 3)** |
+| Runs a **real Apple OS** | ✗ | ✗ (Linux/Windows guests) | ✓ **(iPhone OS 3)** |
 | **Full-system** (boots the actual kernel) | ✗ | ✓ | ✓ |
 | Targets a **real iPhone's** silicon | ✗ | ✗ | ✓ (S5L8900) |
 | **From scratch**, dependency-free core | — | ✗ (QEMU + glib + …) | ✓ (portable C11) |
@@ -74,9 +74,9 @@ Apple-specific code is the UIKit/Metal shell. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 **Why an old phone is the *ideal* host:** the A9 is `arm64` but predates Apple's
-APRR/PAC/PPL JIT hardening (A12+), so once the jailbreak relaxes code-signing we
-get plain **RWX** pages from a bare `mmap` — the cleanest possible home for a
-dynamic recompiler. The guests ran on a 412 MHz single core with 128 MB of RAM;
+APRR JIT hardening (A11) and PAC/PPL (A12), so once the jailbreak relaxes
+code-signing we get plain **RWX** pages from a bare `mmap` — the cleanest
+possible home for a dynamic recompiler. The guests ran on a 412 MHz single core with 128 MB of RAM;
 the host is a dual ~1.85 GHz `arm64` with 2 GB. Realtime is a real goal.
 
 ## Build & run
@@ -89,9 +89,11 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on
 ```
 
 **Get the app:** push to GitHub → the `ios-build` workflow produces an unsigned,
-fake-signed `iOS3VM.ipa` artifact. Download it and install on your jailbroken
-device (TrollStore / any AppSync-enabled installer). No Apple Developer account
-needed.
+fake-signed `iOS3VM.ipa` artifact. Install it on your jailbroken device running
+**AppSync Unified** (which lets `installd` accept the `ldid` ad-hoc-signed IPA)
+via Filza or any package installer — or, on a supported device, with
+**TrollStore** (which permanently re-signs it through the CoreTrust bug, no
+AppSync needed). Either way, no Apple Developer account is required.
 
 **Boot an OS** (from M3 on): drop your **own** iPhone OS 3.1.3 IPSW and its
 (publicly documented) decryption keys into the app's firmware folder — see

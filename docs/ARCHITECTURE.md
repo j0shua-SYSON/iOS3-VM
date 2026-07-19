@@ -73,10 +73,11 @@ The CPU has two interchangeable backends behind one interface (`arm_step`):
 
 Counter-intuitively, an old phone is the better JIT target:
 
-- The A9 is **arm64 (ARMv8-A), not arm64e.** It predates **APRR**, **PAC**, and
-  **PPL** — all of which Apple introduced with the A12 to *harden* JIT. On A9
-  there is no per-thread hardware W^X enforcement, so once code-signing is
-  relaxed we get true, simultaneous **RWX** pages from a plain
+- The A9 is **arm64 (ARMv8-A), not arm64e.** It predates **APRR** (Apple's
+  JIT-hardening permission mechanism, introduced with the A11) and **PAC** +
+  **PPL** (introduced with the A12) — the A9 has none of them. So there is no
+  per-thread hardware W^X enforcement, and once code-signing is relaxed we get
+  true, simultaneous **RWX** pages from a plain
   `mmap(PROT_READ|PROT_WRITE|PROT_EXEC)`. No `MAP_JIT`, no
   `pthread_jit_write_protect_np()` toggling, no double-mapping tricks.
 - The device is **jailbroken** (Dopamine 2.x, or palera1n). The jailbreak
