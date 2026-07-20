@@ -628,6 +628,57 @@ static void test_clcd_interrupt_reaches_the_cpu_on_line_13(void) {
     s5l8900_free(&m);
 }
 
+/*
+ * VICADDRESS (0xF00) is how AppleARMPL192VIC finds the pending source — it does
+ * NOT read IRQSTATUS. It decodes the returned word as source|0x80000000 and
+ * dispatches. Returning a bare 0 (no valid tag) decodes to spurious source 0,
+ * so a real interrupt is acknowledged without its handler running and re-fires
+ * forever — the boot-stopping storm the self-IPI on line 4 produced.
+ */
+static void test_vic_vectaddr_reports_tagged_source(void) {
+    s5l_vic_t v; s5l_vic_reset(&v);
+
+    /* Nothing pending -> 0, which the driver correctly reads as spurious. */
+    CHECK(s5l_vic_vectaddr(&v, 0) == 0, "idle VICADDRESS must be 0");
+
+    /* Reproduce the storm exactly: software interrupt bit 4, enabled, routed to
+     * IRQ (not selected to FIQ) — the self-IPI. */
+    s5l_vic_write(&v, VIC_SOFTINT, 1u << 4);
+    s5l_vic_write(&v, VIC_INTENABLE, 1u << 4);
+    CHECK(s5l_vic_vectaddr(&v, 0) == (0x80000000u | 4u),
+          "VICADDRESS=%08x expect 80000004 (source 4, valid bit) — a bare 0 "
+          "here is the storm", s5l_vic_vectaddr(&v, 0));
+
+    /* The driver then clears it via SOFTINTCLEAR, and it must go idle. */
+    s5l_vic_write(&v, VIC_SOFTINTCLEAR, 1u << 4);
+    CHECK(s5l_vic_vectaddr(&v, 0) == 0,
+          "after SOFTINTCLEAR the source must be gone, not re-reported");
+
+    /* base_source places a VIC in the daisy chain: VIC1's line 4 is global 36. */
+    s5l_vic_reset(&v);
+    s5l_vic_write(&v, VIC_SOFTINT, 1u << 4);
+    s5l_vic_write(&v, VIC_INTENABLE, 1u << 4);
+    CHECK(s5l_vic_vectaddr(&v, 32) == (0x80000000u | 36u),
+          "VIC1 line 4 must report as global source 36");
+
+    /* Lowest-numbered pending line wins (default priority). */
+    s5l_vic_reset(&v);
+    s5l_vic_write(&v, VIC_INTENABLE, 0xffffffffu);
+    s5l_vic_set_line(&v, 9, true);
+    s5l_vic_set_line(&v, 3, true);
+    CHECK(s5l_vic_vectaddr(&v, 0) == (0x80000000u | 3u),
+          "lowest pending line (3) must be selected, got %08x",
+          s5l_vic_vectaddr(&v, 0));
+
+    /* A line routed to FIQ must not appear in VICADDRESS (which is IRQ-only). */
+    s5l_vic_reset(&v);
+    s5l_vic_write(&v, VIC_INTENABLE, 1u << 7);
+    s5l_vic_write(&v, VIC_INTSELECT, 1u << 7);
+    s5l_vic_set_line(&v, 7, true);
+    CHECK(s5l_vic_vectaddr(&v, 0) == 0,
+          "an FIQ-routed line must not surface through VICADDRESS");
+}
+
 static void test_vic_masks_and_routes(void) {
     s5l_vic_t v; s5l_vic_reset(&v);
     s5l_vic_set_line(&v, 5, true);
@@ -724,6 +775,7 @@ int main(void) {
     test_machine_declares_its_known_windows();
     test_gpio_base_is_the_s5l8900_address();
     test_power_gate_state_tracks_onctrl_offctrl();
+    test_vic_vectaddr_reports_tagged_source();
     test_vic_masks_and_routes();
     test_vic1_is_mapped_and_drives_the_cpu();
     test_clcd_raises_the_frame_interrupt();

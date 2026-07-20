@@ -99,9 +99,20 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
     if (in_dev(addr, S5L8900_UART0_BASE)) {
         v = s5l_uart_read(&m->uart0, addr - S5L8900_UART0_BASE);
     } else if (in_dev(addr, S5L8900_VIC0_BASE)) {
-        v = s5l_vic_read(&m->vic[0], addr - S5L8900_VIC0_BASE);
+        uint32_t off = addr - S5L8900_VIC0_BASE;
+        /* VIC0's VICADDRESS surfaces its own sources first, then daisy-chains
+         * to VIC1 (global sources 32-63) — the standard PL192 cascade, and how
+         * the driver reads a single global 0-63 source number from VIC0. */
+        if (off == VIC_VECTADDR) {
+            v = s5l_vic_vectaddr(&m->vic[0], 0);
+            if (!v) v = s5l_vic_vectaddr(&m->vic[1], 32);
+        } else {
+            v = s5l_vic_read(&m->vic[0], off);
+        }
     } else if (in_dev(addr, S5L8900_VIC1_BASE)) {
-        v = s5l_vic_read(&m->vic[1], addr - S5L8900_VIC1_BASE);
+        uint32_t off = addr - S5L8900_VIC1_BASE;
+        if (off == VIC_VECTADDR) v = s5l_vic_vectaddr(&m->vic[1], 32);
+        else                     v = s5l_vic_read(&m->vic[1], off);
     } else if (in_dev(addr, S5L8900_CLCD_BASE)) {
         v = s5l_clcd_read(&m->clcd, addr - S5L8900_CLCD_BASE);
     } else if (in_timer(addr)) {

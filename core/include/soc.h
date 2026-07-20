@@ -91,6 +91,8 @@ void     s5l_uart_write(s5l_uart_t *u, uint32_t off, uint32_t val);
 #define VIC_INTENCLEAR   0x14u
 #define VIC_SOFTINT      0x18u
 #define VIC_SOFTINTCLEAR 0x1cu
+#define VIC_VECTADDR0    0x100u  /* per-source ISR address bank, 32 entries    */
+#define VIC_VECTADDR     0xf00u  /* PL192 vectored dispatch: read = source|bit31, write = EOI */
 
 typedef struct { uint32_t raw, enable, select, soft; } s5l_vic_t;
 
@@ -100,6 +102,9 @@ void     s5l_vic_write(s5l_vic_t *v, uint32_t off, uint32_t val);
 void     s5l_vic_set_line(s5l_vic_t *v, unsigned line, bool level);
 bool     s5l_vic_irq(const s5l_vic_t *v);
 bool     s5l_vic_fiq(const s5l_vic_t *v);
+/* PL192 VICADDRESS: highest-priority pending source tagged with bit 31, or 0.
+ * base_source positions this VIC in the daisy chain (0 for VIC0, 32 for VIC1). */
+uint32_t s5l_vic_vectaddr(const s5l_vic_t *v, unsigned base_source);
 
 /* -------------------------------------------------------------- timer ---
  * The real S5L8900 timer block, as used by XNU rather than as invented by us.
