@@ -9,6 +9,7 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "nand.h"
+#include "storage.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -117,6 +118,67 @@ static void test_absurd_geometry_refused(void) {
           "overflowing geometry accepted");
 }
 
+/* ------------------------------------------------------------ persistence */
+
+static void test_persistence_round_trip(void) {
+    /* The jailbreak use case in miniature: modify the guest's storage, save it,
+     * restore into a fresh device, and find the changes still there. Without
+     * this a jailbreak would evaporate on every relaunch. */
+    const char *path = "ios3vm_nand_test.img";
+    nand_t a; small(&a);
+    uint8_t page[64], spare[8];
+    for (unsigned i = 0; i < 64; i++) page[i] = (uint8_t)(0xff ^ i);
+    for (unsigned i = 0; i < 8; i++)  spare[i] = (uint8_t)(0xff ^ (i * 3));
+    nand_program_page(&a, 7, page, spare);
+    nand_mark_bad(&a, 3);
+
+    CHECK(storage_save_nand(&a, path) == STORAGE_OK, "save failed");
+    nand_free(&a);
+
+    nand_t b; small(&b);
+    storage_status_t st = storage_load_nand(&b, path);
+    CHECK(st == STORAGE_OK, "load failed: %s", storage_strerror(st));
+
+    uint8_t back[64], bspare[8];
+    nand_read_page(&b, 7, back, bspare);
+    CHECK(memcmp(page, back, 64) == 0, "data did not survive save/load");
+    CHECK(memcmp(spare, bspare, 8) == 0, "spare did not survive save/load");
+    CHECK(nand_is_bad(&b, 3), "bad-block map did not survive save/load");
+    CHECK(!nand_is_bad(&b, 0), "block 0 wrongly bad after load");
+    nand_free(&b);
+    remove(path);
+}
+
+static void test_geometry_mismatch_refused(void) {
+    /* Restoring into a differently-shaped device must be refused, not silently
+     * misread — a misinterpreted NAND image looks like a guest bug for days. */
+    const char *path = "ios3vm_nand_geom.img";
+    nand_t a; small(&a);
+    CHECK(storage_save_nand(&a, path) == STORAGE_OK, "save failed");
+    nand_free(&a);
+
+    nand_t b;
+    CHECK(nand_init(&b, 128, 8, 4, 4), "init failed");   /* different page size */
+    CHECK(storage_load_nand(&b, path) == STORAGE_ERR_GEOMETRY,
+          "geometry mismatch accepted");
+    nand_free(&b);
+    remove(path);
+}
+
+static void test_bad_image_refused(void) {
+    const char *path = "ios3vm_nand_junk.img";
+    FILE *f = fopen(path, "wb");
+    if (f) { fputs("not an image at all, really", f); fclose(f); }
+    nand_t n; small(&n);
+    storage_status_t st = storage_load_nand(&n, path);
+    CHECK(st == STORAGE_ERR_FORMAT || st == STORAGE_ERR_TRUNCATED,
+          "junk file accepted (%s)", storage_strerror(st));
+    CHECK(storage_load_nand(&n, "definitely_missing_file.img") == STORAGE_ERR_IO,
+          "missing file did not report an IO error");
+    nand_free(&n);
+    remove(path);
+}
+
 int main(void) {
     printf("iOS3-VM NAND device tests\n");
     test_erased_reads_all_ones();
@@ -125,6 +187,9 @@ int main(void) {
     test_erase_restores_ones();
     test_range_and_bad_blocks();
     test_absurd_geometry_refused();
+    test_persistence_round_trip();
+    test_geometry_mismatch_refused();
+    test_bad_image_refused();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

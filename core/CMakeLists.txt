@@ -8,6 +8,7 @@ add_library(emucore STATIC
     src/soc/timer.c
     src/soc/nor.c
     src/soc/nand.c
+    src/soc/storage.c
     src/soc/machine.c
     src/firmware/img3.c
     src/firmware/aes.c

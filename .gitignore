@@ -21,6 +21,8 @@ Payload/
 *.dmg
 *.n88ap*
 keys.json
+*.img
+ios3vm_nand_*.img
 
 # Editor / OS cruft
 .DS_Store

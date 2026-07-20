@@ -142,7 +142,17 @@ on the phone."
   tests and fail silently on a genuine NAND dump, which is worse than having
   none — so the raw device is provided for the FTL to sit on later, and the gap
   is stated in nand.h rather than papered over.
-- Remaining: the VFL/FTL layers (needs real firmware to validate against),
+- **Done: persistent storage.** NAND contents (data, spare and the bad-block
+  map) save to and restore from a host file, so guest writes survive a
+  relaunch. This matters because **jailbreaking the guest is a project goal**,
+  and a jailbreak is by definition a persistent modification — a RAM-disk-only
+  boot would wipe it every launch and could never demonstrate an untether. The
+  container records its geometry, so restoring into a differently-shaped device
+  is refused rather than silently misread. Note this gives persistence WITHOUT
+  Apple's FTL format.
+- Remaining: the VFL/FTL layers (needs real firmware to validate against;
+  see the licensing note below), and making NOR writable + persistent (the
+  era-appropriate S5L8900 untether, 24kpwn, persists its payload in NOR).
   device tree. Execute Apple's real low-level boot chain far enough to see
   **iBoot** serial output.
 *Requires the user to supply their own iPhone OS 3.1.3 IPSW + the public
