@@ -663,8 +663,22 @@ int main(int argc, char **argv) {
     const uint32_t fb_bytes = want_fb ? FB_W * FB_H * FB_BPP : 0u;
 
     uint32_t ba_pa = (dt_pa + dt_len + 0xfffu) & ~0xfffu;
-    uint32_t fb_pa = (ba_pa + 0x1000u + 0xfffu) & ~0xfffu;
-    uint32_t top_of_kernel_data = (fb_pa + fb_bytes + 0xfffu) & ~0xfffu;
+
+    /*
+     * topOfKernelData is where the kernel starts placing its own page tables,
+     * so anything counted below it moves them. Placing the framebuffer here
+     * and then advancing topOfKernelData past it is what made -F regress into
+     * a prefetch abort: the buffer itself was fine, but every table the kernel
+     * built afterwards landed somewhere else.
+     *
+     * Real iBoot does not put the framebuffer immediately after the kernel; it
+     * sits near the top of DRAM, far above the kernel's data. Do the same, and
+     * leave topOfKernelData describing only the kernel's own data.
+     */
+    uint32_t top_of_kernel_data = (ba_pa + 0x1000u + 0xfffu) & ~0xfffu;
+    uint32_t fb_pa = want_fb
+        ? ((phys_base + ram_size - fb_bytes) & ~0xfffu)   /* top of DRAM */
+        : top_of_kernel_data;
 
     uint8_t ba[0x138];
     memset(ba, 0, sizeof ba);

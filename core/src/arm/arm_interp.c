@@ -1232,15 +1232,19 @@ arm_status_t arm_step(arm_cpu_t *c) {
     if (cond == 0xfu) {
         /* PLD is a hint; a no-op is architecturally correct. Both the immediate
          * and register forms have bits[27:26]==01 and the Rd field SBO (1111). */
-        if ((insn & 0x0c00f000u) == 0x0400f000u) {
+        /*
+         * CLREX must be tested BEFORE PLD. Its encoding 0xF57FF01F satisfies
+         * the PLD pattern (bits[27:26]==01 with the Rd field all ones), so
+         * with PLD first it is silently treated as a hint and does nothing —
+         * which looks harmless and is not: a STREX the architecture requires
+         * to fail then succeeds, and two threads can both hold one lock.
+         */
+        if (insn == 0xf57ff01fu) {
+            c->excl_valid = false;
             c->r[15] = next;
             return ARM_OK;
         }
-        /* CLREX — drop the exclusive monitor. The kernel's context-switch and
-         * exception-return paths use it to make sure a half-finished
-         * LDREX/STREX pair cannot complete across a thread switch. */
-        if (insn == 0xf57ff01fu) {
-            c->excl_valid = false;
+        if ((insn & 0x0c00f000u) == 0x0400f000u) {
             c->r[15] = next;
             return ARM_OK;
         }
@@ -1375,6 +1379,95 @@ arm_status_t arm_step(arm_cpu_t *c) {
             c->r[rd] = 1;                                  /* 1 = failed */
         }
         c->excl_valid = false;         /* the monitor is consumed either way */
+    /*
+     * The rest of the ARMv6K exclusive family. These are not exotic: the real
+     * kernel's 64-bit atomics go through LDREXD/STREXD (OSAddAtomic64 is the
+     * first one the boot reaches), and the byte and halfword forms appear
+     * throughout the prelinked kexts. Rd must be even for the doubleword
+     * forms, which pair Rd with Rd+1.
+     */
+    } else if ((insn & 0x0ff00ff0u) == 0x01b00f90u) {     /* LDREXD Rd,Rd+1,[Rn] */
+        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        if (rd & 1u || rd == 14u) { st = ARM_UNDEFINED; }
+        else {
+            uint32_t addr = reg_read(c, pc, rn);
+            uint32_t lo = mem_r32(c, addr);
+            uint32_t hi = mem_r32(c, addr + 4);
+            if (!c->abort_pending) {
+                c->r[rd] = lo; c->r[rd + 1] = hi;
+                c->excl_valid = true;
+                c->excl_addr  = addr;
+            }
+        }
+    } else if ((insn & 0x0ff00ff0u) == 0x01a00f90u) {     /* STREXD Rd,Rm,Rm+1,[Rn] */
+        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        unsigned rm = insn & 0xfu;
+        if (rm & 1u || rm == 14u) { st = ARM_UNDEFINED; }
+        else {
+            uint32_t addr = reg_read(c, pc, rn);
+            if (c->excl_valid && c->excl_addr == addr) {
+                mem_w32(c, addr,     reg_read(c, pc, rm));
+                mem_w32(c, addr + 4, reg_read(c, pc, rm + 1));
+                if (!c->abort_pending) c->r[rd] = 0;
+            } else {
+                c->r[rd] = 1;
+            }
+            c->excl_valid = false;
+        }
+    } else if ((insn & 0x0ff00ff0u) == 0x01d00f90u) {     /* LDREXB Rd,[Rn] */
+        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        uint32_t addr = reg_read(c, pc, rn);
+        uint32_t v = mem_r8(c, addr);
+        if (!c->abort_pending) {
+            c->r[rd] = v;
+            c->excl_valid = true;
+            c->excl_addr  = addr;
+        }
+    } else if ((insn & 0x0ff00ff0u) == 0x01c00f90u) {     /* STREXB Rd,Rm,[Rn] */
+        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        uint32_t addr = reg_read(c, pc, rn);
+        if (c->excl_valid && c->excl_addr == addr) {
+            mem_w8(c, addr, (uint8_t)reg_read(c, pc, insn & 0xfu));
+            if (!c->abort_pending) c->r[rd] = 0;
+        } else {
+            c->r[rd] = 1;
+        }
+        c->excl_valid = false;
+    } else if ((insn & 0x0ff00ff0u) == 0x01f00f90u) {     /* LDREXH Rd,[Rn] */
+        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        uint32_t addr = reg_read(c, pc, rn);
+        uint32_t v = mem_r16(c, addr);
+        if (!c->abort_pending) {
+            c->r[rd] = v;
+            c->excl_valid = true;
+            c->excl_addr  = addr;
+        }
+    } else if ((insn & 0x0ff00ff0u) == 0x01e00f90u) {     /* STREXH Rd,Rm,[Rn] */
+        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        uint32_t addr = reg_read(c, pc, rn);
+        if (c->excl_valid && c->excl_addr == addr) {
+            mem_w16(c, addr, (uint16_t)reg_read(c, pc, insn & 0xfu));
+            if (!c->abort_pending) c->r[rd] = 0;
+        } else {
+            c->r[rd] = 1;
+        }
+        c->excl_valid = false;
+    /*
+     * SWP/SWPB — the pre-ARMv6 atomic. Deprecated in favour of LDREX/STREX but
+     * still present in shipping code of this vintage. On a single core an
+     * uninterrupted read-then-write is a faithful implementation.
+     */
+    } else if ((insn & 0x0fb00ff0u) == 0x01000090u) {     /* SWP / SWPB */
+        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        bool byte = (insn >> 22) & 1u;
+        uint32_t addr = reg_read(c, pc, rn);
+        uint32_t rm_v = reg_read(c, pc, insn & 0xfu);
+        uint32_t old  = byte ? mem_r8(c, addr) : mem_r32(c, addr);
+        if (!c->abort_pending) {
+            if (byte) mem_w8(c, addr, (uint8_t)rm_v);
+            else      mem_w32(c, addr, rm_v);
+            if (!c->abort_pending) c->r[rd] = old;
+        }
     } else if ((insn & 0x0e000000u) == 0x00000000u &&
                (insn & 0x00000090u) == 0x00000090u) {
         /* Remaining extension space with bits[6:5]==00: SWP/SWPB and the DSP

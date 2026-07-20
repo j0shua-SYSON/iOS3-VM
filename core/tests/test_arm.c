@@ -179,12 +179,82 @@ static void test_bx_branches(void) {
     CHECK(c.r[15] == 0x100, "pc=%08x expect 100 (BX branched)", c.r[15]);
 }
 
-static void test_swp_traps(void) {
-    /* SWP r0,r1,[r2] (0xe1020091) is in the extension space with bits[6:5]==00
-     * and is not implemented; it must trap rather than run as data-processing. */
-    uint32_t p[] = { 0xe1020091 };
-    arm_cpu_t c; arm_status_t st = run_status(&c, p, 1, 1);
-    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for SWP", (int)st);
+static void test_swp_exchanges(void) {
+    /* SWP is an atomic read-then-write: Rd gets the old memory word and the
+     * new value comes from Rm. Getting the order wrong (writing before
+     * reading) silently returns the value just stored, which looks correct
+     * whenever Rd and Rm happen to be the same register. */
+    uint32_t p[] = { 0xe3a01b02 /* MOV r1,#0x800   */,
+                     0xe3a000aa /* MOV r0,#0xAA    */,
+                     0xe5810000 /* STR r0,[r1]     seed memory with 0xAA */,
+                     0xe3a004bb /* MOV r0,#0xBB000000 */,
+                     0xe1012090 /* SWP r2,r0,[r1]  */,
+                     0xe5913000 /* LDR r3,[r1]     */ };
+    arm_cpu_t c; load_and_run(&c, p, 6, 6);
+    CHECK(c.r[2] == 0xaa, "r2=%08x expect aa (SWP returns the OLD word)", c.r[2]);
+    CHECK(c.r[3] == 0xbb000000, "r3=%08x expect bb000000 (SWP stored Rm)", c.r[3]);
+}
+
+/*
+ * LDREXD/STREXD: the doubleword exclusive pair the kernel's 64-bit atomics
+ * use. OSAddAtomic64 is the first one a real boot reaches, so this encoding
+ * is load-bearing rather than obscure.
+ */
+static void test_ldrexd_strexd_roundtrip(void) {
+    uint32_t p[] = { 0xe3a01b02 /* MOV r1,#0x800        */,
+                     0xe3a00012 /* MOV r0,#0x12         */,
+                     0xe5810000 /* STR r0,[r1]          low word  */,
+                     0xe3a00034 /* MOV r0,#0x34         */,
+                     0xe5810004 /* STR r0,[r1,#4]       high word */,
+                     0xe1b14f9f /* LDREXD r4,r5,[r1]    */,
+                     0xe3a06056 /* MOV r6,#0x56         */,
+                     0xe3a07078 /* MOV r7,#0x78         */,
+                     0xe1a13f96 /* STREXD r3,r6,r7,[r1] */,
+                     0xe5918000 /* LDR r8,[r1]          */,
+                     0xe5919004 /* LDR r9,[r1,#4]       */ };
+    arm_cpu_t c; load_and_run(&c, p, 11, 11);
+    CHECK(c.r[4] == 0x12, "r4=%08x expect 12 (LDREXD low)",  c.r[4]);
+    CHECK(c.r[5] == 0x34, "r5=%08x expect 34 (LDREXD high)", c.r[5]);
+    CHECK(c.r[3] == 0,    "r3=%08x expect 0 (STREXD succeeded)", c.r[3]);
+    CHECK(c.r[8] == 0x56, "r8=%08x expect 56 (STREXD low)",  c.r[8]);
+    CHECK(c.r[9] == 0x78, "r9=%08x expect 78 (STREXD high)", c.r[9]);
+}
+
+/*
+ * CLREX must actually drop the monitor. If it silently does nothing, a STREX
+ * that the architecture requires to fail will succeed, and two threads can
+ * both believe they hold the same lock.
+ */
+static void test_clrex_makes_strex_fail(void) {
+    uint32_t p[] = { 0xe3a01b02 /* MOV r1,#0x800   */,
+                     0xe1910f9f /* LDREX r0,[r1]   */,
+                     0xf57ff01f /* CLREX           */,
+                     0xe1812f90 /* STREX r2,r0,[r1]*/ };
+    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    CHECK(c.r[2] == 1, "r2=%08x expect 1 (STREX must fail after CLREX)", c.r[2]);
+}
+
+/*
+ * An exception clears the monitor too. Without this, an interrupt landing
+ * between LDREX and STREX leaves the tag intact and the preempted thread's
+ * STREX still succeeds -- two owners of one spinlock. Modelled here with SWI,
+ * which is the exception we can raise from a test program.
+ */
+static void test_exception_clears_exclusive_monitor(void) {
+    /* Laid out so the SWI vector at 0x08 is part of the same image: branch
+     * over it, run LDREX / SWI / STREX, and let the handler return to the
+     * STREX via MOV pc,lr. */
+    uint32_t p[] = { 0xea000002 /* 0x00 B 0x10        skip the vector */,
+                     0x00000000 /* 0x04 (unused)      */,
+                     0xe1a0f00e /* 0x08 MOV pc,lr     SWI vector        */,
+                     0x00000000 /* 0x0c (unused)      */,
+                     0xe3a01b02 /* 0x10 MOV r1,#0x800 */,
+                     0xe1910f9f /* 0x14 LDREX r0,[r1] */,
+                     0xef000000 /* 0x18 SWI #0        */,
+                     0xe1812f90 /* 0x1c STREX r2,r0,[r1] */ };
+    arm_cpu_t c; load_and_run(&c, p, 8, 6);
+    CHECK(c.r[2] == 1, "r2=%08x expect 1 (STREX must fail after an exception)",
+          c.r[2]);
 }
 
 static void test_strh_ldrh(void) {
@@ -767,7 +837,10 @@ int main(void) {
     test_mul();
     test_orr_bic_mvn();
     test_bx_branches();
-    test_swp_traps();
+    test_swp_exchanges();
+    test_ldrexd_strexd_roundtrip();
+    test_clrex_makes_strex_fail();
+    test_exception_clears_exclusive_monitor();
     test_imm_dp_not_trapped();
     test_strh_ldrh();
     test_ldrsb_sign_extends();
