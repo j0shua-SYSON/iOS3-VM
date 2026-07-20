@@ -169,6 +169,40 @@ static void test_timer_ack_mask_matches_the_kernels(void) {
           s5l_timer_read(&t, TIMER_IRQLATCH));
 }
 
+/*
+ * Guest time must advance at the guest's own CPU:timebase ratio, not once per
+ * instruction. Running the timebase at instruction rate makes time pass ~68x
+ * too fast relative to work done, so the kernel never finishes servicing one
+ * decrementer deadline before the next is already past; it clamps to its
+ * minimum and re-enters forever. That livelock burned 66% of a 200M-instruction
+ * boot inside the FIQ handler before this ratio existed.
+ */
+static void test_timebase_runs_at_the_guest_ratio(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+
+    const uint32_t insns = 412000;      /* one hundredth of a guest second */
+    for (uint32_t i = 0; i < insns; i++) s5l8900_tick(&m, 1);
+
+    uint32_t tb = m.bus.read32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER_TICKSLOW);
+    uint32_t want = (uint32_t)((uint64_t)insns * S5L8900_TB_HZ / S5L8900_CPU_HZ);
+    CHECK(tb == want, "timebase=%u expect %u (%u insns at %u:%u)",
+          tb, want, insns, S5L8900_CPU_HZ, S5L8900_TB_HZ);
+    CHECK(tb != insns, "timebase must not advance once per instruction");
+
+    /* The remainder must carry rather than be discarded: ticking one at a time
+     * has to match ticking in one lump, or time drifts against itself. */
+    s5l8900_t b;
+    CHECK(s5l8900_init(&b, 0, 1u << 20), "machine init failed");
+    s5l8900_tick(&b, insns);
+    uint32_t lump = b.bus.read32(b.bus.ctx, S5L8900_TIMER_BASE + TIMER_TICKSLOW);
+    CHECK(lump == tb, "lump=%u single-stepped=%u — remainder is being dropped",
+          lump, tb);
+
+    s5l8900_free(&m);
+    s5l8900_free(&b);
+}
+
 static void test_vic_masks_and_routes(void) {
     s5l_vic_t v; s5l_vic_reset(&v);
     s5l_vic_set_line(&v, 5, true);
@@ -219,6 +253,10 @@ static void test_timer_interrupt_reaches_handler(void) {
     const uint32_t spin = 0xeafffffeu;              /* B . */
     s5l8900_load(&m, 0x100, &spin, 4);
 
+    /* This test exercises device -> controller -> CPU, not the clock ratio, so
+     * run the timebase at one tick per instruction to keep it readable. */
+    m.cpu_hz = m.tb_hz = 1;
+
     /* Program the controller and timer the way guest setup code would. */
     m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE, 1u << S5L8900_IRQ_TIMER);
     m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER4_COUNTBUF, 4);
@@ -259,6 +297,7 @@ int main(void) {
     test_bare_metal_uart_hello();
     test_vic_masks_and_routes();
     test_timebase_runs_without_a_timer();
+    test_timebase_runs_at_the_guest_ratio();
     test_timer_period_is_exact();
     test_timer_ack_mask_matches_the_kernels();
     test_timer_interrupt_reaches_handler();

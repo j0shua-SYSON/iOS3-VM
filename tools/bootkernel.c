@@ -442,7 +442,40 @@ static struct {
     uint64_t    strex_total, strex_failed;
     unsigned    strex_log_n;
     struct { unsigned at; uint32_t pc, addr; } strex_log[32];
+
+    /* --- DIAGNOSTIC: FIQ arrival rate and the timer latch ------------------ */
+    unsigned    fiq_n, fiq_last;
+    uint64_t    fiq_instrs, fiq_longest;
+    unsigned    fiq_storm_logged;
+
+    /* --- DIAGNOSTIC: where the time actually goes -------------------------
+     * A sampled profile keyed by function. When a boot runs a hundred million
+     * instructions without reaching its next milestone, the question is not
+     * "where did it crash" but "what is it doing instead", and a call-path
+     * snapshot at an arbitrary stopping point does not answer that. */
+    unsigned    prof_n, prof_dropped;
+    struct { const char *fn; unsigned hits; } prof[1024];
 } G;
+
+/* Attribute one sample to a function, keeping the table small and exact. */
+static void prof_sample(uint32_t va) {
+    const char *nm = ksym_at(va);
+    const char *bar = strchr(nm, '+');
+    static char names[1024][96];
+    char base[96];
+    snprintf(base, sizeof base, "%.*s",
+             bar ? (int)(bar - nm) : (int)strlen(nm), nm);
+    for (unsigned i = 0; i < G.prof_n; i++)
+        if (!strcmp(G.prof[i].fn, base)) { G.prof[i].hits++; return; }
+    /* Never drop silently: a profile that quietly stops counting new
+     * functions looks like "all the time is in early boot" when in fact the
+     * later work simply had nowhere to go. */
+    if (G.prof_n >= 1024) { G.prof_dropped++; return; }
+    snprintf(names[G.prof_n], 96, "%s", base);
+    G.prof[G.prof_n].fn = names[G.prof_n];
+    G.prof[G.prof_n].hits = 1;
+    G.prof_n++;
+}
 
 static void note_dev_page(uint32_t addr, uint32_t pc, bool wr) {
     uint32_t pg = addr & ~0xfffu;
@@ -871,6 +904,12 @@ int main(int argc, char **argv) {
         }
         uint32_t strex_addr = strex_rn < 16 ? mach.cpu.r[strex_rn] : 0;
 
+        if ((n & 0x3ffu) == 0) {
+            uint32_t va = last_pc >= phys_base && last_pc < virt_base
+                        ? last_pc - phys_base + virt_base : last_pc;
+            prof_sample(va);
+        }
+
         st = arm_step(&mach.cpu);
         if (st != ARM_OK) break;
         s5l8900_tick(&mach, 1);
@@ -885,6 +924,38 @@ int main(int argc, char **argv) {
                     G.strex_log[G.strex_log_n].addr = strex_addr;
                     G.strex_log_n++;
                 }
+            }
+        }
+
+        /*
+         * FIQ rate and what the handler does to the timer latch. A decrementer
+         * of ~60,000 ticks that re-enters every ~100 instructions means the
+         * acknowledge is not clearing our latch, and the handler is simply
+         * re-entering forever.
+         */
+        {
+            uint32_t mode_after = mach.cpu.cpsr & ARM_CPSR_MODE_MASK;
+            if (mode_after == ARM_MODE_FIQ) G.fiq_instrs++;
+            if (mode_after == ARM_MODE_FIQ && mode_before != ARM_MODE_FIQ) {
+                /* Log the first few, and then the first few *close-spaced*
+                 * ones: a storm that starts late is invisible if only the
+                 * opening FIQs are sampled. */
+                if (G.fiq_n < 12 ||
+                    (n - G.fiq_last < 1000 && G.fiq_storm_logged++ < 10))
+                    printf("  FIQ #%u @instr %u  gap %u  latch=%08x "
+                           "t4_count=%u t4_value=%u ticks=%llu\n",
+                           G.fiq_n, n, n - G.fiq_last, mach.timer.irqlatch,
+                           mach.timer.t4_count, mach.timer.t4_value,
+                           (unsigned long long)mach.timer.ticks);
+                G.fiq_last = n;
+                G.fiq_n++;
+            }
+            if (mode_before == ARM_MODE_FIQ && mode_after != ARM_MODE_FIQ) {
+                uint64_t dur = (uint64_t)n - G.fiq_last;
+                if (dur > G.fiq_longest) G.fiq_longest = dur;
+                if (G.fiq_n <= 12)
+                    printf("      FIQ exit @instr %u  latch=%08x t4_value=%u\n",
+                           n, mach.timer.irqlatch, mach.timer.t4_value);
             }
         }
 
@@ -1077,6 +1148,34 @@ int main(int argc, char **argv) {
         if (G.mile_hits[i])
             printf("    %-28s hits %-10llu first @ instr %u\n", MILESTONES[i].name,
                    (unsigned long long)G.mile_hits[i], G.mile_first[i]);
+
+    printf("\n=== WHERE THE TIME WENT (sampled every 1024 instructions) ===\n");
+    {
+        unsigned total = 0;
+        for (unsigned i = 0; i < G.prof_n; i++) total += G.prof[i].hits;
+        printf("    %u samples over %u distinct functions%s\n", total, G.prof_n,
+               G.prof_dropped ? "" : "");
+        if (G.prof_dropped)
+            printf("    WARNING: %u samples dropped (table full) — profile is "
+                   "NOT representative\n", G.prof_dropped);
+        for (unsigned rank = 0; rank < 12; rank++) {
+            unsigned best = 0, bi = G.prof_n;
+            for (unsigned i = 0; i < G.prof_n; i++)
+                if (G.prof[i].hits > best) { best = G.prof[i].hits; bi = i; }
+            if (bi == G.prof_n || !best) break;
+            printf("    %5.1f%%  %-44s %u samples\n",
+                   total ? 100.0 * best / total : 0.0, G.prof[bi].fn, best);
+            G.prof[bi].hits = 0;   /* consume */
+        }
+    }
+
+    printf("\n=== FIQ COST ===\n");
+    printf("    entries              : %u\n", G.fiq_n);
+    printf("    instructions in FIQ  : %llu (%.1f%% of the run)\n",
+           (unsigned long long)G.fiq_instrs,
+           100.0 * (double)G.fiq_instrs / (double)(n ? n : 1));
+    printf("    longest single FIQ   : %llu instructions\n",
+           (unsigned long long)G.fiq_longest);
 
     printf("\n=== EXCEPTION RETURNS INTO THUMB ===\n");
     printf("    total                       : %llu\n", (unsigned long long)G.exret_thumb);

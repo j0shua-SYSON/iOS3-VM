@@ -131,6 +131,8 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
     if (!m->ram) return false;
     m->ram_base = ram_base;
     m->ram_size = ram_size;
+    m->cpu_hz   = S5L8900_CPU_HZ;
+    m->tb_hz    = S5L8900_TB_HZ;
 
     s5l_uart_reset(&m->uart0);
     s5l_vic_reset(&m->vic0);
@@ -159,8 +161,21 @@ void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
 }
 
 void s5l8900_tick(s5l8900_t *m, uint32_t ticks) {
+    /*
+     * Convert retired instructions into timebase ticks at the guest's own
+     * CPU:timebase ratio, carrying the remainder so it stays exact rather than
+     * drifting. Feeding instructions straight in runs guest time ~68x fast and
+     * livelocks the kernel's decrementer (see S5L8900_CPU_HZ).
+     */
+    uint32_t tb = ticks;
+    if (m->cpu_hz && m->tb_hz) {
+        m->tb_accum += (uint64_t)ticks * m->tb_hz;
+        tb = (uint32_t)(m->tb_accum / m->cpu_hz);
+        m->tb_accum %= m->cpu_hz;
+    }
+
     /* Devices advance, then the controller recomputes what the CPU sees. */
-    bool timer_irq = s5l_timer_tick(&m->timer, ticks);
+    bool timer_irq = s5l_timer_tick(&m->timer, tb);
     s5l_vic_set_line(&m->vic0, S5L8900_IRQ_TIMER, timer_irq);
 
     m->cpu.irq_line = s5l_vic_irq(&m->vic0);

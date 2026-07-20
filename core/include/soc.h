@@ -124,6 +124,24 @@ bool     s5l_vic_fiq(const s5l_vic_t *v);
 
 #define S5L8900_IRQ_TIMER 7u     /* VIC line the timer drives (routed to FIQ) */
 
+/*
+ * The guest's clocks, as we advertise them to it in the device tree.
+ *
+ * This ratio is a real design parameter, not bookkeeping. On the hardware the
+ * CPU runs at 412 MHz while the timebase counts at 6 MHz, so one timebase tick
+ * costs about 68 CPU cycles. Advancing the timebase once per retired
+ * instruction instead makes guest time run ~68x fast relative to guest work,
+ * and the kernel then cannot finish servicing one timer deadline before the
+ * next one is already in the past: it clamps the decrementer to its minimum,
+ * re-enters immediately, and livelocks. That is not a hypothetical -- it burned
+ * 66% of a 200M-instruction boot in the FIQ handler.
+ *
+ * One retired instruction is treated as one CPU cycle, which is optimistic for
+ * an ARM1176 but keeps the ratio honest in the direction that matters.
+ */
+#define S5L8900_CPU_HZ 412000000u
+#define S5L8900_TB_HZ    6000000u
+
 typedef struct {
     uint64_t ticks;              /* free-running; never gated by any enable */
     uint32_t config;
@@ -228,6 +246,14 @@ typedef struct {
     uint32_t   dev_value[S5L_DEVLOG];
     bool       dev_is_write[S5L_DEVLOG];
     unsigned   dev_count;
+
+    /*
+     * How fast guest time runs relative to guest work. See S5L8900_CPU_HZ.
+     * cpu_hz retired instructions advance the timebase by tb_hz ticks;
+     * tb_accum carries the remainder so the ratio stays exact over time.
+     */
+    uint32_t   cpu_hz, tb_hz;
+    uint64_t   tb_accum;
 } s5l8900_t;
 
 /* Advance the devices and refresh the CPU's interrupt lines. */
