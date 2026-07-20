@@ -511,16 +511,31 @@ static void test_msr_still_works(void) {
           "mode=%02x expect IRQ", c.cpsr & ARM_CPSR_MODE_MASK);
 }
 
-static void test_media_space_traps(void) {
-    /* REV and UXTB are media-space encodings we do not implement; they must
-     * trap rather than be executed as loads/stores. */
-    uint32_t rev[] = { 0xe6bf0f31 };   /* REV r0,r1  */
-    arm_cpu_t c; arm_status_t st = run_status(&c, rev, 1, 1);
-    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for REV", (int)st);
+static void test_arm_media_extend_and_reverse(void) {
+    /* The ARM media extend and byte-reverse families, which real XNU uses in
+     * ordinary compiled code. (These used to trap; that assertion documented a
+     * limitation that no longer exists.) */
+    uint32_t p[] = { 0xe59f1010 /*LDR r1,[pc,#16] -> the literal at 0x18*/,
+                     0xe6bf0f31 /*REV  r0,r1 */,
+                     0xe6ef2071 /*UXTB r2,r1 */,
+                     0xe6bf3071 /*SXTH r3,r1 */,
+                     0xe6ff4071 /*UXTH r4,r1 */,
+                     0xeafffffe /*B .        */,
+                     0x11228344 /*literal    */ };
+    arm_cpu_t c; load_and_run(&c, p, 7, 5);
+    CHECK(c.r[1] == 0x11228344u, "r1=%08x expect 11228344", c.r[1]);
+    CHECK(c.r[0] == 0x44832211u, "r0=%08x expect 44832211 (REV)", c.r[0]);
+    CHECK(c.r[2] == 0x44, "r2=%08x expect 44 (UXTB)", c.r[2]);
+    CHECK(c.r[3] == 0xffff8344u, "r3=%08x expect ffff8344 (SXTH sign-extends)", c.r[3]);
+    CHECK(c.r[4] == 0x8344, "r4=%08x expect 8344 (UXTH)", c.r[4]);
+}
 
-    uint32_t uxtb[] = { 0xe6ef0071 };  /* UXTB r0,r1 */
-    st = run_status(&c, uxtb, 1, 1);
-    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for UXTB", (int)st);
+static void test_unimplemented_media_still_traps(void) {
+    /* SEL is media-space but not implemented; it must still be named rather
+     * than silently mis-executed as a load/store. */
+    uint32_t sel[] = { 0xe6800fb1 };   /* SEL r0,r0,r1 */
+    arm_cpu_t c; arm_status_t st = run_status(&c, sel, 1, 1);
+    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for SEL", (int)st);
 }
 
 static void test_apx_makes_mapping_read_only(void) {
@@ -781,7 +796,8 @@ int main(void) {
     test_unconditional_space_traps();
     test_clz_does_not_corrupt_cpsr();
     test_msr_still_works();
-    test_media_space_traps();
+    test_arm_media_extend_and_reverse();
+    test_unimplemented_media_still_traps();
     test_apx_makes_mapping_read_only();
     test_abort_restores_base_register();
     test_thumb_mov_add();

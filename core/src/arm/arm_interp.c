@@ -153,7 +153,18 @@ static void take_exception(arm_cpu_t *c, uint32_t vector, uint32_t mode,
  */
 static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     unsigned cp   = (insn >> 8)  & 0xfu;
-    if (cp != 15) return ARM_UNDEFINED;         /* only CP15 exists on this SoC */
+
+    /*
+     * CP14 is the debug coprocessor. The kernel probes it during init (reading
+     * DBGDIDR) to decide whether a debug unit is present. Reporting "no debug
+     * hardware" — zeros — is truthful for this emulator and lets the probe
+     * proceed; trapping it would stop a boot over a feature query.
+     */
+    if (cp == 14) {
+        if ((insn >> 20) & 1u) c->r[(insn >> 12) & 0xfu] = 0;  /* MRC reads 0 */
+        return ARM_OK;                                          /* MCR ignored */
+    }
+    if (cp != 15) return ARM_UNDEFINED;         /* only CP14/CP15 on this SoC */
 
     bool     load = (insn >> 20) & 1u;          /* 1 = MRC (read), 0 = MCR */
     unsigned crn  = (insn >> 16) & 0xfu;
@@ -547,7 +558,10 @@ static arm_status_t exec_single_transfer(arm_cpu_t *c, uint32_t pc, uint32_t ins
          * be left untouched so the handler can fix the mapping and re-execute. */
         if (c->abort_pending) return ARM_OK;
         c->r[rd] = val;
-        if (rd == 15) *next = val & ~3u;
+        if (rd == 15) {                      /* LDR to PC interworks too */
+            if (val & 1u) c->cpsr |= ARM_CPSR_T; else c->cpsr &= ~ARM_CPSR_T;
+            *next = val & (uint32_t)((val & 1u) ? ~1u : ~3u);
+        }
     } else {  /* store */
         uint32_t val = reg_read(c, pc, rd); /* stored r15 is +12 on real HW; +8 is close enough here */
         if (B) mem_w8_as(c, addr, (uint8_t)val, priv);
@@ -662,7 +676,17 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
             if (!(list & (1u << i))) continue;
             if (user_bank) { reg_write_user(c, i, loaded[i]); continue; }
             c->r[i] = loaded[i];
-            if (i == 15) *next = loaded[i] & ~3u;  /* LDM with PC branches */
+            if (i == 15) {
+                /* ARMv5 and later: loading PC INTERWORKS. Bit 0 selects the
+                 * instruction set, so "POP {..,pc}" returning to a Thumb caller
+                 * must switch to Thumb. Masking bit 0 off without setting T
+                 * leaves the CPU decoding Thumb bytes as ARM — which is exactly
+                 * how real XNU ended up executing garbage and taking a
+                 * spurious SWI. */
+                if (loaded[i] & 1u) c->cpsr |= ARM_CPSR_T;
+                else                c->cpsr &= ~ARM_CPSR_T;
+                *next = loaded[i] & (uint32_t)((loaded[i] & 1u) ? ~1u : ~3u);
+            }
         }
     }
 
@@ -679,6 +703,58 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
         c->cpsr = (c->cpsr & ARM_CPSR_MODE_MASK) | (s & ~ARM_CPSR_MODE_MASK);
     }
     return ARM_OK;
+}
+
+/*
+ * ARMv6 media space: the extend and byte-reverse families. Real XNU uses these
+ * in ordinary compiled code, so they are not optional.
+ *
+ *   extend: cccc 0110 1 op nnnn dddd rr00 0111 mmmm
+ *           Rn == 15 is the plain form; otherwise the result is added to Rn.
+ *           rr rotates the source right by rr*8 before extracting.
+ */
+static arm_status_t exec_media(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    if ((insn & 0x0f0000f0u) == 0x06000070u) {
+        unsigned op  = (insn >> 20) & 0xfu;
+        unsigned rn  = (insn >> 16) & 0xfu;
+        unsigned rd  = (insn >> 12) & 0xfu;
+        unsigned rot = (insn >> 10) & 3u;
+        uint32_t v   = ror32(reg_read(c, pc, insn & 0xfu), rot * 8u);
+        uint32_t res;
+        switch (op) {
+            case 0xa: res = (uint32_t)(int32_t)(int8_t)(uint8_t)v;    break; /* SXTB  */
+            case 0xb: res = (uint32_t)(int32_t)(int16_t)(uint16_t)v;  break; /* SXTH  */
+            case 0xe: res = v & 0xffu;                                break; /* UXTB  */
+            case 0xf: res = v & 0xffffu;                              break; /* UXTH  */
+            default:  return ARM_UNDEFINED;      /* the 16-bit pair variants */
+        }
+        if (rn != 15) res += reg_read(c, pc, rn);          /* accumulate form */
+        c->r[rd] = res;
+        return ARM_OK;
+    }
+
+    /* REV / REV16 / REVSH */
+    if ((insn & 0x0fff0ff0u) == 0x06bf0f30u) {             /* REV */
+        uint32_t v = reg_read(c, pc, insn & 0xfu);
+        c->r[(insn >> 12) & 0xfu] =
+            ((v & 0xffu) << 24) | ((v & 0xff00u) << 8)
+          | ((v >> 8) & 0xff00u) | ((v >> 24) & 0xffu);
+        return ARM_OK;
+    }
+    if ((insn & 0x0fff0ff0u) == 0x06bf0fb0u) {             /* REV16 */
+        uint32_t v = reg_read(c, pc, insn & 0xfu);
+        c->r[(insn >> 12) & 0xfu] =
+            ((v & 0x00ffu) << 8) | ((v & 0xff00u) >> 8)
+          | ((v & 0x00ff0000u) << 8) | ((v & 0xff000000u) >> 8);
+        return ARM_OK;
+    }
+    if ((insn & 0x0fff0ff0u) == 0x06ff0fb0u) {             /* REVSH */
+        uint32_t v = reg_read(c, pc, insn & 0xfu);
+        uint16_t h = (uint16_t)(((v & 0xffu) << 8) | ((v >> 8) & 0xffu));
+        c->r[(insn >> 12) & 0xfu] = (uint32_t)(int32_t)(int16_t)h;
+        return ARM_OK;
+    }
+    return ARM_UNDEFINED;                  /* PKH, SEL, USAT, SMLAD, ... */
 }
 
 static arm_status_t exec_multiply(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
@@ -1209,11 +1285,10 @@ arm_status_t arm_step(arm_cpu_t *c) {
         st = exec_multiply(c, pc, insn);
     } else if ((insn & 0x0e000000u) == 0x06000000u &&
                (insn & 0x00000010u) != 0) {
-        /* bits[27:25]==011 with bit4==1 is the ARMv6 media space (REV, REV16,
-         * UXTB/SXTB/UXTH, PKH, SEL, USAT, SMLAD, ...). These are real ARM1176
-         * instructions we do not implement; without this guard they fall into
-         * the single-transfer decode below and silently read/write memory. */
-        st = ARM_UNDEFINED;
+        /* bits[27:25]==011 with bit4==1 is the ARMv6 media space. The extend
+         * and byte-reverse families are implemented; the rest still trap, so
+         * they are named rather than silently mis-executed as loads/stores. */
+        st = exec_media(c, pc, insn);
     } else if ((insn & 0x0c000000u) == 0x04000000u) {     /* single data transfer */
         st = exec_single_transfer(c, pc, insn, &next);
     } else if ((insn & 0x0e000000u) == 0x08000000u) {     /* LDM / STM */

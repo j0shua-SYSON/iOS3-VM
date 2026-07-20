@@ -56,15 +56,16 @@ int main(int argc, char **argv) {
     const char *cmdline = "debug=0x8 serial=1";
     bool stop_on_abort = false;
 
-    for (int i = 2; i < argc; i++)
-        if (!strcmp(argv[i], "-a")) stop_on_abort = true;
-
-    for (int i = 2; i + 1 < argc; i += 2) {
-        if      (!strcmp(argv[i], "-p")) phys_base = (uint32_t)strtoul(argv[i+1], NULL, 0);
-        else if (!strcmp(argv[i], "-V")) virt_base = (uint32_t)strtoul(argv[i+1], NULL, 0);
-        else if (!strcmp(argv[i], "-n")) steps     = (unsigned)strtoul(argv[i+1], NULL, 0);
-        else if (!strcmp(argv[i], "-d")) dtpath    = argv[i+1];
-        else if (!strcmp(argv[i], "-c")) cmdline   = argv[i+1];
+    /* Walk the arguments one at a time: pair-stepping breaks as soon as a
+     * single-argument flag like -a appears. */
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "-a")) { stop_on_abort = true; continue; }
+        if (i + 1 >= argc) break;
+        if      (!strcmp(argv[i], "-p")) phys_base = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-V")) virt_base = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-n")) steps     = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-d")) dtpath    = argv[++i];
+        else if (!strcmp(argv[i], "-c")) cmdline   = argv[++i];
     }
 
     size_t len = 0;
@@ -168,7 +169,7 @@ int main(int argc, char **argv) {
      * instructions that led there, not the state a few million instructions
      * later once it is spinning in a handler.
      */
-#define KTRACE 32
+#define KTRACE 160
     struct { uint32_t pc, cpsr, r[16]; } tr[KTRACE];
     unsigned tw = 0, tcount = 0;
 
