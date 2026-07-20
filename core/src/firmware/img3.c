@@ -64,25 +64,39 @@ bool img3_decrypt_data(const img3_t *img, const uint8_t *key, unsigned key_bits,
 }
 
 static void parse_kbag(const uint8_t *d, uint32_t len, img3_kbag_t *k) {
-    /* cryptState(4) keyBits(4) IV(16) key(keyBits/8) */
+    /* cryptState(4) keyBits(4) IV(16) key(keyBits/8)
+     *
+     * Every early return marks the bag malformed rather than merely absent. The
+     * distinction matters: the loader decides whether to decrypt from this, and
+     * silently treating an unparseable KBAG as "not encrypted" would copy
+     * ciphertext into guest RAM and report success. */
+    k->malformed = true;
     if (len < 24) return;
     k->crypt_state = rd32(d);
     k->key_bits    = rd32(d + 4);
     memcpy(k->iv, d + 8, 16);
 
     uint32_t key_len = k->key_bits / 8u;
-    if (key_len > sizeof k->key) return;          /* implausible: ignore */
+    if (key_len > sizeof k->key) return;          /* implausible key size */
     if ((uint64_t)24 + key_len > (uint64_t)len) return;
     memcpy(k->key, d + 24, key_len);
-    k->present = true;
+    k->present   = true;
+    k->malformed = false;
 }
 
 img3_status_t img3_parse(const uint8_t *buf, size_t len, img3_t *out) {
     memset(out, 0, sizeof *out);
     if (!buf || len < IMG3_HEADER_SIZE) return IMG3_ERR_TOO_SMALL;
 
-    /* The magic is stored reversed on disk ("3gmI"). */
-    if (rd32(buf) != 0x33676d49u) return IMG3_ERR_BAD_MAGIC;
+    /*
+     * A real IMG3 begins with the bytes 33 67 6d 49, which read as "3gmI" in a
+     * hex dump; a little-endian rd32 of those bytes is 0x496d6733 == IMG3_MAGIC.
+     * This is the same convention the tags use (a DATA tag is stored "ATAD" and
+     * reads back as 0x44415441), so the header must follow it too. Comparing
+     * against the byte-swapped value instead would reject every genuine Apple
+     * image while our own synthetic test images still parsed.
+     */
+    if (rd32(buf) != IMG3_MAGIC) return IMG3_ERR_BAD_MAGIC;
 
     out->full_size   = rd32(buf + 4);
     out->data_size   = rd32(buf + 8);

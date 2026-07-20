@@ -37,6 +37,10 @@ fw_status_t fw_load_img3(s5l8900_t *m, const uint8_t *buf, size_t len,
 
     uint8_t *dst = &m->ram[off];
 
+    /* A KBAG we could not parse means "encrypted, but we do not know how".
+     * Refuse rather than copying ciphertext in and calling it success. */
+    if (img.kbag.malformed) return FW_ERR_DECRYPT;
+
     if (img.kbag.present) {
         if (!key) return FW_ERR_KEY_REQUIRED;
         uint32_t written = 0;

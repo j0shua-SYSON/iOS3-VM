@@ -12,10 +12,13 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "soc.h"
+#include "img3.h"
 #include <stdlib.h>
 #include <string.h>
 
-#define IMG3_DISK_MAGIC 0x33676d49u   /* "3gmI" as stored */
+/* Shared with the parser so the two layers cannot disagree: a real image
+ * starts with the bytes 33 67 6d 49 ("3gmI"), read little-endian as IMG3_MAGIC. */
+#define IMG3_DISK_MAGIC IMG3_MAGIC
 #define IMG3_HEADER     20u
 
 static uint32_t rd32(const uint8_t *p) {
@@ -39,6 +42,9 @@ void s5l_nor_free(s5l_nor_t *n) {
 }
 
 uint32_t s5l_nor_read(const s5l_nor_t *n, uint32_t off, unsigned bytes) {
+    /* The result is a uint32_t, so a wider access cannot be represented — bound
+     * it here rather than trusting every present and future caller. */
+    if (bytes > sizeof(uint32_t)) return 0;
     /* 64-bit comparison so an offset near the top of the space cannot wrap. */
     if (!n->data || (uint64_t)off + bytes > (uint64_t)n->size) return 0;
     uint32_t v = 0;

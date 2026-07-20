@@ -31,7 +31,7 @@ static void put32(uint32_t off, uint32_t v) {
 /* Start a container with the given ident (e.g. 'ibot' as 0x69626f74). */
 static void img_begin(uint32_t ident) {
     memset(g_buf, 0, sizeof g_buf);
-    put32(0, 0x33676d49u);      /* "3gmI" on disk */
+    put32(0, IMG3_MAGIC);   /* bytes 33 67 6d 49 == "3gmI" */      /* "3gmI" on disk */
     put32(16, ident);
     g_len = 20;
 }
@@ -228,6 +228,111 @@ static void test_decrypt_requires_kbag(void) {
           "decrypt without a KBAG should fail");
 }
 
+/* --- regressions from the adversarial audit ----------------------------- */
+
+static void test_magic_is_literal_3gmI(void) {
+    /* Asserted against raw bytes, not the constant, so a future byte-swap of
+     * IMG3_MAGIC fails loudly instead of being mirrored by the fixtures. A real
+     * Apple image begins with the ASCII bytes "3gmI". */
+    img_begin(0x69626f74u);
+    img_tag(IMG3_TAG_DATA, "X", 1);
+    img_finish();
+    CHECK(memcmp(g_buf, "3gmI", 4) == 0, "header bytes must be ASCII 3gmI");
+
+    img3_t img;
+    CHECK(img3_parse(g_buf, g_len, &img) == IMG3_OK, "real-layout header must parse");
+
+    memcpy(g_buf, "Img3", 4);                    /* the byte-swapped form */
+    CHECK(img3_parse(g_buf, g_len, &img) == IMG3_ERR_BAD_MAGIC,
+          "byte-swapped magic must be rejected");
+}
+
+/* Build a KBAG declaring `key_bits` with `n` bytes of key material, parse it
+ * behind a canary, and check nothing outside kbag.key was touched. */
+static void kbag_case(uint32_t key_bits, uint32_t n, bool expect_present) {
+    static uint8_t k[24 + 512];
+    memset(k, 0, sizeof k);
+    k[0] = 1;
+    k[4] = (uint8_t)key_bits;        k[5] = (uint8_t)(key_bits >> 8);
+    k[6] = (uint8_t)(key_bits >> 16);k[7] = (uint8_t)(key_bits >> 24);
+    for (uint32_t i = 0; i < 16; i++) k[8 + i]  = (uint8_t)(0xa0 + i);
+    for (uint32_t i = 0; i < n;  i++) k[24 + i] = (uint8_t)(0xb0 + i);
+
+    img_begin(0x69626f74u);
+    img_tag(IMG3_TAG_KBAG, k, 24 + n);
+    img_tag(IMG3_TAG_DATA, "abcd", 4);
+    img_finish();
+
+    struct { img3_t img; uint8_t canary[256]; } w;
+    memset(&w, 0xEE, sizeof w);
+
+    CHECK(img3_parse(g_buf, g_len, &w.img) == IMG3_OK,
+          "keyBits=%u n=%u: parse failed", key_bits, n);
+    CHECK(w.img.kbag.present == expect_present,
+          "keyBits=%u n=%u: present=%d expect %d",
+          key_bits, n, (int)w.img.kbag.present, (int)expect_present);
+
+    unsigned dirty = 0;
+    for (unsigned i = 0; i < sizeof w.canary; i++)
+        if (w.canary[i] != 0xEE) dirty++;
+    CHECK(dirty == 0, "keyBits=%u n=%u: %u bytes clobbered past the img3_t",
+          key_bits, n, dirty);
+}
+
+static void test_kbag_192_and_256_accepted(void) {
+    kbag_case(192, 24, true);
+    kbag_case(256, 32, true);            /* exactly fills key[32] */
+}
+
+static void test_kbag_absurd_keybits_rejected(void) {
+    /* The only thing protecting the fixed 32-byte key field is one bounds
+     * check on an attacker-controlled length. Pin it. */
+    kbag_case(264,  33,  false);         /* one byte past the field */
+    kbag_case(512,  64,  false);
+    kbag_case(4096, 512, false);
+    kbag_case(0xffffffffu, 16, false);   /* must not wrap */
+}
+
+static void test_malformed_kbag_is_not_treated_as_plaintext(void) {
+    /* A KBAG we cannot understand means "encrypted, method unknown". It must
+     * not be silently downgraded to "not encrypted". */
+    uint8_t k[8] = {1,0,0,0, 128,0,0,0};   /* too short to hold IV or key */
+    img_begin(0x69626f74u);
+    img_tag(IMG3_TAG_KBAG, k, sizeof k);
+    img_tag(IMG3_TAG_DATA, "abcd", 4);
+    img_finish();
+
+    img3_t img;
+    CHECK(img3_parse(g_buf, g_len, &img) == IMG3_OK, "parse failed");
+    CHECK(!img.kbag.present, "unparseable KBAG should not be present");
+    CHECK(img.kbag.malformed, "unparseable KBAG should be flagged malformed");
+}
+
+static void test_long_vers_is_clamped(void) {
+    /* The version string is copied into a fixed 64-byte field from an
+     * attacker-controlled length; the clamp was previously never exercised. */
+    uint8_t vers[4 + 200];
+    memset(vers, 0, sizeof vers);
+    vers[0] = 200;                                  /* declared length */
+    for (unsigned i = 0; i < 200; i++) vers[4 + i] = 'A';
+
+    img_begin(0x6b726e6cu);
+    img_tag(IMG3_TAG_VERS, vers, sizeof vers);
+    img_tag(IMG3_TAG_DATA, "abcd", 4);
+    img_finish();
+
+    struct { img3_t img; uint8_t canary[64]; } w;
+    memset(&w, 0xEE, sizeof w);
+    CHECK(img3_parse(g_buf, g_len, &w.img) == IMG3_OK, "parse failed");
+    CHECK(strlen(w.img.vers) < sizeof w.img.vers,
+          "vers must stay NUL-terminated inside its field (len=%u)",
+          (unsigned)strlen(w.img.vers));
+    unsigned dirty = 0;
+    for (unsigned i = 0; i < sizeof w.canary; i++)
+        if (w.canary[i] != 0xEE) dirty++;
+    CHECK(dirty == 0, "%u bytes clobbered past the img3_t by a long VERS", dirty);
+}
+
 int main(void) {
     printf("iOS3-VM IMG3 parser tests\n");
     test_parse_minimal();
@@ -241,6 +346,11 @@ int main(void) {
     test_truncated_kbag_ignored();
     test_decrypt_data_roundtrip();
     test_decrypt_requires_kbag();
+    test_magic_is_literal_3gmI();
+    test_kbag_192_and_256_accepted();
+    test_kbag_absurd_keybits_rejected();
+    test_malformed_kbag_is_not_treated_as_plaintext();
+    test_long_vers_is_clamped();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

@@ -32,7 +32,7 @@ static void put32(uint32_t off, uint32_t v) {
 }
 static void img_begin(uint32_t ident) {
     memset(g_img, 0, sizeof g_img);
-    put32(0, 0x33676d49u);
+    put32(0, IMG3_MAGIC);   /* bytes 33 67 6d 49 == "3gmI" */
     put32(16, ident);
     g_len = 20;
 }
@@ -270,6 +270,79 @@ static void test_boot_from_nor(void) {
     s5l8900_free(&m);
 }
 
+/* --- regressions from the adversarial audit ----------------------------- */
+
+static void test_nor_directory_cap(void) {
+    /* NOR contents are user-supplied dumps and can trivially hold more images
+     * than the directory has room for. Mutation testing showed an off-by-one in
+     * the cap would overflow s5l_nor_t.images with the suite still green. */
+    s5l8900_t m;
+    s5l8900_init(&m, 0, 1u << 16);
+
+    /* A minimal 20-byte container, repeated well past S5L_NOR_MAX_IMAGES. */
+    uint8_t tiny[20];
+    memset(tiny, 0, sizeof tiny);
+    tiny[0] = 0x33; tiny[1] = 0x67; tiny[2] = 0x6d; tiny[3] = 0x49;  /* "3gmI" */
+    tiny[4] = 20;                                                    /* fullSize */
+    for (unsigned i = 0; i < S5L_NOR_MAX_IMAGES * 4u; i++)
+        s5l_nor_program(&m.nor, i * 32u, tiny, sizeof tiny);
+
+    unsigned n = s5l_nor_scan(&m.nor);
+    CHECK(n <= S5L_NOR_MAX_IMAGES, "scan reported %u images, cap is %u",
+          n, S5L_NOR_MAX_IMAGES);
+    CHECK(m.nor.image_count <= S5L_NOR_MAX_IMAGES,
+          "image_count=%u exceeds the directory size", m.nor.image_count);
+    s5l8900_free(&m);
+}
+
+static void test_load_with_non_zero_ram_base(void) {
+    /* Every other test uses ram_base 0, which makes the loader's ram_base
+     * subtraction a no-op. Real S5L8900 SDRAM does not live at 0 and M4 will
+     * need a non-zero base, so exercise it. */
+    const uint32_t base = S5L8900_SDRAM_BASE;
+    img_begin(0x69626f74u);
+    img_tag(0x44415441u, PAYLOAD, (uint32_t)sizeof PAYLOAD);
+    img_finish();
+
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, base, 1u << 20), "init failed");
+
+    fw_image_t info;
+    fw_status_t st = fw_boot_img3(&m, g_img, g_len, NULL, 0, base + 0x1000, &info);
+    CHECK(st == FW_OK, "boot at a non-zero RAM base failed: %s", fw_strerror(st));
+
+    /* The payload must land at the right offset within the allocation. */
+    CHECK(memcmp(&m.ram[0x1000], PAYLOAD, sizeof PAYLOAD) == 0,
+          "payload was written to the wrong offset for a non-zero ram_base");
+
+    arm_status_t ast = ARM_OK;
+    s5l8900_run(&m, 64, &ast);
+    m.uart0.tx[m.uart0.tx_len] = '\0';
+    CHECK(strcmp(m.uart0.tx, "iBoot") == 0, "uart=\"%s\" expect iBoot", m.uart0.tx);
+
+    /* An address below the RAM base must be refused. */
+    CHECK(fw_load_img3(&m, g_img, g_len, NULL, 0, base - 0x100, NULL) == FW_ERR_NO_ROOM,
+          "a load address below ram_base should be refused");
+    printf("  [non-zero RAM base 0x%08x -> guest said] %s\n", base, m.uart0.tx);
+    s5l8900_free(&m);
+}
+
+static void test_malformed_kbag_refused_by_loader(void) {
+    /* "Encrypted, method unknown" must not be downgraded to "plaintext" and
+     * executed as code. */
+    uint8_t k[8] = {1,0,0,0, 128,0,0,0};
+    img_begin(0x69626f74u);
+    img_tag(0x4b424147u, k, sizeof k);
+    img_tag(0x44415441u, PAYLOAD, (uint32_t)sizeof PAYLOAD);
+    img_finish();
+
+    s5l8900_t m;
+    s5l8900_init(&m, 0, 1u << 20);
+    fw_status_t st = fw_load_img3(&m, g_img, g_len, NULL, 0, 0x1000, NULL);
+    CHECK(st == FW_ERR_DECRYPT, "expected FW_ERR_DECRYPT, got %s", fw_strerror(st));
+    s5l8900_free(&m);
+}
+
 int main(void) {
     printf("iOS3-VM firmware loader tests\n");
     test_plain_image_boots();
@@ -281,6 +354,9 @@ int main(void) {
     test_nor_is_memory_mapped();
     test_nor_scan_rejects_corrupt_header();
     test_boot_from_nor();
+    test_nor_directory_cap();
+    test_load_with_non_zero_ram_base();
+    test_malformed_kbag_refused_by_loader();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

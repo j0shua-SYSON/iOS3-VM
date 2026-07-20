@@ -35,14 +35,18 @@ static uint32_t node_begin(uint32_t nprops, uint32_t nchildren) {
     return off;
 }
 
-static void prop(const char *name, const void *val, uint32_t len) {
+static void prop_ex(const char *name, const void *val, uint32_t len, uint32_t flags) {
     memset(&g_dt[g_len], 0, DT_PROP_NAME_LEN);
     memcpy(&g_dt[g_len], name, strlen(name));
     g_len += DT_PROP_NAME_LEN;
-    put32(g_len, len);
+    put32(g_len, len | flags);      /* Apple stores flags in the top bit */
     g_len += 4;
     if (val && len) memcpy(&g_dt[g_len], val, len);
     g_len += (len + 3u) & ~3u;      /* values are 4-byte padded */
+}
+
+static void prop(const char *name, const void *val, uint32_t len) {
+    prop_ex(name, val, len, 0u);
 }
 
 static void prop_str(const char *name, const char *val) {
@@ -175,6 +179,35 @@ static void test_reject_excessive_nesting(void) {
     CHECK(st != DT_OK, "excessively nested tree accepted");
 }
 
+/*
+ * Apple's tooling sets the top bit of a property length as a flag, and the
+ * parser masks it off. That is the one piece of Apple-format knowledge in this
+ * parser and nothing exercised it — mutation testing showed the whole mask
+ * could be deleted with the suite staying green, which would break every real
+ * Apple device tree. A flagged tree must parse exactly like an unflagged one,
+ * and the reported length must be the masked value.
+ */
+static void test_property_length_flag_bit(void) {
+    static const uint8_t regval[4] = { 0x11, 0x22, 0x33, 0x44 };
+    memset(g_dt, 0, sizeof g_dt);
+    g_len = 0;
+    node_begin(2, 0);
+    prop_ex("name", "flagged", 8, 0x80000000u);
+    prop_ex("reg", regval, 4, 0x80000000u);
+
+    dt_t dt; dt_node_t root;
+    dt_status_t st = dt_parse(g_dt, g_len, &dt, &root);
+    CHECK(st == DT_OK, "flagged tree failed to parse: %s", dt_strerror(st));
+
+    const uint8_t *v; uint32_t n;
+    CHECK(dt_property(&dt, &root, "name", &v, &n) == DT_OK, "flagged name missing");
+    CHECK(n == 8, "length=%u expect 8 (the flag bit must be masked off)", n);
+
+    uint32_t reg = 0;
+    CHECK(dt_property_u32(&dt, &root, "reg", &reg) == DT_OK, "flagged reg missing");
+    CHECK(reg == 0x44332211u, "reg=%08x expect 44332211", reg);
+}
+
 int main(void) {
     printf("iOS3-VM device tree tests\n");
     test_parse_and_root_properties();
@@ -185,6 +218,7 @@ int main(void) {
     test_reject_absurd_property_length();
     test_reject_absurd_child_count();
     test_reject_excessive_nesting();
+    test_property_length_flag_bit();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

@@ -58,7 +58,8 @@ typedef struct {
     uint32_t key_bits;      /* 128 / 192 / 256 */
     uint8_t  iv[16];
     uint8_t  key[32];
-    bool     present;
+    bool     present;    /* a KBAG was found AND understood        */
+    bool     malformed;  /* a KBAG was found but could NOT be parsed */
 } img3_kbag_t;
 
 typedef struct {
