@@ -216,6 +216,14 @@ static void test_stub_window_stores_and_counts(void) {
 
     CHECK(s5l8900_add_stub(&m, 0x3b000000u, 0x1000u, "unknown-3b0"),
           "declaring a stub window should succeed");
+    /* The machine declares its own stubs at init, so this one is not index 0.
+     * Look it up by name rather than by position — an index that silently
+     * points at the wrong window would make every assertion below vacuous. */
+    s5l_stub_t *mine = NULL;
+    for (unsigned i = 0; i < m.stub_count; i++)
+        if (!strcmp(m.stubs[i].name, "unknown-3b0")) mine = &m.stubs[i];
+    CHECK(mine != NULL, "the stub just declared should be in the table");
+    if (!mine) { s5l8900_free(&m); return; }
 
     /* Reads return what was written, not zero. */
     m.bus.write32(m.bus.ctx, 0x3b000010u, 0xa5a5a5a5u);
@@ -227,10 +235,10 @@ static void test_stub_window_stores_and_counts(void) {
      * window so it shows up by name in the report. */
     CHECK(m.unmapped_reads == 0 && m.unmapped_writes == 0,
           "stubbed access must not count as unmapped");
-    CHECK(m.stubs[0].reads == 1 && m.stubs[0].writes == 1,
+    CHECK(mine->reads == 1 && mine->writes == 1,
           "stub r=%llu w=%llu expect 1/1",
-          (unsigned long long)m.stubs[0].reads,
-          (unsigned long long)m.stubs[0].writes);
+          (unsigned long long)mine->reads,
+          (unsigned long long)mine->writes);
 
     /* The backing store must cover the WHOLE declared window, not a fixed
      * prefix. A 64-register array covered offsets 0x000-0x0FC while the two
@@ -242,12 +250,12 @@ static void test_stub_window_stores_and_counts(void) {
     CHECK(m.bus.read32(m.bus.ctx, 0x3b000320u) == 0x0006070fu,
           "off 0x320 read=%08x expect the value written (whole window backed)",
           m.bus.read32(m.bus.ctx, 0x3b000320u));
-    CHECK(m.stubs[0].oob == 0, "an in-window access must not count as oob");
+    CHECK(mine->oob == 0, "an in-window access must not count as oob");
 
     /* Past the declared window is a different matter: still counted, not
      * stored, so the shortfall stays visible instead of being pretended away. */
     (void)m.bus.read32(m.bus.ctx, 0x3b000000u + 0x1000u - 4u);
-    CHECK(m.stubs[0].oob == 0, "the final in-window word must still be backed");
+    CHECK(mine->oob == 0, "the final in-window word must still be backed");
 
     /* Overlap must be refused: silently shadowing a modelled device would be
      * far harder to notice than a rejected declaration. */
@@ -306,6 +314,318 @@ static void test_power_gate_state_tracks_onctrl_offctrl(void) {
     CHECK(s5l_power_read(&p, POWER_STATE) == S5L_POWER_DOMAIN_MASK,
           "STATE=%08x expect only the 14 real domains",
           s5l_power_read(&p, POWER_STATE));
+}
+
+/*
+ * The peripheral windows the machine declares for itself. The property under
+ * test is not "a stub exists" but that each one is at the address two
+ * independent sources agree on — the device tree's arm-io ranges and a walk of
+ * the guest's live page tables — and that declaring them all actually
+ * succeeded. A refused declaration leaves the window unmapped, which reads back
+ * as zero and is exactly the silent guess stubs exist to replace.
+ */
+static void test_machine_declares_its_known_windows(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+    CHECK(m.stub_declare_failures == 0,
+          "%u stub declarations were refused at init", m.stub_declare_failures);
+
+    static const struct { uint32_t addr; const char *name; } WANT[] = {
+        { S5L8900_CLOCK_BASE,  "clkrstgen" },
+        { S5L8900_MIU_BASE,    "miu"       },
+        { S5L8900_GPIO_BASE,   "gpio"      },
+        { S5L8900_EDGEIC_BASE, "edgeic"    },
+        { S5L8900_GPIOIC_BASE, "gpioic"    },
+    };
+    for (unsigned i = 0; i < sizeof WANT / sizeof WANT[0]; i++) {
+        /* Reads must come back as storage, not as the unmapped-access zero. */
+        m.bus.write32(m.bus.ctx, WANT[i].addr + 8u, 0xc0ffee00u + i);
+        CHECK(m.bus.read32(m.bus.ctx, WANT[i].addr + 8u) == 0xc0ffee00u + i,
+              "%s at 0x%08x did not read back what was written",
+              WANT[i].name, WANT[i].addr);
+    }
+    CHECK(m.unmapped_reads == 0 && m.unmapped_writes == 0,
+          "declared windows must not count as unmapped (r=%llu w=%llu)",
+          (unsigned long long)m.unmapped_reads,
+          (unsigned long long)m.unmapped_writes);
+
+    /* The two registers we have actually measured on this SoC live past the
+     * first 256 bytes; check them specifically, because a short backing store
+     * once swallowed exactly these. */
+    m.bus.write32(m.bus.ctx, S5L8900_GPIO_BASE + 0x320u, 0x0006070fu);
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_GPIO_BASE + 0x320u) == 0x0006070fu,
+          "GPIO FSEL at +0x320 must be backed");
+    m.bus.write32(m.bus.ctx, S5L8900_MIU_BASE + 0x404u, 0x12345678u);
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_MIU_BASE + 0x404u) == 0x12345678u,
+          "MIU +0x404 must be backed");
+
+    /* The gpioic stub must not shadow the power controller: they share a page
+     * and only 0x00-0x7f belongs to power. */
+    m.bus.write32(m.bus.ctx, S5L8900_POWER_BASE + POWER_OFFCTRL, 0x12fcu);
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_POWER_BASE + POWER_STATE) == 0x12fcu,
+          "the gpioic stub must not take over the power controller's half");
+
+    s5l8900_free(&m);
+}
+
+/*
+ * S5L8900_GPIO_BASE was 0x3cf00000 — the S5L8720-era address. The device tree
+ * says /arm-io/gpio is reg {0x6400000,0x1000} over ranges child+0x38000000,
+ * and the guest's page tables agree. It was unused, so it was a landmine
+ * rather than a live bug; this pins it so it cannot drift back.
+ */
+static void test_gpio_base_is_the_s5l8900_address(void) {
+    CHECK(S5L8900_GPIO_BASE == 0x3e400000u,
+          "S5L8900_GPIO_BASE=0x%08x expect 0x3e400000 (device tree + page walk)",
+          S5L8900_GPIO_BASE);
+}
+
+/*
+ * There are two PL192 VICs (device tree: reg {0xe00000,0x2000}, vic-stride
+ * 0x1000) and AppleARMPL192VIC maps both pages. VIC1 used to be unmapped, so
+ * its registers read back as zero and its outputs went nowhere — meaning any
+ * device on a line above 31 (the watchdog at 0x33, SDIO at 0x2a, GPIO at
+ * 0x20/0x21) could be correctly programmed and still never reach the CPU.
+ */
+static void test_vic1_is_mapped_and_drives_the_cpu(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+
+    /* It is a real controller, not a hole: enables read back. */
+    m.bus.write32(m.bus.ctx, S5L8900_VIC1_BASE + VIC_INTENABLE, 1u << 3);
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_VIC1_BASE + VIC_INTENABLE) == (1u << 3),
+          "VIC1 INTENABLE=%08x expect bit 3",
+          m.bus.read32(m.bus.ctx, S5L8900_VIC1_BASE + VIC_INTENABLE));
+    CHECK(m.unmapped_reads == 0 && m.unmapped_writes == 0,
+          "VIC1 accesses must not be unmapped");
+
+    /* And it reaches the CPU. Assert a line on VIC1 only and tick. */
+    s5l_vic_set_line(&m.vic[1], 3, true);
+    s5l8900_tick(&m, 1);
+    CHECK(m.cpu.irq_line,
+          "an enabled VIC1 line must raise the CPU's IRQ — otherwise every "
+          "device-tree interrupt above 31 is unreachable");
+
+    /* Routing still works independently on each controller. */
+    m.bus.write32(m.bus.ctx, S5L8900_VIC1_BASE + VIC_INTSELECT, 1u << 3);
+    s5l8900_tick(&m, 1);
+    CHECK(!m.cpu.irq_line && m.cpu.fiq_line, "VIC1 select must route to FIQ");
+
+    s5l8900_free(&m);
+}
+
+/*
+ * The CLCD's reason to be a device model rather than a stub.
+ *
+ * AppleH1CLCD submits a framebuffer swap, sets bit 0 of the interrupt mask at
+ * 0x014, and then waits for bit 0 of the status at 0x018. Storage that returns
+ * what was last written returns zero forever and the swap never completes — the
+ * UI wedges with no error at all. So the frame interrupt has to arrive on its
+ * own, at about the panel's refresh rate in GUEST time.
+ */
+static void test_clcd_raises_the_frame_interrupt(void) {
+    s5l_clcd_t c; s5l_clcd_reset(&c);
+
+    /* Nothing before scanout starts, however long we wait. */
+    s5l_clcd_write(&c, CLCD_INTMASK, CLCD_INT_FRAME);
+    CHECK(!s5l_clcd_tick(&c, c.frame_ticks * 10u),
+          "no frame interrupt before CLCD_ENABLE is written");
+    CHECK(c.frames == 0, "frames=%llu expect 0 while stopped",
+          (unsigned long long)c.frames);
+
+    /* The driver's own order: mask first, enable last. */
+    s5l_clcd_write(&c, CLCD_ENABLE, 1);
+    CHECK(!s5l_clcd_tick(&c, c.frame_ticks - 1u),
+          "the first VBL must be a whole frame after start, not immediate");
+    CHECK(s5l_clcd_tick(&c, 1), "a frame's worth of ticks must raise the line");
+    CHECK((s5l_clcd_read(&c, CLCD_INTSTATUS) & CLCD_INT_FRAME) != 0,
+          "status=%08x expect bit 0 set at VBL",
+          s5l_clcd_read(&c, CLCD_INTSTATUS));
+
+    /* Never the underrun bits: they only make a correct driver log errors. */
+    CHECK((s5l_clcd_read(&c, CLCD_INTSTATUS) & CLCD_INT_UNDERRUN) == 0,
+          "the underrun bits must never be asserted");
+
+    /* Write-1-to-clear, exactly as the handler acknowledges at 0xc0705dac. */
+    s5l_clcd_write(&c, CLCD_INTSTATUS, CLCD_INT_FRAME);
+    CHECK(s5l_clcd_read(&c, CLCD_INTSTATUS) == 0,
+          "status=%08x expect cleared by the driver's write-1 acknowledge",
+          s5l_clcd_read(&c, CLCD_INTSTATUS));
+    CHECK(!s5l_clcd_tick(&c, 0), "the line must drop once acknowledged");
+
+    /* Steady, one per frame — not a burst and not a stall. */
+    unsigned n = 0;
+    for (unsigned i = 0; i < 10u * c.frame_ticks; i++)
+        if (s5l_clcd_tick(&c, 1)) { n++; s5l_clcd_write(&c, CLCD_INTSTATUS, CLCD_INT_FRAME); }
+    CHECK(n == 10, "raised %u frames in 10 frames' worth of ticks", n);
+}
+
+/*
+ * The interrupt LINE must be gated by the hardware mask at 0x014, not by the
+ * status alone. The handler at 0xc0705d7c computes `status & shadowMask` and
+ * only acknowledges what is in that intersection. If the line were asserted for
+ * a source the mask has turned off, the handler would clear nothing, return,
+ * and be re-entered immediately — an interrupt storm, which is the same failure
+ * that the timer's acknowledge mask exists to avoid.
+ */
+static void test_clcd_line_is_gated_by_the_mask(void) {
+    s5l_clcd_t c; s5l_clcd_reset(&c);
+    s5l_clcd_write(&c, CLCD_ENABLE, 1);
+
+    /* Mask clear: a frame still latches in the status (the hardware does not
+     * stop counting) but nothing reaches the controller. */
+    CHECK(!s5l_clcd_tick(&c, c.frame_ticks), "masked-off frame must not raise the line");
+    CHECK((s5l_clcd_read(&c, CLCD_INTSTATUS) & CLCD_INT_FRAME) != 0,
+          "the status latch should still record the frame");
+
+    /* This is the driver's actual swap_submit sequence at 0xc0705d44: clear the
+     * stale status FIRST, then enable. If the status were not clearable the
+     * very first swap would look already-complete. */
+    s5l_clcd_write(&c, CLCD_INTSTATUS, CLCD_INT_FRAME);
+    s5l_clcd_write(&c, CLCD_INTMASK, 0x3f00u | CLCD_INT_FRAME);
+    CHECK(!s5l_clcd_tick(&c, 0),
+          "arming the mask must not immediately re-raise a cleared status");
+    CHECK(s5l_clcd_tick(&c, c.frame_ticks), "the next frame must raise the line");
+
+    /* And the underrun bits are enabled in that same mask (0x3f01), so if we
+     * ever set them the driver would log an error every frame. */
+    CHECK((s5l_clcd_read(&c, CLCD_INTSTATUS) & CLCD_INT_UNDERRUN) == 0,
+          "underrun must stay clear even while it is unmasked");
+}
+
+/*
+ * 0x204 must not read as 0xC0. The driver does
+ *   0xc0705ccc  ldr r3,[reg,#0x204]; lsr r3,r3,#6; and r3,r3,#3; cmp r3,#3
+ * and DEFERS the swap when both bits are set. A stub that echoed a previous
+ * write, or any model that guessed at those bits, could stall every swap the
+ * display ever attempts. Zero is "not busy" and is the only answer that cannot
+ * deadlock.
+ */
+static void test_clcd_status_never_defers_the_swap(void) {
+    s5l_clcd_t c; s5l_clcd_reset(&c);
+    CHECK(((s5l_clcd_read(&c, CLCD_STATUS) >> 6) & 3u) != 3u,
+          "status=%08x has bits[7:6] set — AppleH1CLCD would defer every swap",
+          s5l_clcd_read(&c, CLCD_STATUS));
+    /* Not even if the guest writes it: it is read-only. */
+    s5l_clcd_write(&c, CLCD_STATUS, 0xffffffffu);
+    CHECK(s5l_clcd_read(&c, CLCD_STATUS) == 0,
+          "status=%08x expect 0 — a write must not be able to stall the display",
+          s5l_clcd_read(&c, CLCD_STATUS));
+}
+
+/*
+ * Everything else on the page is storage the driver saves and restores across
+ * sleep. It never initialises the panel timing at 0x0d8..0x0ec — it only saves
+ * and restores it — so iBoot must set it, and read-back is the whole contract.
+ */
+static void test_clcd_saved_registers_read_back(void) {
+    s5l_clcd_t c; s5l_clcd_reset(&c);
+    static const uint32_t OFFS[] = {
+        CLCD_TIMING0, CLCD_TIMING0 + 4u, CLCD_TIMING0 + 8u, CLCD_TIMING0 + 12u,
+        CLCD_TIMING4, CLCD_CTRL, CLCD_FIFO, CLCD_BACKDROP,
+        CLCD_VIDEO_FIRST, CLCD_VIDEO_LAST, CLCD_CSC_FIRST, CLCD_CSC_LAST,
+        CLCD_OPAQUE_FIRST, CLCD_OPAQUE_LAST, CLCD_GATE,
+        CLCD_GAMMA0, CLCD_GAMMA0 + CLCD_GAMMA_SIZE - 4u,
+        CLCD_GAMMA0 + CLCD_GAMMA_SIZE, CLCD_GAMMA0 + 3u * CLCD_GAMMA_SIZE - 4u,
+    };
+    for (unsigned i = 0; i < sizeof OFFS / sizeof OFFS[0]; i++) {
+        s5l_clcd_write(&c, OFFS[i], 0xa5000000u + i);
+        CHECK(s5l_clcd_read(&c, OFFS[i]) == 0xa5000000u + i,
+              "offset 0x%03x read=%08x expect %08x", OFFS[i],
+              s5l_clcd_read(&c, OFFS[i]), 0xa5000000u + i);
+    }
+    /* The three LUTs must be distinct, not aliases of one another. */
+    CHECK(s5l_clcd_read(&c, CLCD_GAMMA0) !=
+          s5l_clcd_read(&c, CLCD_GAMMA0 + CLCD_GAMMA_SIZE),
+          "the gamma LUTs must not alias each other");
+}
+
+/*
+ * Seeding stands in for iBoot: window 0 programmed over a running scanout, so
+ * IOMobileFramebuffer::start adopts our framebuffer instead of inventing one.
+ * The property that matters is that what iBoot wrote is what the guest reads —
+ * through the real register path, at the real offsets.
+ */
+static void test_clcd_seed_is_visible_to_the_guest(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+
+    const uint32_t FB = 0x0ff00000u, W = 320, H = 480, STRIDE = 320 * 4;
+    s5l_clcd_seed_window0(&m.clcd, FB, W, H, STRIDE,
+                          CLCD_FMT_32BPP, CLCD_ORDER_BGRA);
+
+    uint32_t b = S5L8900_CLCD_BASE + CLCD_WIN_FIRST;
+    CHECK(m.bus.read32(m.bus.ctx, b + CLCD_WIN_FBADDR) == FB,
+          "window 0 base=%08x expect %08x",
+          m.bus.read32(m.bus.ctx, b + CLCD_WIN_FBADDR), FB);
+    CHECK(m.bus.read32(m.bus.ctx, b + CLCD_WIN_GEOMETRY) == ((W << 16) | H),
+          "window 0 geometry=%08x expect %08x",
+          m.bus.read32(m.bus.ctx, b + CLCD_WIN_GEOMETRY), (W << 16) | H);
+    CHECK(m.bus.read32(m.bus.ctx, b + CLCD_WIN_PITCH) == STRIDE, "stride");
+    CHECK(m.bus.read32(m.bus.ctx, b + CLCD_WIN_LINEWORDS) == STRIDE / 4u, "line words");
+    CHECK(((m.bus.read32(m.bus.ctx, b + CLCD_WIN_CONTROL) >> CLCD_FMT_SHIFT)
+           & CLCD_FMT_MASK) == CLCD_FMT_32BPP, "pixel format");
+    CHECK((m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_CTRL) & CLCD_CTRL_WIN0) != 0,
+          "window 0 must be enabled in CLCD_CTRL");
+
+    /* And the host-side accessor reports the same thing, which is the seam a
+     * renderer reads. */
+    uint32_t fb = 0, w = 0, h = 0, st = 0, fmt = 0, ord = 0;
+    CHECK(s5l_clcd_window(&m.clcd, 0, &fb, &w, &h, &st, &fmt, &ord),
+          "window 0 should report as enabled");
+    CHECK(fb == FB && w == W && h == H && st == STRIDE &&
+          fmt == CLCD_FMT_32BPP && ord == CLCD_ORDER_BGRA,
+          "window 0 = {%08x %ux%u stride %u fmt %u order %u}", fb, w, h, st, fmt, ord);
+    CHECK(!s5l_clcd_window(&m.clcd, 1, &fb, &w, &h, &st, &fmt, &ord),
+          "window 1 is not enabled and must not report as if it were");
+
+    /* Seeding must not be able to fire an interrupt at a guest that has not
+     * asked for one: the mask is still zero. */
+    s5l8900_tick(&m, m.cpu_hz);                 /* a whole guest second */
+    CHECK(!m.cpu.irq_line, "a seeded display must not interrupt before the "
+                           "guest enables the frame interrupt");
+    CHECK(m.clcd.frames > 0, "scanout should have been running all the same");
+
+    s5l8900_free(&m);
+}
+
+/*
+ * The whole path, end to end: the guest arms the frame interrupt exactly the
+ * way AppleH1CLCD's swap_submit does, and the CPU's IRQ line comes up through
+ * VIC line 13 — the line the device tree gives /arm-io/clcd.
+ */
+static void test_clcd_interrupt_reaches_the_cpu_on_line_13(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+
+    m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE, 1u << S5L8900_IRQ_CLCD);
+    /* swap_submit: clear stale status, then enable the frame interrupt. */
+    m.bus.write32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_INTSTATUS, CLCD_INT_FRAME);
+    m.bus.write32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_INTMASK,
+                  CLCD_INT_UNDERRUN | CLCD_INT_FRAME);
+    m.bus.write32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_ENABLE, 1);
+
+    /* One guest frame of instructions at the real CPU:timebase ratio. */
+    uint32_t insns = (uint32_t)((uint64_t)m.cpu_hz / S5L_CLCD_REFRESH_HZ) + 16u;
+    for (uint32_t i = 0; i < insns; i++) s5l8900_tick(&m, 1);
+
+    CHECK(m.cpu.irq_line,
+          "no IRQ after a guest frame — swap_submit would never complete");
+    uint32_t st = m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_INTSTATUS);
+    CHECK((st & CLCD_INT_FRAME) != 0, "status=%08x expect the frame bit", st);
+    CHECK((st & CLCD_INT_UNDERRUN) == 0, "status=%08x must never report underrun", st);
+    CHECK((m.bus.read32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_IRQSTATUS) &
+           (1u << S5L8900_IRQ_CLCD)) != 0,
+          "the CLCD must present on VIC line 13, as the device tree says");
+
+    /* Acknowledge as the handler does, and the line must drop. */
+    m.bus.write32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_INTSTATUS, CLCD_INT_FRAME);
+    s5l8900_tick(&m, 1);
+    CHECK(!m.cpu.irq_line, "the IRQ must drop once the frame bit is acknowledged");
+
+    printf("  [CLCD] %llu frames in one guest frame period, VIC line %u\n",
+           (unsigned long long)m.clcd.frames, S5L8900_IRQ_CLCD);
+    s5l8900_free(&m);
 }
 
 static void test_vic_masks_and_routes(void) {
@@ -401,8 +721,17 @@ int main(void) {
     test_bounds_check_cannot_overflow();
     test_bare_metal_uart_hello();
     test_stub_window_stores_and_counts();
+    test_machine_declares_its_known_windows();
+    test_gpio_base_is_the_s5l8900_address();
     test_power_gate_state_tracks_onctrl_offctrl();
     test_vic_masks_and_routes();
+    test_vic1_is_mapped_and_drives_the_cpu();
+    test_clcd_raises_the_frame_interrupt();
+    test_clcd_line_is_gated_by_the_mask();
+    test_clcd_status_never_defers_the_swap();
+    test_clcd_saved_registers_read_back();
+    test_clcd_seed_is_visible_to_the_guest();
+    test_clcd_interrupt_reaches_the_cpu_on_line_13();
     test_timebase_runs_without_a_timer();
     test_timebase_runs_at_the_guest_ratio();
     test_timer_period_is_exact();

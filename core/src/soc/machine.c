@@ -99,7 +99,11 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
     if (in_dev(addr, S5L8900_UART0_BASE)) {
         v = s5l_uart_read(&m->uart0, addr - S5L8900_UART0_BASE);
     } else if (in_dev(addr, S5L8900_VIC0_BASE)) {
-        v = s5l_vic_read(&m->vic0, addr - S5L8900_VIC0_BASE);
+        v = s5l_vic_read(&m->vic[0], addr - S5L8900_VIC0_BASE);
+    } else if (in_dev(addr, S5L8900_VIC1_BASE)) {
+        v = s5l_vic_read(&m->vic[1], addr - S5L8900_VIC1_BASE);
+    } else if (in_dev(addr, S5L8900_CLCD_BASE)) {
+        v = s5l_clcd_read(&m->clcd, addr - S5L8900_CLCD_BASE);
     } else if (in_timer(addr)) {
         v = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
     } else if (in_power(addr)) {
@@ -137,7 +141,16 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         return;
     }
     if (in_dev(addr, S5L8900_VIC0_BASE)) {
-        s5l_vic_write(&m->vic0, addr - S5L8900_VIC0_BASE, val);
+        s5l_vic_write(&m->vic[0], addr - S5L8900_VIC0_BASE, val);
+        return;
+    }
+    if (in_dev(addr, S5L8900_VIC1_BASE)) {
+        s5l_vic_write(&m->vic[1], addr - S5L8900_VIC1_BASE, val);
+        return;
+    }
+    if (in_dev(addr, S5L8900_CLCD_BASE)) {
+        note_device(m, addr, val, true);
+        s5l_clcd_write(&m->clcd, addr - S5L8900_CLCD_BASE, val);
         return;
     }
     if (in_timer(addr)) {
@@ -195,10 +208,46 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
     m->tb_hz    = S5L8900_TB_HZ;
 
     s5l_uart_reset(&m->uart0);
-    s5l_vic_reset(&m->vic0);
+    for (unsigned i = 0; i < S5L8900_VIC_COUNT; i++) s5l_vic_reset(&m->vic[i]);
     s5l_timer_reset(&m->timer);
     s5l_power_reset(&m->power);
+    s5l_clcd_reset(&m->clcd);
+    /* Refresh in the guest's own time: the CLCD is ticked with timebase ticks,
+     * so the period is expressed in them. */
+    m->clcd.frame_ticks = m->tb_hz / S5L_CLCD_REFRESH_HZ;
     if (!s5l_nor_init(&m->nor, S5L8900_NOR_SIZE)) { free(m->ram); m->ram = NULL; return false; }
+
+    /*
+     * Peripheral windows we have identified but not modelled. Each base was
+     * resolved twice — from the VA the guest's own driver printed, walked
+     * through its live page tables, and from the shipped device tree's arm-io
+     * ranges (child + 0x38000000) — and the two agree. All are low-traffic and
+     * none blocks the boot today; they are declared so their traffic is named
+     * and stored instead of reading back as the zero an unmapped access
+     * returns. See s5l_stub_t for why a stub is honest here and where the line
+     * is that turns one into a real device model.
+     *
+     * A failure to declare one is not fatal but must not be silent, so the
+     * result is folded into a counter the caller can see.
+     */
+    {
+        static const struct { uint32_t base, size; const char *name; } STUBS[] = {
+            /* AppleS5L8900XClockController _ccBaseAddress. */
+            { S5L8900_CLOCK_BASE,  S5L8900_DEV_SIZE,   "clkrstgen" },
+            /* _miuBaseAddress, the clock controller's second reg range.
+             * Offsets 0x008 and 0x404 are the ones actually touched. */
+            { S5L8900_MIU_BASE,    S5L8900_DEV_SIZE,   "miu"       },
+            /* Offset 0x320 (FSEL) is the one actually touched. */
+            { S5L8900_GPIO_BASE,   S5L8900_DEV_SIZE,   "gpio"      },
+            { S5L8900_EDGEIC_BASE, S5L8900_DEV_SIZE,   "edgeic"    },
+            /* The upper part of the power page — power.c owns 0x00-0x7f and
+             * this is a different block with a different driver. */
+            { S5L8900_GPIOIC_BASE, S5L8900_GPIOIC_SIZE, "gpioic"   },
+        };
+        for (unsigned i = 0; i < sizeof STUBS / sizeof STUBS[0]; i++)
+            if (!s5l8900_add_stub(m, STUBS[i].base, STUBS[i].size, STUBS[i].name))
+                m->stub_declare_failures++;
+    }
 
     m->bus.ctx = m;
     m->bus.read32 = r32; m->bus.read16 = r16; m->bus.read8 = r8;
@@ -240,12 +289,37 @@ void s5l8900_tick(s5l8900_t *m, uint32_t ticks) {
         m->tb_accum %= m->cpu_hz;
     }
 
-    /* Devices advance, then the controller recomputes what the CPU sees. */
+    /* Devices advance, then the controllers recompute what the CPU sees. */
     bool timer_irq = s5l_timer_tick(&m->timer, tb);
-    s5l_vic_set_line(&m->vic0, S5L8900_IRQ_TIMER, timer_irq);
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_TIMER, timer_irq);
 
-    m->cpu.irq_line = s5l_vic_irq(&m->vic0);
-    m->cpu.fiq_line = s5l_vic_fiq(&m->vic0);
+    bool clcd_irq = s5l_clcd_tick(&m->clcd, tb);
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_CLCD, clcd_irq);
+
+    /*
+     * BOTH VICs drive the CPU.
+     *
+     * Only VIC0 used to, which was fine while VIC0 was the only one mapped. It
+     * is not defensible now: the device tree numbers interrupts flat across the
+     * pair — /arm-io/gpio lists lines 0x20 and 0x21, /arm-io/wdt 0x33,
+     * /arm-io/sdio 0x2a, /arm-io/edgeic 0x23 and 0x29 — and every one of those
+     * is past VIC0's 32 lines, so it lives on VIC1. Leaving VIC1's outputs
+     * disconnected would mean the watchdog, the SD controller and the GPIO
+     * interrupt controller could be correctly programmed, correctly asserted,
+     * and still never reach the CPU: a silent failure, and precisely the kind
+     * this core exists to avoid.
+     *
+     * OR-ing the two is the standard PL192 cascade. Nothing asserts a VIC1 line
+     * today, so this changes no behaviour now; it removes a trap for the next
+     * device that needs a line above 31.
+     */
+    bool irq = false, fiq = false;
+    for (unsigned i = 0; i < S5L8900_VIC_COUNT; i++) {
+        irq |= s5l_vic_irq(&m->vic[i]);
+        fiq |= s5l_vic_fiq(&m->vic[i]);
+    }
+    m->cpu.irq_line = irq;
+    m->cpu.fiq_line = fiq;
 }
 
 unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {

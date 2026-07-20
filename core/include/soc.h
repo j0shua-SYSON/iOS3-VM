@@ -25,8 +25,29 @@
 #define S5L8900_VIC0_BASE   0x38e00000u
 #define S5L8900_TIMER_BASE  0x3e200000u
 #define S5L8900_CLOCK_BASE  0x3c500000u
-#define S5L8900_GPIO_BASE   0x3cf00000u
+/*
+ * GPIO. CONFIRMED against two independent sources: the shipped device tree's
+ * /arm-io/gpio has reg {0x6400000,0x1000} and arm-io maps child+0x38000000, and
+ * a walk of the guest's live page tables from the VA AppleS5L8900XGPIOIC prints
+ * lands on the same page. The value here was previously 0x3cf00000 — the
+ * S5L8720-era GPIO address, wrong for this SoC. It was unused, so it was a
+ * landmine rather than a live bug; it is corrected rather than left to be
+ * "confirmed" by whoever wired it up next.
+ */
+#define S5L8900_GPIO_BASE   0x3e400000u
+#define S5L8900_MIU_BASE    0x38100000u   /* clkrstgen's second reg range */
+#define S5L8900_EDGEIC_BASE 0x38e02000u
 #define S5L8900_DEV_SIZE    0x00001000u   /* per-peripheral window */
+
+/*
+ * There are TWO PL192 VICs, not one. The device tree gives the block as
+ * reg {0xe00000, 0x2000} with vic-stride 0x1000, and AppleARMPL192VIC maps both
+ * pages. The interrupt numbering is flat across the pair: /arm-io/gpio lists
+ * lines 0x20 and 0x21, /arm-io/wdt line 0x33, /arm-io/sdio line 0x2a — all past
+ * VIC0's 32 lines, so they can only be VIC1 lines 0, 1, 19 and 10.
+ */
+#define S5L8900_VIC1_BASE   0x38e01000u
+#define S5L8900_VIC_COUNT   2u
 
 /* --------------------------------------------------------------- UART ---
  * Samsung-style UART (as on S3C-family parts). Writing a byte to UTXH
@@ -271,6 +292,129 @@ void     s5l_power_reset(s5l_power_t *p);
 uint32_t s5l_power_read(s5l_power_t *p, uint32_t off);
 void     s5l_power_write(s5l_power_t *p, uint32_t off, uint32_t val);
 
+/* ---------------------------------------------------- CLCD display controller ---
+ * The path to pixels. See core/src/soc/clcd.c for the evidence behind every
+ * register below; the short version is that AppleH1CLCD's own code was read out
+ * of the shipped kernelcache and each offset here is a line of that code.
+ *
+ * Base and interrupt line are CONFIRMED from the shipped device tree:
+ *   /arm-io/clcd  reg {0x900000, 0x1000}  interrupts {0xd}
+ * and /arm-io ranges maps child + 0x38000000.
+ */
+#define S5L8900_CLCD_BASE 0x38900000u
+#define S5L8900_IRQ_CLCD  13u
+
+#define CLCD_ENABLE      0x000u  /* write 1: start scanout (written last)      */
+#define CLCD_DISABLE     0x004u  /* write 1: stop scanout                      */
+#define CLCD_CTRL        0x008u  /* display + per-window enables               */
+#define CLCD_FIFO        0x00cu  /* per-window FIFO thresholds                 */
+#define CLCD_INTMASK     0x014u  /* interrupt enable mask                      */
+#define CLCD_INTSTATUS   0x018u  /* interrupt status, WRITE-1-TO-CLEAR         */
+#define CLCD_REG1C       0x01cu  /* cleared to 0 on start and on stop          */
+#define CLCD_PREENABLE   0x020u  /* write 1 just before CLCD_ENABLE            */
+#define CLCD_BACKDROP    0x024u  /* backdrop colour, ARGB                      */
+#define CLCD_VIDEO_FIRST 0x028u  /* 11 video/YUV overlay regs, 0x028..0x054    */
+#define CLCD_VIDEO_LAST  0x054u
+#define CLCD_WIN_FIRST   0x058u  /* RGB window k at CLCD_WIN_FIRST + k*0x18    */
+#define CLCD_WIN_STRIDE  0x018u
+#define CLCD_WIN_COUNT   4u
+#define CLCD_UPDATE      0x0d4u  /* write 2 at the head of every window update */
+#define CLCD_TIMING0     0x0d8u  /* panel timing: 0x0d8,0x0dc,0x0e0,0x0e4,0x0ec */
+#define CLCD_UPDATE2     0x0e8u  /* constant 0x50001000 per update             */
+#define CLCD_TIMING4     0x0ecu
+#define CLCD_CSC_FIRST   0x1c8u  /* 8 YUV->RGB matrix regs, 0x1c8..0x1e8       */
+#define CLCD_CSC_LAST    0x1e8u
+#define CLCD_GATE        0x200u  /* clock/scanout gate, bit0                   */
+#define CLCD_STATUS      0x204u  /* read-only; see clcd.c, bits[7:6] matter    */
+#define CLCD_OPAQUE_FIRST 0x208u /* 0x208..0x218, saved/restored across sleep  */
+#define CLCD_OPAQUE_LAST  0x218u
+#define CLCD_GAMMA0      0x400u  /* three 256-entry u32 LUTs, 0x400/0x800/0xc00 */
+#define CLCD_GAMMA_SIZE  0x400u
+
+/* Window register sub-offsets, from CLCD_WIN_FIRST + k*CLCD_WIN_STRIDE. */
+#define CLCD_WIN_PITCH     0x00u  /* stride in BYTES                          */
+#define CLCD_WIN_CONTROL   0x04u  /* bits[10:8] pixel format, [17:16] order   */
+#define CLCD_WIN_FBADDR    0x08u  /* framebuffer PHYSICAL base                */
+#define CLCD_WIN_GEOMETRY  0x0cu  /* (width << 16) | height                   */
+#define CLCD_WIN_LINEWORDS 0x10u  /* line length in 32-bit words              */
+#define CLCD_WIN_POSITION  0x14u  /* (dstX << 16) | dstY                      */
+
+/* CLCD_CTRL window-enable bits. */
+#define CLCD_CTRL_WIN0   0x40u
+#define CLCD_CTRL_WIN1   0x20u
+#define CLCD_CTRL_WIN2   0x10u
+#define CLCD_CTRL_WIN3   0x08u
+#define CLCD_CTRL_VIDEO  0x80u
+#define CLCD_CTRL_ENABLE 0x01u    /* start_hardware ORs this in */
+
+/* CLCD_INTSTATUS / CLCD_INTMASK bits. */
+#define CLCD_INT_FRAME    0x0001u /* frame (VBL) done — the swap completion   */
+#define CLCD_INT_UNDERRUN 0x3f00u /* per-window FIFO underrun; we never set it */
+
+/* Pixel formats, from window control bits[10:8]. */
+#define CLCD_FMT_SHIFT     8u
+#define CLCD_FMT_MASK      0x7u
+#define CLCD_FMT_32BPP     7u
+#define CLCD_FMT_RGB565    3u
+#define CLCD_FMT_RGB555    2u
+#define CLCD_FMT_ARGB4444  5u
+/* Component order, from window control bits[17:16]; only meaningful at 32bpp. */
+#define CLCD_ORDER_SHIFT   16u
+#define CLCD_ORDER_MASK    0x3u
+#define CLCD_ORDER_BGRA    0u
+#define CLCD_ORDER_ARGB    3u
+
+/* Refresh rate we present to the guest, in GUEST time. */
+#define S5L_CLCD_REFRESH_HZ 60u
+
+typedef struct {
+    uint32_t stride, control, fbaddr, geometry, linewords, position;
+} s5l_clcd_window_t;
+
+typedef struct {
+    uint32_t enable, disable, ctrl, fifo;
+    uint32_t intmask, intstatus, reg1c, preenable, backdrop;
+    uint32_t video[(CLCD_VIDEO_LAST - CLCD_VIDEO_FIRST) / 4u + 1u];
+    s5l_clcd_window_t win[CLCD_WIN_COUNT];
+    uint32_t update, update2;
+    uint32_t timing[5];                      /* 0x0d8,0x0dc,0x0e0,0x0e4,0x0ec */
+    uint32_t csc[(CLCD_CSC_LAST - CLCD_CSC_FIRST) / 4u + 1u];
+    uint32_t gate;
+    uint32_t opaque[(CLCD_OPAQUE_LAST - CLCD_OPAQUE_FIRST) / 4u + 1u];
+    uint32_t gamma[3][256];
+
+    bool     scanning;        /* CLCD_ENABLE has been written 1, no stop since */
+    uint32_t frame_ticks;     /* timebase ticks per frame; 0 disables the VBL  */
+    uint32_t frame_accum;
+    uint64_t frames;          /* how many VBLs we have raised (visibility)     */
+} s5l_clcd_t;
+
+void     s5l_clcd_reset(s5l_clcd_t *c);
+uint32_t s5l_clcd_read(s5l_clcd_t *c, uint32_t off);
+void     s5l_clcd_write(s5l_clcd_t *c, uint32_t off, uint32_t val);
+/* Advance by `ticks` timebase ticks; returns true while the controller's
+ * interrupt output is asserted (status AND mask, as the hardware ANDs them). */
+bool     s5l_clcd_tick(s5l_clcd_t *c, uint32_t ticks);
+
+/*
+ * Pre-seed the controller the way iBoot leaves it: window 0 programmed and
+ * enabled over an already-running scanout. IOMobileFramebuffer::start then
+ * adopts the framebuffer verbatim instead of having to invent one.
+ *
+ * `format` is a CLCD_FMT_* value and `order` a CLCD_ORDER_* value; `stride` is
+ * in bytes. This is a host-side call, not a guest-visible register: a boot stub
+ * standing in for iBoot calls it before the guest runs.
+ */
+void     s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
+                               uint32_t width, uint32_t height,
+                               uint32_t stride, uint32_t format, uint32_t order);
+
+/* Read back a window's programming. Returns false if `k` is out of range or the
+ * window is not enabled in CLCD_CTRL. */
+bool     s5l_clcd_window(const s5l_clcd_t *c, unsigned k,
+                         uint32_t *fb_phys, uint32_t *width, uint32_t *height,
+                         uint32_t *stride, uint32_t *format, uint32_t *order);
+
 #define S5L_STUB_MAX      16
 
 typedef struct {
@@ -300,9 +444,15 @@ typedef struct {
     uint32_t   ram_base;
     uint32_t   ram_size;
     s5l_uart_t  uart0;
-    s5l_vic_t   vic0;
+    /*
+     * Both PL192 VICs. vic[0] is the historical vic0; vic[1] backs the second
+     * page at S5L8900_VIC1_BASE, which AppleARMPL192VIC maps and which carries
+     * device-tree interrupt lines 32..63.
+     */
+    s5l_vic_t   vic[S5L8900_VIC_COUNT];
     s5l_timer_t timer;
     s5l_power_t power;
+    s5l_clcd_t  clcd;
     s5l_nor_t   nor;
     uint64_t   unmapped_reads;   /* visibility: accesses outside the map */
     uint64_t   unmapped_writes;
@@ -333,6 +483,10 @@ typedef struct {
     /* Identified-but-unmodelled peripheral windows. See s5l_stub_t. */
     s5l_stub_t stubs[S5L_STUB_MAX];
     unsigned   stub_count;
+    /* Declarations that were refused (table full, overlap, allocation). Zero is
+     * the only acceptable value after init; a non-zero count means a window we
+     * meant to name is silently unmapped instead. */
+    unsigned   stub_declare_failures;
 } s5l8900_t;
 
 /*
