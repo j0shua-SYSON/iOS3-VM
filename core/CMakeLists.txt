@@ -3,6 +3,8 @@
 add_library(emucore STATIC
     src/arm/arm_interp.c
     src/mmu.c
+    src/soc/uart.c
+    src/soc/machine.c
 )
 target_include_directories(emucore PUBLIC include)
 
@@ -14,3 +16,7 @@ endif()
 add_executable(test_arm tests/test_arm.c)
 target_link_libraries(test_arm PRIVATE emucore)
 add_test(NAME arm_interp COMMAND test_arm)
+
+add_executable(test_soc tests/test_soc.c)
+target_link_libraries(test_soc PRIVATE emucore)
+add_test(NAME s5l8900_machine COMMAND test_soc)

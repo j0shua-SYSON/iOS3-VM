@@ -51,9 +51,20 @@ register/memory results.
   via DACR, AP permission checks, and data/prefetch aborts wired into execution
   (DFSR/DFAR, IFSR/IFAR). Page tables are walked out of guest RAM through the
   normal bus, exactly as hardware does.
-- Remaining: the system bus/memory map and the minimum S5L8900 devices (VIC,
-  timers, UART, GPIO, clock) to run *our own* small bare-metal ARM payload that
-  prints over the emulated UART, surfaced in the app.
+- **Done: the system bus and UART.** The S5L8900 memory map routes physical
+  accesses to RAM or a peripheral window; unmapped accesses are *counted*, not
+  silently swallowed, so gaps are visible. The Samsung-style UART captures
+  everything the guest transmits — the same channel iBoot and XNU will use.
+- **Done: guest code produces output.** A hand-assembled bare-metal ARM payload
+  runs on the emulated SoC and prints over the UART:
+
+  ```
+  iOS3-VM S5L8900 machine tests
+    [guest said] HI
+  ```
+
+- Remaining: VIC (interrupt controller), timers, GPIO and clock; then surface
+  the UART stream in the iOS app.
 
 **Observable:** text from guest code appears on the iPhone screen. First "it runs
 on the phone."
