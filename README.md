@@ -49,11 +49,37 @@ can see.** No months in the dark.
 | | Milestone | State |
 |---|---|---|
 | **M0** | Toolchain online: core builds + tests in CI, iOS `.ipa` builds on a macOS runner, on-device self-test runs ARM code | ✅ **done** |
-| **M1** | Complete ARMv6 (ARM1176) interpreter, unit-tested | ✅ **done** — ARM + Thumb, *96 CPU tests* |
-| **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | 🔵 **guest code prints; timer IRQs reach a handler** — MMU, bus, UART, VIC, timer · *22 SoC tests* |
+| **M1** | Complete ARMv6 (ARM1176) interpreter, unit-tested | ✅ **done** — ARM + Thumb, *138 CPU tests* |
+| **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, NOR/NAND · *40 SoC tests* |
 | **M3** | IMG3 + NAND/NOR: Apple's real **iBoot** runs | ✅ **done** — decrypts real firmware; LLB runs, kernel extracted |
-| **M4** | The real **XNU kernel** boots and logs | 🔵 **XNU runs and enables the MMU** — 20M instructions under virtual memory |
-| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | ⚪ |
+| **M4** | The real **XNU kernel** boots and logs | 🔵 **the kernel talks, and Apple's own drivers start** — reaches `bsd_init`, zero panics, zero aborts |
+| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | ⚪ next — needs a root filesystem and the display path |
+
+### What it actually does today
+
+Apple's real `xnu-1357.5.30`, decrypted from a stock 3.1.3 IPSW, running on
+hardware that exists only as C in this repo — and introducing itself over an
+emulated Samsung UART:
+
+```
+Darwin Kernel Version 10.0.0d3: Fri Dec 18 01:26:55 PST 2009;
+  root:xnu-1357.5.30~6/RELEASE_ARM_S5L8900X
+secure boot?: YES
+
+Seatbelt MACF policy initialized
+AppleS5L8900XIO::start: chip-revision: EVT0
+AppleARMPL192VIC::start: _vicBaseAddress = 0xe397c000
+AppleS5L8900XGPIOIC::start: gpioBaseAddress: 0xe3985000
+AppleS5L8900XClockController: Dynamic Performance State Management Enabled
+AppleS5L8900XSDIO::start(): SDIO Revision 8900X
+AppleS5L8900XSPIController::start: spi0 ...
+AppleS5L8900XI2CController::start: i2c0 ... i2c1 ...
+```
+
+Those are **Apple's own kernel extensions**, unmodified, matching against our
+emulated device tree and programming our emulated peripherals. Nothing is
+stubbed out to make that log appear — the kernel found the hardware it expected,
+or it would have panicked instead.
 
 Full detail in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
