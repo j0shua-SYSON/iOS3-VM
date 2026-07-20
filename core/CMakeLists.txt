@@ -6,6 +6,7 @@ add_library(emucore STATIC
     src/soc/uart.c
     src/soc/vic.c
     src/soc/timer.c
+    src/soc/power.c
     src/soc/nor.c
     src/soc/nand.c
     src/soc/storage.c

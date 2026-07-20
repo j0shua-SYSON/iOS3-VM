@@ -850,6 +850,54 @@ static arm_status_t exec_multiply(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     return ARM_OK;
 }
 
+/*
+ * The 64-bit multiplies: UMULL, UMLAL, SMULL, SMLAL.
+ *
+ *   cccc 0000 1 Un A S hhhh llll ssss 1001 mmmm
+ *
+ * Bit 22 SELECTS SIGNED, not unsigned: 100=UMULL, 101=UMLAL, 110=SMULL,
+ * 111=SMLAL for bits[23:21]. Getting that polarity backwards is invisible for
+ * small operands and wrong only in the high word, which is exactly the sort of
+ * error that shows up a long way from its cause. A accumulates into the existing
+ * RdHi:RdLo. These are ordinary compiled code — a driver in the real 3.1.3
+ * kernelcache stopped the boot dead on a plain UMULL — so the distinction
+ * between signed and unsigned matters: doing the multiply in 64-bit unsigned
+ * for both gives the right low word and a silently wrong high word.
+ */
+static arm_status_t exec_multiply_long(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    bool is_signed = (insn >> 22) & 1u;
+    bool A = (insn >> 21) & 1u;
+    bool S = (insn >> 20) & 1u;
+    unsigned rdhi = (insn >> 16) & 0xfu;
+    unsigned rdlo = (insn >> 12) & 0xfu;
+    unsigned rs   = (insn >> 8)  & 0xfu;
+    unsigned rm   = insn & 0xfu;
+
+    /* PC as an operand or destination here is unpredictable, and RdHi must
+     * differ from RdLo. Trap rather than invent a result. */
+    if (rdhi == 15 || rdlo == 15 || rs == 15 || rm == 15 || rdhi == rdlo)
+        return ARM_UNDEFINED;
+
+    uint32_t a = reg_read(c, pc, rm), b = reg_read(c, pc, rs);
+    uint64_t res;
+    if (is_signed) {
+        /* Sign-extend through int64 so the high word is right. */
+        res = (uint64_t)((int64_t)(int32_t)a * (int64_t)(int32_t)b);
+    } else {
+        res = (uint64_t)a * (uint64_t)b;
+    }
+    if (A) res += ((uint64_t)c->r[rdhi] << 32) | (uint64_t)c->r[rdlo];
+
+    c->r[rdlo] = (uint32_t)res;
+    c->r[rdhi] = (uint32_t)(res >> 32);
+    if (S) {
+        set_flag(c, ARM_CPSR_N, (res >> 63) & 1u);
+        set_flag(c, ARM_CPSR_Z, res == 0);
+        /* C and V are unpredictable after a long multiply on ARMv6. */
+    }
+    return ARM_OK;
+}
+
 /* ------------------------------------------------------------------- step */
 
 /* ==================================================================== Thumb */
@@ -1386,6 +1434,8 @@ arm_status_t arm_step(arm_cpu_t *c) {
         st = exec_branch(c, pc, insn, &next);
     } else if ((insn & 0x0fc000f0u) == 0x00000090u) {     /* MUL / MLA */
         st = exec_multiply(c, pc, insn);
+    } else if ((insn & 0x0f8000f0u) == 0x00800090u) {     /* UMULL/UMLAL/SMULL/SMLAL */
+        st = exec_multiply_long(c, pc, insn);
     } else if ((insn & 0x0e000000u) == 0x06000000u &&
                (insn & 0x00000010u) != 0) {
         /* bits[27:25]==011 with bit4==1 is the ARMv6 media space. The extend

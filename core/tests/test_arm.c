@@ -290,6 +290,46 @@ static void test_setend_le_runs_be_traps(void) {
           "status=%d expect ARM_UNDEFINED for SETEND BE", (int)st);
 }
 
+/*
+ * The 64-bit multiplies. A driver in the real 3.1.3 kernelcache stopped the
+ * boot on a plain UMULL, so these are ordinary compiled code rather than an
+ * exotic corner. The signed/unsigned distinction is the part worth pinning:
+ * doing both in 64-bit unsigned yields the correct low word and a silently
+ * wrong high word, which is the kind of error that surfaces a long way away.
+ */
+static void test_umull_and_smull(void) {
+    /* UMULL r0,r1,r2,r3 with 0xFFFFFFFF * 0xFFFFFFFF = 0xFFFFFFFE00000001 */
+    uint32_t p[] = { 0xe3e02000 /* MVN r2,#0  -> 0xffffffff */,
+                     0xe3e03000 /* MVN r3,#0  -> 0xffffffff */,
+                     0xe0810392 /* UMULL r0,r1,r2,r3        */ };
+    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    CHECK(c.r[0] == 0x00000001u, "lo=%08x expect 00000001", c.r[0]);
+    CHECK(c.r[1] == 0xfffffffeu, "hi=%08x expect fffffffe", c.r[1]);
+
+    /* SMULL of the same bit patterns is (-1) * (-1) = 1, so the high word is
+     * ZERO. Same inputs, different answer — this is the check that catches an
+     * unsigned implementation of the signed form. */
+    uint32_t q[] = { 0xe3e02000, 0xe3e03000,
+                     0xe0c10392 /* SMULL r0,r1,r2,r3 */ };
+    arm_cpu_t d; load_and_run(&d, q, 3, 3);
+    CHECK(d.r[0] == 0x00000001u, "lo=%08x expect 00000001 (-1 * -1)", d.r[0]);
+    CHECK(d.r[1] == 0x00000000u,
+          "hi=%08x expect 00000000 — a signed multiply done unsigned gives "
+          "fffffffe here", d.r[1]);
+}
+
+static void test_umlal_accumulates(void) {
+    /* r0:r1 = 5, then UMLAL r0,r1,r2,r3 with 3 * 7 -> 26 */
+    uint32_t p[] = { 0xe3a00005 /* MOV r0,#5 */,
+                     0xe3a01000 /* MOV r1,#0 */,
+                     0xe3a02003 /* MOV r2,#3 */,
+                     0xe3a03007 /* MOV r3,#7 */,
+                     0xe0a10392 /* UMLAL r0,r1,r2,r3 */ };
+    arm_cpu_t c; load_and_run(&c, p, 5, 5);
+    CHECK(c.r[0] == 26, "lo=%u expect 26 (5 + 3*7)", c.r[0]);
+    CHECK(c.r[1] == 0,  "hi=%u expect 0", c.r[1]);
+}
+
 static void test_swp_exchanges(void) {
     /* SWP is an atomic read-then-write: Rd gets the old memory word and the
      * new value comes from Rm. Getting the order wrong (writing before
@@ -953,6 +993,8 @@ int main(void) {
     test_ldm_exception_return_takes_state_from_spsr();
     test_rfe_aligns_for_the_restored_state();
     test_setend_le_runs_be_traps();
+    test_umull_and_smull();
+    test_umlal_accumulates();
     test_swp_exchanges();
     test_ldrexd_strexd_roundtrip();
     test_clrex_makes_strex_fail();

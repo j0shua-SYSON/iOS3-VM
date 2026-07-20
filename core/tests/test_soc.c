@@ -214,14 +214,14 @@ static void test_stub_window_stores_and_counts(void) {
     s5l8900_t m;
     CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
 
-    CHECK(s5l8900_add_stub(&m, 0x39a00000u, 0x1000u, "unknown-39a"),
+    CHECK(s5l8900_add_stub(&m, 0x3b000000u, 0x1000u, "unknown-3b0"),
           "declaring a stub window should succeed");
 
     /* Reads return what was written, not zero. */
-    m.bus.write32(m.bus.ctx, 0x39a00010u, 0xa5a5a5a5u);
-    CHECK(m.bus.read32(m.bus.ctx, 0x39a00010u) == 0xa5a5a5a5u,
+    m.bus.write32(m.bus.ctx, 0x3b000010u, 0xa5a5a5a5u);
+    CHECK(m.bus.read32(m.bus.ctx, 0x3b000010u) == 0xa5a5a5a5u,
           "stub read=%08x expect the value written",
-          m.bus.read32(m.bus.ctx, 0x39a00010u));
+          m.bus.read32(m.bus.ctx, 0x3b000010u));
 
     /* Stubbed traffic must not be counted as unmapped — it is accounted to the
      * window so it shows up by name in the report. */
@@ -232,20 +232,80 @@ static void test_stub_window_stores_and_counts(void) {
           (unsigned long long)m.stubs[0].reads,
           (unsigned long long)m.stubs[0].writes);
 
-    /* Beyond the backing registers, accesses are counted rather than stored,
-     * so the shortfall is visible instead of pretended away. */
-    (void)m.bus.read32(m.bus.ctx, 0x39a00000u + S5L_STUB_REGS * 4u);
-    CHECK(m.stubs[0].oob == 1, "out-of-range stub access should be counted");
+    /* The backing store must cover the WHOLE declared window, not a fixed
+     * prefix. A 64-register array covered offsets 0x000-0x0FC while the two
+     * registers actually measured on this SoC live at 0x320 (GPIO FSEL) and
+     * 0x404 (CLOCK0 ADJ2) — so both were counted but not stored, and the stub
+     * silently failed to be honest storage for exactly the registers that
+     * mattered. */
+    m.bus.write32(m.bus.ctx, 0x3b000320u, 0x0006070fu);
+    CHECK(m.bus.read32(m.bus.ctx, 0x3b000320u) == 0x0006070fu,
+          "off 0x320 read=%08x expect the value written (whole window backed)",
+          m.bus.read32(m.bus.ctx, 0x3b000320u));
+    CHECK(m.stubs[0].oob == 0, "an in-window access must not count as oob");
+
+    /* Past the declared window is a different matter: still counted, not
+     * stored, so the shortfall stays visible instead of being pretended away. */
+    (void)m.bus.read32(m.bus.ctx, 0x3b000000u + 0x1000u - 4u);
+    CHECK(m.stubs[0].oob == 0, "the final in-window word must still be backed");
 
     /* Overlap must be refused: silently shadowing a modelled device would be
      * far harder to notice than a rejected declaration. */
-    CHECK(!s5l8900_add_stub(&m, 0x39a00800u, 0x1000u, "overlapping"),
+    CHECK(!s5l8900_add_stub(&m, 0x3b000800u, 0x1000u, "overlapping"),
           "an overlapping stub window must be refused");
     CHECK(!s5l8900_add_stub(&m, S5L8900_UART0_BASE, 0x1000u, "over-uart") ||
           m.bus.read32(m.bus.ctx, S5L8900_UART0_BASE + UART_UTRSTAT) & (1u << 2),
           "a stub must never take precedence over a real device model");
 
     s5l8900_free(&m);
+}
+
+/*
+ * The power controller is the block that stood between a booting kernel and a
+ * booting OS. AppleS5L8900XPowerController::start writes the domains it wants
+ * gated and then spins until STATE agrees:
+ *
+ *     write(OFFCTRL, 0x12fc);  do { s = read(STATE); } while ((s & 0x12fc) != 0x12fc);
+ *
+ * Unmodelled, STATE read 0 forever: 3,887,707 reads, about a quarter of a
+ * 200M-instruction boot, and start() never returned. The property under test is
+ * the coupling — that ONCTRL and OFFCTRL are the only things that move STATE,
+ * with the polarity the driver's own gate routine uses.
+ */
+static void test_power_gate_state_tracks_onctrl_offctrl(void) {
+    s5l_power_t p; s5l_power_reset(&p);
+
+    /* Gate: write-1-to-SET. This is the exact sequence and mask the driver
+     * uses, so passing this is passing the loop that wedged the boot. */
+    s5l_power_write(&p, POWER_OFFCTRL, 0x12fcu);
+    uint32_t st = s5l_power_read(&p, POWER_STATE);
+    CHECK((st & 0x12fcu) == 0x12fcu,
+          "STATE=%08x expect bits 0x12fc set after OFFCTRL — this is the "
+          "condition AppleS5L8900XPowerController::start spins on", st);
+
+    /* Ungate: write-1-to-CLEAR. Bit 9 is USB, gated then ungated around
+     * AppleS5L8900XUSBPhy::start. */
+    s5l_power_write(&p, POWER_ONCTRL, 1u << 9);
+    st = s5l_power_read(&p, POWER_STATE);
+    CHECK((st & (1u << 9)) == 0, "STATE=%08x expect bit 9 cleared by ONCTRL", st);
+    CHECK((st & (1u << 12)) != 0,
+          "ONCTRL must clear only the bits written (bit 12 was gated too)");
+
+    /* STATE is read-only: it moves via ONCTRL/OFFCTRL and nothing else. A
+     * storage stub would have "worked" here by accident and failed in the
+     * boot, because the guest never writes STATE at all. */
+    uint32_t before = s5l_power_read(&p, POWER_STATE);
+    s5l_power_write(&p, POWER_STATE, 0xffffffffu);
+    CHECK(s5l_power_read(&p, POWER_STATE) == before,
+          "STATE must be read-only");
+
+    /* Writes outside the 14 modelled domains must not set phantom bits. */
+    s5l_power_reset(&p);
+    s5l_power_write(&p, POWER_ONCTRL, 0xffffffffu);
+    s5l_power_write(&p, POWER_OFFCTRL, 0xffffffffu);
+    CHECK(s5l_power_read(&p, POWER_STATE) == S5L_POWER_DOMAIN_MASK,
+          "STATE=%08x expect only the 14 real domains",
+          s5l_power_read(&p, POWER_STATE));
 }
 
 static void test_vic_masks_and_routes(void) {
@@ -341,6 +401,7 @@ int main(void) {
     test_bounds_check_cannot_overflow();
     test_bare_metal_uart_hello();
     test_stub_window_stores_and_counts();
+    test_power_gate_state_tracks_onctrl_offctrl();
     test_vic_masks_and_routes();
     test_timebase_runs_without_a_timer();
     test_timebase_runs_at_the_guest_ratio();

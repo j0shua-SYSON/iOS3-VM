@@ -234,15 +234,60 @@ const s5l_nor_entry_t *s5l_nor_find(const s5l_nor_t *n, uint32_t ident);
  * bit to change on its own, that is a real device model, not a stub, and it
  * belongs in its own file.
  */
+/* ------------------------------------------------------ power controller ---
+ * The power-gate block. See core/src/soc/power.c for why this is a real model
+ * rather than a stub: the guest never writes STATE, so read-back storage would
+ * leave it reading zero forever — which is exactly what wedged the boot.
+ *
+ * Note the page is SHARED. Only 0x00-0x7F belongs to the power controller;
+ * 0x80 and above is the GPIO interrupt controller, a different block with a
+ * different driver.
+ */
+#define S5L8900_POWER_BASE   0x39a00000u
+#define S5L8900_POWER_SIZE   0x00000080u   /* the rest of the page is GPIOIC */
+#define S5L8900_GPIOIC_BASE  0x39a00080u
+#define S5L8900_GPIOIC_SIZE  0x00000f80u
+
+#define POWER_CONFIG0   0x00u
+#define POWER_CONFIG1   0x04u
+#define POWER_SETSTATE  0x08u
+#define POWER_ONCTRL    0x0cu   /* write 1 to ungate: clears the STATE bit */
+#define POWER_OFFCTRL   0x10u   /* write 1 to gate:   sets the STATE bit   */
+#define POWER_STATE     0x14u   /* bit n set == domain n is gated OFF      */
+#define POWER_SRAM      0x20u
+#define POWER_CFG24     0x24u
+#define POWER_CFG28     0x28u
+
+/* 14 domains; the driver masks with 0x3fff and the device tree lists 14. */
+#define S5L_POWER_DOMAIN_MASK    0x00003fffu
+/* The device tree's power-gate-defaults. See s5l_power_reset. */
+#define S5L_POWER_GATE_DEFAULTS  0x000012fcu
+
+typedef struct {
+    uint32_t state, cfg0, cfg1, sram, cfg24, cfg28;
+} s5l_power_t;
+
+void     s5l_power_reset(s5l_power_t *p);
+uint32_t s5l_power_read(s5l_power_t *p, uint32_t off);
+void     s5l_power_write(s5l_power_t *p, uint32_t off, uint32_t val);
+
 #define S5L_STUB_MAX      16
-#define S5L_STUB_REGS     64          /* 4-byte registers kept per window */
 
 typedef struct {
     uint32_t    base, size;
     const char *name;
-    uint32_t    regs[S5L_STUB_REGS];
+    /* Backing store covers the WHOLE declared window. A fixed-size array was
+     * the first design and it was wrong in a way worth remembering: at 64
+     * registers it covered offsets 0x000-0x0FC, while the two registers we had
+     * actually measured live at 0x320 (GPIO FSEL) and 0x404 (CLOCK0 ADJ2).
+     * Both fell past the array and were counted but not stored, so read-back
+     * returned 0 — the stub silently failed to be the honest storage it exists
+     * to be, for precisely the registers that mattered. Size the backing to
+     * the window instead of hoping the window is small. */
+    uint32_t   *regs;
+    uint32_t    nregs;
     uint64_t    reads, writes;
-    uint64_t    oob;                  /* accesses past S5L_STUB_REGS */
+    uint64_t    oob;                  /* accesses past the backing store */
 } s5l_stub_t;
 
 /* ------------------------------------------------------------- machine ---
@@ -257,6 +302,7 @@ typedef struct {
     s5l_uart_t  uart0;
     s5l_vic_t   vic0;
     s5l_timer_t timer;
+    s5l_power_t power;
     s5l_nor_t   nor;
     uint64_t   unmapped_reads;   /* visibility: accesses outside the map */
     uint64_t   unmapped_writes;

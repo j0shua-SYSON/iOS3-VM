@@ -27,6 +27,10 @@ static inline bool in_dev(uint32_t a, uint32_t base) {
 }
 /* The timer is the one peripheral that does not fit the uniform 4 KB window:
  * its interrupt-status alias sits at offset 0x10000. */
+static inline bool in_power(uint32_t a) {
+    return a >= S5L8900_POWER_BASE &&
+           (uint64_t)a < (uint64_t)S5L8900_POWER_BASE + S5L8900_POWER_SIZE;
+}
 static inline bool in_timer(uint32_t a) {
     return a >= S5L8900_TIMER_BASE &&
            (uint64_t)a < (uint64_t)S5L8900_TIMER_BASE + S5L8900_TIMER_SIZE;
@@ -44,9 +48,14 @@ bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
         uint64_t b0 = base,             b1 = b0 + size;
         if (b0 < a1 && a0 < b1) return false;
     }
+    uint32_t nregs = (size + 3u) / 4u;
+    uint32_t *regs = calloc(nregs, sizeof *regs);
+    if (!regs) return false;
+
     s5l_stub_t *s = &m->stubs[m->stub_count++];
     memset(s, 0, sizeof *s);
     s->base = base; s->size = size; s->name = name;
+    s->regs = regs; s->nregs = nregs;
     return true;
 }
 
@@ -93,6 +102,8 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         v = s5l_vic_read(&m->vic0, addr - S5L8900_VIC0_BASE);
     } else if (in_timer(addr)) {
         v = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
+    } else if (in_power(addr)) {
+        v = s5l_power_read(&m->power, addr - S5L8900_POWER_BASE);
     } else if (addr >= S5L8900_NOR_BASE &&
                (uint64_t)addr < (uint64_t)S5L8900_NOR_BASE + m->nor.size) {
         v = s5l_nor_read(&m->nor, addr - S5L8900_NOR_BASE, bytes);
@@ -106,7 +117,7 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         }
         uint32_t off = (addr - s->base) >> 2;
         s->reads++;
-        if (off < S5L_STUB_REGS) v = s->regs[off];
+        if (off < s->nregs) v = s->regs[off];
         else { s->oob++; v = 0; }
     }
     note_device(m, addr, v, false);
@@ -133,6 +144,11 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         s5l_timer_write(&m->timer, addr - S5L8900_TIMER_BASE, val);
         return;
     }
+    if (in_power(addr)) {
+        note_device(m, addr, val, true);
+        s5l_power_write(&m->power, addr - S5L8900_POWER_BASE, val);
+        return;
+    }
     if (addr >= S5L8900_NOR_BASE &&
         (uint64_t)addr < (uint64_t)S5L8900_NOR_BASE + m->nor.size) {
         /* Guest writes program the flash (bits can only be cleared). Note this
@@ -150,7 +166,7 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
             uint32_t off = (addr - s->base) >> 2;
             s->writes++;
             note_device(m, addr, val, true);
-            if (off < S5L_STUB_REGS) s->regs[off] = val;
+            if (off < s->nregs) s->regs[off] = val;
             else s->oob++;
             return;
         }
@@ -181,6 +197,7 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
     s5l_uart_reset(&m->uart0);
     s5l_vic_reset(&m->vic0);
     s5l_timer_reset(&m->timer);
+    s5l_power_reset(&m->power);
     if (!s5l_nor_init(&m->nor, S5L8900_NOR_SIZE)) { free(m->ram); m->ram = NULL; return false; }
 
     m->bus.ctx = m;
@@ -192,6 +209,11 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
 }
 
 void s5l8900_free(s5l8900_t *m) {
+    for (unsigned i = 0; i < m->stub_count; i++) {
+        free(m->stubs[i].regs);
+        m->stubs[i].regs = NULL;
+    }
+    m->stub_count = 0;
     free(m->ram);
     m->ram = NULL;
     s5l_nor_free(&m->nor);
