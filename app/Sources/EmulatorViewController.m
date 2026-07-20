@@ -109,9 +109,9 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
         0xe3a01054u,   // MOV r1,#'T'
         0xe5801020u,   // STR r1,[r0,#0x20]
         0xe3a01000u,   // MOV r1,#0
-        0xe5821000u,   // STR r1,[r2,#0x00]   disable timer
-        0xe3a01001u,   // MOV r1,#1
-        0xe582100cu,   // STR r1,[r2,#0x0c]   clear timer interrupt
+        0xe58210a4u,   // STR r1,[r2,#0xa4]   stop timer 4
+        0xe3a01803u,   // MOV r1,#0x00030000
+        0xe58210f4u,   // STR r1,[r2,#0xf4]   acknowledge, as the kernel does
         0xe25ef004u    // SUBS pc,lr,#4
     };
     s5l8900_load(&m, 0x40, handler, sizeof handler);
@@ -119,10 +119,14 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
     const uint32_t spin = 0xeafffffeu;
     s5l8900_load(&m, 0x100, &spin, 4);
 
+    // This self-test exercises device -> controller -> CPU, not the clock
+    // ratio, so run the timebase at one tick per instruction to keep it quick.
+    m.cpu_hz = m.tb_hz = 1;
+
     m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE, 1u << S5L8900_IRQ_TIMER);
-    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER_RELOAD, 4);
-    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER_CTRL,
-                  TIMER_CTRL_ENABLE | TIMER_CTRL_INT_EN);
+    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER4_COUNTBUF, 4);
+    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER4_STATE,
+                  TIMER4_STATE_START | TIMER4_STATE_UPDATE);
 
     m.cpu.r[15] = 0x100;
     m.cpu.r[0]  = S5L8900_UART0_BASE;
