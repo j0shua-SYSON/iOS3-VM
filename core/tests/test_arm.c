@@ -641,6 +641,37 @@ static void test_thumb_bl_pair(void) {
     CHECK(c.r[14] == 0x05, "lr=%08x expect 05 (return addr | Thumb bit)", c.r[14]);
 }
 
+static void test_thumb_extend_and_reverse(void) {
+    /* ARMv6 Thumb extend group. Real Apple LLB reaches UXTB within a few
+     * thousand instructions, so these are required, not optional. */
+    uint16_t p[] = { 0x21ff,   /* MOV  r1,#0xff        */
+                     0xb2ca,   /* UXTB r2,r1  -> 0xff  */
+                     0xb24b,   /* SXTB r3,r1  -> -1    */
+                     0xb289 }; /* UXTH r1,r1  -> 0xff  */
+    arm_cpu_t c; load_thumb(&c, p, 4, 4);
+    CHECK(c.r[2] == 0xff, "r2=%08x expect ff (UXTB)", c.r[2]);
+    CHECK(c.r[3] == 0xffffffffu, "r3=%08x expect ffffffff (SXTB)", c.r[3]);
+    CHECK(c.r[1] == 0xff, "r1=%08x expect ff (UXTH)", c.r[1]);
+}
+
+static void test_thumb_rev(void) {
+    /* Build 0x11223344 a byte at a time, then REV it. */
+    uint16_t p[] = { 0x2011, 0x0200, 0x3022, 0x0200,
+                     0x3033, 0x0200, 0x3044, 0xba01 };
+    arm_cpu_t c; load_thumb(&c, p, 8, 8);
+    CHECK(c.r[0] == 0x11223344u, "r0=%08x expect 11223344", c.r[0]);
+    CHECK(c.r[1] == 0x44332211u, "r1=%08x expect 44332211 (REV)", c.r[1]);
+}
+
+static void test_thumb_cps(void) {
+    /* CPSID i then CPSIE i must set and clear the CPSR I bit. */
+    uint16_t p[] = { 0xb672, 0xb662 };
+    arm_cpu_t c; load_thumb(&c, p, 2, 1);
+    CHECK((c.cpsr & ARM_CPSR_I) != 0, "CPSID should mask IRQs");
+    arm_step(&c);
+    CHECK((c.cpsr & ARM_CPSR_I) == 0, "CPSIE should unmask IRQs");
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -695,6 +726,9 @@ int main(void) {
     test_thumb_conditional_branch();
     test_arm_to_thumb_and_back();
     test_thumb_bl_pair();
+    test_thumb_extend_and_reverse();
+    test_thumb_rev();
+    test_thumb_cps();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

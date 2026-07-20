@@ -82,6 +82,18 @@ register/memory results.
 on the phone."
 
 ### 🔵 M3 — iBoot / SecureROM chain *(started)*
+
+**Real Apple firmware now parses and executes.** Pointed at a genuine
+`iPhone1,2_3.1.3_7E18` IPSW, the emulator's own parser reads Apple's iBoot,
+LLB, device tree and kernelcache correctly — every tag in real firmware
+(`TYPE`/`DATA`/`VERS`/`SEPO`/`BORD`/`KBAG`/`SHSH`/`CERT`) is one we handle, and
+the real version strings come out (`iBoot-636.66.33`,
+`EmbeddedDeviceTrees-390.16`). LLB ships **unencrypted**, so it runs today
+without keys: it executes **6,668 instructions** of genuine Apple code —
+switching into Thumb, making real function calls, touching zero unmapped
+addresses — before failing a header check on the empty NOR we have not yet
+populated and returning.
+
 - **Done: the IMG3 container parser.** Reads the header and tag stream, exposing
   the DATA payload, the KBAG (crypt state, key bits, IV and key), SHSH presence
   and the VERS string. Strictly bounds-checked with 64-bit arithmetic: this is

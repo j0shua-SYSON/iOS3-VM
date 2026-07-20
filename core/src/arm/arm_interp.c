@@ -879,7 +879,47 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
             }
             return ARM_OK;
         }
-        return ARM_UNDEFINED;                 /* CPS, SETEND, REV, BKPT: later */
+        /* ARMv6 Thumb extend and byte-reverse group. Real Apple LLB reaches
+         * UXTB within a few thousand instructions, so these are not optional. */
+        if ((insn & 0xff00u) == 0xb200u) {            /* SXTH/SXTB/UXTH/UXTB */
+            unsigned rd = TB(0);
+            uint32_t v = c->r[TB(3)];
+            switch ((insn >> 6) & 3u) {
+                case 0: c->r[rd] = (uint32_t)(int32_t)(int16_t)(uint16_t)v; break; /* SXTH */
+                case 1: c->r[rd] = (uint32_t)(int32_t)(int8_t)(uint8_t)v;   break; /* SXTB */
+                case 2: c->r[rd] = v & 0xffffu;                            break; /* UXTH */
+                default: c->r[rd] = v & 0xffu;                             break; /* UXTB */
+            }
+            return ARM_OK;
+        }
+        if ((insn & 0xff00u) == 0xba00u) {            /* REV/REV16/REVSH */
+            unsigned rd = TB(0);
+            uint32_t v = c->r[TB(3)];
+            switch ((insn >> 6) & 3u) {
+                case 0:                                                    /* REV */
+                    c->r[rd] = ((v & 0xffu) << 24) | ((v & 0xff00u) << 8)
+                             | ((v >> 8) & 0xff00u) | ((v >> 24) & 0xffu);
+                    break;
+                case 1:                                                    /* REV16 */
+                    c->r[rd] = ((v & 0x00ffu) << 8)  | ((v & 0xff00u) >> 8)
+                             | ((v & 0x00ff0000u) << 8) | ((v & 0xff000000u) >> 8);
+                    break;
+                case 3: {                                                  /* REVSH */
+                    uint16_t h = (uint16_t)(((v & 0xffu) << 8) | ((v >> 8) & 0xffu));
+                    c->r[rd] = (uint32_t)(int32_t)(int16_t)h;
+                    break;
+                }
+                default: return ARM_UNDEFINED;
+            }
+            return ARM_OK;
+        }
+        if ((insn & 0xffe0u) == 0xb660u) {            /* CPS (interrupt masks) */
+            bool disable = (insn >> 4) & 1u;
+            if (insn & (1u << 1)) set_flag(c, ARM_CPSR_I, disable);
+            if (insn & (1u << 0)) set_flag(c, ARM_CPSR_F, disable);
+            return ARM_OK;
+        }
+        return ARM_UNDEFINED;                 /* SETEND, BKPT, IT: later */
     }
     case 0xc: {                              /* STMIA / LDMIA Rb!, {rlist} */
         unsigned rb = (insn >> 8) & 7u;

@@ -159,6 +159,8 @@ unsigned s5l_nor_scan(s5l_nor_t *n);
 /* Find a scanned image by ident; returns NULL if absent. */
 const s5l_nor_entry_t *s5l_nor_find(const s5l_nor_t *n, uint32_t ident);
 
+#define S5L_UNMAPPED_LOG 32
+
 /* ------------------------------------------------------------- machine ---
  * Wires the CPU to RAM and the peripherals through one arm_bus_t.
  */
@@ -174,6 +176,12 @@ typedef struct {
     s5l_nor_t   nor;
     uint64_t   unmapped_reads;   /* visibility: accesses outside the map */
     uint64_t   unmapped_writes;
+
+    /* Diagnostic: the first distinct addresses the guest touched outside the
+     * memory map. When real firmware wanders off, these name the peripheral we
+     * have not modelled yet — which is the next thing to build. */
+    uint32_t   unmapped_addr[S5L_UNMAPPED_LOG];
+    unsigned   unmapped_addr_count;
 } s5l8900_t;
 
 /* Advance the devices and refresh the CPU's interrupt lines. */

@@ -28,6 +28,16 @@ static inline bool in_dev(uint32_t a, uint32_t base) {
 
 /* ------------------------------------------------------------- reads --- */
 
+/* Record the first distinct out-of-map addresses so a wandering guest tells us
+ * which peripheral is missing rather than leaving us to guess. */
+static void note_unmapped(s5l8900_t *m, uint32_t addr) {
+    uint32_t page = addr & ~0xfffu;
+    for (unsigned i = 0; i < m->unmapped_addr_count; i++)
+        if (m->unmapped_addr[i] == page) return;
+    if (m->unmapped_addr_count < S5L_UNMAPPED_LOG)
+        m->unmapped_addr[m->unmapped_addr_count++] = page;
+}
+
 static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
     s5l8900_t *m = ctx;
 
@@ -47,6 +57,7 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         return s5l_nor_read(&m->nor, addr - S5L8900_NOR_BASE, bytes);
 
     m->unmapped_reads++;
+    note_unmapped(m, addr);
     return 0;
 }
 
@@ -81,6 +92,7 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         return;
     }
     m->unmapped_writes++;
+    note_unmapped(m, addr);
 }
 
 static uint32_t r32(void *c, uint32_t a) { return bus_read(c, a, 4); }

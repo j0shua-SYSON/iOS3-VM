@@ -55,3 +55,8 @@ add_test(NAME nand_device COMMAND test_nand)
 # validates our format handling.
 add_executable(img3dump ../tools/img3dump.c)
 target_link_libraries(img3dump PRIVATE emucore)
+
+# runfw executes a decrypted payload on the emulated machine and reports exactly
+# where and why it stopped — the diagnostic that says what to build next.
+add_executable(runfw ../tools/runfw.c)
+target_link_libraries(runfw PRIVATE emucore)
