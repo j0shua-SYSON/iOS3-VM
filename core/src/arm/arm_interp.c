@@ -138,6 +138,15 @@ static void take_exception(arm_cpu_t *c, uint32_t vector, uint32_t mode,
     c->cpsr |= ARM_CPSR_I;                 /* IRQs off on entry */
     if (mask_fiq) c->cpsr |= ARM_CPSR_F;
     c->cpsr &= ~ARM_CPSR_T;                /* exceptions enter in ARM state */
+    /*
+     * Taking an exception clears the exclusive monitor. Without this, an
+     * interrupt landing between a thread's LDREX and its STREX leaves the tag
+     * intact, so the preempted thread's STREX still succeeds after the
+     * preempting thread has taken the same lock — two owners of one spinlock.
+     * This is invisible until interrupts actually fire, which is why it
+     * survived until the timer started working.
+     */
+    c->excl_valid = false;
     *next = ((c->cp15.sctlr & ARM_SCTLR_V) ? 0xffff0000u : 0u) + vector;
 }
 
@@ -1224,6 +1233,14 @@ arm_status_t arm_step(arm_cpu_t *c) {
         /* PLD is a hint; a no-op is architecturally correct. Both the immediate
          * and register forms have bits[27:26]==01 and the Rd field SBO (1111). */
         if ((insn & 0x0c00f000u) == 0x0400f000u) {
+            c->r[15] = next;
+            return ARM_OK;
+        }
+        /* CLREX — drop the exclusive monitor. The kernel's context-switch and
+         * exception-return paths use it to make sure a half-finished
+         * LDREX/STREX pair cannot complete across a thread switch. */
+        if (insn == 0xf57ff01fu) {
+            c->excl_valid = false;
             c->r[15] = next;
             return ARM_OK;
         }

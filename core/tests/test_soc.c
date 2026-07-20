@@ -114,23 +114,59 @@ static void test_bare_metal_uart_hello(void) {
     s5l8900_free(&m);
 }
 
+/*
+ * The free-running counter is mach_absolute_time(). It must advance even when
+ * no timer is armed: a counter that only runs while timer 4 is started reads
+ * zero for the whole of early boot, and every delay loop in the kernel then
+ * waits forever on a clock that never moves.
+ */
+static void test_timebase_runs_without_a_timer(void) {
+    s5l_timer_t t; s5l_timer_reset(&t);
+    s5l_timer_tick(&t, 1000);
+    uint32_t lo = s5l_timer_read(&t, TIMER_TICKSLOW);
+    CHECK(lo == 1000, "timebase=%u expect 1000 with no timer armed", lo);
+
+    /* And it must carry into the high word rather than wrapping silently. */
+    s5l_timer_reset(&t);
+    for (unsigned i = 0; i < 5; i++) s5l_timer_tick(&t, 0xfffffffful / 4u);
+    uint32_t hi = s5l_timer_read(&t, TIMER_TICKSHIGH);
+    CHECK(hi == 1, "timebase high=%u expect 1 after passing 2^32", hi);
+}
+
 static void test_timer_period_is_exact(void) {
     /* One interrupt per reload period, at a steady interval. Latching on both
      * the decrement-to-zero and reload-from-zero paths produced two interrupts
      * per period at intervals N, 1, N, 1, ... */
     s5l_timer_t t; s5l_timer_reset(&t);
-    s5l_timer_write(&t, TIMER_RELOAD, 4);
-    s5l_timer_write(&t, TIMER_CTRL, TIMER_CTRL_ENABLE | TIMER_CTRL_INT_EN);
+    s5l_timer_write(&t, TIMER4_COUNTBUF, 4);
+    s5l_timer_write(&t, TIMER4_STATE, TIMER4_STATE_START | TIMER4_STATE_UPDATE);
     unsigned expiries = 0, last = 0; int deltas_ok = 1;
     for (unsigned tick = 1; tick <= 20; tick++) {
         if (s5l_timer_tick(&t, 1)) {
             if (last && (tick - last) != 4) deltas_ok = 0;
             last = tick; expiries++;
-            s5l_timer_write(&t, TIMER_INTSTAT, 1);   /* acknowledge */
+            s5l_timer_write(&t, TIMER_IRQACK, TIMER4_IRQ_BITS);   /* acknowledge */
         }
     }
-    CHECK(expiries == 5, "expiries=%u expect 5 in 20 ticks with reload 4", expiries);
+    CHECK(expiries == 5, "expiries=%u expect 5 in 20 ticks with count 4", expiries);
     CHECK(deltas_ok, "expiry intervals were not a steady 4 ticks");
+}
+
+/*
+ * The acknowledge mask is not a free choice: the kernel's FIQ handler writes
+ * exactly TIMER4_IRQ_BITS. If the latch holds any bit that write does not
+ * clear, the line stays asserted, the handler re-enters immediately, and the
+ * boot presents as a hang rather than as a scheduler tick.
+ */
+static void test_timer_ack_mask_matches_the_kernels(void) {
+    s5l_timer_t t; s5l_timer_reset(&t);
+    s5l_timer_write(&t, TIMER4_COUNTBUF, 1);
+    s5l_timer_write(&t, TIMER4_STATE, TIMER4_STATE_START | TIMER4_STATE_UPDATE);
+    CHECK(s5l_timer_tick(&t, 1), "timer should latch an interrupt at expiry");
+    s5l_timer_write(&t, TIMER_IRQACK, TIMER4_IRQ_BITS);
+    CHECK(s5l_timer_read(&t, TIMER_IRQLATCH) == 0,
+          "latch=%08x expect fully cleared by the kernel's ack mask",
+          s5l_timer_read(&t, TIMER_IRQLATCH));
 }
 
 static void test_vic_masks_and_routes(void) {
@@ -154,8 +190,8 @@ static void test_vic_masks_and_routes(void) {
  *   0x18: B 0x40          ; IRQ vector
  *   0x40: MOV r1,#'T'
  *   0x44: STR r1,[r0,#0x20]
- *   0x48: MOV r1,#1
- *   0x4c: STR r1,[r2,#0x0c]  ; clear timer interrupt
+ *   0x48: MOV r1,#0x00030000
+ *   0x4c: STR r1,[r2,#0xf4]  ; acknowledge, exactly as the kernel's handler does
  *   0x50: SUBS pc,lr,#4      ; return from IRQ (restores CPSR from SPSR)
  *   0x100: B .               ; main loop
  */
@@ -173,9 +209,9 @@ static void test_timer_interrupt_reaches_handler(void) {
         0xe3a01054u,   /* MOV r1,#0x54 'T'      */
         0xe5801020u,   /* STR r1,[r0,#0x20]     */
         0xe3a01000u,   /* MOV r1,#0             */
-        0xe5821000u,   /* STR r1,[r2,#0x00]  disable timer */
-        0xe3a01001u,   /* MOV r1,#1             */
-        0xe582100cu,   /* STR r1,[r2,#0x0c]  clear timer interrupt */
+        0xe58210a4u,   /* STR r1,[r2,#0xa4]  stop timer 4 */
+        0xe3a01803u,   /* MOV r1,#0x00030000    */
+        0xe58210f4u,   /* STR r1,[r2,#0xf4]  acknowledge */
         0xe25ef004u    /* SUBS pc,lr,#4      return from IRQ */
     };
     s5l8900_load(&m, 0x40, handler, sizeof handler);
@@ -185,9 +221,9 @@ static void test_timer_interrupt_reaches_handler(void) {
 
     /* Program the controller and timer the way guest setup code would. */
     m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE, 1u << S5L8900_IRQ_TIMER);
-    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER_RELOAD, 4);
-    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER_CTRL,
-                  TIMER_CTRL_ENABLE | TIMER_CTRL_INT_EN);
+    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER4_COUNTBUF, 4);
+    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER4_STATE,
+                  TIMER4_STATE_START | TIMER4_STATE_UPDATE);
 
     /* Start in SYS mode with IRQs unmasked, spinning at 0x100. */
     m.cpu.r[15] = 0x100;
@@ -222,7 +258,9 @@ int main(void) {
     test_bounds_check_cannot_overflow();
     test_bare_metal_uart_hello();
     test_vic_masks_and_routes();
+    test_timebase_runs_without_a_timer();
     test_timer_period_is_exact();
+    test_timer_ack_mask_matches_the_kernels();
     test_timer_interrupt_reaches_handler();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

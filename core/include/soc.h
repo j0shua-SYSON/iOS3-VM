@@ -81,20 +81,56 @@ bool     s5l_vic_irq(const s5l_vic_t *v);
 bool     s5l_vic_fiq(const s5l_vic_t *v);
 
 /* -------------------------------------------------------------- timer ---
- * A periodic down-counter. NOTE: this register layout is provisional — it is
- * enough to drive our own payloads and exercise the interrupt path, and will be
- * replaced with the real S5L8900 timer block when we run Apple firmware at M3.
+ * The real S5L8900 timer block, as used by XNU rather than as invented by us.
+ *
+ * The layout below is not guesswork: instrumenting the bus and correlating each
+ * access against the kernel's own symbols shows exactly which registers matter
+ * and what it expects of them.
+ *
+ *   _s5l8900x_get_timebase    reads 0x080/0x084 as a free-running 64-bit
+ *                             counter. This is mach_absolute_time(). It must
+ *                             count whether or not any timer is "enabled", or
+ *                             every delay loop in the kernel spins forever.
+ *   _pe_arm_init_interrupts   programs timer 4 at 0x0A0-0x0AF and then routes
+ *                             VIC line 7 to *FIQ*, not IRQ.
+ *   _s5l8900x_set_decrementer writes the next deadline to 0x0A8.
+ *   _fleh_fiq_s5l8900x        acknowledges by writing 0x00030000 to the latch.
+ *
+ * That acknowledge mask is load-bearing. Latching any other bit pattern leaves
+ * the line asserted after the handler returns, which produces an interrupt
+ * storm rather than a scheduler tick.
+ *
+ * The status alias at 0x10000 sits outside the usual 4 KB peripheral window,
+ * which is why the timer's window is widened (see S5L8900_TIMER_SIZE).
  */
-#define TIMER_CTRL       0x00u
-#define TIMER_RELOAD     0x04u
-#define TIMER_VALUE      0x08u
-#define TIMER_INTSTAT    0x0cu   /* read: pending; write: clear */
-#define TIMER_CTRL_ENABLE (1u << 0)
-#define TIMER_CTRL_INT_EN (1u << 1)
+#define TIMER_TICKSHIGH  0x0080u   /* free-running counter, high word */
+#define TIMER_TICKSLOW   0x0084u   /* free-running counter, low word  */
+#define TIMER_CONFIG     0x0088u
+#define TIMER4_CONFIG    0x00a0u
+#define TIMER4_STATE     0x00a4u   /* bit0 start, bit1 update-from-buffer */
+#define TIMER4_COUNTBUF  0x00a8u   /* deadline written by set_decrementer  */
+#define TIMER4_COUNTBUF2 0x00acu
+#define TIMER4_VALUE     0x00b4u   /* live down-count */
+#define TIMER_IRQACK     0x00f4u   /* write-1-to-clear */
+#define TIMER_IRQLATCH   0x00f8u
+#define TIMER_IRQSTATUS  0x10000u  /* alias, outside the 4 KB window */
 
-#define S5L8900_IRQ_TIMER 5u     /* VIC line the timer drives */
+#define TIMER4_STATE_START  (1u << 0)
+#define TIMER4_STATE_UPDATE (1u << 1)
+#define TIMER4_IRQ_BITS  0x00030000u  /* what _fleh_fiq_s5l8900x acks */
 
-typedef struct { uint32_t ctrl, reload, value, intstat; } s5l_timer_t;
+/* Widened so TIMER_IRQSTATUS at 0x10000 falls inside the timer's window. */
+#define S5L8900_TIMER_SIZE 0x00011000u
+
+#define S5L8900_IRQ_TIMER 7u     /* VIC line the timer drives (routed to FIQ) */
+
+typedef struct {
+    uint64_t ticks;              /* free-running; never gated by any enable */
+    uint32_t config;
+    uint32_t t4_config, t4_state;
+    uint32_t t4_count, t4_count2, t4_value;
+    uint32_t irqlatch;
+} s5l_timer_t;
 
 void s5l_timer_reset(s5l_timer_t *t);
 uint32_t s5l_timer_read(s5l_timer_t *t, uint32_t off);

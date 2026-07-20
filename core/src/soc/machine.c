@@ -25,6 +25,12 @@ static inline bool in_ram(const s5l8900_t *m, uint32_t a, uint32_t len) {
 static inline bool in_dev(uint32_t a, uint32_t base) {
     return a >= base && (uint64_t)a < (uint64_t)base + S5L8900_DEV_SIZE;
 }
+/* The timer is the one peripheral that does not fit the uniform 4 KB window:
+ * its interrupt-status alias sits at offset 0x10000. */
+static inline bool in_timer(uint32_t a) {
+    return a >= S5L8900_TIMER_BASE &&
+           (uint64_t)a < (uint64_t)S5L8900_TIMER_BASE + S5L8900_TIMER_SIZE;
+}
 
 /* ------------------------------------------------------------- reads --- */
 
@@ -59,7 +65,7 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         v = s5l_uart_read(&m->uart0, addr - S5L8900_UART0_BASE);
     } else if (in_dev(addr, S5L8900_VIC0_BASE)) {
         v = s5l_vic_read(&m->vic0, addr - S5L8900_VIC0_BASE);
-    } else if (in_dev(addr, S5L8900_TIMER_BASE)) {
+    } else if (in_timer(addr)) {
         v = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
     } else if (addr >= S5L8900_NOR_BASE &&
                (uint64_t)addr < (uint64_t)S5L8900_NOR_BASE + m->nor.size) {
@@ -90,7 +96,7 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         s5l_vic_write(&m->vic0, addr - S5L8900_VIC0_BASE, val);
         return;
     }
-    if (in_dev(addr, S5L8900_TIMER_BASE)) {
+    if (in_timer(addr)) {
         s5l_timer_write(&m->timer, addr - S5L8900_TIMER_BASE, val);
         return;
     }
