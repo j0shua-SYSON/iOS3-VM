@@ -24,6 +24,9 @@ static inline bool get_flag(const arm_cpu_t *c, uint32_t bit) {
     return (c->cpsr & bit) != 0;
 }
 
+/* Defined below, but needed by the CP15 helper above it. */
+static inline uint32_t reg_read(const arm_cpu_t *c, uint32_t pc, unsigned n);
+
 arm_bank_t arm_bank_of_mode(uint32_t mode) {
     switch (mode & ARM_CPSR_MODE_MASK) {
         case ARM_MODE_FIQ: return ARM_BANK_FIQ;
@@ -59,7 +62,8 @@ void arm_set_mode(arm_cpu_t *c, uint32_t mode) {
 }
 
 /* Enter an exception: bank in the handler mode, stash the return address in its
- * LR and the old CPSR in its SPSR, mask interrupts, and vector the PC. */
+ * LR and the old CPSR in its SPSR, mask interrupts, and vector the PC.
+ * CP15 SCTLR.V relocates the vector table to 0xFFFF0000. */
 static void take_exception(arm_cpu_t *c, uint32_t vector, uint32_t mode,
                            uint32_t ret_addr, bool mask_fiq, uint32_t *next) {
     uint32_t saved = c->cpsr;
@@ -69,7 +73,73 @@ static void take_exception(arm_cpu_t *c, uint32_t vector, uint32_t mode,
     c->cpsr |= ARM_CPSR_I;                 /* IRQs off on entry */
     if (mask_fiq) c->cpsr |= ARM_CPSR_F;
     c->cpsr &= ~ARM_CPSR_T;                /* exceptions enter in ARM state */
-    *next = vector;
+    *next = ((c->cp15.sctlr & ARM_SCTLR_V) ? 0xffff0000u : 0u) + vector;
+}
+
+/*
+ * CP15 access via MCR (write) / MRC (read).
+ *
+ * Note on coverage: the architecturally significant registers below are modeled
+ * exactly. Cache and TLB maintenance (c7/c8) are accepted as no-ops because we
+ * have no caches to flush, and CP15 registers we do not model read as zero and
+ * ignore writes. That is a deliberate exception to this core's usual
+ * "trap what you don't implement" rule: CP15 is a configuration space that
+ * kernels probe widely, and trapping harmless probes would stop a boot dead.
+ */
+static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    unsigned cp   = (insn >> 8)  & 0xfu;
+    if (cp != 15) return ARM_UNDEFINED;         /* only CP15 exists on this SoC */
+
+    bool     load = (insn >> 20) & 1u;          /* 1 = MRC (read), 0 = MCR */
+    unsigned crn  = (insn >> 16) & 0xfu;
+    unsigned rd   = (insn >> 12) & 0xfu;
+    unsigned opc2 = (insn >> 5)  & 7u;
+    unsigned crm  = insn & 0xfu;
+    arm_cp15_t *p = &c->cp15;
+
+    if (load) {
+        uint32_t v = 0;
+        switch (crn) {
+            case 0:
+                if (crm == 0 && opc2 == 0) v = ARM1176_MIDR;
+                else if (crm == 0 && opc2 == 1) v = ARM1176_CACHE_TYPE;
+                break;
+            case 1:
+                if (opc2 == 0) v = p->sctlr; else if (opc2 == 1) v = p->actlr;
+                else if (opc2 == 2) v = p->cpacr;
+                break;
+            case 2:
+                if (opc2 == 0) v = p->ttbr0; else if (opc2 == 1) v = p->ttbr1;
+                else if (opc2 == 2) v = p->ttbcr;
+                break;
+            case 3:  v = p->dacr; break;
+            case 5:  v = (opc2 == 1) ? p->ifsr : p->dfsr; break;
+            case 6:  v = (opc2 == 2) ? p->ifar : p->dfar; break;
+            case 13: v = (opc2 == 1) ? p->context_id : p->fcse_pid; break;
+            default: v = 0; break;              /* unmodelled: reads as zero */
+        }
+        c->r[rd] = v;
+    } else {
+        uint32_t v = reg_read(c, pc, rd);
+        switch (crn) {
+            case 1:
+                if (opc2 == 0) p->sctlr = v; else if (opc2 == 1) p->actlr = v;
+                else if (opc2 == 2) p->cpacr = v;
+                break;
+            case 2:
+                if (opc2 == 0) p->ttbr0 = v; else if (opc2 == 1) p->ttbr1 = v;
+                else if (opc2 == 2) p->ttbcr = v;
+                break;
+            case 3:  p->dacr = v; break;
+            case 5:  if (opc2 == 1) p->ifsr = v; else p->dfsr = v; break;
+            case 6:  if (opc2 == 2) p->ifar = v; else p->dfar = v; break;
+            case 7:  break;                     /* cache maintenance: no-op */
+            case 8:  break;                     /* TLB maintenance: no-op   */
+            case 13: if (opc2 == 1) p->context_id = v; else p->fcse_pid = v; break;
+            default: break;                     /* unmodelled: ignored      */
+        }
+    }
+    return ARM_OK;
 }
 
 void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
@@ -78,6 +148,7 @@ void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
         cpu->spsr[i] = 0; cpu->bank_r13[i] = 0; cpu->bank_r14[i] = 0;
     }
     for (int i = 0; i < 5; i++) { cpu->fiq_r8_12[i] = 0; cpu->usr_r8_12[i] = 0; }
+    { arm_cp15_t z = {0}; cpu->cp15 = z; }   /* MMU off, low vectors */
     /* On reset the ARM1176 enters SVC mode with IRQ+FIQ disabled and begins
      * execution from the reset vector (0x0, or 0xffff0000 with high vectors).
      * We start at 0x0; the machine layer relocates PC as needed. */
@@ -528,6 +599,8 @@ arm_status_t arm_step(arm_cpu_t *c) {
          * set (e.g. MOV r0,#0x90), so it must NOT be trapped here. MUL/MLA are
          * handled above; these are unimplemented — trap rather than corrupt Rd. */
         st = ARM_UNDEFINED;
+    } else if ((insn & 0x0f000010u) == 0x0e000010u) {     /* MCR / MRC (CP15) */
+        st = exec_coprocessor(c, pc, insn);
     } else if ((insn & 0x0f000000u) == 0x0f000000u) {     /* SWI / SVC */
         take_exception(c, ARM_VEC_SWI, ARM_MODE_SVC, pc + 4, false, &next);
     } else if ((insn & 0x0c000000u) == 0x00000000u) {     /* data processing / PSR */

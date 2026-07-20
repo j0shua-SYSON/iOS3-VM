@@ -333,6 +333,51 @@ static void test_exception_return_restores_mode(void) {
     CHECK(c.r[15] == 4, "pc=%08x expect 4 (returned after the SWI)", c.r[15]);
 }
 
+static void test_cp15_reads_midr(void) {
+    /* MRC p15,0,r0,c0,c0,0 -> the ARM1176JZF-S main ID. The kernel reads this
+     * to identify the CPU it is running on. */
+    uint32_t p[] = { 0xee100f10 };
+    arm_cpu_t c; load_and_run(&c, p, 1, 1);
+    CHECK(c.r[0] == ARM1176_MIDR, "r0=%08x expect %08x (MIDR)", c.r[0], ARM1176_MIDR);
+}
+
+static void test_cp15_sctlr_roundtrip(void) {
+    /* MOV r0,#1 ; MCR c1 (SCTLR <- 1, MMU enable bit) ; MRC c1 -> r1 */
+    uint32_t p[] = { 0xe3a00001 /*MOV r0,#1*/,
+                     0xee010f10 /*MCR p15,0,r0,c1,c0,0*/,
+                     0xee111f10 /*MRC p15,0,r1,c1,c0,0*/ };
+    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    CHECK(c.r[1] == 1, "r1=%08x expect 1 (SCTLR readback)", c.r[1]);
+    CHECK((c.cp15.sctlr & ARM_SCTLR_M) != 0, "SCTLR.M should be set");
+}
+
+static void test_cp15_ttbr0_roundtrip(void) {
+    /* Translation table base survives a write/read cycle (needed for the MMU). */
+    uint32_t p[] = { 0xe3a00b02 /*MOV r0,#0x800*/,
+                     0xee020f10 /*MCR p15,0,r0,c2,c0,0  (TTBR0)*/,
+                     0xee121f10 /*MRC p15,0,r1,c2,c0,0*/ };
+    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    CHECK(c.cp15.ttbr0 == 0x800, "ttbr0=%08x expect 800", c.cp15.ttbr0);
+    CHECK(c.r[1] == 0x800, "r1=%08x expect 800", c.r[1]);
+}
+
+static void test_cp15_cache_op_is_accepted(void) {
+    /* MCR p15,0,r0,c7,c5,0 (invalidate I-cache) must not trap. */
+    uint32_t p[] = { 0xee070f15 };
+    arm_cpu_t c; arm_status_t st = run_status(&c, p, 1, 1);
+    CHECK(st == ARM_OK, "status=%d expect ARM_OK for cache maintenance", (int)st);
+}
+
+static void test_high_vectors(void) {
+    /* Setting SCTLR.V (bit 13) moves the vector table to 0xFFFF0000, so a SWI
+     * must vector to 0xFFFF0008 instead of 0x8. */
+    uint32_t p[] = { 0xe3a00a02 /*MOV r0,#0x2000 (SCTLR.V)*/,
+                     0xee010f10 /*MCR p15,0,r0,c1,c0,0*/,
+                     0xef000000 /*SWI #0*/ };
+    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    CHECK(c.r[15] == 0xffff0008u, "pc=%08x expect ffff0008 (high vectors)", c.r[15]);
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -363,6 +408,11 @@ int main(void) {
     test_msr_switches_mode();
     test_swi_enters_svc();
     test_exception_return_restores_mode();
+    test_cp15_reads_midr();
+    test_cp15_sctlr_roundtrip();
+    test_cp15_ttbr0_roundtrip();
+    test_cp15_cache_op_is_accepted();
+    test_high_vectors();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

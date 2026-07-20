@@ -27,7 +27,18 @@
 #define ARM_CPSR_T (1u << 5)  /* Thumb state  */
 #define ARM_CPSR_MODE_MASK 0x1fu
 
-/* Exception vector addresses (low vectors; CP15 high vectors come later). */
+/* CP15 c1 system control register (SCTLR) bits we act on. */
+#define ARM_SCTLR_M (1u << 0)   /* MMU enable          */
+#define ARM_SCTLR_A (1u << 1)   /* alignment check     */
+#define ARM_SCTLR_C (1u << 2)   /* data cache enable   */
+#define ARM_SCTLR_I (1u << 12)  /* instruction cache   */
+#define ARM_SCTLR_V (1u << 13)  /* high exception vectors @ 0xFFFF0000 */
+
+/* Main ID register value reported for the ARM1176JZF-S in the S5L8900. */
+#define ARM1176_MIDR       0x410fb767u
+#define ARM1176_CACHE_TYPE 0x1d152152u
+
+/* Exception vector offsets (added to 0x0, or 0xFFFF0000 when SCTLR.V is set). */
 #define ARM_VEC_RESET      0x00u
 #define ARM_VEC_UNDEFINED  0x04u
 #define ARM_VEC_SWI        0x08u
@@ -76,9 +87,28 @@ typedef enum {
     ARM_BANK_SVC, ARM_BANK_ABT, ARM_BANK_UND, ARM_BANK_COUNT
 } arm_bank_t;
 
+/*
+ * CP15, the system control coprocessor. The kernel programs the MMU, caches,
+ * and vector base through here, so these values steer real execution.
+ */
+typedef struct arm_cp15 {
+    uint32_t sctlr;       /* c1,c0,0  system control            */
+    uint32_t actlr;       /* c1,c0,1  auxiliary control         */
+    uint32_t cpacr;       /* c1,c0,2  coprocessor access        */
+    uint32_t ttbr0;       /* c2,c0,0  translation table base 0  */
+    uint32_t ttbr1;       /* c2,c0,1  translation table base 1  */
+    uint32_t ttbcr;       /* c2,c0,2  translation table control */
+    uint32_t dacr;        /* c3,c0,0  domain access control     */
+    uint32_t dfsr, ifsr;  /* c5       fault status              */
+    uint32_t dfar, ifar;  /* c6       fault address             */
+    uint32_t fcse_pid;    /* c13,c0,0 */
+    uint32_t context_id;  /* c13,c0,1 */
+} arm_cp15_t;
+
 typedef struct arm_cpu {
     uint32_t r[16];      /* r0–r15; r15 is PC (address of current instruction) */
     uint32_t cpsr;
+    arm_cp15_t cp15;
     uint32_t spsr[ARM_BANK_COUNT];     /* saved CPSR per privileged bank        */
     uint32_t bank_r13[ARM_BANK_COUNT]; /* banked stack pointers                 */
     uint32_t bank_r14[ARM_BANK_COUNT]; /* banked link registers                 */

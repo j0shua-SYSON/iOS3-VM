@@ -24,17 +24,23 @@ core on the phone.
 ### 🔵 M1 — ARMv6 interpreter *(in progress)*
 A complete, correct ARM1176 instruction interpreter validated against a growing
 unit-test suite.
-- **Done** (51 tests passing): data-processing with the full barrel shifter,
+- **Done** (58 tests passing): data-processing with the full barrel shifter,
   branch/BL, BX/BLX, single load/store, multiply, **LDM/STM in all four
   addressing modes** (incl. push/pop and LDM-into-PC branching), the
   halfword/sign-extending loads (LDRH/STRH/LDRSB/LDRSH), **banked registers and
   mode switching** (per-mode r13/r14 + SPSR, FIQ's private r8–r12), **MRS/MSR**,
   and **SWI with a full exception round trip** (vector → SVC entry with SPSR/LR
-  saved → `LDM ^` exception return restoring CPSR).
+  saved → `LDM ^` exception return restoring CPSR), and the **CP15 system
+  control coprocessor** via MCR/MRC (MIDR, SCTLR, TTBR0/1, DACR, fault status,
+  context ID; cache/TLB maintenance accepted as no-ops) — including SCTLR.V
+  relocating the vector table to `0xFFFF0000`.
 - Unimplemented encodings deliberately return `ARM_UNDEFINED` rather than
   silently corrupting state, so the harness tells us exactly what to add next.
-- Remaining: Thumb, coprocessor (CP15) for MMU/cache control, IRQ/FIQ delivery
-  and abort exceptions, SWP, LDRD/STRD, user-bank `LDM ^`.
+  (CP15 is the documented exception: unmodelled config registers read as zero
+  instead of trapping, since kernels probe that space widely.)
+- Remaining: Thumb, IRQ/FIQ delivery and abort exceptions, SWP, LDRD/STRD,
+  user-bank `LDM ^`. **MMU page-table walking** uses the CP15 state landed here
+  but belongs to M2.
 
 **Observable:** the interpreter runs a known ARM test binary with bit-exact
 register/memory results.
