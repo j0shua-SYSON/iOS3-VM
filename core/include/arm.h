@@ -111,6 +111,11 @@ typedef struct arm_cp15 {
     uint32_t dfar, ifar;  /* c6       fault address             */
     uint32_t fcse_pid;    /* c13,c0,0 */
     uint32_t context_id;  /* c13,c0,1 */
+    /* Software thread-ID registers. The kernel keeps per-CPU data in TPIDRPRW,
+     * so these must actually store rather than read back as zero. */
+    uint32_t tpidrurw;    /* c13,c0,2 user read/write */
+    uint32_t tpidruro;    /* c13,c0,3 user read-only  */
+    uint32_t tpidrprw;    /* c13,c0,4 privileged only */
 } arm_cp15_t;
 
 typedef struct arm_cpu {

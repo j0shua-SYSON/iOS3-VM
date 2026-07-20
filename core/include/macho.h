@@ -1,0 +1,67 @@
+/*
+ * iOS3-VM — 32-bit Mach-O loader for the XNU kernelcache.
+ *
+ * After decrypting and decompressing, the kernelcache is a plain 32-bit Mach-O
+ * executable (magic feedface, cputype ARM, subtype v6). Booting it means
+ * placing each segment at the physical address its virtual address maps to,
+ * and finding the entry point the kernel wants to start at.
+ *
+ * Mach-O is a documented format, and this parser treats it as untrusted input
+ * because it arrives inside user-supplied firmware: every load command and
+ * segment extent is validated against the buffer before use.
+ *
+ * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
+ */
+#ifndef IOS3VM_MACHO_H
+#define IOS3VM_MACHO_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define MH_MAGIC_32       0xfeedfaceu
+#define MH_CPU_TYPE_ARM   12u
+#define MH_CPU_SUBTYPE_V6 6u
+#define MH_EXECUTE        2u
+
+#define LC_SEGMENT        0x01u
+#define LC_UNIXTHREAD     0x05u
+
+#define MACHO_MAX_SEGMENTS 16u
+
+typedef struct {
+    char     name[17];
+    uint32_t vmaddr;
+    uint32_t vmsize;
+    uint32_t fileoff;
+    uint32_t filesize;
+} macho_segment_t;
+
+typedef struct {
+    uint32_t        cputype;
+    uint32_t        cpusubtype;
+    uint32_t        filetype;
+    macho_segment_t segments[MACHO_MAX_SEGMENTS];
+    unsigned        segment_count;
+
+    bool     has_entry;
+    uint32_t entry;          /* initial PC from LC_UNIXTHREAD */
+    uint32_t entry_sp;       /* initial SP, if the thread state carries one */
+
+    uint32_t vm_low;         /* lowest  vmaddr across segments */
+    uint32_t vm_high;        /* highest vmaddr + vmsize        */
+} macho_t;
+
+typedef enum {
+    MACHO_OK = 0,
+    MACHO_ERR_TOO_SMALL,
+    MACHO_ERR_BAD_MAGIC,     /* not a 32-bit little-endian Mach-O          */
+    MACHO_ERR_NOT_ARM,       /* wrong CPU type for this machine            */
+    MACHO_ERR_MALFORMED,     /* a load command or segment runs past the end */
+    MACHO_ERR_TOO_MANY       /* more segments than we track                 */
+} macho_status_t;
+
+macho_status_t macho_parse(const uint8_t *buf, size_t len, macho_t *out);
+const char *macho_strerror(macho_status_t st);
+
+#endif /* IOS3VM_MACHO_H */

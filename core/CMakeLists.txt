@@ -15,6 +15,7 @@ add_library(emucore STATIC
     src/firmware/loader.c
     src/firmware/devicetree.c
     src/firmware/lzss.c
+    src/firmware/macho.c
 )
 target_include_directories(emucore PUBLIC include)
 
@@ -68,3 +69,9 @@ target_link_libraries(runfw PRIVATE emucore)
 
 add_executable(unlzss ../tools/unlzss.c)
 target_link_libraries(unlzss PRIVATE emucore)
+
+add_executable(machoinfo ../tools/machoinfo.c)
+target_link_libraries(machoinfo PRIVATE emucore)
+
+add_executable(bootkernel ../tools/bootkernel.c)
+target_link_libraries(bootkernel PRIVATE emucore)

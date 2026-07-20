@@ -51,8 +51,8 @@ can see.** No months in the dark.
 | **M0** | Toolchain online: core builds + tests in CI, iOS `.ipa` builds on a macOS runner, on-device self-test runs ARM code | ✅ **done** |
 | **M1** | Complete ARMv6 (ARM1176) interpreter, unit-tested | ✅ **done** — ARM + Thumb, *96 CPU tests* |
 | **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | 🔵 **guest code prints; timer IRQs reach a handler** — MMU, bus, UART, VIC, timer · *22 SoC tests* |
-| **M3** | IMG3 + NAND/NOR: Apple's real **iBoot** runs | 🔵 **real Apple LLB executes 6,668 instructions** — parses genuine IMG3 firmware |
-| **M4** | The real **XNU kernel** boots and logs | ⚪ |
+| **M3** | IMG3 + NAND/NOR: Apple's real **iBoot** runs | ✅ **done** — decrypts real firmware; LLB runs, kernel extracted |
+| **M4** | The real **XNU kernel** boots and logs | 🔵 **XNU runs and enables the MMU** — 20M instructions under virtual memory |
 | **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | ⚪ |
 
 Full detail in [`docs/ROADMAP.md`](docs/ROADMAP.md).

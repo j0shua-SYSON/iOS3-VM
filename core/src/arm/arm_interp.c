@@ -157,7 +157,15 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
             case 3:  v = p->dacr; break;
             case 5:  v = (opc2 == 1) ? p->ifsr : p->dfsr; break;
             case 6:  v = (opc2 == 2) ? p->ifar : p->dfar; break;
-            case 13: v = (opc2 == 1) ? p->context_id : p->fcse_pid; break;
+            case 13:
+                switch (opc2) {
+                    case 1:  v = p->context_id; break;
+                    case 2:  v = p->tpidrurw;   break;
+                    case 3:  v = p->tpidruro;   break;
+                    case 4:  v = p->tpidrprw;   break;
+                    default: v = p->fcse_pid;   break;
+                }
+                break;
             default: v = 0; break;              /* unmodelled: reads as zero */
         }
         c->r[rd] = v;
@@ -177,7 +185,15 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
             case 6:  if (opc2 == 2) p->ifar = v; else p->dfar = v; break;
             case 7:  break;                     /* cache maintenance: no-op */
             case 8:  break;                     /* TLB maintenance: no-op   */
-            case 13: if (opc2 == 1) p->context_id = v; else p->fcse_pid = v; break;
+            case 13:
+                switch (opc2) {
+                    case 1:  p->context_id = v; break;
+                    case 2:  p->tpidrurw   = v; break;
+                    case 3:  p->tpidruro   = v; break;
+                    case 4:  p->tpidrprw   = v; break;
+                    default: p->fcse_pid   = v; break;
+                }
+                break;
             default: break;                     /* unmodelled: ignored      */
         }
     }
@@ -1052,8 +1068,41 @@ arm_status_t arm_step(arm_cpu_t *c) {
             c->r[15] = next;
             return ARM_OK;
         }
-        /* BLX imm, SETEND, CPS, RFE, SRS are not implemented yet: trap rather
-         * than execute something else by accident. */
+        /*
+         * CPS — change processor state. Kernels use this constantly to mask
+         * interrupts and switch mode in one instruction; real XNU reaches it
+         * within the first 40k instructions.
+         *   1111 0001 0000 imod M 0 0000 000 A I F 0 mode
+         * imod 10 = enable (clear the mask bits), 11 = disable (set them);
+         * M selects whether the mode field is applied.
+         */
+        if ((insn & 0xfff1fe20u) == 0xf1000000u) {
+            unsigned imod = (insn >> 18) & 3u;
+            bool     chg_mode = (insn >> 17) & 1u;
+            if (imod & 2u) {
+                bool disable = (imod & 1u) != 0;
+                if (insn & (1u << 8)) set_flag(c, (1u << 8), disable);  /* A: aborts */
+                if (insn & (1u << 7)) set_flag(c, ARM_CPSR_I, disable);
+                if (insn & (1u << 6)) set_flag(c, ARM_CPSR_F, disable);
+            }
+            if (chg_mode) arm_set_mode(c, insn & ARM_CPSR_MODE_MASK);
+            c->r[15] = next;
+            return ARM_OK;
+        }
+
+        /* BLX <immediate>: an unconditional call that always switches to Thumb.
+         *   1111 101 H imm24    target = PC + 8 + (imm24 << 2) + (H << 1) */
+        if ((insn & 0xfe000000u) == 0xfa000000u) {
+            int32_t off = (int32_t)(insn << 8) >> 6;      /* sign-extend, <<2 */
+            uint32_t h = (insn >> 24) & 1u;
+            c->r[14] = pc + 4;
+            c->cpsr |= ARM_CPSR_T;
+            c->r[15] = (pc + 8 + (uint32_t)off + (h << 1)) & ~1u;
+            return ARM_OK;
+        }
+
+        /* SETEND, RFE, SRS are not implemented yet: trap rather than execute
+         * something else by accident. */
         return ARM_UNDEFINED;
     }
 
