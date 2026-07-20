@@ -37,6 +37,8 @@
 /* Main ID register value reported for the ARM1176JZF-S in the S5L8900. */
 #define ARM1176_MIDR       0x410fb767u
 #define ARM1176_CACHE_TYPE 0x1d152152u
+/* VFP11 identity register as reported by the ARM1176JZF-S. */
+#define ARM1176_FPSID      0x410120b4u
 
 /* ARMv6 fault status codes (FSR[3:0]); FSR[7:4] carries the domain. */
 #define ARM_FSR_SECTION_TRANSLATION 0x5u
@@ -146,6 +148,12 @@ typedef struct arm_cpu {
      * optional. One CPU means a single address tag is sufficient. */
     bool     excl_valid;
     uint32_t excl_addr;
+
+    /* VFP11 system registers. The kernel disables VFP and enables it lazily
+     * per thread, so the context-switch path reads and writes FPEXC on every
+     * switch. Only the control registers are modelled — no FP arithmetic. */
+    uint32_t vfp_fpexc;
+    uint32_t vfp_fpscr;
 } arm_cpu_t;
 
 /*

@@ -39,6 +39,8 @@ static uint8_t *slurp(const char *path, size_t *len_out) {
  * The kernelcache still carries its full nlist symbol table, so every address
  * we print can be named. Without this a panic report is a list of hex numbers.
  * ------------------------------------------------------------------------- */
+#define DTNAME 32                 /* device-tree property names are char[32] */
+
 typedef struct { uint32_t value; const char *name; } ksym_t;
 static ksym_t   *ksyms;
 static unsigned  ksym_count;
@@ -110,6 +112,208 @@ static uint32_t ksym_value(const char *name) {
         if (!strcmp(ksyms[i].name, name)) return ksyms[i].value;
     return 0;
 }
+
+/* ===========================================================================
+ * Device-tree patching — standing in for iBoot.
+ *
+ * The device tree shipped in the IPSW is a TEMPLATE. On real hardware iBoot
+ * measures the PLLs and writes the actual clock rates into it before handing
+ * it to the kernel; every frequency property in the file on disk is zero.
+ * pe_identify_machine() copies those zeros into gPEClockFrequencyInfo, and the
+ * kernel then divides by them:
+ *
+ *   pe_identify_machine+0xbe:  bus_to_cpu_rate_num = (cpu_clock_hz * 2) / bus_clock_hz
+ *   pe_identify_machine+0xd0:  bus_to_dec_rate_den = bus_clock_hz / dec_clock_hz
+ *   rtclock.c:132              panic if timebase_num < timebase_den
+ *
+ * so we do iBoot's job here. Patching is IN PLACE and SAME-LENGTH: the flat
+ * format has no relocation table but every offset is implicit in the byte
+ * stream, so resizing a property would mean rebuilding the whole blob.
+ *
+ * Format (Apple's, not FDT):
+ *   node     := u32 nProperties, u32 nChildren, property[], node[]
+ *   property := char name[32], u32 length (bit31 is a tool flag), value[],
+ *               padded up to a 4-byte boundary
+ * ------------------------------------------------------------------------- */
+
+static size_t dtn_hdr(const uint8_t *b, size_t len, size_t off,
+                      uint32_t *np, uint32_t *nc) {
+    if (off + 8 > len) return 0;
+    *np = ld32(b + off);
+    *nc = ld32(b + off + 4);
+    if (*np > 4096 || *nc > 4096) return 0;   /* corrupt-input guard */
+    return off + 8;
+}
+
+/* Offset just past the last property of the node at `off`. */
+static size_t dtn_props_end(const uint8_t *b, size_t len, size_t off) {
+    uint32_t np, nc;
+    size_t p = dtn_hdr(b, len, off, &np, &nc);
+    if (!p) return 0;
+    for (uint32_t i = 0; i < np; i++) {
+        if (p + 36 > len) return 0;
+        uint32_t l = ld32(b + p + 32) & 0x7fffffffu;
+        p += 36 + ((l + 3u) & ~3u);
+        if (p > len) return 0;
+    }
+    return p;
+}
+
+/* Offset just past the whole subtree rooted at `off`. */
+static size_t dtn_end(const uint8_t *b, size_t len, size_t off, unsigned depth) {
+    uint32_t np, nc;
+    if (depth > 32) return 0;
+    if (!dtn_hdr(b, len, off, &np, &nc)) return 0;
+    size_t p = dtn_props_end(b, len, off);
+    for (uint32_t i = 0; p && i < nc; i++) p = dtn_end(b, len, p, depth + 1);
+    return p;
+}
+
+/* Writable pointer to a property's value on the node at `off`. */
+static uint8_t *dtn_prop(uint8_t *b, size_t len, size_t off,
+                         const char *name, uint32_t *vlen) {
+    uint32_t np, nc;
+    size_t p = dtn_hdr(b, len, off, &np, &nc);
+    if (!p) return NULL;
+    for (uint32_t i = 0; i < np; i++) {
+        if (p + 36 > len) return NULL;
+        char nm[DTNAME + 1];
+        memcpy(nm, b + p, DTNAME); nm[DTNAME] = '\0';
+        uint32_t l = ld32(b + p + 32) & 0x7fffffffu;
+        if (p + 36 + (size_t)l > len) return NULL;
+        if (!strcmp(nm, name)) { if (vlen) *vlen = l; return b + p + 36; }
+        p += 36 + ((l + 3u) & ~3u);
+    }
+    return NULL;
+}
+
+#define DT_NONE ((size_t)-1)
+
+/* Walk a slash-separated path of node "name" properties from the root.
+ * "" is the root itself; "cpus/cpu0" is the CPU node. */
+static size_t dtn_path(uint8_t *b, size_t len, const char *path) {
+    size_t off = 0;
+    while (path && *path) {
+        while (*path == '/') path++;
+        if (!*path) break;
+        const char *slash = strchr(path, '/');
+        size_t clen = slash ? (size_t)(slash - path) : strlen(path);
+        uint32_t np, nc;
+        if (!dtn_hdr(b, len, off, &np, &nc)) return DT_NONE;
+        size_t c = dtn_props_end(b, len, off);
+        size_t found = DT_NONE;
+        for (uint32_t i = 0; c && i < nc; i++) {
+            uint32_t vl = 0;
+            const uint8_t *nm = dtn_prop(b, len, c, "name", &vl);
+            if (nm && vl >= clen && !memcmp(nm, path, clen) &&
+                (vl == clen || nm[clen] == '\0')) { found = c; break; }
+            c = dtn_end(b, len, c, 0);
+        }
+        if (found == DT_NONE) return DT_NONE;
+        off = found;
+        path = slash ? slash + 1 : path + clen;
+    }
+    return off;
+}
+
+/* Overwrite a 4-byte property in place. Refuses to change its length. */
+static bool dt_set_u32(uint8_t *b, size_t len, const char *path,
+                       const char *prop, uint32_t v) {
+    size_t node = dtn_path(b, len, path);
+    if (node == DT_NONE) {
+        printf("  dt: node /%-22s NOT FOUND (skipping %s)\n", path, prop);
+        return false;
+    }
+    uint32_t vl = 0;
+    uint8_t *p = dtn_prop(b, len, node, prop, &vl);
+    if (!p) {
+        printf("  dt: /%s: property %s NOT FOUND\n", path, prop);
+        return false;
+    }
+    if (vl != 4) {
+        printf("  dt: /%s:%s is %u bytes, not 4 — refusing to resize\n",
+               path, prop, vl);
+        return false;
+    }
+    uint32_t old = ld32(p);
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+    printf("  dt: /%-14s %-22s 0x%08x -> 0x%08x (%u)\n",
+           *path ? path : "device-tree", prop, old, v, v);
+    return true;
+}
+
+/* Overwrite two consecutive 32-bit cells (an 8-byte "reg" entry) in place. */
+static bool dt_set_reg(uint8_t *b, size_t len, const char *path,
+                       const char *prop, uint32_t base, uint32_t size) {
+    size_t node = dtn_path(b, len, path);
+    if (node == DT_NONE) { printf("  dt: node /%s NOT FOUND\n", path); return false; }
+    uint32_t vl = 0;
+    uint8_t *p = dtn_prop(b, len, node, prop, &vl);
+    if (!p || vl != 8) {
+        printf("  dt: /%s:%s missing or not 8 bytes (%u)\n", path, prop, vl);
+        return false;
+    }
+    uint32_t o0 = ld32(p), o1 = ld32(p + 4);
+    uint32_t vals[2] = { base, size };
+    for (int i = 0; i < 2; i++) {
+        p[i*4+0] = (uint8_t)vals[i];        p[i*4+1] = (uint8_t)(vals[i] >> 8);
+        p[i*4+2] = (uint8_t)(vals[i] >> 16); p[i*4+3] = (uint8_t)(vals[i] >> 24);
+    }
+    printf("  dt: /%-14s %-22s {0x%08x,0x%08x} -> {0x%08x,0x%08x}\n",
+           path, prop, o0, o1, base, size);
+    return true;
+}
+
+/*
+ * S5L8900 clock rates.
+ *
+ * RESEARCHED (two independent sources agree):
+ *   TB_HZ  6 MHz  — openiBoot plat-s5l8900/clock.c computes
+ *                   TimebaseFrequency = FREQUENCY_BASE / 2 with
+ *                   FREQUENCY_BASE == 12000000, and measurements of
+ *                   mach_absolute_time() on the original iPhone and the
+ *                   iPhone 3G report a 6 MHz tick (the 3GS and later are
+ *                   24 MHz / the familiar 125:3 timebase). This is the value
+ *                   the rtclock panic is actually about.
+ *   FIX_HZ 24 MHz — same file: FixedFrequency = FREQUENCY_BASE * 2.
+ *   CPU_HZ 412 MHz— the universally documented iPhone 3G core clock
+ *                   (ARM1176JZF-S underclocked from ~620 MHz).
+ *
+ * PROVISIONAL / DERIVED — I could not find a dump of a real iBoot-populated
+ * iPhone1,2 tree, and openiBoot reads these out of the PLL registers at run
+ * time rather than hard-coding them. These are the self-consistent ratios that
+ * fall out of the S5L8900 clock tree (AHB = core/4, peripheral = AHB/2), and
+ * nothing the kernel does with them is sensitive to the exact value — only to
+ * their being non-zero and to (2*CPU)/BUS being a sane small integer:
+ *   BUS_HZ 103 MHz = CPU/4        (bus_to_cpu_rate comes out 8/2 == 4)
+ *   MEM_HZ 103 MHz                (LPDDR clock; assumed equal to the bus)
+ *   PRF_HZ 51.5 MHz = BUS/2
+ * If a real iPhone1,2 IORegistry dump ever turns up, replace these three.
+ */
+#define S5L8900_CPU_HZ  412000000u
+#define S5L8900_BUS_HZ  103000000u
+#define S5L8900_MEM_HZ  103000000u
+#define S5L8900_PRF_HZ   51500000u
+#define S5L8900_FIX_HZ   24000000u
+#define S5L8900_TB_HZ     6000000u
+
+/* Applied in order; later entries win, and -D on the command line wins over
+ * all of them. Nothing here changes firmware/devicetree.bin on disk — this
+ * runs on the copy that is about to be loaded into guest RAM. */
+static const struct { const char *path, *prop; uint32_t val; } DT_PATCH[] = {
+    /* Root clock-frequency. PROVISIONAL: I have not found anything in
+     * xnu-1357 that reads it, and no dump that says what iBoot puts there;
+     * the SoC/bus clock is the plausible reading of the name. */
+    { "",          "clock-frequency",      S5L8900_BUS_HZ },
+    { "cpus/cpu0", "timebase-frequency",   S5L8900_TB_HZ  },
+    { "cpus/cpu0", "clock-frequency",      S5L8900_CPU_HZ },
+    { "cpus/cpu0", "bus-frequency",        S5L8900_BUS_HZ },
+    { "cpus/cpu0", "memory-frequency",     S5L8900_MEM_HZ },
+    { "cpus/cpu0", "peripheral-frequency", S5L8900_PRF_HZ },
+    { "cpus/cpu0", "fixed-frequency",      S5L8900_FIX_HZ },
+};
+#define NDTPATCH ((unsigned)(sizeof DT_PATCH / sizeof DT_PATCH[0]))
 
 /* ---------------------------------------------------------------------------
  * Reading guest memory from the host, bypassing the MMU.
@@ -305,7 +509,12 @@ static const char *status_name(arm_status_t s) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-            "usage: %s <kernel.macho> [-p <physbase>] [-V <virtbase>] [-n <steps>]\n",
+            "usage: %s <kernel.macho> [-p <physbase>] [-V <virtbase>] [-n <steps>]\n"
+            "          [-d <devicetree.bin>] [-c <cmdline>] [-a] [-M]\n"
+            "          [-D <node/path>:<prop>=<value>] ...\n"
+            "  -D  patch a 4-byte device-tree property in the in-memory copy\n"
+            "      (empty path == root), e.g. -D cpus/cpu0:timebase-frequency=6000000\n"
+            "  -M  do not synthesise /memory reg from the RAM layout\n",
             argv[0]);
         return 1;
     }
@@ -315,6 +524,10 @@ int main(int argc, char **argv) {
     const char *dtpath = NULL;
     const char *cmdline = "debug=0x8 serial=1";
     bool stop_on_abort = false;
+    /* Advertising a framebuffer moves topOfKernelData and therefore where the
+     * kernel places its page tables; that regressed the boot, so it is opt-in
+     * until the interaction is understood. */
+    bool want_fb = false;
     /*
      * boot_args header. MEASURED, not guessed: pe_identify_machine() at
      * 0xc01a7f22 does `ldrh r3,[r0,#2]; cmp r3,#6` and panics
@@ -324,11 +537,36 @@ int main(int argc, char **argv) {
      */
     unsigned ba_rev = 1, ba_ver = 6;
 
+    /* -D <path>:<prop>=<value> overrides / adds a device-tree patch, so the
+     * frequencies can be probed from the shell instead of by rebuilding. */
+    struct { const char *path, *prop; uint32_t val; } dtov[32];
+    unsigned ndtov = 0;
+    char dtbuf[32][96];
+    bool patch_memnode = true;
+
     /* Walk the arguments one at a time: pair-stepping breaks as soon as a
      * single-argument flag like -a appears. */
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-a")) { stop_on_abort = true; continue; }
+        if (!strcmp(argv[i], "-F")) { want_fb = true; continue; }
+        if (!strcmp(argv[i], "-M")) { patch_memnode = false; continue; }
         if (i + 1 >= argc) break;
+        if (!strcmp(argv[i], "-D")) {
+            if (ndtov >= 32) { i++; continue; }
+            snprintf(dtbuf[ndtov], sizeof dtbuf[0], "%s", argv[++i]);
+            char *colon = strchr(dtbuf[ndtov], ':');
+            char *eq    = strchr(dtbuf[ndtov], '=');
+            if (!colon || !eq || eq < colon) {
+                fprintf(stderr, "-D wants <node/path>:<prop>=<value>\n");
+                return 1;
+            }
+            *colon = '\0'; *eq = '\0';
+            dtov[ndtov].path = dtbuf[ndtov];
+            dtov[ndtov].prop = colon + 1;
+            dtov[ndtov].val  = (uint32_t)strtoul(eq + 1, NULL, 0);
+            ndtov++;
+            continue;
+        }
         if      (!strcmp(argv[i], "-p")) phys_base = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-V")) virt_base = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-n")) steps     = (unsigned)strtoul(argv[++i], NULL, 0);
@@ -394,14 +632,39 @@ int main(int argc, char **argv) {
         uint8_t *dt = slurp(dtpath, &n);
         if (dt) {
             dt_len = (uint32_t)n;
-            s5l8900_load(&mach, dt_pa, dt, n);
             printf("devicetree : %s -> pa 0x%08x (%u bytes)\n", dtpath, dt_pa, dt_len);
+            /*
+             * Stand in for iBoot: the shipped tree is a template whose clock
+             * properties are all zero. Patch the in-memory copy only.
+             */
+            printf("  --- device-tree patches (iBoot would have done these) ---\n");
+            for (unsigned i = 0; i < NDTPATCH; i++)
+                dt_set_u32(dt, n, DT_PATCH[i].path, DT_PATCH[i].prop, DT_PATCH[i].val);
+            /* /memory reg: the real iBoot fills in the DRAM bank. Ours is
+             * zero, which would advertise a zero-sized bank. */
+            if (patch_memnode)
+                dt_set_reg(dt, n, "memory", "reg", phys_base, ram_size);
+            for (unsigned i = 0; i < ndtov; i++)
+                dt_set_u32(dt, n, dtov[i].path, dtov[i].prop, dtov[i].val);
+            printf("  ---------------------------------------------------------\n");
+            s5l8900_load(&mach, dt_pa, dt, n);
             free(dt);
         }
     }
 
+    /*
+     * Reserve a linear framebuffer and advertise it in Boot_Video. With
+     * v_baseAddr left at 0 the kernel's PE_create_console reads address 0,
+     * finds no framebuffer, and the video console silently goes nowhere — which
+     * is why no boot text ever appeared. A real buffer lets the kernel render
+     * its console into memory we can look at.
+     */
+    const uint32_t FB_W = 320, FB_H = 480, FB_BPP = 4;
+    const uint32_t fb_bytes = want_fb ? FB_W * FB_H * FB_BPP : 0u;
+
     uint32_t ba_pa = (dt_pa + dt_len + 0xfffu) & ~0xfffu;
-    uint32_t top_of_kernel_data = (ba_pa + 0x1000u + 0xfffu) & ~0xfffu;
+    uint32_t fb_pa = (ba_pa + 0x1000u + 0xfffu) & ~0xfffu;
+    uint32_t top_of_kernel_data = (fb_pa + fb_bytes + 0xfffu) & ~0xfffu;
 
     uint8_t ba[0x138];
     memset(ba, 0, sizeof ba);
@@ -419,12 +682,12 @@ int main(int argc, char **argv) {
     PUT32(0x10, top_of_kernel_data);
     /* Boot_Video: no framebuffer yet, but give it a sane 320x480 geometry
      * rather than zeros, which some early code divides by. */
-    PUT32(0x14, 0);                    /* v_baseAddr — none yet */
-    PUT32(0x18, 0);                    /* v_display             */
-    PUT32(0x1c, 320 * 4);              /* v_rowBytes            */
-    PUT32(0x20, 320);                  /* v_width               */
-    PUT32(0x24, 480);                  /* v_height              */
-    PUT32(0x28, 32);                   /* v_depth               */
+    PUT32(0x14, want_fb ? fb_pa : 0u); /* v_baseAddr */
+    PUT32(0x18, want_fb ? 1u : 0u);    /* v_display */
+    PUT32(0x1c, FB_W * FB_BPP);        /* v_rowBytes */
+    PUT32(0x20, FB_W);                 /* v_width    */
+    PUT32(0x24, FB_H);                 /* v_height   */
+    PUT32(0x28, FB_BPP * 8);           /* v_depth    */
     PUT32(0x2c, 0);                    /* machineType           */
     PUT32(0x30, dt_len ? (dt_pa - phys_base + virt_base) : 0);
     PUT32(0x34, dt_len);
@@ -432,6 +695,7 @@ int main(int argc, char **argv) {
 #undef PUT16
 #undef PUT32
     s5l8900_load(&mach, ba_pa, ba, sizeof ba);
+    printf("framebuffer: pa 0x%08x  %ux%u %u-bit\n", fb_pa, FB_W, FB_H, FB_BPP*8);
     printf("boot_args  : pa 0x%08x  topOfKernelData vm 0x%08x  cmdline \"%s\"\n\n",
            ba_pa, top_of_kernel_data - phys_base + virt_base, cmdline);
 
@@ -606,6 +870,46 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
+    /* An abnormal stop (undefined instruction, halt) leaves no panic string,
+     * so dump the same call path the panic watchpoints print — otherwise the
+     * only evidence is a bare PC. */
+    if (st != ARM_OK) {
+        uint32_t p = last_pc;
+        const uint8_t *ip = guest_ptr(p, 4);
+        printf("\n=== ABNORMAL STOP: %s ===\n", status_name(st));
+        if (ip) {
+            if (mach.cpu.cpsr & ARM_CPSR_T)
+                printf("  encoding at pc: %04x %04x (Thumb)\n",
+                       (unsigned)(ip[0] | (ip[1] << 8)),
+                       (unsigned)(ip[2] | (ip[3] << 8)));
+            else
+                printf("  encoding at pc: 0x%08x (ARM)\n", ld32(ip));
+        }
+        printf("  lr 0x%08x (%s)\n", mach.cpu.r[14], ksym_at(mach.cpu.r[14]));
+        for (int i = 0; i < 16; i += 4)
+            printf("  r%-2d %08x  r%-2d %08x  r%-2d %08x  r%-2d %08x\n",
+                   i, mach.cpu.r[i], i+1, mach.cpu.r[i+1],
+                   i+2, mach.cpu.r[i+2], i+3, mach.cpu.r[i+3]);
+        printf("  recent call path (oldest first, one line per function):\n");
+        unsigned start = (tw + KTRACE - tcount) % KTRACE;
+        char seen[160]; seen[0] = '\0';
+        for (unsigned i = 0; i < tcount; i++) {
+            unsigned k = (start + i) % KTRACE;
+            uint32_t va = tr[k].pc >= phys_base && tr[k].pc < virt_base
+                        ? tr[k].pc - phys_base + virt_base : tr[k].pc;
+            const char *nm = ksym_at(va);
+            char base[160];
+            const char *bar = strchr(nm, '+');
+            snprintf(base, sizeof base, "%.*s",
+                     bar ? (int)(bar - nm) : (int)strlen(nm), nm);
+            if (strcmp(base, seen)) {
+                printf("    %08x  %s\n", tr[k].pc, nm);
+                snprintf(seen, sizeof seen, "%s", base);
+            }
+        }
+        printf("\n");
+    }
+
     mach.uart0.tx[mach.uart0.tx_len] = '\0';
     printf("stopped after %u instructions: %s\n", n, status_name(st));
     printf("  pc             : 0x%08x", last_pc);
@@ -675,6 +979,30 @@ int main(int argc, char **argv) {
                mach.uart0.tx_len, mach.uart0.tx);
     else
         printf("\n(no UART output yet)\n");
+
+    /* Did the kernel actually draw? Count non-zero framebuffer bytes and, if
+     * so, write a PPM so the console output can be looked at directly. */
+    {
+        uint32_t nonzero = 0;
+        for (uint32_t i = 0; i < fb_bytes; i++)
+            if (mach.ram[fb_pa - phys_base + i]) nonzero++;
+        printf("\nframebuffer: %u of %u bytes non-zero\n", nonzero, fb_bytes);
+        if (nonzero) {
+            FILE *o = fopen("firmware/screen.ppm", "wb");
+            if (o) {
+                fprintf(o, "P6\n%u %u\n255\n", FB_W, FB_H);
+                for (uint32_t y = 0; y < FB_H; y++)
+                    for (uint32_t x = 0; x < FB_W; x++) {
+                        const uint8_t *px =
+                            &mach.ram[fb_pa - phys_base + (y * FB_W + x) * 4];
+                        /* Stored BGRA; emit RGB. */
+                        fputc(px[2], o); fputc(px[1], o); fputc(px[0], o);
+                    }
+                fclose(o);
+                printf("wrote firmware/screen.ppm - THE KERNEL DREW SOMETHING\n");
+            }
+        }
+    }
 
     s5l8900_free(&mach);
     free(img);

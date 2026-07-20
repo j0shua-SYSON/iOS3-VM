@@ -164,7 +164,44 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
         if ((insn >> 20) & 1u) c->r[(insn >> 12) & 0xfu] = 0;  /* MRC reads 0 */
         return ARM_OK;                                          /* MCR ignored */
     }
-    if (cp != 15) return ARM_UNDEFINED;         /* only CP14/CP15 on this SoC */
+    /*
+     * CP10/CP11 are the VFP11 coprocessor. XNU disables VFP and enables it
+     * lazily per thread, so machine_switch_context reads and writes FPEXC on
+     * every context switch — these are reached within the first ten million
+     * instructions of boot.
+     *
+     * Only the SYSTEM registers are modelled (VMRS/VMSR, encoded as MRC/MCR on
+     * p10 with opc1 == 7). Floating-point arithmetic is not implemented; if the
+     * guest executes a real VFP data-processing instruction it will still trap,
+     * which is the honest outcome — it names what is missing rather than
+     * silently computing nonsense.
+     */
+    if (cp == 10 || cp == 11) {
+        unsigned opc1 = (insn >> 21) & 7u;
+        unsigned rd_  = (insn >> 12) & 0xfu;
+        if (opc1 != 7) return ARM_UNDEFINED;      /* FP data-processing */
+
+        unsigned reg = (insn >> 16) & 0xfu;       /* CRn selects the sysreg */
+        if ((insn >> 20) & 1u) {                  /* VMRS: read */
+            uint32_t v;
+            switch (reg) {
+                case 0:  v = ARM1176_FPSID;  break;   /* VFP11 identity   */
+                case 1:  v = c->vfp_fpscr;   break;
+                case 8:  v = c->vfp_fpexc;   break;
+                default: v = 0;              break;   /* MVFR etc: absent */
+            }
+            /* Rt == 15 means "write the flags", used by VMRS APSR_nzcv. */
+            if (rd_ == 15) c->cpsr = (c->cpsr & 0x0fffffffu) | (v & 0xf0000000u);
+            else           c->r[rd_] = v;
+        } else {                                  /* VMSR: write */
+            uint32_t v = reg_read(c, pc, rd_);
+            if (reg == 1)      c->vfp_fpscr = v;
+            else if (reg == 8) c->vfp_fpexc = v;
+        }
+        return ARM_OK;
+    }
+
+    if (cp != 15) return ARM_UNDEFINED;         /* CP10/11/14/15 only */
 
     bool     load = (insn >> 20) & 1u;          /* 1 = MRC (read), 0 = MCR */
     unsigned crn  = (insn >> 16) & 0xfu;
@@ -248,6 +285,8 @@ void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
     cpu->fiq_line = false;
     cpu->excl_valid = false;
     cpu->excl_addr = 0;
+    cpu->vfp_fpexc = 0;
+    cpu->vfp_fpscr = 0;
     /* On reset the ARM1176 enters SVC mode with IRQ+FIQ disabled and begins
      * execution from the reset vector (0x0, or 0xffff0000 with high vectors).
      * We start at 0x0; the machine layer relocates PC as needed. */
