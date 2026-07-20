@@ -12,11 +12,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Bounds checks are done in 64-bit deliberately. The guest controls every
+ * address, so a 32-bit "(a - base) + len <= size" can be made to wrap: an
+ * access at 0xFFFFFFFE with len 4 sums to 2, passes the test, and then indexes
+ * ram[0xFFFFFFFE]. Widening makes that impossible.
+ */
 static inline bool in_ram(const s5l8900_t *m, uint32_t a, uint32_t len) {
-    return a >= m->ram_base && (a - m->ram_base) + len <= m->ram_size;
+    if (a < m->ram_base) return false;
+    return (uint64_t)(a - m->ram_base) + (uint64_t)len <= (uint64_t)m->ram_size;
 }
 static inline bool in_dev(uint32_t a, uint32_t base) {
-    return a >= base && a < base + S5L8900_DEV_SIZE;
+    return a >= base && (uint64_t)a < (uint64_t)base + S5L8900_DEV_SIZE;
 }
 
 /* ------------------------------------------------------------- reads --- */
@@ -96,6 +103,8 @@ void s5l8900_free(s5l8900_t *m) {
 }
 
 void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
+    /* Check before narrowing: a >4 GiB length must not truncate into range. */
+    if (len > 0xffffffffu) return;
     if (!in_ram(m, addr, (uint32_t)len)) return;
     memcpy(&m->ram[addr - m->ram_base], data, len);
 }

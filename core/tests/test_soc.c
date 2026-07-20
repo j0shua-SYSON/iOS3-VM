@@ -39,6 +39,25 @@ static void test_uart_status_is_ready(void) {
     s5l8900_free(&m);
 }
 
+static void test_bounds_check_cannot_overflow(void) {
+    /* Regression: a 32-bit "(addr - base) + len <= size" wraps for addresses
+     * near the top of the address space, letting a guest access index far
+     * outside the RAM allocation. The guest controls every address, so this
+     * must be rejected and merely counted as unmapped. */
+    s5l8900_t m;
+    s5l8900_init(&m, 0, 1u << 20);
+    (void)m.bus.read32(m.bus.ctx, 0xfffffffeu);
+    CHECK(m.unmapped_reads == 1, "0xfffffffe read should be unmapped, not accepted");
+    m.bus.write32(m.bus.ctx, 0xfffffffcu, 0xdeadbeefu);
+    CHECK(m.unmapped_writes == 1, "0xfffffffc write should be unmapped, not accepted");
+    /* The last legal word must still work. */
+    m.bus.write32(m.bus.ctx, (1u << 20) - 4u, 0x12345678u);
+    CHECK(m.bus.read32(m.bus.ctx, (1u << 20) - 4u) == 0x12345678u,
+          "the final in-range word should still be accessible");
+    CHECK(m.unmapped_writes == 1, "in-range write was wrongly rejected");
+    s5l8900_free(&m);
+}
+
 static void test_unmapped_access_counted(void) {
     /* Accesses outside the memory map are counted, not silently swallowed. */
     s5l8900_t m;
@@ -181,6 +200,7 @@ int main(void) {
     test_ram_readback();
     test_uart_status_is_ready();
     test_unmapped_access_counted();
+    test_bounds_check_cannot_overflow();
     test_bare_metal_uart_hello();
     test_vic_masks_and_routes();
     test_timer_interrupt_reaches_handler();
