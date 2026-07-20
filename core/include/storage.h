@@ -28,6 +28,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "nand.h"
+#include "soc.h"
 
 typedef enum {
     STORAGE_OK = 0,
@@ -47,6 +48,14 @@ storage_status_t storage_save_nand(const nand_t *n, const char *path);
  * the device is left untouched.
  */
 storage_status_t storage_load_nand(nand_t *n, const char *path);
+
+/*
+ * NOR persistence. An untethered jailbreak on this SoC (24kpwn) persists its
+ * payload in NOR, so flash changes must survive a relaunch just as NAND
+ * changes do.
+ */
+storage_status_t storage_save_nor(const s5l_nor_t *n, const char *path);
+storage_status_t storage_load_nor(s5l_nor_t *n, const char *path);
 
 const char *storage_strerror(storage_status_t st);
 

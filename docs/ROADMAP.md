@@ -150,9 +150,24 @@ on the phone."
   container records its geometry, so restoring into a differently-shaped device
   is refused rather than silently misread. Note this gives persistence WITHOUT
   Apple's FTL format.
-- Remaining: the VFL/FTL layers (needs real firmware to validate against;
-  see the licensing note below), and making NOR writable + persistent (the
-  era-appropriate S5L8900 untether, 24kpwn, persists its payload in NOR).
+- **Done: writable, persistent NOR.** Guest stores into the NOR window now
+  program the flash with real semantics (bits only go 1 -> 0; an erase restores
+  a sector to 0xFF), and the image saves to and restores from a host file. This
+  is the shape an untethered jailbreak needs — the era-appropriate S5L8900
+  untether, 24kpwn, persists its payload in NOR:
+
+  ```
+  [payload written to NOR survived a relaunch] 0xa5a5a5a5
+  ```
+
+  Simplification, stated: real NOR here is SPI-attached and is programmed
+  through controller commands rather than by storing to a memory window.
+  Modelling it as a direct write keeps the path a payload needs without a full
+  SPI protocol model.
+- Remaining: the VFL/FTL layers. These need real firmware to validate against,
+  and the existing open-source implementations are GPL while this project is
+  MIT — so they must be reimplemented from documentation, or shipped as a
+  separately-licensed component, not copied.
   device tree. Execute Apple's real low-level boot chain far enough to see
   **iBoot** serial output.
 *Requires the user to supply their own iPhone OS 3.1.3 IPSW + the public

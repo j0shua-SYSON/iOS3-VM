@@ -97,3 +97,44 @@ storage_status_t storage_load_nand(nand_t *n, const char *path) {
     fclose(f);
     return ok ? STORAGE_OK : STORAGE_ERR_TRUNCATED;
 }
+
+/* --------------------------------------------------------------- NOR ---- */
+
+#define STORAGE_NOR_MAGIC 0x524f4e56u   /* "VNOR" */
+
+storage_status_t storage_save_nor(const s5l_nor_t *n, const char *path) {
+    if (!n || !n->data || !path) return STORAGE_ERR_IO;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return STORAGE_ERR_IO;
+
+    bool ok = wr32(f, STORAGE_NOR_MAGIC) && wr32(f, STORAGE_VERSION)
+           && wr32(f, n->size) && wr32(f, 0);
+    if (ok) ok = fwrite(n->data, 1, n->size, f) == n->size;
+
+    if (fclose(f) != 0) ok = false;
+    return ok ? STORAGE_OK : STORAGE_ERR_IO;
+}
+
+storage_status_t storage_load_nor(s5l_nor_t *n, const char *path) {
+    if (!n || !n->data || !path) return STORAGE_ERR_IO;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return STORAGE_ERR_IO;
+
+    uint32_t hdr[4];
+    for (unsigned i = 0; i < 4; i++) {
+        if (!rd32(f, &hdr[i])) { fclose(f); return STORAGE_ERR_TRUNCATED; }
+    }
+    if (hdr[0] != STORAGE_NOR_MAGIC) { fclose(f); return STORAGE_ERR_FORMAT; }
+    if (hdr[1] != STORAGE_VERSION)   { fclose(f); return STORAGE_ERR_VERSION; }
+    if (hdr[2] != n->size)           { fclose(f); return STORAGE_ERR_GEOMETRY; }
+
+    bool ok = fread(n->data, 1, n->size, f) == n->size;
+    fclose(f);
+    if (!ok) return STORAGE_ERR_TRUNCATED;
+
+    /* Contents changed underneath the directory, so rebuild it. */
+    s5l_nor_scan(n);
+    return STORAGE_OK;
+}

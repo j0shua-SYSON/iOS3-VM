@@ -28,9 +28,13 @@ static uint32_t rd32(const uint8_t *p) {
 
 bool s5l_nor_init(s5l_nor_t *n, uint32_t size) {
     memset(n, 0, sizeof *n);
-    n->data = calloc(size ? size : 1u, 1);
+    n->data = malloc(size ? size : 1u);
     if (!n->data) return false;
     n->size = size;
+    /* Erased flash reads as all ones. Starting from zero would make the device
+     * behave like RAM-that-cannot-be-written: programming only clears bits, so
+     * with every bit already 0 no write could ever have an effect. */
+    memset(n->data, 0xff, size ? size : 1u);
     return true;
 }
 
@@ -95,4 +99,28 @@ const s5l_nor_entry_t *s5l_nor_find(const s5l_nor_t *n, uint32_t ident) {
     for (unsigned i = 0; i < n->image_count; i++)
         if (n->images[i].ident == ident) return &n->images[i];
     return NULL;
+}
+
+bool s5l_nor_write(s5l_nor_t *n, uint32_t off, uint32_t val, unsigned bytes) {
+    if (!n->data || bytes > sizeof(uint32_t)) return false;
+    if ((uint64_t)off + bytes > (uint64_t)n->size) return false;
+
+    /* Flash programming can only clear bits. Refuse a write that would need to
+     * set one back to 1 rather than silently behaving like RAM — the same
+     * discipline the NAND model uses. */
+    for (unsigned i = 0; i < bytes; i++) {
+        uint8_t want = (uint8_t)(val >> (8 * i));
+        if ((n->data[off + i] & want) != want) return false;
+    }
+    for (unsigned i = 0; i < bytes; i++)
+        n->data[off + i] &= (uint8_t)(val >> (8 * i));
+    return true;
+}
+
+bool s5l_nor_erase_sector(s5l_nor_t *n, uint32_t off) {
+    if (!n->data) return false;
+    uint32_t base = off & ~(S5L8900_NOR_SECTOR - 1u);
+    if ((uint64_t)base + S5L8900_NOR_SECTOR > (uint64_t)n->size) return false;
+    memset(&n->data[base], 0xff, S5L8900_NOR_SECTOR);
+    return true;
 }

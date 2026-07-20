@@ -71,7 +71,14 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
     }
     if (addr >= S5L8900_NOR_BASE &&
         (uint64_t)addr < (uint64_t)S5L8900_NOR_BASE + m->nor.size) {
-        return;                     /* NOR is read-only to the guest */
+        /* Guest writes program the flash (bits can only be cleared). Note this
+         * is a simplification: on real hardware the NOR is SPI-attached and is
+         * programmed through controller commands rather than by storing to a
+         * memory window. Modelling it as a direct write keeps the path a guest
+         * payload needs — persisting itself into NOR, as an untethered
+         * jailbreak does — without a full SPI protocol model. */
+        s5l_nor_write(&m->nor, addr - S5L8900_NOR_BASE, val, bytes);
+        return;
     }
     m->unmapped_writes++;
 }

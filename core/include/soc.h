@@ -132,11 +132,28 @@ typedef struct {
     unsigned        image_count;
 } s5l_nor_t;
 
+/* NOR erase granularity. Programming can only clear bits (as on real flash);
+ * an erase restores a whole sector to 0xFF. */
+#define S5L8900_NOR_SECTOR 0x1000u
+
 bool     s5l_nor_init(s5l_nor_t *n, uint32_t size);
 void     s5l_nor_free(s5l_nor_t *n);
 uint32_t s5l_nor_read(const s5l_nor_t *n, uint32_t off, unsigned bytes);
-/* Copy `len` bytes into the NOR at `off` (as a flasher would). */
+/* Copy `len` bytes into the NOR at `off` (as a factory flasher would). This is
+ * an unconditional overwrite, used to lay down an initial image. */
 void     s5l_nor_program(s5l_nor_t *n, uint32_t off, const void *src, size_t len);
+
+/*
+ * Flash-accurate programming: bits can only go 1 -> 0. Returns false if the
+ * write would need to set a bit back to 1 (erase the sector first) or is out of
+ * range. This is the path guest writes take, so a guest payload can persist
+ * itself into NOR — which is exactly what an untethered jailbreak such as
+ * 24kpwn does on this SoC.
+ */
+bool     s5l_nor_write(s5l_nor_t *n, uint32_t off, uint32_t val, unsigned bytes);
+
+/* Erase one sector back to all-ones. */
+bool     s5l_nor_erase_sector(s5l_nor_t *n, uint32_t off);
 /* Rebuild the image directory by scanning for IMG3 containers. */
 unsigned s5l_nor_scan(s5l_nor_t *n);
 /* Find a scanned image by ident; returns NULL if absent. */

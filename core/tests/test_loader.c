@@ -13,6 +13,7 @@
  */
 #include "loader.h"
 #include "aes.h"
+#include "storage.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -216,11 +217,12 @@ static void test_nor_is_memory_mapped(void) {
     s5l_nor_program(&m.nor, 0x40, &marker, 4);
     CHECK(m.bus.read32(m.bus.ctx, S5L8900_NOR_BASE + 0x40) == 0xcafebabeu,
           "NOR not readable through the bus");
-    /* NOR is read-only: a guest write must not take effect, and must not be
-     * miscounted as an unmapped access. */
-    m.bus.write32(m.bus.ctx, S5L8900_NOR_BASE + 0x40, 0);
-    CHECK(m.bus.read32(m.bus.ctx, S5L8900_NOR_BASE + 0x40) == 0xcafebabeu,
-          "guest write modified read-only NOR");
+    /* Guest writes now program the flash (bits can only be cleared), which is
+     * the path a jailbreak payload needs. They must not be miscounted as
+     * unmapped accesses. */
+    m.bus.write32(m.bus.ctx, S5L8900_NOR_BASE + 0x40, 0x0a0eba0eu);
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_NOR_BASE + 0x40) == (0xcafebabeu & 0x0a0eba0eu),
+          "guest write should AND into the flash");
     CHECK(m.unmapped_writes == 0, "NOR write counted as unmapped");
     s5l8900_free(&m);
 }
@@ -343,6 +345,82 @@ static void test_malformed_kbag_refused_by_loader(void) {
     s5l8900_free(&m);
 }
 
+/* ------------------------------------------- writable + persistent NOR --- */
+
+static void test_nor_write_is_flash_not_ram(void) {
+    /* Programming can only clear bits; setting one back to 1 needs an erase. */
+    s5l8900_t m;
+    s5l8900_init(&m, 0, 1u << 16);
+
+    CHECK(s5l_nor_write(&m.nor, 0x40, 0x0f0f0f0fu, 4), "initial program failed");
+    CHECK(s5l_nor_read(&m.nor, 0x40, 4) == 0x0f0f0f0fu, "program did not take");
+
+    CHECK(!s5l_nor_write(&m.nor, 0x40, 0xffffffffu, 4),
+          "setting bits back to 1 should require an erase");
+    CHECK(s5l_nor_write(&m.nor, 0x40, 0x03030303u, 4),
+          "clearing further bits should be allowed");
+    CHECK(s5l_nor_read(&m.nor, 0x40, 4) == 0x03030303u, "further clear did not take");
+
+    CHECK(s5l_nor_erase_sector(&m.nor, 0x40), "erase failed");
+    CHECK(s5l_nor_read(&m.nor, 0x40, 4) == 0xffffffffu, "erase should restore ones");
+    s5l8900_free(&m);
+}
+
+/*
+ * The untether shape in miniature: guest code writes a payload into NOR, the
+ * image is saved, and a freshly-created machine loads it and still sees the
+ * payload. Without this a jailbreak would evaporate on every relaunch.
+ */
+static void test_guest_payload_persists_in_nor(void) {
+    const char *path = "ios3vm_nor_test.img";
+    s5l8900_t m;
+    s5l8900_init(&m, 0, 1u << 20);
+
+    /* A store into the NOR window programs the flash, which is the path a
+     * guest payload would use to persist itself. */
+    m.bus.write32(m.bus.ctx, S5L8900_NOR_BASE + 0x800, 0xa5a5a5a5u);
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_NOR_BASE + 0x800) == 0xa5a5a5a5u,
+          "guest write to the NOR window did not program the flash");
+
+    CHECK(storage_save_nor(&m.nor, path) == STORAGE_OK, "NOR save failed");
+    s5l8900_free(&m);
+
+    s5l8900_t m2;
+    s5l8900_init(&m2, 0, 1u << 20);
+    storage_status_t st = storage_load_nor(&m2.nor, path);
+    CHECK(st == STORAGE_OK, "NOR load failed: %s", storage_strerror(st));
+    CHECK(m2.bus.read32(m2.bus.ctx, S5L8900_NOR_BASE + 0x800) == 0xa5a5a5a5u,
+          "the payload did not survive a relaunch");
+    printf("  [payload written to NOR survived a relaunch] 0x%08x\n",
+           m2.bus.read32(m2.bus.ctx, S5L8900_NOR_BASE + 0x800));
+    s5l8900_free(&m2);
+    remove(path);
+}
+
+static void test_nor_image_rebuilds_directory_on_load(void) {
+    /* A restored image must have its image directory rebuilt, or a boot after
+     * a relaunch would find no images in a perfectly good flash. */
+    const char *path = "ios3vm_nor_dir.img";
+    s5l8900_t m;
+    s5l8900_init(&m, 0, 1u << 20);
+    img_begin(0x69626f74u);
+    img_tag(0x44415441u, PAYLOAD, (uint32_t)sizeof PAYLOAD);
+    img_finish();
+    s5l_nor_program(&m.nor, 0x3000, g_img, g_len);
+    s5l_nor_scan(&m.nor);
+    CHECK(storage_save_nor(&m.nor, path) == STORAGE_OK, "save failed");
+    s5l8900_free(&m);
+
+    s5l8900_t m2;
+    s5l8900_init(&m2, 0, 1u << 20);
+    CHECK(storage_load_nor(&m2.nor, path) == STORAGE_OK, "load failed");
+    const s5l_nor_entry_t *e = s5l_nor_find(&m2.nor, 0x69626f74u);
+    CHECK(e != NULL && e->offset == 0x3000,
+          "directory was not rebuilt after restoring the image");
+    s5l8900_free(&m2);
+    remove(path);
+}
+
 int main(void) {
     printf("iOS3-VM firmware loader tests\n");
     test_plain_image_boots();
@@ -357,6 +435,9 @@ int main(void) {
     test_nor_directory_cap();
     test_load_with_non_zero_ram_base();
     test_malformed_kbag_refused_by_loader();
+    test_nor_write_is_flash_not_ram();
+    test_guest_payload_persists_in_nor();
+    test_nor_image_rebuilds_directory_on_load();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
