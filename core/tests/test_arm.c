@@ -330,6 +330,40 @@ static void test_umlal_accumulates(void) {
     CHECK(c.r[1] == 0,  "hi=%u expect 0", c.r[1]);
 }
 
+static void test_clz(void) {
+    /* CLZ r0,r1 -> e16f0f11.  Compilers emit this constantly. */
+    uint32_t p[] = { 0xe3a01001 /* MOV r1,#1        */, 0xe16f0f11 /* CLZ r0,r1 */,
+                     0xe3a01000 /* MOV r1,#0        */, 0xe16f2f11 /* CLZ r2,r1 */,
+                     0xe3e01000 /* MVN r1,#0 -> ~0  */, 0xe16f3f11 /* CLZ r3,r1 */ };
+    arm_cpu_t c; load_and_run(&c, p, 6, 6);
+    CHECK(c.r[0] == 31, "clz(1)=%u expect 31", c.r[0]);
+    CHECK(c.r[2] == 32, "clz(0)=%u expect 32 — the case that tempts a loop bug", c.r[2]);
+    CHECK(c.r[3] == 0,  "clz(0xffffffff)=%u expect 0", c.r[3]);
+}
+
+/*
+ * Saturating arithmetic clamps instead of wrapping, and sets the sticky Q
+ * flag. Wrapping would be silently correct everywhere except the extremes,
+ * which is exactly where these instructions are used.
+ */
+static void test_qadd_saturates_and_sets_q(void) {
+    /* r1 = 0x7fffffff, r2 = 1, QADD r0,r2,r1  (Rd, Rm, Rn) */
+    uint32_t p[] = { 0xe3e01102 /* MVN r1,#0x80000000 -> 0x7fffffff */,
+                     0xe3a02001 /* MOV r2,#1                        */,
+                     0xe1010052 /* QADD r0,r2,r1                    */ };
+    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    CHECK(c.r[0] == 0x7fffffffu,
+          "r0=%08x expect 7fffffff (clamped, not wrapped to 80000000)", c.r[0]);
+    CHECK((c.cpsr & ARM_CPSR_Q) != 0, "Q must be set on saturation");
+
+    /* Without saturation Q must stay clear and the result is ordinary. */
+    uint32_t q[] = { 0xe3a01005 /* MOV r1,#5 */, 0xe3a02003 /* MOV r2,#3 */,
+                     0xe1010052 /* QADD r0,r2,r1 */ };
+    arm_cpu_t d; load_and_run(&d, q, 3, 3);
+    CHECK(d.r[0] == 8, "r0=%u expect 8", d.r[0]);
+    CHECK((d.cpsr & ARM_CPSR_Q) == 0, "Q must not be set without saturation");
+}
+
 static void test_swp_exchanges(void) {
     /* SWP is an atomic read-then-write: Rd gets the old memory word and the
      * new value comes from Rm. Getting the order wrong (writing before
@@ -717,9 +751,11 @@ static void test_clz_does_not_corrupt_cpsr(void) {
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, p[0]);
     c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS;
+    c.r[1] = 1;
     uint32_t before = c.cpsr;
     arm_status_t st = arm_step(&c);
-    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for CLZ", (int)st);
+    CHECK(st == ARM_OK, "status=%d expect ARM_OK — CLZ is implemented", (int)st);
+    CHECK(c.r[0] == 31, "r0=%u expect 31 (clz of 1)", c.r[0]);
     CHECK(c.cpsr == before, "cpsr changed %08x -> %08x (CLZ decoded as MSR)",
           before, c.cpsr);
 }
@@ -995,6 +1031,8 @@ int main(void) {
     test_setend_le_runs_be_traps();
     test_umull_and_smull();
     test_umlal_accumulates();
+    test_clz();
+    test_qadd_saturates_and_sets_q();
     test_swp_exchanges();
     test_ldrexd_strexd_roundtrip();
     test_clrex_makes_strex_fail();

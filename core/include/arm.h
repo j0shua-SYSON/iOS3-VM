@@ -20,6 +20,9 @@
 #define ARM_CPSR_Z (1u << 30) /* Zero     */
 #define ARM_CPSR_C (1u << 29) /* Carry    */
 #define ARM_CPSR_V (1u << 28) /* Overflow */
+/* Sticky saturation. Set by the saturating arithmetic, never cleared by it —
+ * software clears it with MSR when it wants to test a span of operations. */
+#define ARM_CPSR_Q (1u << 27)
 
 /* CPSR control bits. */
 #define ARM_CPSR_I (1u << 7)  /* IRQ disable  */

@@ -461,6 +461,52 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
             return ARM_OK;
         }
 
+        /*
+         * CLZ Rd, Rm — count leading zeros.
+         *   cccc 0001 0110 1111 dddd 1111 0001 mmmm
+         * Compilers emit this constantly for bit scans, allocators and
+         * normalisation, so it is ordinary code rather than a DSP curiosity.
+         */
+        if ((insn & 0x0fff0ff0u) == 0x016f0f10u) {
+            uint32_t v = reg_read(c, pc, insn & 0xfu);
+            unsigned n = 0;
+            if (!v) n = 32;
+            else while (!(v & 0x80000000u)) { v <<= 1; n++; }
+            c->r[(insn >> 12) & 0xfu] = n;
+            return ARM_OK;
+        }
+
+        /*
+         * Saturating arithmetic: QADD, QSUB, QDADD, QDSUB.
+         *   cccc 0001 0op0 nnnn dddd 0000 0101 mmmm
+         * These saturate to INT32_MIN/INT32_MAX rather than wrapping, and set
+         * the sticky Q flag (CPSR bit 27) on saturation. Wrapping instead
+         * would be silently wrong only at the extremes.
+         */
+        if ((insn & 0x0f900ff0u) == 0x01000050u) {
+            unsigned op = (insn >> 21) & 3u;
+            int32_t  m  = (int32_t)reg_read(c, pc, insn & 0xfu);
+            int32_t  n  = (int32_t)reg_read(c, pc, (insn >> 16) & 0xfu);
+            bool sat = false;
+            int64_t acc;
+
+            if (op == 2 || op == 3) {          /* QDADD / QDSUB: double Rn first */
+                int64_t d = (int64_t)n * 2;
+                if (d > INT32_MAX) { d = INT32_MAX; sat = true; }
+                if (d < INT32_MIN) { d = INT32_MIN; sat = true; }
+                n = (int32_t)d;
+            }
+            if (op == 0 || op == 2) acc = (int64_t)m + (int64_t)n;   /* QADD/QDADD */
+            else                    acc = (int64_t)m - (int64_t)n;   /* QSUB/QDSUB */
+
+            if (acc > INT32_MAX) { acc = INT32_MAX; sat = true; }
+            if (acc < INT32_MIN) { acc = INT32_MIN; sat = true; }
+
+            c->r[(insn >> 12) & 0xfu] = (uint32_t)(int32_t)acc;
+            if (sat) c->cpsr |= ARM_CPSR_Q;    /* sticky: only ever set here */
+            return ARM_OK;
+        }
+
         {
             bool spsr = (insn >> 22) & 1u;   /* R bit: 0 = CPSR, 1 = SPSR */
             arm_bank_t bank = arm_bank_of_mode(c->cpsr);
