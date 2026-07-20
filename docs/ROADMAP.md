@@ -77,10 +77,17 @@ register/memory results.
 **Observable:** text from guest code appears on the iPhone screen. First "it runs
 on the phone."
 
-### ⚪ M3 — iBoot / SecureROM chain
-IMG3 firmware parser (AES + RSA via a bundled crypto), NOR + NAND with the
-FTL/VFL layers, device tree. Execute Apple's real low-level boot chain far enough
-to see **iBoot** serial output.
+### 🔵 M3 — iBoot / SecureROM chain *(started)*
+- **Done: the IMG3 container parser.** Reads the header and tag stream, exposing
+  the DATA payload, the KBAG (crypt state, key bits, IV and key), SHSH presence
+  and the VERS string. Strictly bounds-checked with 64-bit arithmetic: this is
+  the first component to touch untrusted user-supplied files, so malformed
+  containers are rejected rather than read out of bounds (tests cover oversized
+  fullSize, tags past the end, dataLen exceeding its tag, and the zero-length
+  tag that would otherwise loop forever).
+- Remaining: AES-CBC decryption of DATA, NOR + NAND with the FTL/VFL layers,
+  device tree. Execute Apple's real low-level boot chain far enough to see
+  **iBoot** serial output.
 *Requires the user to supply their own iPhone OS 3.1.3 IPSW + the public
 decryption keys — see [BOOT_CHAIN.md](BOOT_CHAIN.md).*
 

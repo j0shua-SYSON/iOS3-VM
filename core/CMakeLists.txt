@@ -7,6 +7,7 @@ add_library(emucore STATIC
     src/soc/vic.c
     src/soc/timer.c
     src/soc/machine.c
+    src/firmware/img3.c
 )
 target_include_directories(emucore PUBLIC include)
 
@@ -22,3 +23,7 @@ add_test(NAME arm_interp COMMAND test_arm)
 add_executable(test_soc tests/test_soc.c)
 target_link_libraries(test_soc PRIVATE emucore)
 add_test(NAME s5l8900_machine COMMAND test_soc)
+
+add_executable(test_img3 tests/test_img3.c)
+target_link_libraries(test_img3 PRIVATE emucore)
+add_test(NAME img3_parser COMMAND test_img3)
