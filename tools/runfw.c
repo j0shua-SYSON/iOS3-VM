@@ -67,6 +67,7 @@ int main(int argc, char **argv) {
     if (!s5l8900_init(&m, base, 64u << 20)) { fprintf(stderr, "init failed\n"); return 1; }
     s5l8900_load(&m, base, payload, len);
 
+    m.trace_devices = true;
     m.cpu.r[15] = base;
     printf("loaded %zu bytes at 0x%08x, running up to %u instructions\n\n",
            len, base, steps);
@@ -142,6 +143,15 @@ int main(int argc, char **argv) {
             }
             printf("\n");
         }
+    }
+
+    if (m.dev_count) {
+        printf("\n  device accesses (first %u, RAM excluded):\n", m.dev_count);
+        unsigned shown = m.dev_count < 40 ? m.dev_count : 40;
+        for (unsigned i = 0; i < shown; i++)
+            printf("    %s 0x%08x = 0x%08x\n",
+                   m.dev_is_write[i] ? "W" : "R", m.dev_addr[i], m.dev_value[i]);
+        if (m.dev_count > shown) printf("    ... %u more\n", m.dev_count - shown);
     }
 
     if (m.unmapped_addr_count) {

@@ -38,6 +38,14 @@ static void note_unmapped(s5l8900_t *m, uint32_t addr) {
         m->unmapped_addr[m->unmapped_addr_count++] = page;
 }
 
+static void note_device(s5l8900_t *m, uint32_t addr, uint32_t val, bool is_write) {
+    if (!m->trace_devices || m->dev_count >= S5L_DEVLOG) return;
+    m->dev_addr[m->dev_count]     = addr;
+    m->dev_value[m->dev_count]    = val;
+    m->dev_is_write[m->dev_count] = is_write;
+    m->dev_count++;
+}
+
 static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
     s5l8900_t *m = ctx;
 
@@ -46,19 +54,24 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         memcpy(&v, &m->ram[addr - m->ram_base], bytes);   /* little-endian host */
         return v;
     }
-    if (in_dev(addr, S5L8900_UART0_BASE))
-        return s5l_uart_read(&m->uart0, addr - S5L8900_UART0_BASE);
-    if (in_dev(addr, S5L8900_VIC0_BASE))
-        return s5l_vic_read(&m->vic0, addr - S5L8900_VIC0_BASE);
-    if (in_dev(addr, S5L8900_TIMER_BASE))
-        return s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
-    if (addr >= S5L8900_NOR_BASE &&
-        (uint64_t)addr < (uint64_t)S5L8900_NOR_BASE + m->nor.size)
-        return s5l_nor_read(&m->nor, addr - S5L8900_NOR_BASE, bytes);
-
-    m->unmapped_reads++;
-    note_unmapped(m, addr);
-    return 0;
+    uint32_t v;
+    if (in_dev(addr, S5L8900_UART0_BASE)) {
+        v = s5l_uart_read(&m->uart0, addr - S5L8900_UART0_BASE);
+    } else if (in_dev(addr, S5L8900_VIC0_BASE)) {
+        v = s5l_vic_read(&m->vic0, addr - S5L8900_VIC0_BASE);
+    } else if (in_dev(addr, S5L8900_TIMER_BASE)) {
+        v = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
+    } else if (addr >= S5L8900_NOR_BASE &&
+               (uint64_t)addr < (uint64_t)S5L8900_NOR_BASE + m->nor.size) {
+        v = s5l_nor_read(&m->nor, addr - S5L8900_NOR_BASE, bytes);
+    } else {
+        m->unmapped_reads++;
+        note_unmapped(m, addr);
+        note_device(m, addr, 0, false);
+        return 0;
+    }
+    note_device(m, addr, v, false);
+    return v;
 }
 
 static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
@@ -69,6 +82,7 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         return;
     }
     if (in_dev(addr, S5L8900_UART0_BASE)) {
+        note_device(m, addr, val, true);
         s5l_uart_write(&m->uart0, addr - S5L8900_UART0_BASE, val);
         return;
     }
@@ -93,6 +107,7 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
     }
     m->unmapped_writes++;
     note_unmapped(m, addr);
+    note_device(m, addr, val, true);
 }
 
 static uint32_t r32(void *c, uint32_t a) { return bus_read(c, a, 4); }

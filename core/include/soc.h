@@ -160,6 +160,7 @@ unsigned s5l_nor_scan(s5l_nor_t *n);
 const s5l_nor_entry_t *s5l_nor_find(const s5l_nor_t *n, uint32_t ident);
 
 #define S5L_UNMAPPED_LOG 32
+#define S5L_DEVLOG        256
 
 /* ------------------------------------------------------------- machine ---
  * Wires the CPU to RAM and the peripherals through one arm_bus_t.
@@ -182,6 +183,15 @@ typedef struct {
      * have not modelled yet — which is the next thing to build. */
     uint32_t   unmapped_addr[S5L_UNMAPPED_LOG];
     unsigned   unmapped_addr_count;
+
+    /* Diagnostic: log accesses to device windows (not RAM). Real firmware
+     * polls hardware to decide what to do next, so seeing exactly which
+     * registers it reads is how we learn what it is waiting for. */
+    bool       trace_devices;
+    uint32_t   dev_addr[S5L_DEVLOG];
+    uint32_t   dev_value[S5L_DEVLOG];
+    bool       dev_is_write[S5L_DEVLOG];
+    unsigned   dev_count;
 } s5l8900_t;
 
 /* Advance the devices and refresh the CPU's interrupt lines. */
