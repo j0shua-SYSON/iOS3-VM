@@ -265,6 +265,28 @@ static bool dt_set_reg(uint8_t *b, size_t len, const char *path,
     return true;
 }
 
+/*
+ * Break a node's "compatible" so no driver matches it. IOKit matches AppleMBX
+ * (and friends) purely by IONameMatch against this string; flipping the first
+ * byte leaves the length unchanged (so the flat tree is not disturbed) and
+ * makes the name match nothing. Used to keep the MBX/PowerVR graphics driver
+ * from starting: it busy-polls a wrapper-reset bit in its 16 MB register block
+ * that we do not model, which wedges the whole boot at ~72% of runtime. iPhone
+ * OS 3 has a software-blit path (LK_ENABLE_MBX2D=0), so the GPU is not required
+ * to reach a rendered SpringBoard.
+ */
+static bool dt_unmatch(uint8_t *b, size_t len, const char *path) {
+    size_t node = dtn_path(b, len, path);
+    if (node == DT_NONE) { printf("  dt: node /%s NOT FOUND\n", path); return false; }
+    uint32_t vl = 0;
+    uint8_t *p = dtn_prop(b, len, node, "compatible", &vl);
+    if (!p || !vl) { printf("  dt: /%s:compatible missing\n", path); return false; }
+    char was = (char)p[0];
+    p[0] = 'x';                      /* 'm'bx... -> 'x'bx..., matches nothing */
+    printf("  dt: /%-14s compatible '%c...' -> 'x...' (unmatched)\n", path, was);
+    return true;
+}
+
 /* ---------------------------------------------------------------------------
  * Adding an entry to /chosen/memory-map WITHOUT rebuilding the blob.
  *
@@ -741,6 +763,7 @@ int main(int argc, char **argv) {
      * until the interaction is understood. */
     bool want_fb = false;
     uint32_t v_display = 0;   /* 0 = kernel text console draws; 1 = defer to IOMFB */
+    bool want_mbx = false;    /* -g keeps the (unmodelled, hang-prone) MBX GPU driver */
     /* -A: from outside the core, undo the word-alignment the interpreter
      * applies when an exception return resumes in Thumb state. This is a
      * PROOF SHIM for a suspected core bug, not a fix. */
@@ -781,7 +804,7 @@ int main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-a")) { stop_on_abort = true; continue; }
         if (!strcmp(argv[i], "-F")) { want_fb = true; continue; }
-        if (!strcmp(argv[i], "-g")) { v_display = 1; continue; }  /* defer to IOMFB */
+        if (!strcmp(argv[i], "-g")) { v_display = 1; want_mbx = true; continue; }  /* defer to IOMFB, keep MBX */
         if (!strcmp(argv[i], "-M")) { patch_memnode = false; continue; }
         if (i + 1 >= argc) break;
         if (!strcmp(argv[i], "-D")) {
@@ -1005,6 +1028,11 @@ int main(int argc, char **argv) {
          * not something to smuggle into this one. */
         if (rd)
             dt_memmap_add(dt, dt_n, "RAMDisk", rd_dt_addr, rd_len);
+        /* Keep the PowerVR MBX driver from matching unless -g asks for it: it
+         * busy-polls a reset bit in a register block we do not model and hangs
+         * the boot. Disabled by default so the boot can reach the root device. */
+        if (!want_mbx)
+            dt_unmatch(dt, dt_n, "arm-io/mbx");
         for (unsigned i = 0; i < ndtov; i++)
             dt_set_u32(dt, dt_n, dtov[i].path, dtov[i].prop, dtov[i].val);
         printf("  ---------------------------------------------------------\n");
