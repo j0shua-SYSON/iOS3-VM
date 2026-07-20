@@ -7,6 +7,7 @@ add_library(emucore STATIC
     src/soc/vic.c
     src/soc/timer.c
     src/soc/nor.c
+    src/soc/nand.c
     src/soc/machine.c
     src/firmware/img3.c
     src/firmware/aes.c
@@ -43,3 +44,7 @@ add_test(NAME firmware_loader COMMAND test_loader)
 add_executable(test_devicetree tests/test_devicetree.c)
 target_link_libraries(test_devicetree PRIVATE emucore)
 add_test(NAME device_tree COMMAND test_devicetree)
+
+add_executable(test_nand tests/test_nand.c)
+target_link_libraries(test_nand PRIVATE emucore)
+add_test(NAME nand_device COMMAND test_nand)

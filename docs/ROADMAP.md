@@ -131,7 +131,18 @@ on the phone."
   [device tree] /arm-io/uart0 reg = 0x3cc00000
   ```
 
-- Remaining: NAND with the FTL/VFL layers,
+- **Done: the NAND device.** Geometry, page read/program, block erase, spare
+  (OOB) bytes and bad-block marking. It behaves like real NAND rather than like
+  RAM: erased pages read as all ones and programming can only clear bits, so
+  writing 1s over 0s is refused instead of silently succeeding.
+- **Deliberately NOT done: Apple's VFL/FTL.** The virtual-flash and
+  flash-translation layers that map logical to physical pages are a substantial
+  reverse-engineering job that cannot be done faithfully without validating
+  against real firmware behaviour. A plausible-looking guess would pass our
+  tests and fail silently on a genuine NAND dump, which is worse than having
+  none — so the raw device is provided for the FTL to sit on later, and the gap
+  is stated in nand.h rather than papered over.
+- Remaining: the VFL/FTL layers (needs real firmware to validate against),
   device tree. Execute Apple's real low-level boot chain far enough to see
   **iBoot** serial output.
 *Requires the user to supply their own iPhone OS 3.1.3 IPSW + the public
