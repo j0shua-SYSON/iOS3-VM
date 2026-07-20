@@ -228,6 +228,68 @@ static void test_exception_return_to_arm_stays_word_aligned(void) {
     CHECK((c.cpsr & ARM_CPSR_T) == 0, "should have resumed in ARM state");
 }
 
+/*
+ * LDM {..., pc}^ is an exception return, and differs from a plain POP {..,pc}
+ * in two ways that are easy to get wrong together: bit 0 of the loaded word is
+ * part of the address rather than a Thumb selector, and the alignment must
+ * follow the T bit the SPSR restores. Doing the PC write before the restore
+ * gets both wrong.
+ */
+static void test_ldm_exception_return_takes_state_from_spsr(void) {
+    /* LDMIA sp, {pc}^  ->  0xe8dd8000 */
+    uint32_t p[] = { 0xe8dd8000u };
+    arm_cpu_t c; load_and_run(&c, p, 1, 0);
+
+    arm_set_mode(&c, ARM_MODE_IRQ);
+    c.spsr[arm_bank_of_mode(ARM_MODE_IRQ)] = ARM_MODE_SVC | ARM_CPSR_T;
+    c.r[13] = 0x800;
+    c.bus->write32(c.bus->ctx, 0x800, 0x0000101au);  /* even: no Thumb bit set */
+    c.r[15] = 0;
+    arm_step(&c);
+
+    CHECK(c.r[15] == 0x0000101a, "pc=%08x expect 101a (halfword, from SPSR.T)",
+          c.r[15]);
+    CHECK((c.cpsr & ARM_CPSR_T) != 0,
+          "T must come from the SPSR, not from bit 0 of the loaded word");
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC,
+          "mode=%02x expect SVC restored from SPSR",
+          c.cpsr & ARM_CPSR_MODE_MASK);
+}
+
+/* RFE restores PC and CPSR from memory; the same alignment rule applies. */
+static void test_rfe_aligns_for_the_restored_state(void) {
+    /* RFEIA r0 -> 0xf8900a00 (P=0, U=1: read from [r0], not [r0-4]) */
+    uint32_t p[] = { 0xf8900a00u };
+    arm_cpu_t c; load_and_run(&c, p, 1, 0);
+
+    arm_set_mode(&c, ARM_MODE_IRQ);
+    c.r[0] = 0x900;
+    c.bus->write32(c.bus->ctx, 0x900, 0x0000101au);      /* new pc   */
+    c.bus->write32(c.bus->ctx, 0x904, ARM_MODE_SVC);     /* new cpsr, T clear */
+    c.r[15] = 0;
+    arm_step(&c);
+
+    CHECK(c.r[15] == 0x00001018,
+          "pc=%08x expect 1018 (ARM state must align to a word)", c.r[15]);
+    CHECK((c.cpsr & ARM_CPSR_T) == 0, "should have resumed in ARM state");
+}
+
+/*
+ * SETEND LE is a no-op for a little-endian machine and must execute. SETEND BE
+ * must keep trapping: we do not model a big-endian data path, so honouring it
+ * would silently corrupt every subsequent load.
+ */
+static void test_setend_le_runs_be_traps(void) {
+    uint32_t le[] = { 0xf1010000u, 0xe3a0002au };   /* SETEND LE ; MOV r0,#42 */
+    arm_cpu_t c; load_and_run(&c, le, 2, 2);
+    CHECK(c.r[0] == 42, "r0=%u expect 42 (SETEND LE must be a no-op)", c.r[0]);
+
+    uint32_t be[] = { 0xf1010200u };                /* SETEND BE */
+    arm_cpu_t d; arm_status_t st = run_status(&d, be, 1, 1);
+    CHECK(st == ARM_UNDEFINED,
+          "status=%d expect ARM_UNDEFINED for SETEND BE", (int)st);
+}
+
 static void test_swp_exchanges(void) {
     /* SWP is an atomic read-then-write: Rd gets the old memory word and the
      * new value comes from Rm. Getting the order wrong (writing before
@@ -888,6 +950,9 @@ int main(void) {
     test_bx_branches();
     test_exception_return_to_thumb_keeps_halfword();
     test_exception_return_to_arm_stays_word_aligned();
+    test_ldm_exception_return_takes_state_from_spsr();
+    test_rfe_aligns_for_the_restored_state();
+    test_setend_le_runs_be_traps();
     test_swp_exchanges();
     test_ldrexd_strexd_roundtrip();
     test_clrex_makes_strex_fail();

@@ -739,7 +739,7 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
             if (!(list & (1u << i))) continue;
             if (user_bank) { reg_write_user(c, i, loaded[i]); continue; }
             c->r[i] = loaded[i];
-            if (i == 15) {
+            if (i == 15 && !restore_cpsr) {
                 /* ARMv5 and later: loading PC INTERWORKS. Bit 0 selects the
                  * instruction set, so "POP {..,pc}" returning to a Thumb caller
                  * must switch to Thumb. Masking bit 0 off without setting T
@@ -750,6 +750,10 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
                 else                c->cpsr &= ~ARM_CPSR_T;
                 *next = loaded[i] & (uint32_t)((loaded[i] & 1u) ? ~1u : ~3u);
             }
+            /* The exception-return form (LDM {...,pc}^) is deliberately NOT
+             * handled here: there, bit 0 of the loaded word is not a Thumb
+             * selector — T comes from the SPSR, which has not been restored
+             * yet. It is finished below, after the restore. */
         }
     }
 
@@ -764,6 +768,14 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
         uint32_t s = c->spsr[b];
         arm_set_mode(c, s);
         c->cpsr = (c->cpsr & ARM_CPSR_MODE_MASK) | (s & ~ARM_CPSR_MODE_MASK);
+
+        /* Now that T is back, finish the PC write for LDM {...,pc}^. The
+         * restored T decides both the instruction set and the alignment; bit 0
+         * of the loaded word is part of the address, not a selector. Doing
+         * this before the restore — as the plain-LDM path above does — would
+         * both interwork off the wrong bit and align for the wrong state. */
+        if (L && (list & (1u << 15)))
+            *next = loaded[15] & (uint32_t)((c->cpsr & ARM_CPSR_T) ? ~1u : ~3u);
     }
     return ARM_OK;
 }
@@ -1339,12 +1351,28 @@ arm_status_t arm_step(arm_cpu_t *c) {
             if (W) c->r[rn] = U ? sp + 8u : sp - 8u;
             arm_set_mode(c, new_cpsr);
             c->cpsr = (c->cpsr & ARM_CPSR_MODE_MASK) | (new_cpsr & ~ARM_CPSR_MODE_MASK);
-            c->r[15] = new_pc & ~1u;
+            /* Align for the state the restored CPSR selects, not always to a
+             * halfword: returning into ARM code must land on a word boundary.
+             * Same family of bug as the MOVS pc,lr path — see
+             * exec_data_processing. */
+            c->r[15] = new_pc & (uint32_t)((c->cpsr & ARM_CPSR_T) ? ~1u : ~3u);
             return ARM_OK;
         }
 
-        /* SETEND is not implemented yet: trap rather than execute something
-         * else by accident. */
+        /*
+         * SETEND — select the data endianness for loads and stores.
+         *   1111 0001 0000 0001 0000 0000 E000 0000
+         * This core, the bus, and the guest are all little-endian, so SETEND LE
+         * is genuinely a no-op and executing it is correct. SETEND BE is not:
+         * we do not model a big-endian data path, so honouring it would mean
+         * silently doing the wrong thing on every subsequent load. It keeps
+         * trapping, which is the honest answer.
+         */
+        if ((insn & 0xfffffdffu) == 0xf1010000u) {
+            if (insn & (1u << 9)) return ARM_UNDEFINED;   /* SETEND BE */
+            c->r[15] = next;
+            return ARM_OK;
+        }
         return ARM_UNDEFINED;
     }
 
