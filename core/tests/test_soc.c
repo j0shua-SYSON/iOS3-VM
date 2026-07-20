@@ -114,6 +114,25 @@ static void test_bare_metal_uart_hello(void) {
     s5l8900_free(&m);
 }
 
+static void test_timer_period_is_exact(void) {
+    /* One interrupt per reload period, at a steady interval. Latching on both
+     * the decrement-to-zero and reload-from-zero paths produced two interrupts
+     * per period at intervals N, 1, N, 1, ... */
+    s5l_timer_t t; s5l_timer_reset(&t);
+    s5l_timer_write(&t, TIMER_RELOAD, 4);
+    s5l_timer_write(&t, TIMER_CTRL, TIMER_CTRL_ENABLE | TIMER_CTRL_INT_EN);
+    unsigned expiries = 0, last = 0; int deltas_ok = 1;
+    for (unsigned tick = 1; tick <= 20; tick++) {
+        if (s5l_timer_tick(&t, 1)) {
+            if (last && (tick - last) != 4) deltas_ok = 0;
+            last = tick; expiries++;
+            s5l_timer_write(&t, TIMER_INTSTAT, 1);   /* acknowledge */
+        }
+    }
+    CHECK(expiries == 5, "expiries=%u expect 5 in 20 ticks with reload 4", expiries);
+    CHECK(deltas_ok, "expiry intervals were not a steady 4 ticks");
+}
+
 static void test_vic_masks_and_routes(void) {
     s5l_vic_t v; s5l_vic_reset(&v);
     s5l_vic_set_line(&v, 5, true);
@@ -203,6 +222,7 @@ int main(void) {
     test_bounds_check_cannot_overflow();
     test_bare_metal_uart_hello();
     test_vic_masks_and_routes();
+    test_timer_period_is_exact();
     test_timer_interrupt_reaches_handler();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

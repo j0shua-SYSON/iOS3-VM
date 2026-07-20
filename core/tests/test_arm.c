@@ -467,6 +467,98 @@ static void test_data_abort_taken(void) {
     CHECK(c.cp15.dfar == 0x90000000u, "dfar=%08x expect 90000000", c.cp15.dfar);
 }
 
+/* --- regressions from the adversarial audit ----------------------------- */
+
+static void test_pld_is_a_nop_not_a_branch(void) {
+    /* cond==0xF is the ARMv6 unconditional space. PLD must be a no-op; if it is
+     * decoded as a conditional instruction it becomes "LDRB pc,[r1]" and
+     * branches to whatever byte it loaded. */
+    uint32_t p[] = { 0xe3a01a01 /*MOV r1,#0x1000*/,
+                     0xf5d1f000 /*PLD [r1]*/,
+                     0xe3a00007 /*MOV r0,#7*/ };
+    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    CHECK(c.r[0] == 7, "r0=%u expect 7 (execution continued past PLD)", c.r[0]);
+    CHECK(c.r[15] == 12, "pc=%08x expect 0c (PLD did not branch)", c.r[15]);
+}
+
+static void test_unconditional_space_traps(void) {
+    /* Unimplemented cond==0xF encodings (e.g. SETEND) must trap, not execute. */
+    uint32_t p[] = { 0xf1010200 /*SETEND BE*/ };
+    arm_cpu_t c; arm_status_t st = run_status(&c, p, 1, 1);
+    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for SETEND", (int)st);
+}
+
+static void test_clz_does_not_corrupt_cpsr(void) {
+    /* CLZ sits in the same opcode space as MSR. With a loose MSR mask it would
+     * rewrite CPSR (including the mode field) instead of trapping. */
+    uint32_t p[] = { 0xe16f0f11 /*CLZ r0,r1*/ };
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, p[0]);
+    c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS;
+    uint32_t before = c.cpsr;
+    arm_status_t st = arm_step(&c);
+    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for CLZ", (int)st);
+    CHECK(c.cpsr == before, "cpsr changed %08x -> %08x (CLZ decoded as MSR)",
+          before, c.cpsr);
+}
+
+static void test_msr_still_works(void) {
+    /* The tightened mask must not break real MSR. */
+    uint32_t p[] = { 0xe3a000d2 /*MOV r0,#0xD2*/, 0xe121f000 /*MSR CPSR_c,r0*/ };
+    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_IRQ,
+          "mode=%02x expect IRQ", c.cpsr & ARM_CPSR_MODE_MASK);
+}
+
+static void test_media_space_traps(void) {
+    /* REV and UXTB are media-space encodings we do not implement; they must
+     * trap rather than be executed as loads/stores. */
+    uint32_t rev[] = { 0xe6bf0f31 };   /* REV r0,r1  */
+    arm_cpu_t c; arm_status_t st = run_status(&c, rev, 1, 1);
+    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for REV", (int)st);
+
+    uint32_t uxtb[] = { 0xe6ef0071 };  /* UXTB r0,r1 */
+    st = run_status(&c, uxtb, 1, 1);
+    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for UXTB", (int)st);
+}
+
+static void test_apx_makes_mapping_read_only(void) {
+    /* APX=1, AP=01 is privileged read-only: a privileged write must fault. */
+    arm_cpu_t c;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0x4000 + ((0x80000000u >> 20) << 2),
+          0x00200000u | (1u << 15) | (1u << 10) | 2u);   /* APX=1, AP=01 */
+    arm_reset(&c, &g_bus);
+    c.cp15.ttbr0 = 0x4000; c.cp15.dacr = 1u; c.cp15.sctlr |= ARM_SCTLR_M;
+
+    uint32_t pa = 0;
+    CHECK(arm_mmu_translate(&c, 0x80000000u, false, true, &pa) == 0,
+          "privileged read should be allowed with APX=1,AP=01");
+    uint32_t f = arm_mmu_translate(&c, 0x80000000u, true, true, &pa);
+    CHECK((f & 0xf) == ARM_FSR_SECTION_PERMISSION,
+          "fsr=%x expect permission fault on write to a read-only section", f);
+}
+
+static void test_abort_restores_base_register(void) {
+    /* Base Restored Abort Model: after a data abort the base and destination
+     * registers must be unchanged so the handler can retry the instruction. */
+    arm_cpu_t c;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0x4000 + 0, 0x00000000u | (3u << 10) | 2u);   /* identity map VA 0 */
+    uint32_t prog[] = { 0xe4901004 };    /* LDR r1,[r0],#4  (post-indexed) */
+    m_w32(NULL, 0, prog[0]);
+    arm_reset(&c, &g_bus);
+    c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS;
+    c.cp15.ttbr0 = 0x4000; c.cp15.dacr = 1u; c.cp15.sctlr |= ARM_SCTLR_M;
+    c.r[0] = 0x00100000;                 /* unmapped */
+    c.r[1] = 0x5a5a5a5a;
+    arm_step(&c);
+    CHECK(c.r[0] == 0x00100000u, "r0=%08x expect 00100000 (base restored)", c.r[0]);
+    CHECK(c.r[1] == 0x5a5a5a5au, "r1=%08x expect 5a5a5a5a (dest untouched)", c.r[1]);
+    CHECK(c.cp15.dfar == 0x00100000u, "dfar=%08x expect 00100000", c.cp15.dfar);
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -508,6 +600,13 @@ int main(void) {
     test_mmu_user_write_permission();
     test_mmu_small_page_translation();
     test_data_abort_taken();
+    test_pld_is_a_nop_not_a_branch();
+    test_unconditional_space_traps();
+    test_clz_does_not_corrupt_cpsr();
+    test_msr_still_works();
+    test_media_space_traps();
+    test_apx_makes_mapping_read_only();
+    test_abort_restores_base_register();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

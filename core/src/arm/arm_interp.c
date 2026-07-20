@@ -42,17 +42,29 @@ static void note_abort(arm_cpu_t *c, uint32_t fsr, uint32_t va) {
     c->abort_fsr = fsr;
     c->abort_far = va;
 }
+/* The `priv` argument is explicit because the translation-mode load/stores
+ * (LDRT/STRT/LDRBT/STRBT, encoded P==0 && W==1) must translate as *unprivileged*
+ * even when executing in a privileged mode. That is precisely the mechanism a
+ * kernel uses to touch user memory safely, so getting it wrong would let a
+ * guest kernel read pages it should fault on. */
 #define MEM_READ(bits)                                                        \
-    static uint##bits##_t mem_r##bits(arm_cpu_t *c, uint32_t va) {            \
-        uint32_t pa, f = arm_mmu_translate(c, va, false, cpu_is_priv(c), &pa);\
+    static uint##bits##_t mem_r##bits##_as(arm_cpu_t *c, uint32_t va, bool priv) { \
+        uint32_t pa, f = arm_mmu_translate(c, va, false, priv, &pa);          \
         if (f) { note_abort(c, f, va); return 0; }                            \
         return c->bus->read##bits(c->bus->ctx, pa);                           \
+    }                                                                         \
+    static inline uint##bits##_t mem_r##bits(arm_cpu_t *c, uint32_t va) {     \
+        return mem_r##bits##_as(c, va, cpu_is_priv(c));                       \
     }
 #define MEM_WRITE(bits)                                                       \
-    static void mem_w##bits(arm_cpu_t *c, uint32_t va, uint##bits##_t v) {    \
-        uint32_t pa, f = arm_mmu_translate(c, va, true, cpu_is_priv(c), &pa); \
+    static void mem_w##bits##_as(arm_cpu_t *c, uint32_t va, uint##bits##_t v, \
+                                 bool priv) {                                 \
+        uint32_t pa, f = arm_mmu_translate(c, va, true, priv, &pa);           \
         if (f) { note_abort(c, f, va); return; }                              \
         c->bus->write##bits(c->bus->ctx, pa, v);                              \
+    }                                                                         \
+    static inline void mem_w##bits(arm_cpu_t *c, uint32_t va, uint##bits##_t v) {\
+        mem_w##bits##_as(c, va, v, cpu_is_priv(c));                           \
     }
 MEM_READ(32)  MEM_READ(16)  MEM_READ(8)
 MEM_WRITE(32) MEM_WRITE(16) MEM_WRITE(8)
@@ -211,7 +223,8 @@ bool arm_cond_passed(const arm_cpu_t *c, uint32_t cond) {
         case 0xc: return !Z && (N == V); /* GT */
         case 0xd: return Z || (N != V);  /* LE */
         case 0xe: return true;           /* AL */
-        default:  return true;           /* 0xf (NV) is unpredictable on ARMv6; treat as AL */
+        default:  return true;           /* 0xf is the unconditional space; arm_step
+                                          * intercepts it before this is reached. */
     }
 }
 
@@ -357,9 +370,15 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
 
             /* MSR <psr>_fields, Rm | #imm:
              *   register:  cccc 00010 R 10 mask 1111 00000000 mmmm
-             *   immediate: cccc 00110 R 10 mask 1111 rot   imm8   */
-            if ((insn & 0x0fb00000u) == 0x01200000u ||
-                (insn & 0x0fb00000u) == 0x03200000u) {
+             *   immediate: cccc 00110 R 10 mask 1111 rot   imm8
+             *
+             * The SBO field bits[15:12]==0b1111 must be checked, and for the
+             * register form bits[11:4]==0 as well. Without them this mask also
+             * swallows CLZ, BKPT, QSUB/QDSUB and the SMULxy/SMLAWy DSP space,
+             * which would then silently rewrite CPSR — including the mode
+             * field — instead of executing or trapping. */
+            if ((insn & 0x0fb0fff0u) == 0x0120f000u ||      /* register  */
+                (insn & 0x0fb0f000u) == 0x0320f000u) {      /* immediate */
                 unsigned fields = (insn >> 16) & 0xfu;
                 uint32_t val;
                 if (insn & (1u << 25)) {                     /* immediate form */
@@ -473,15 +492,23 @@ static arm_status_t exec_single_transfer(arm_cpu_t *c, uint32_t pc, uint32_t ins
     uint32_t base = reg_read(c, pc, rn);
     uint32_t addr = P ? (U ? base + offset : base - offset) : base;
 
+    /* P==0 && W==1 is the translation form (LDRT/STRT/LDRBT/STRBT): the access
+     * is performed as if unprivileged. */
+    bool priv = (!P && W) ? false : cpu_is_priv(c);
+
     if (L) { /* load */
-        uint32_t val = B ? mem_r8(c, addr)
-                         : mem_r32(c, addr);
+        uint32_t val = B ? mem_r8_as(c, addr, priv)
+                         : mem_r32_as(c, addr, priv);
+        /* Base Restored Abort Model: on a fault the destination and base must
+         * be left untouched so the handler can fix the mapping and re-execute. */
+        if (c->abort_pending) return ARM_OK;
         c->r[rd] = val;
         if (rd == 15) *next = val & ~3u;
     } else {  /* store */
         uint32_t val = reg_read(c, pc, rd); /* stored r15 is +12 on real HW; +8 is close enough here */
-        if (B) mem_w8(c, addr, (uint8_t)val);
-        else   mem_w32(c, addr, val);
+        if (B) mem_w8_as(c, addr, (uint8_t)val, priv);
+        else   mem_w32_as(c, addr, val, priv);
+        if (c->abort_pending) return ARM_OK;
     }
 
     /* Writeback: post-indexed always writes back; pre-indexed writes back if W. */
@@ -518,11 +545,13 @@ static arm_status_t exec_extra_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
             case 3: val = (uint32_t)(int32_t)(int16_t)mem_r16(c, addr); break; /* LDRSH */
             default: return ARM_UNDEFINED;
         }
+        if (c->abort_pending) return ARM_OK;      /* base-restored abort model */
         c->r[rd] = val;
         if (rd == 15) *next = val & ~3u;
     } else {
         if (sh != 1) return ARM_UNDEFINED;        /* LDRD/STRD: not yet */
         mem_w16(c, addr, (uint16_t)reg_read(c, pc, rd)); /* STRH */
+        if (c->abort_pending) return ARM_OK;
     }
 
     if (!P) { addr = U ? base + offset : base - offset; c->r[rn] = addr; }
@@ -563,16 +592,28 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
     if (U) { addr = P ? base + 4u : base;                  wb = base + 4u * n; }
     else   { addr = P ? base - 4u * n : base - 4u * n + 4u; wb = base - 4u * n; }
 
+    /* Loaded values are buffered and only committed once every access has
+     * succeeded: the base-restored abort model requires that a data abort part
+     * way through an LDM leaves the register file (and especially Rn) as it
+     * was, so the handler can map the page and re-execute the instruction. */
+    uint32_t loaded[16];
     for (unsigned i = 0; i < 16; i++) {
         if (!(list & (1u << i))) continue;
         if (L) {
-            uint32_t v = mem_r32(c, addr);
-            c->r[i] = v;
-            if (i == 15) *next = v & ~3u;    /* LDM with PC in the list branches */
+            loaded[i] = mem_r32(c, addr);
         } else {
             mem_w32(c, addr, reg_read(c, pc, i));
         }
+        if (c->abort_pending) return ARM_OK;
         addr += 4u;
+    }
+
+    if (L) {
+        for (unsigned i = 0; i < 16; i++) {
+            if (!(list & (1u << i))) continue;
+            c->r[i] = loaded[i];
+            if (i == 15) *next = loaded[i] & ~3u;  /* LDM with PC branches */
+        }
     }
 
     /* On LDM with Rn in the list, the loaded value wins over writeback. */
@@ -650,6 +691,25 @@ arm_status_t arm_step(arm_cpu_t *c) {
     c->cycles++;
 
     uint32_t cond = insn >> 28;
+
+    /* cond==0xF is NOT "always" on ARMv6 — it is the unconditional instruction
+     * space (PLD, BLX immediate, SETEND, CPS, RFE, SRS). Decoding it as a
+     * normal conditional instruction is catastrophic: PLD would fall into the
+     * single-data-transfer decode as "LDRB pc,[Rn]" and branch to whatever byte
+     * it loaded. ARMv6-optimised code (memcpy loops in libSystem, XNU copy
+     * routines) issues PLD constantly. */
+    if (cond == 0xfu) {
+        /* PLD is a hint; a no-op is architecturally correct. Both the immediate
+         * and register forms have bits[27:26]==01 and the Rd field SBO (1111). */
+        if ((insn & 0x0c00f000u) == 0x0400f000u) {
+            c->r[15] = next;
+            return ARM_OK;
+        }
+        /* BLX imm, SETEND, CPS, RFE, SRS are not implemented yet: trap rather
+         * than execute something else by accident. */
+        return ARM_UNDEFINED;
+    }
+
     if (!arm_cond_passed(c, cond)) { c->r[15] = next; return ARM_OK; }
 
     /* Coarse top-level decode. This intentionally covers only the encodings
@@ -660,6 +720,13 @@ arm_status_t arm_step(arm_cpu_t *c) {
         st = exec_branch(c, pc, insn, &next);
     } else if ((insn & 0x0fc000f0u) == 0x00000090u) {     /* MUL / MLA */
         st = exec_multiply(c, pc, insn);
+    } else if ((insn & 0x0e000000u) == 0x06000000u &&
+               (insn & 0x00000010u) != 0) {
+        /* bits[27:25]==011 with bit4==1 is the ARMv6 media space (REV, REV16,
+         * UXTB/SXTB/UXTH, PKH, SEL, USAT, SMLAD, ...). These are real ARM1176
+         * instructions we do not implement; without this guard they fall into
+         * the single-transfer decode below and silently read/write memory. */
+        st = ARM_UNDEFINED;
     } else if ((insn & 0x0c000000u) == 0x04000000u) {     /* single data transfer */
         st = exec_single_transfer(c, pc, insn, &next);
     } else if ((insn & 0x0e000000u) == 0x08000000u) {     /* LDM / STM */

@@ -39,15 +39,18 @@ void s5l_timer_write(s5l_timer_t *t, uint32_t off, uint32_t val) {
 }
 
 bool s5l_timer_tick(s5l_timer_t *t, uint32_t ticks) {
-    if (t->ctrl & TIMER_CTRL_ENABLE) {
-        while (ticks--) {
-            if (t->value == 0) {
-                t->value = t->reload;
-                if (t->ctrl & TIMER_CTRL_INT_EN) t->intstat = 1;
-            } else {
-                t->value--;
-                if (t->value == 0 && (t->ctrl & TIMER_CTRL_INT_EN)) t->intstat = 1;
-            }
+    if (!(t->ctrl & TIMER_CTRL_ENABLE)) return t->intstat != 0;
+
+    while (ticks--) {
+        if (t->value == 0) t->value = t->reload;   /* begin a period */
+        if (t->value == 0) break;                  /* reload 0: nothing to count */
+
+        /* Exactly one expiry per reload period. Latching on both the
+         * decrement-to-zero and the reload-from-zero paths would raise two
+         * interrupts per period, at intervals N, 1, N, 1, ... */
+        if (--t->value == 0) {
+            if (t->ctrl & TIMER_CTRL_INT_EN) t->intstat = 1;
+            t->value = t->reload;                  /* reload immediately */
         }
     }
     return t->intstat != 0;

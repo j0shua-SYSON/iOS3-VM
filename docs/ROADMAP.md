@@ -24,7 +24,7 @@ core on the phone.
 ### 🔵 M1 — ARMv6 interpreter *(in progress)*
 A complete, correct ARM1176 instruction interpreter validated against a growing
 unit-test suite.
-- **Done** (70 CPU tests passing): data-processing with the full barrel shifter,
+- **Done** (83 CPU tests passing): data-processing with the full barrel shifter,
   branch/BL, BX/BLX, single load/store, multiply, **LDM/STM in all four
   addressing modes** (incl. push/pop and LDM-into-PC branching), the
   halfword/sign-extending loads (LDRH/STRH/LDRSB/LDRSH), **banked registers and
