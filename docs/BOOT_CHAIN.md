@@ -53,6 +53,36 @@ The app's firmware directory is git-ignored precisely so no copyrighted image is
 ever committed. Think of it like a console emulator: the emulator is legal and
 open; the ROM is yours to provide.
 
+## Inspecting your IPSW
+
+Two host tools make a real IPSW immediately useful, and deliberately run our
+*real* parser against real bytes — so inspection doubles as validation:
+
+```sh
+# What is actually inside? (an IPSW is a ZIP)
+python tools/ipsw_explore.py firmware/iPhone1,2_3.1.3_7E18_Restore.ipsw
+
+# Pull out one container...
+python tools/ipsw_explore.py <ipsw> -x iBoot.n82ap.RELEASE.img3 -o firmware/iboot.img3
+
+# ...and see whether our parser agrees with Apple's actual layout
+./build/core/img3dump firmware/iboot.img3
+
+# With a published key, decrypt the payload
+./build/core/img3dump firmware/iboot.img3 -k <hexkey> -o firmware/iboot.bin
+
+# Scan a NOR dump for containers
+./build/core/img3dump -s firmware/nor.bin
+```
+
+`img3dump` prints the raw header bytes before parsing. That matters: a
+byte-swapped magic constant once survived a fully green test suite because our
+fixtures shared the same mistake as our code. Seeing the real bytes is how that
+class of error gets caught.
+
+Everything you drop in `firmware/` is git-ignored, so no Apple data can reach
+the public repository.
+
 ## Why 3.1.3 specifically
 
 - It's the **last** iPhone OS 3.x release — the most complete 3.x to target.

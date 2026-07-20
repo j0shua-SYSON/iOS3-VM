@@ -49,3 +49,9 @@ add_test(NAME device_tree COMMAND test_devicetree)
 add_executable(test_nand tests/test_nand.c)
 target_link_libraries(test_nand PRIVATE emucore)
 add_test(NAME nand_device COMMAND test_nand)
+
+# --- host tools -------------------------------------------------------------
+# img3dump points the real parser at real firmware, so inspecting an IPSW also
+# validates our format handling.
+add_executable(img3dump ../tools/img3dump.c)
+target_link_libraries(img3dump PRIVATE emucore)
