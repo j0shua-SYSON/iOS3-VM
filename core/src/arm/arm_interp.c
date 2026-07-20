@@ -27,6 +27,36 @@ static inline bool get_flag(const arm_cpu_t *c, uint32_t bit) {
 /* Defined below, but needed by the CP15 helper above it. */
 static inline uint32_t reg_read(const arm_cpu_t *c, uint32_t pc, unsigned n);
 
+static inline bool cpu_is_priv(const arm_cpu_t *c) {
+    return (c->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
+}
+
+/*
+ * Data-side memory accessors. Every guest load/store goes through translation;
+ * a fault is latched on the CPU and converted into a data abort by arm_step
+ * once the instruction finishes.
+ */
+static void note_abort(arm_cpu_t *c, uint32_t fsr, uint32_t va) {
+    if (c->abort_pending) return;          /* keep the first fault */
+    c->abort_pending = true;
+    c->abort_fsr = fsr;
+    c->abort_far = va;
+}
+#define MEM_READ(bits)                                                        \
+    static uint##bits##_t mem_r##bits(arm_cpu_t *c, uint32_t va) {            \
+        uint32_t pa, f = arm_mmu_translate(c, va, false, cpu_is_priv(c), &pa);\
+        if (f) { note_abort(c, f, va); return 0; }                            \
+        return c->bus->read##bits(c->bus->ctx, pa);                           \
+    }
+#define MEM_WRITE(bits)                                                       \
+    static void mem_w##bits(arm_cpu_t *c, uint32_t va, uint##bits##_t v) {    \
+        uint32_t pa, f = arm_mmu_translate(c, va, true, cpu_is_priv(c), &pa); \
+        if (f) { note_abort(c, f, va); return; }                              \
+        c->bus->write##bits(c->bus->ctx, pa, v);                              \
+    }
+MEM_READ(32)  MEM_READ(16)  MEM_READ(8)
+MEM_WRITE(32) MEM_WRITE(16) MEM_WRITE(8)
+
 arm_bank_t arm_bank_of_mode(uint32_t mode) {
     switch (mode & ARM_CPSR_MODE_MASK) {
         case ARM_MODE_FIQ: return ARM_BANK_FIQ;
@@ -149,6 +179,9 @@ void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
     }
     for (int i = 0; i < 5; i++) { cpu->fiq_r8_12[i] = 0; cpu->usr_r8_12[i] = 0; }
     { arm_cp15_t z = {0}; cpu->cp15 = z; }   /* MMU off, low vectors */
+    cpu->abort_pending = false;
+    cpu->abort_fsr = 0;
+    cpu->abort_far = 0;
     /* On reset the ARM1176 enters SVC mode with IRQ+FIQ disabled and begins
      * execution from the reset vector (0x0, or 0xffff0000 with high vectors).
      * We start at 0x0; the machine layer relocates PC as needed. */
@@ -426,14 +459,14 @@ static arm_status_t exec_single_transfer(arm_cpu_t *c, uint32_t pc, uint32_t ins
     uint32_t addr = P ? (U ? base + offset : base - offset) : base;
 
     if (L) { /* load */
-        uint32_t val = B ? c->bus->read8(c->bus->ctx, addr)
-                         : c->bus->read32(c->bus->ctx, addr);
+        uint32_t val = B ? mem_r8(c, addr)
+                         : mem_r32(c, addr);
         c->r[rd] = val;
         if (rd == 15) *next = val & ~3u;
     } else {  /* store */
         uint32_t val = reg_read(c, pc, rd); /* stored r15 is +12 on real HW; +8 is close enough here */
-        if (B) c->bus->write8 (c->bus->ctx, addr, (uint8_t)val);
-        else   c->bus->write32(c->bus->ctx, addr, val);
+        if (B) mem_w8(c, addr, (uint8_t)val);
+        else   mem_w32(c, addr, val);
     }
 
     /* Writeback: post-indexed always writes back; pre-indexed writes back if W. */
@@ -465,16 +498,16 @@ static arm_status_t exec_extra_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
     if (L) {
         uint32_t val;
         switch (sh) {
-            case 1: val = c->bus->read16(c->bus->ctx, addr); break;   /* LDRH  */
-            case 2: val = (uint32_t)(int32_t)(int8_t) c->bus->read8 (c->bus->ctx, addr); break; /* LDRSB */
-            case 3: val = (uint32_t)(int32_t)(int16_t)c->bus->read16(c->bus->ctx, addr); break; /* LDRSH */
+            case 1: val = mem_r16(c, addr); break;   /* LDRH  */
+            case 2: val = (uint32_t)(int32_t)(int8_t) mem_r8(c, addr); break;  /* LDRSB */
+            case 3: val = (uint32_t)(int32_t)(int16_t)mem_r16(c, addr); break; /* LDRSH */
             default: return ARM_UNDEFINED;
         }
         c->r[rd] = val;
         if (rd == 15) *next = val & ~3u;
     } else {
         if (sh != 1) return ARM_UNDEFINED;        /* LDRD/STRD: not yet */
-        c->bus->write16(c->bus->ctx, addr, (uint16_t)reg_read(c, pc, rd)); /* STRH */
+        mem_w16(c, addr, (uint16_t)reg_read(c, pc, rd)); /* STRH */
     }
 
     if (!P) { addr = U ? base + offset : base - offset; c->r[rn] = addr; }
@@ -518,11 +551,11 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
     for (unsigned i = 0; i < 16; i++) {
         if (!(list & (1u << i))) continue;
         if (L) {
-            uint32_t v = c->bus->read32(c->bus->ctx, addr);
+            uint32_t v = mem_r32(c, addr);
             c->r[i] = v;
             if (i == 15) *next = v & ~3u;    /* LDM with PC in the list branches */
         } else {
-            c->bus->write32(c->bus->ctx, addr, reg_read(c, pc, i));
+            mem_w32(c, addr, reg_read(c, pc, i));
         }
         addr += 4u;
     }
@@ -564,7 +597,19 @@ static arm_status_t exec_multiply(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
 
 arm_status_t arm_step(arm_cpu_t *c) {
     uint32_t pc   = c->r[15];
-    uint32_t insn = c->bus->read32(c->bus->ctx, pc);
+    /* Instruction fetch is translated too; a fault here is a prefetch abort. */
+    uint32_t fetch_pa;
+    uint32_t fetch_fsr = arm_mmu_translate(c, pc, false, cpu_is_priv(c), &fetch_pa);
+    if (fetch_fsr) {
+        uint32_t vec;
+        c->cycles++;
+        c->cp15.ifsr = fetch_fsr;
+        c->cp15.ifar = pc;
+        take_exception(c, ARM_VEC_PREFETCH, ARM_MODE_ABT, pc + 4, false, &vec);
+        c->r[15] = vec;
+        return ARM_OK;
+    }
+    uint32_t insn = c->bus->read32(c->bus->ctx, fetch_pa);
     uint32_t next = pc + 4;
     arm_status_t st = ARM_OK;
 
@@ -607,6 +652,18 @@ arm_status_t arm_step(arm_cpu_t *c) {
         st = exec_data_processing(c, pc, insn, &next);
     } else {
         st = ARM_UNDEFINED;
+    }
+
+    /* A translation fault latched during the instruction becomes a data abort.
+     * LR_abt is the aborting instruction's address + 8, per the architecture. */
+    if (c->abort_pending) {
+        uint32_t vec;
+        c->abort_pending = false;
+        c->cp15.dfsr = c->abort_fsr;
+        c->cp15.dfar = c->abort_far;
+        take_exception(c, ARM_VEC_DATA_ABORT, ARM_MODE_ABT, pc + 8, false, &vec);
+        c->r[15] = vec;
+        return ARM_OK;
     }
 
     if (st == ARM_OK) c->r[15] = next;

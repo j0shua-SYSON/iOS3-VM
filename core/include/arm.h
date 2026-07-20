@@ -38,6 +38,14 @@
 #define ARM1176_MIDR       0x410fb767u
 #define ARM1176_CACHE_TYPE 0x1d152152u
 
+/* ARMv6 fault status codes (FSR[3:0]); FSR[7:4] carries the domain. */
+#define ARM_FSR_SECTION_TRANSLATION 0x5u
+#define ARM_FSR_PAGE_TRANSLATION    0x7u
+#define ARM_FSR_SECTION_DOMAIN      0x9u
+#define ARM_FSR_PAGE_DOMAIN         0xbu
+#define ARM_FSR_SECTION_PERMISSION  0xdu
+#define ARM_FSR_PAGE_PERMISSION     0xfu
+
 /* Exception vector offsets (added to 0x0, or 0xFFFF0000 when SCTLR.V is set). */
 #define ARM_VEC_RESET      0x00u
 #define ARM_VEC_UNDEFINED  0x04u
@@ -116,7 +124,21 @@ typedef struct arm_cpu {
     uint32_t usr_r8_12[5];             /* user r8–r12 parked while in FIQ mode  */
     uint64_t cycles;     /* retired-instruction counter (1 insn == 1 tick for now) */
     const arm_bus_t *bus;
+
+    /* A translation fault raised mid-instruction; arm_step turns this into a
+     * data abort once the instruction finishes. */
+    bool     abort_pending;
+    uint32_t abort_fsr;
+    uint32_t abort_far;
 } arm_cpu_t;
+
+/*
+ * Translate a virtual address. Returns 0 on success (writing the physical
+ * address to *pa) or a non-zero ARMv6 fault status register value.
+ * With the MMU disabled (SCTLR.M clear) translation is the identity map.
+ */
+uint32_t arm_mmu_translate(arm_cpu_t *cpu, uint32_t va, bool write, bool priv,
+                           uint32_t *pa);
 
 /* Which bank a CPSR mode value selects (USR and SYS share ARM_BANK_USR). */
 arm_bank_t arm_bank_of_mode(uint32_t mode);

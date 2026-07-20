@@ -2,6 +2,7 @@
 # This same static library is what the iOS app links against.
 add_library(emucore STATIC
     src/arm/arm_interp.c
+    src/mmu.c
 )
 target_include_directories(emucore PUBLIC include)
 

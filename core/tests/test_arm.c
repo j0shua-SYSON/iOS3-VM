@@ -342,13 +342,15 @@ static void test_cp15_reads_midr(void) {
 }
 
 static void test_cp15_sctlr_roundtrip(void) {
-    /* MOV r0,#1 ; MCR c1 (SCTLR <- 1, MMU enable bit) ; MRC c1 -> r1 */
-    uint32_t p[] = { 0xe3a00001 /*MOV r0,#1*/,
+    /* Deliberately write SCTLR.C (data cache) rather than SCTLR.M: setting M
+     * would switch the MMU on mid-program and, with no page tables loaded, the
+     * very next fetch would legitimately take a prefetch abort. */
+    uint32_t p[] = { 0xe3a00004 /*MOV r0,#4 (SCTLR.C)*/,
                      0xee010f10 /*MCR p15,0,r0,c1,c0,0*/,
                      0xee111f10 /*MRC p15,0,r1,c1,c0,0*/ };
     arm_cpu_t c; load_and_run(&c, p, 3, 3);
-    CHECK(c.r[1] == 1, "r1=%08x expect 1 (SCTLR readback)", c.r[1]);
-    CHECK((c.cp15.sctlr & ARM_SCTLR_M) != 0, "SCTLR.M should be set");
+    CHECK(c.r[1] == 4, "r1=%08x expect 4 (SCTLR readback)", c.r[1]);
+    CHECK((c.cp15.sctlr & ARM_SCTLR_C) != 0, "SCTLR.C should be set");
 }
 
 static void test_cp15_ttbr0_roundtrip(void) {
@@ -376,6 +378,93 @@ static void test_high_vectors(void) {
                      0xef000000 /*SWI #0*/ };
     arm_cpu_t c; load_and_run(&c, p, 3, 3);
     CHECK(c.r[15] == 0xffff0008u, "pc=%08x expect ffff0008 (high vectors)", c.r[15]);
+}
+
+/* ---------------------------------------------------------------- MMU tests */
+/* Build a first-level table at 0x4000 mapping one 1 MB section, exactly as a
+ * kernel would lay it out in RAM, then let the real walker translate. */
+static void mmu_setup_section(arm_cpu_t *c, uint32_t va, uint32_t pa,
+                              unsigned ap, unsigned domain) {
+    const uint32_t l1 = 0x4000;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, l1 + ((va >> 20) << 2),
+          (pa & 0xfff00000u) | (ap << 10) | (domain << 5) | 2u); /* section */
+    arm_reset(c, &g_bus);
+    c->cp15.ttbr0 = l1;
+    c->cp15.dacr  = 1u << (domain * 2);       /* client: check AP */
+    c->cp15.sctlr |= ARM_SCTLR_M;             /* MMU on */
+}
+
+static void test_mmu_disabled_is_identity(void) {
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    uint32_t pa = 0;
+    uint32_t f = arm_mmu_translate(&c, 0xdeadb000u, false, true, &pa);
+    CHECK(f == 0, "fsr=%u expect 0 with MMU off", f);
+    CHECK(pa == 0xdeadb000u, "pa=%08x expect identity", pa);
+}
+
+static void test_mmu_section_translation(void) {
+    arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 3, 0);
+    uint32_t pa = 0;
+    uint32_t f = arm_mmu_translate(&c, 0x80001234u, false, true, &pa);
+    CHECK(f == 0, "fsr=%u expect 0", f);
+    CHECK(pa == 0x00201234u, "pa=%08x expect 00201234", pa);
+}
+
+static void test_mmu_unmapped_faults(void) {
+    arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 3, 0);
+    uint32_t pa = 0;
+    uint32_t f = arm_mmu_translate(&c, 0x90000000u, false, true, &pa); /* no entry */
+    CHECK((f & 0xf) == ARM_FSR_SECTION_TRANSLATION,
+          "fsr=%x expect section translation fault", f);
+}
+
+static void test_mmu_user_write_permission(void) {
+    /* AP=10: privileged RW, user read-only. A user write must fault. */
+    arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 2, 0);
+    uint32_t pa = 0;
+    CHECK(arm_mmu_translate(&c, 0x80000000u, false, false, &pa) == 0,
+          "user read should be permitted with AP=10");
+    uint32_t f = arm_mmu_translate(&c, 0x80000000u, true, false, &pa);
+    CHECK((f & 0xf) == ARM_FSR_SECTION_PERMISSION,
+          "fsr=%x expect permission fault on user write", f);
+}
+
+static void test_mmu_small_page_translation(void) {
+    /* Two-level walk: L1 coarse pointer -> L2 small page. */
+    const uint32_t l1 = 0x4000, l2 = 0x5000;
+    arm_cpu_t c;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, l1 + ((0x80000000u >> 20) << 2), (l2 & 0xfffffc00u) | 1u); /* coarse */
+    m_w32(NULL, l2 + (((0x80000000u >> 12) & 0xff) << 2),
+          (0x00300000u & 0xfffff000u) | (3u << 4) | 2u);                   /* small page, AP=11 */
+    arm_reset(&c, &g_bus);
+    c.cp15.ttbr0 = l1; c.cp15.dacr = 1u; c.cp15.sctlr |= ARM_SCTLR_M;
+    uint32_t pa = 0;
+    uint32_t f = arm_mmu_translate(&c, 0x80000abcu, false, true, &pa);
+    CHECK(f == 0, "fsr=%u expect 0 for small page", f);
+    CHECK(pa == 0x00300abcu, "pa=%08x expect 00300abc", pa);
+}
+
+static void test_data_abort_taken(void) {
+    /* With the MMU on and nothing mapped at the load address, LDR must raise a
+     * data abort: ABT mode, vector 0x10, and DFAR recording the address. */
+    arm_cpu_t c;
+    memset(g_ram, 0, sizeof g_ram);
+    /* identity-map the low section so the fetch itself succeeds */
+    m_w32(NULL, 0x4000 + 0, (0x00000000u) | (3u << 10) | 2u);
+    /* 0x90000000 is in a different 1 MB section than the identity-mapped one,
+     * so it has no descriptor at all. */
+    uint32_t prog[] = { 0xe3a01209 /*MOV r1,#0x90000000*/, 0xe5912000 /*LDR r2,[r1]*/ };
+    for (unsigned i = 0; i < 2; i++) m_w32(NULL, i * 4, prog[i]);
+    arm_reset(&c, &g_bus);
+    c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS;
+    c.cp15.ttbr0 = 0x4000; c.cp15.dacr = 1u; c.cp15.sctlr |= ARM_SCTLR_M;
+    arm_step(&c); arm_step(&c);
+    CHECK(c.r[15] == ARM_VEC_DATA_ABORT, "pc=%08x expect 10 (data abort)", c.r[15]);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_ABT,
+          "mode=%02x expect ABT(17)", c.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK(c.cp15.dfar == 0x90000000u, "dfar=%08x expect 90000000", c.cp15.dfar);
 }
 
 int main(void) {
@@ -413,6 +502,12 @@ int main(void) {
     test_cp15_ttbr0_roundtrip();
     test_cp15_cache_op_is_accepted();
     test_high_vectors();
+    test_mmu_disabled_is_identity();
+    test_mmu_section_translation();
+    test_mmu_unmapped_faults();
+    test_mmu_user_write_permission();
+    test_mmu_small_page_translation();
+    test_data_abort_taken();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

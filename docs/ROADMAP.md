@@ -45,10 +45,15 @@ unit-test suite.
 **Observable:** the interpreter runs a known ARM test binary with bit-exact
 register/memory results.
 
-### ⚪ M2 — Bare-metal boot + UART
-MMU/TLB, the system bus, and the minimum S5L8900 devices (VIC, timers, UART,
-GPIO, clock) to run *our own* small bare-metal ARM payload that prints over the
-emulated UART, surfaced in the app.
+### 🔵 M2 — Bare-metal boot + UART *(started)*
+- **Done: the MMU.** Full ARMv6 short-descriptor translation — 1 MB sections,
+  two-level coarse tables with 64 KB large and 4 KB small pages, domain checks
+  via DACR, AP permission checks, and data/prefetch aborts wired into execution
+  (DFSR/DFAR, IFSR/IFAR). Page tables are walked out of guest RAM through the
+  normal bus, exactly as hardware does.
+- Remaining: the system bus/memory map and the minimum S5L8900 devices (VIC,
+  timers, UART, GPIO, clock) to run *our own* small bare-metal ARM payload that
+  prints over the emulated UART, surfaced in the app.
 
 **Observable:** text from guest code appears on the iPhone screen. First "it runs
 on the phone."
