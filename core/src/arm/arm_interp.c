@@ -1209,7 +1209,15 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
             if (insn & (1u << 0)) set_flag(c, ARM_CPSR_F, disable);
             return ARM_OK;
         }
-        return ARM_UNDEFINED;                 /* SETEND, BKPT, IT: later */
+        /* SETEND, Thumb encoding: 1011 0110 0101 0E00. Same reasoning as the
+         * ARM form — LE is a genuine no-op for a little-endian machine, BE
+         * keeps trapping because we do not model a big-endian data path and
+         * honouring it would corrupt every subsequent load. */
+        if ((insn & 0xfff7u) == 0xb650u) {
+            if (insn & (1u << 3)) return ARM_UNDEFINED;   /* SETEND BE */
+            return ARM_OK;
+        }
+        return ARM_UNDEFINED;                 /* BKPT and friends: still trap */
     }
     case 0xc: {                              /* STMIA / LDMIA Rb!, {rlist} */
         unsigned rb = (insn >> 8) & 7u;
