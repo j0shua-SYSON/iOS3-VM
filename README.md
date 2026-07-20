@@ -49,8 +49,8 @@ can see.** No months in the dark.
 | | Milestone | State |
 |---|---|---|
 | **M0** | Toolchain online: core builds + tests in CI, iOS `.ipa` builds on a macOS runner, on-device self-test runs ARM code | ✅ **done** |
-| **M1** | Complete ARMv6 (ARM1176) interpreter, unit-tested | ✅ **done** — ARM + Thumb, *138 CPU tests* |
-| **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, NOR/NAND · *40 SoC tests* |
+| **M1** | Complete ARMv6 (ARM1176) interpreter, unit-tested | ✅ **done** — ARM + Thumb, *152 CPU tests* |
+| **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, NOR/NAND · *119 SoC tests* |
 | **M3** | IMG3 + NAND/NOR: Apple's real **iBoot** runs | ✅ **done** — decrypts real firmware; LLB runs, kernel extracted |
 | **M4** | The real **XNU kernel** boots and logs | 🔵 **the kernel talks, and Apple's own drivers start** — reaches `bsd_init`, zero panics, zero aborts |
 | **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | ⚪ next — needs a root filesystem and the display path |
