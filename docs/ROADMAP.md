@@ -187,7 +187,29 @@ decryption keys — see [BOOT_CHAIN.md](BOOT_CHAIN.md).*
 
 **Observable:** genuine iBoot banner over emulated serial.
 
-### ⚪ M4 — XNU kernel boots
+### 🔵 M4 — XNU kernel boots *(in progress)*
+
+**The real kernel runs under virtual memory.** Apple's iPhone OS 3.1.3
+kernelcache — decrypted with the published 7E18 keys, LZSS-expanded to a 7.6 MB
+ARMv6 Mach-O — loads, builds its own page tables, enables the MMU and executes
+~40,000 instructions of kernel-virtual code with **zero unmapped accesses**. Our
+ARMv6 MMU is walking XNU's real page tables correctly.
+
+Real firmware has found four genuine emulator bugs that a fully green synthetic
+suite never could, each now pinned by a regression test:
+- a byte-swapped IMG3 magic (every real Apple image was being rejected)
+- MMU **supersections** decoded as 1 MB sections, silently resolving the wrong
+  physical address
+- the Thumb **BLX suffix** decoded as a plain branch, sending calls into data
+- a 32-bit overflow in the bus bounds check
+
+Currently stalled ~40,237 instructions in: the kernel reaches code that reads
+per-CPU data before initialisation has set it up, which means control flow got
+there when it should not have. Diagnostics confirm this is the FIRST exception
+taken, so it is a stray branch rather than an early fault. Next step is finding
+the branch that goes astray.
+
+### ⚪ M4 — original plan
 Enough SoC fidelity (interrupt semantics, timers, cache/MMU maintenance ops,
 ARMv6 unaligned-access quirks) for the **real iPhone OS 3 XNU kernel** to
 initialize and emit console logs.

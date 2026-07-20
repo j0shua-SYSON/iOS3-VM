@@ -175,7 +175,7 @@ int main(int argc, char **argv) {
     arm_status_t st = ARM_OK;
     unsigned n = 0;
     uint32_t last_pc = entry_pa;
-    unsigned first_abort_at = 0;
+    unsigned first_abort_at = 0, first_exc = 0;
     uint32_t abort_dfar = 0, abort_dfsr = 0;
 
     for (; n < steps; n++) {
@@ -186,9 +186,28 @@ int main(int argc, char **argv) {
         tw = (tw + 1) % KTRACE;
         if (tcount < KTRACE) tcount++;
 
+        uint32_t mode_before = mach.cpu.cpsr & ARM_CPSR_MODE_MASK;
         st = arm_step(&mach.cpu);
         if (st != ARM_OK) break;
         s5l8900_tick(&mach, 1);
+
+        /* Report the first entry into an exception mode with the PC that caused
+         * it — the kernel reading uninitialised per-CPU data usually means an
+         * exception fired earlier than the kernel expected. */
+        {
+            uint32_t mode_after = mach.cpu.cpsr & ARM_CPSR_MODE_MASK;
+            if (!first_exc && mode_after != mode_before &&
+                (mode_after == ARM_MODE_ABT || mode_after == ARM_MODE_UND ||
+                 mode_after == ARM_MODE_IRQ || mode_after == ARM_MODE_FIQ)) {
+                first_exc = n;
+                printf("FIRST exception entry at instruction %u: mode %02x -> %02x,\n"
+                       "  caused by pc 0x%08x, vectored to 0x%08x\n"
+                       "  (IFSR 0x%08x IFAR 0x%08x  DFSR 0x%08x DFAR 0x%08x)\n\n",
+                       n, mode_before, mode_after, last_pc, mach.cpu.r[15],
+                       mach.cpu.cp15.ifsr, mach.cpu.cp15.ifar,
+                       mach.cpu.cp15.dfsr, mach.cpu.cp15.dfar);
+            }
+        }
 
         /* Catch the very first data abort and stop, so the trace above is the
          * code that actually faulted. */
