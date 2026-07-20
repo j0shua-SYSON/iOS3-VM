@@ -54,6 +54,10 @@ int main(int argc, char **argv) {
     unsigned steps = 2000000u;
     const char *dtpath = NULL;
     const char *cmdline = "debug=0x8 serial=1";
+    bool stop_on_abort = false;
+
+    for (int i = 2; i < argc; i++)
+        if (!strcmp(argv[i], "-a")) stop_on_abort = true;
 
     for (int i = 2; i + 1 < argc; i += 2) {
         if      (!strcmp(argv[i], "-p")) phys_base = (uint32_t)strtoul(argv[i+1], NULL, 0);
@@ -159,14 +163,60 @@ int main(int argc, char **argv) {
     mach.cpu.r[15] = entry_pa;
     mach.cpu.r[0]  = ba_pa;            /* XNU takes boot_args in r0 */
 
+    /*
+     * Ring buffer of recent execution. When the kernel faults we want the
+     * instructions that led there, not the state a few million instructions
+     * later once it is spinning in a handler.
+     */
+#define KTRACE 32
+    struct { uint32_t pc, cpsr, r[16]; } tr[KTRACE];
+    unsigned tw = 0, tcount = 0;
+
     arm_status_t st = ARM_OK;
     unsigned n = 0;
     uint32_t last_pc = entry_pa;
+    unsigned first_abort_at = 0;
+    uint32_t abort_dfar = 0, abort_dfsr = 0;
+
     for (; n < steps; n++) {
         last_pc = mach.cpu.r[15];
+        tr[tw].pc = last_pc;
+        tr[tw].cpsr = mach.cpu.cpsr;
+        memcpy(tr[tw].r, mach.cpu.r, sizeof mach.cpu.r);
+        tw = (tw + 1) % KTRACE;
+        if (tcount < KTRACE) tcount++;
+
         st = arm_step(&mach.cpu);
         if (st != ARM_OK) break;
         s5l8900_tick(&mach, 1);
+
+        /* Catch the very first data abort and stop, so the trace above is the
+         * code that actually faulted. */
+        if (!first_abort_at && mach.cpu.cp15.dfsr) {
+            first_abort_at = n;
+            abort_dfsr = mach.cpu.cp15.dfsr;
+            abort_dfar = mach.cpu.cp15.dfar;
+            if (stop_on_abort) { n++; break; }
+        }
+    }
+
+    if (first_abort_at) {
+        printf("FIRST data abort at instruction %u: DFSR 0x%08x  DFAR 0x%08x\n\n",
+               first_abort_at, abort_dfsr, abort_dfar);
+        printf("  instructions leading up to it (newest last):\n");
+        unsigned start = (tw + KTRACE - tcount) % KTRACE;
+        for (unsigned i = 0; i < tcount; i++) {
+            unsigned k = (start + i) % KTRACE;
+            printf("    %08x  %s\n", tr[k].pc,
+                   (tr[k].cpsr & ARM_CPSR_T) ? "Thumb" : "ARM");
+        }
+        unsigned last = (tw + KTRACE - 1) % KTRACE;
+        printf("\n  registers at the faulting instruction:\n");
+        for (int i = 0; i < 16; i += 4)
+            printf("    r%-2d %08x  r%-2d %08x  r%-2d %08x  r%-2d %08x\n",
+                   i, tr[last].r[i], i+1, tr[last].r[i+1],
+                   i+2, tr[last].r[i+2], i+3, tr[last].r[i+3]);
+        printf("\n");
     }
 
     mach.uart0.tx[mach.uart0.tx_len] = '\0';

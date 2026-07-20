@@ -672,6 +672,33 @@ static void test_thumb_cps(void) {
     CHECK((c.cpsr & ARM_CPSR_I) == 0, "CPSIE should unmask IRQs");
 }
 
+static void test_mmu_supersection(void) {
+    /* Regression from booting real XNU: a type-2 descriptor with bit 18 set is
+     * a 16 MB SUPERsection, taking its base from bits[31:24] and the offset
+     * from va[23:0] — a different split from the 1 MB section. Treating one as
+     * a section silently resolves the wrong physical address, and the kernel
+     * read garbage where a valid pointer lived. */
+    arm_cpu_t c;
+    memset(g_ram, 0, sizeof g_ram);
+    uint32_t super = 0x08000000u | (1u << 18) | (3u << 10) | 2u;
+    for (unsigned i = 0; i < 16; i++)
+        m_w32(NULL, 0x4000 + ((((0xc0000000u >> 20) + i)) << 2), super);
+    arm_reset(&c, &g_bus);
+    c.cp15.ttbr0 = 0x4000; c.cp15.dacr = 1u; c.cp15.sctlr |= ARM_SCTLR_M;
+
+    uint32_t pa = 0;
+    CHECK(arm_mmu_translate(&c, 0xc020e220u, false, true, &pa) == 0,
+          "supersection translation faulted");
+    CHECK(pa == 0x0820e220u,
+          "pa=%08x expect 0820e220 (supersection uses va[23:0])", pa);
+
+    /* A plain section must still use the 1 MB split. */
+    uint32_t sect = 0x08000000u | (3u << 10) | 2u;
+    m_w32(NULL, 0x4000 + ((0xc0000000u >> 20) << 2), sect);
+    CHECK(arm_mmu_translate(&c, 0xc0001234u, false, true, &pa) == 0, "section faulted");
+    CHECK(pa == 0x08001234u, "pa=%08x expect 08001234 (plain section)", pa);
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -729,6 +756,7 @@ int main(void) {
     test_thumb_extend_and_reverse();
     test_thumb_rev();
     test_thumb_cps();
+    test_mmu_supersection();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

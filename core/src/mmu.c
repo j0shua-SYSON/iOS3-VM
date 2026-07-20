@@ -68,12 +68,23 @@ uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, bool write, bool priv,
         return fsr_make(type == 2u ? ARM_FSR_SECTION_DOMAIN : ARM_FSR_PAGE_DOMAIN,
                         domain);
 
-    if (type == 2u) {                       /* 1 MB section */
+    if (type == 2u) {                       /* section or supersection */
         unsigned ap  = (l1 >> 10) & 3u;
         bool     apx = (l1 >> 15) & 1u;
         if (dac != 3u && !ap_permits(ap, apx, write, priv))
             return fsr_make(ARM_FSR_SECTION_PERMISSION, domain);
-        *pa = (l1 & 0xfff00000u) | (va & 0x000fffffu);
+
+        /*
+         * Bit 18 selects a 16 MB supersection, which takes its base from
+         * bits[31:24] and the offset from va[23:0] — a different split from the
+         * 1 MB section. Treating a supersection as a section silently resolves
+         * the wrong physical address, which is exactly how a real XNU kernel
+         * ended up reading garbage where a valid pointer lived.
+         */
+        if ((l1 >> 18) & 1u)
+            *pa = (l1 & 0xff000000u) | (va & 0x00ffffffu);
+        else
+            *pa = (l1 & 0xfff00000u) | (va & 0x000fffffu);
         return 0;
     }
 
