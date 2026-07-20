@@ -9,6 +9,7 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "img3.h"
+#include "aes.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -175,6 +176,58 @@ static void test_truncated_kbag_ignored(void) {
     CHECK(!img.kbag.present, "truncated kbag should not be marked present");
 }
 
+/* Build an encrypted image the way Apple does, then decrypt it back — the
+ * exact operation M3 performs on real firmware. */
+static void test_decrypt_data_roundtrip(void) {
+    static const uint8_t key[16] = {
+        0x0f,0x1e,0x2d,0x3c,0x4b,0x5a,0x69,0x78,
+        0x87,0x96,0xa5,0xb4,0xc3,0xd2,0xe1,0xf0
+    };
+    uint8_t iv[16];
+    for (unsigned i = 0; i < 16; i++) iv[i] = (uint8_t)(0x10 + i);
+
+    /* 32 bytes of "firmware" + a 5-byte unaligned tail. */
+    uint8_t plain[37];
+    for (unsigned i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i * 3 + 1);
+
+    uint8_t cipher[sizeof plain];
+    aes_ctx_t ctx;
+    aes_init(&ctx, key, 128);
+    aes_cbc_encrypt(&ctx, iv, plain, cipher, 32);
+    memcpy(cipher + 32, plain + 32, 5);            /* tail passes through */
+
+    uint8_t kbag[24 + 16];
+    memset(kbag, 0, sizeof kbag);
+    kbag[0] = 1; kbag[4] = 128;
+    memcpy(&kbag[8], iv, 16);
+
+    img_begin(0x69626f74u);
+    img_tag(IMG3_TAG_KBAG, kbag, sizeof kbag);
+    img_tag(IMG3_TAG_DATA, cipher, (uint32_t)sizeof cipher);
+    img_finish();
+
+    img3_t img;
+    CHECK(img3_parse(g_buf, g_len, &img) == IMG3_OK, "parse failed");
+
+    uint8_t out[sizeof plain];
+    uint32_t out_len = 0;
+    CHECK(img3_decrypt_data(&img, key, 128, out, &out_len), "decrypt failed");
+    CHECK(out_len == sizeof plain, "out_len=%u expect %u", out_len, (unsigned)sizeof plain);
+    CHECK(memcmp(out, plain, sizeof plain) == 0, "decrypted payload mismatch");
+}
+
+static void test_decrypt_requires_kbag(void) {
+    static const uint8_t key[16] = {0};
+    img_begin(0x69626f74u);
+    img_tag(IMG3_TAG_DATA, "0123456789abcdef", 16);
+    img_finish();
+    img3_t img;
+    CHECK(img3_parse(g_buf, g_len, &img) == IMG3_OK, "parse failed");
+    uint8_t out[16];
+    CHECK(!img3_decrypt_data(&img, key, 128, out, NULL),
+          "decrypt without a KBAG should fail");
+}
+
 int main(void) {
     printf("iOS3-VM IMG3 parser tests\n");
     test_parse_minimal();
@@ -186,6 +239,8 @@ int main(void) {
     test_reject_tag_data_exceeds_tag();
     test_reject_zero_length_tag();
     test_truncated_kbag_ignored();
+    test_decrypt_data_roundtrip();
+    test_decrypt_requires_kbag();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

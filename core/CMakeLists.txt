@@ -8,6 +8,7 @@ add_library(emucore STATIC
     src/soc/timer.c
     src/soc/machine.c
     src/firmware/img3.c
+    src/firmware/aes.c
 )
 target_include_directories(emucore PUBLIC include)
 
@@ -27,3 +28,7 @@ add_test(NAME s5l8900_machine COMMAND test_soc)
 add_executable(test_img3 tests/test_img3.c)
 target_link_libraries(test_img3 PRIVATE emucore)
 add_test(NAME img3_parser COMMAND test_img3)
+
+add_executable(test_aes tests/test_aes.c)
+target_link_libraries(test_aes PRIVATE emucore)
+add_test(NAME aes_fips197 COMMAND test_aes)

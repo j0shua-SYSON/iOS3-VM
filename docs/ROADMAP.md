@@ -85,7 +85,12 @@ on the phone."
   containers are rejected rather than read out of bounds (tests cover oversized
   fullSize, tags past the end, dataLen exceeding its tag, and the zero-length
   tag that would otherwise loop forever).
-- Remaining: AES-CBC decryption of DATA, NOR + NAND with the FTL/VFL layers,
+- **Done: AES-CBC decryption.** A self-contained AES (128/192/256)
+  implementation, validated against the FIPS-197 known-answer vectors, wired
+  into the IMG3 parser: given a user-supplied key it decrypts the DATA payload
+  using the KBAG's IV, passing any unaligned tail through unchanged. No
+  OpenSSL, so the core keeps its zero-dependency property.
+- Remaining: NOR + NAND with the FTL/VFL layers,
   device tree. Execute Apple's real low-level boot chain far enough to see
   **iBoot** serial output.
 *Requires the user to supply their own iPhone OS 3.1.3 IPSW + the public

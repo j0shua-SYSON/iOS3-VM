@@ -10,6 +10,7 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "img3.h"
+#include "aes.h"
 #include <string.h>
 
 /* On-disk header: magic, fullSize, sizeNoPack, sigCheckArea, ident. */
@@ -39,6 +40,27 @@ const char *img3_strerror(img3_status_t st) {
         case IMG3_ERR_BAD_TAG:   return "a tag runs past the end of the container";
         default:                 return "unknown error";
     }
+}
+
+bool img3_decrypt_data(const img3_t *img, const uint8_t *key, unsigned key_bits,
+                       uint8_t *out, uint32_t *out_len) {
+    if (!img || !img->data || !key || !out) return false;
+    if (!img->kbag.present) return false;          /* no IV to work with */
+
+    aes_ctx_t ctx;
+    if (!aes_init(&ctx, key, key_bits)) return false;
+
+    /* Real payloads are not always a whole number of blocks; CBC covers the
+     * aligned prefix and the remainder is passed through unchanged. */
+    uint32_t whole = img->data_len & ~(AES_BLOCK_SIZE - 1u);
+    uint32_t tail  = img->data_len - whole;
+
+    if (whole && !aes_cbc_decrypt(&ctx, img->kbag.iv, img->data, out, whole))
+        return false;
+    if (tail) memcpy(out + whole, img->data + whole, tail);
+
+    if (out_len) *out_len = img->data_len;
+    return true;
 }
 
 static void parse_kbag(const uint8_t *d, uint32_t len, img3_kbag_t *k) {

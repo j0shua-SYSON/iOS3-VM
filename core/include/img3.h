@@ -79,6 +79,20 @@ typedef struct {
  * outlive it. Returns IMG3_OK or a specific error. */
 img3_status_t img3_parse(const uint8_t *buf, size_t len, img3_t *out);
 
+/*
+ * Decrypt the DATA payload with a user-supplied AES key, using the IV from the
+ * image's KBAG. Apple encrypts 3.x firmware with AES-CBC; the keys are
+ * published by the community and supplied by the user (we ship none).
+ *
+ * `out` must have room for img.data_len bytes. Only whole 16-byte blocks are
+ * decrypted; any trailing partial block is copied through verbatim, which is
+ * what real images need since their payloads are not always block-aligned.
+ * Returns false if the image has no DATA, no usable KBAG IV, or the key size
+ * is invalid. `out_len` receives the number of bytes written.
+ */
+bool img3_decrypt_data(const img3_t *img, const uint8_t *key, unsigned key_bits,
+                       uint8_t *out, uint32_t *out_len);
+
 /* Human-readable status, for logs and the app UI. */
 const char *img3_strerror(img3_status_t st);
 
