@@ -263,6 +263,76 @@ static void test_imm_dp_not_trapped(void) {
     CHECK(c.r[0] == 0x90, "r0=%08x expect 90", c.r[0]);
 }
 
+static void test_banked_sp_per_mode(void) {
+    /* r13 is banked per mode: a value written in SVC must not be visible in IRQ,
+     * and must come back when we switch back. */
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_set_mode(&c, ARM_MODE_SVC);
+    c.r[13] = 0xAAAA0000u;
+    arm_set_mode(&c, ARM_MODE_IRQ);
+    CHECK(c.r[13] != 0xAAAA0000u, "sp_irq leaked sp_svc (%08x)", c.r[13]);
+    c.r[13] = 0xBBBB0000u;
+    arm_set_mode(&c, ARM_MODE_SVC);
+    CHECK(c.r[13] == 0xAAAA0000u, "sp_svc=%08x expect aaaa0000 after switch back", c.r[13]);
+    arm_set_mode(&c, ARM_MODE_IRQ);
+    CHECK(c.r[13] == 0xBBBB0000u, "sp_irq=%08x expect bbbb0000", c.r[13]);
+}
+
+static void test_fiq_banks_r8_r12(void) {
+    /* FIQ additionally banks r8-r12. */
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_set_mode(&c, ARM_MODE_SVC);
+    c.r[8] = 0x1234;
+    arm_set_mode(&c, ARM_MODE_FIQ);
+    CHECK(c.r[8] != 0x1234, "r8_fiq leaked r8_usr (%08x)", c.r[8]);
+    c.r[8] = 0x5678;
+    arm_set_mode(&c, ARM_MODE_SVC);
+    CHECK(c.r[8] == 0x1234, "r8=%08x expect 1234 restored", c.r[8]);
+}
+
+static void test_mrs_reads_cpsr(void) {
+    /* MRS r0, CPSR */
+    uint32_t p[] = { 0xe10f0000 };
+    arm_cpu_t c; load_and_run(&c, p, 1, 1);
+    CHECK(c.r[0] == c.cpsr, "r0=%08x expect cpsr=%08x", c.r[0], c.cpsr);
+}
+
+static void test_msr_switches_mode(void) {
+    /* MOV r0,#0xD2 (IRQ mode, I set) ; MSR CPSR_c, r0 -> mode becomes IRQ */
+    uint32_t p[] = { 0xe3a000d2 /*MOV r0,#0xD2*/,
+                     0xe121f000 /*MSR CPSR_c, r0*/ };
+    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_IRQ,
+          "mode=%02x expect IRQ(12)", c.cpsr & ARM_CPSR_MODE_MASK);
+}
+
+static void test_swi_enters_svc(void) {
+    /* SWI #0 from SYS mode: vectors to 0x08, enters SVC, LR=return, SPSR=old. */
+    uint32_t p[] = { 0xef000000 /*SWI #0*/ };
+    arm_cpu_t c; load_and_run(&c, p, 1, 1);
+    CHECK(c.r[15] == ARM_VEC_SWI, "pc=%08x expect 08 (SWI vector)", c.r[15]);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC,
+          "mode=%02x expect SVC(13)", c.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK(c.r[14] == 4, "lr_svc=%08x expect 4 (return address)", c.r[14]);
+    CHECK((c.cpsr & ARM_CPSR_I) != 0, "IRQs should be masked on exception entry");
+    CHECK((c.spsr[ARM_BANK_SVC] & ARM_CPSR_MODE_MASK) == ARM_MODE_SYS,
+          "spsr_svc should record the interrupted SYS mode");
+}
+
+static void test_exception_return_restores_mode(void) {
+    /* Full round trip: SWI from SYS lands in SVC; the handler pushes LR and
+     * returns with LDMIA sp!,{pc}^ which restores CPSR from SPSR (back to SYS). */
+    uint32_t p[16] = {0};
+    p[0] = 0xef000000;                 /* 0x00: SWI #0 -> vectors to 0x08 */
+    p[2] = 0xe3a0dc09;                 /* 0x08: MOV sp,#0x900 (sp_svc)    */
+    p[3] = 0xe92d4000;                 /* 0x0c: STMDB sp!,{lr}            */
+    p[4] = 0xe8fd8000;                 /* 0x10: LDMIA sp!,{pc}^  (return) */
+    arm_cpu_t c; load_and_run(&c, p, 16, 4);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SYS,
+          "mode=%02x expect back in SYS(1f)", c.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK(c.r[15] == 4, "pc=%08x expect 4 (returned after the SWI)", c.r[15]);
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -287,6 +357,12 @@ int main(void) {
     test_stmia_ldmia();
     test_push_pop();
     test_ldm_to_pc_branches();
+    test_banked_sp_per_mode();
+    test_fiq_banks_r8_r12();
+    test_mrs_reads_cpsr();
+    test_msr_switches_mode();
+    test_swi_enters_svc();
+    test_exception_return_restores_mode();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

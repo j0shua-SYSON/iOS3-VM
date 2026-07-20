@@ -24,8 +24,60 @@ static inline bool get_flag(const arm_cpu_t *c, uint32_t bit) {
     return (c->cpsr & bit) != 0;
 }
 
+arm_bank_t arm_bank_of_mode(uint32_t mode) {
+    switch (mode & ARM_CPSR_MODE_MASK) {
+        case ARM_MODE_FIQ: return ARM_BANK_FIQ;
+        case ARM_MODE_IRQ: return ARM_BANK_IRQ;
+        case ARM_MODE_SVC: return ARM_BANK_SVC;
+        case ARM_MODE_ABT: return ARM_BANK_ABT;
+        case ARM_MODE_UND: return ARM_BANK_UND;
+        default:           return ARM_BANK_USR;   /* USR and SYS share a bank */
+    }
+}
+
+void arm_set_mode(arm_cpu_t *c, uint32_t mode) {
+    uint32_t old = c->cpsr & ARM_CPSR_MODE_MASK;
+    mode &= ARM_CPSR_MODE_MASK;
+    arm_bank_t ob = arm_bank_of_mode(old), nb = arm_bank_of_mode(mode);
+
+    if (ob != nb) {
+        /* Park the outgoing bank, then load the incoming one. */
+        c->bank_r13[ob] = c->r[13];
+        c->bank_r14[ob] = c->r[14];
+
+        /* FIQ additionally banks r8–r12. */
+        if (ob == ARM_BANK_FIQ) {
+            for (int i = 0; i < 5; i++) { c->fiq_r8_12[i] = c->r[8+i]; c->r[8+i] = c->usr_r8_12[i]; }
+        } else if (nb == ARM_BANK_FIQ) {
+            for (int i = 0; i < 5; i++) { c->usr_r8_12[i] = c->r[8+i]; c->r[8+i] = c->fiq_r8_12[i]; }
+        }
+
+        c->r[13] = c->bank_r13[nb];
+        c->r[14] = c->bank_r14[nb];
+    }
+    c->cpsr = (c->cpsr & ~ARM_CPSR_MODE_MASK) | mode;
+}
+
+/* Enter an exception: bank in the handler mode, stash the return address in its
+ * LR and the old CPSR in its SPSR, mask interrupts, and vector the PC. */
+static void take_exception(arm_cpu_t *c, uint32_t vector, uint32_t mode,
+                           uint32_t ret_addr, bool mask_fiq, uint32_t *next) {
+    uint32_t saved = c->cpsr;
+    arm_set_mode(c, mode);
+    c->spsr[arm_bank_of_mode(mode)] = saved;
+    c->r[14] = ret_addr;
+    c->cpsr |= ARM_CPSR_I;                 /* IRQs off on entry */
+    if (mask_fiq) c->cpsr |= ARM_CPSR_F;
+    c->cpsr &= ~ARM_CPSR_T;                /* exceptions enter in ARM state */
+    *next = vector;
+}
+
 void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
     for (int i = 0; i < 16; i++) cpu->r[i] = 0;
+    for (int i = 0; i < ARM_BANK_COUNT; i++) {
+        cpu->spsr[i] = 0; cpu->bank_r13[i] = 0; cpu->bank_r14[i] = 0;
+    }
+    for (int i = 0; i < 5; i++) { cpu->fiq_r8_12[i] = 0; cpu->usr_r8_12[i] = 0; }
     /* On reset the ARM1176 enters SVC mode with IRQ+FIQ disabled and begins
      * execution from the reset vector (0x0, or 0xffff0000 with high vectors).
      * We start at 0x0; the machine layer relocates PC as needed. */
@@ -184,7 +236,59 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
             *next = reg_read(c, pc, insn & 0xf) & ~1u;
             return ARM_OK;
         }
-        return ARM_UNDEFINED;                                /* MRS/MSR/CLZ/SWP: M1 work */
+
+        {
+            bool spsr = (insn >> 22) & 1u;   /* R bit: 0 = CPSR, 1 = SPSR */
+            arm_bank_t bank = arm_bank_of_mode(c->cpsr);
+            bool has_spsr = (bank != ARM_BANK_USR);
+
+            /* MRS Rd, <psr>: cccc 00010 R 001111 dddd 000000000000 */
+            if ((insn & 0x0fbf0fffu) == 0x010f0000u) {
+                if (spsr && !has_spsr) return ARM_UNDEFINED; /* no SPSR in USR/SYS */
+                c->r[rd] = spsr ? c->spsr[bank] : c->cpsr;
+                return ARM_OK;
+            }
+
+            /* MSR <psr>_fields, Rm | #imm:
+             *   register:  cccc 00010 R 10 mask 1111 00000000 mmmm
+             *   immediate: cccc 00110 R 10 mask 1111 rot   imm8   */
+            if ((insn & 0x0fb00000u) == 0x01200000u ||
+                (insn & 0x0fb00000u) == 0x03200000u) {
+                unsigned fields = (insn >> 16) & 0xfu;
+                uint32_t val;
+                if (insn & (1u << 25)) {                     /* immediate form */
+                    val = ror32(insn & 0xffu, ((insn >> 8) & 0xfu) * 2u);
+                } else {
+                    val = reg_read(c, pc, insn & 0xfu);
+                }
+                uint32_t mask = 0;
+                if (fields & 1u) mask |= 0x000000ffu;        /* c: control (mode, I/F/T) */
+                if (fields & 2u) mask |= 0x0000ff00u;        /* x: extension            */
+                if (fields & 4u) mask |= 0x00ff0000u;        /* s: status               */
+                if (fields & 8u) mask |= 0xff000000u;        /* f: flags                */
+
+                if (spsr) {
+                    if (!has_spsr) return ARM_UNDEFINED;
+                    c->spsr[bank] = (c->spsr[bank] & ~mask) | (val & mask);
+                } else {
+                    /* User mode may only change the flags byte. */
+                    if (!has_spsr && (c->cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR)
+                        mask &= 0xff000000u;
+                    uint32_t newcpsr = (c->cpsr & ~mask) | (val & mask);
+                    if ((mask & 0x1fu) && (newcpsr & ARM_CPSR_MODE_MASK)
+                                          != (c->cpsr & ARM_CPSR_MODE_MASK)) {
+                        /* Mode field changed: rebank, then apply the rest. */
+                        arm_set_mode(c, newcpsr);
+                        c->cpsr = (c->cpsr & ARM_CPSR_MODE_MASK)
+                                | (newcpsr & ~ARM_CPSR_MODE_MASK);
+                    } else {
+                        c->cpsr = newcpsr;
+                    }
+                }
+                return ARM_OK;
+            }
+        }
+        return ARM_UNDEFINED;                                /* CLZ, saturating/DSP: later */
     }
 
     bool shifter_carry = get_flag(c, ARM_CPSR_C);
@@ -321,11 +425,16 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
     unsigned rn = (insn >> 16) & 0xf;
     uint32_t list = insn & 0xffffu;
 
-    /* S=1 means "use the user-mode register bank" or "restore CPSR from SPSR".
-     * Both need banked registers/SPSR, which this milestone does not model —
-     * trap rather than silently doing the wrong thing. */
-    if (S) return ARM_UNDEFINED;
     if (list == 0) return ARM_UNDEFINED;     /* empty list is unpredictable */
+
+    /* S=1 has two meanings. With PC in a load list it is an exception return
+     * (CPSR <- SPSR); otherwise it transfers the *user* bank, which needs more
+     * plumbing than we have, so that variant still traps. */
+    bool restore_cpsr = false;
+    if (S) {
+        if (L && (list & (1u << 15))) restore_cpsr = true;
+        else return ARM_UNDEFINED;
+    }
 
     unsigned n = 0;
     for (unsigned i = 0; i < 16; i++) if (list & (1u << i)) n++;
@@ -349,6 +458,16 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
 
     /* On LDM with Rn in the list, the loaded value wins over writeback. */
     if (W && !(L && (list & (1u << rn)))) c->r[rn] = wb;
+
+    /* Exception return: writeback lands in the handler's banked Rn above,
+     * then CPSR <- SPSR rebanks us into the interrupted mode. */
+    if (restore_cpsr) {
+        arm_bank_t b = arm_bank_of_mode(c->cpsr);
+        if (b == ARM_BANK_USR) return ARM_UNDEFINED;   /* no SPSR in USR/SYS */
+        uint32_t s = c->spsr[b];
+        arm_set_mode(c, s);
+        c->cpsr = (c->cpsr & ARM_CPSR_MODE_MASK) | (s & ~ARM_CPSR_MODE_MASK);
+    }
     return ARM_OK;
 }
 
@@ -409,6 +528,8 @@ arm_status_t arm_step(arm_cpu_t *c) {
          * set (e.g. MOV r0,#0x90), so it must NOT be trapped here. MUL/MLA are
          * handled above; these are unimplemented — trap rather than corrupt Rd. */
         st = ARM_UNDEFINED;
+    } else if ((insn & 0x0f000000u) == 0x0f000000u) {     /* SWI / SVC */
+        take_exception(c, ARM_VEC_SWI, ARM_MODE_SVC, pc + 4, false, &next);
     } else if ((insn & 0x0c000000u) == 0x00000000u) {     /* data processing / PSR */
         st = exec_data_processing(c, pc, insn, &next);
     } else {

@@ -21,6 +21,21 @@
 #define ARM_CPSR_C (1u << 29) /* Carry    */
 #define ARM_CPSR_V (1u << 28) /* Overflow */
 
+/* CPSR control bits. */
+#define ARM_CPSR_I (1u << 7)  /* IRQ disable  */
+#define ARM_CPSR_F (1u << 6)  /* FIQ disable  */
+#define ARM_CPSR_T (1u << 5)  /* Thumb state  */
+#define ARM_CPSR_MODE_MASK 0x1fu
+
+/* Exception vector addresses (low vectors; CP15 high vectors come later). */
+#define ARM_VEC_RESET      0x00u
+#define ARM_VEC_UNDEFINED  0x04u
+#define ARM_VEC_SWI        0x08u
+#define ARM_VEC_PREFETCH   0x0cu
+#define ARM_VEC_DATA_ABORT 0x10u
+#define ARM_VEC_IRQ        0x18u
+#define ARM_VEC_FIQ        0x1cu
+
 /* Processor modes (CPSR[4:0]). Only the ones we currently model are named. */
 #define ARM_MODE_USR 0x10
 #define ARM_MODE_FIQ 0x11
@@ -52,12 +67,32 @@ typedef struct arm_bus {
     void     (*write8 )(void *ctx, uint32_t addr, uint8_t  val);
 } arm_bus_t;
 
+/*
+ * Register banks. ARM banks r13/r14 per privileged mode, and additionally
+ * banks r8–r12 for FIQ. USR and SYS share one bank and have no SPSR.
+ */
+typedef enum {
+    ARM_BANK_USR = 0, ARM_BANK_FIQ, ARM_BANK_IRQ,
+    ARM_BANK_SVC, ARM_BANK_ABT, ARM_BANK_UND, ARM_BANK_COUNT
+} arm_bank_t;
+
 typedef struct arm_cpu {
     uint32_t r[16];      /* r0–r15; r15 is PC (address of current instruction) */
     uint32_t cpsr;
+    uint32_t spsr[ARM_BANK_COUNT];     /* saved CPSR per privileged bank        */
+    uint32_t bank_r13[ARM_BANK_COUNT]; /* banked stack pointers                 */
+    uint32_t bank_r14[ARM_BANK_COUNT]; /* banked link registers                 */
+    uint32_t fiq_r8_12[5];             /* FIQ's private r8–r12                  */
+    uint32_t usr_r8_12[5];             /* user r8–r12 parked while in FIQ mode  */
     uint64_t cycles;     /* retired-instruction counter (1 insn == 1 tick for now) */
     const arm_bus_t *bus;
 } arm_cpu_t;
+
+/* Which bank a CPSR mode value selects (USR and SYS share ARM_BANK_USR). */
+arm_bank_t arm_bank_of_mode(uint32_t mode);
+
+/* Switch processor mode, swapping the banked registers in and out. */
+void arm_set_mode(arm_cpu_t *cpu, uint32_t mode);
 
 /* Put the core into a defined post-reset state (SVC mode, IRQ/FIQ masked). */
 void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus);
