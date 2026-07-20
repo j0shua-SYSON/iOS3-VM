@@ -94,6 +94,16 @@ img3_status_t img3_parse(const uint8_t *buf, size_t len, img3_t *out);
 bool img3_decrypt_data(const img3_t *img, const uint8_t *key, unsigned key_bits,
                        uint8_t *out, uint32_t *out_len);
 
+/*
+ * As above, but with an explicit IV. This is the form real firmware needs: the
+ * IV stored in the KBAG is RSA/GID-wrapped, whereas the IV published alongside
+ * the key by the reverse-engineering community is the unwrapped one. They are
+ * different values, so decrypting with the KBAG's IV would silently produce
+ * garbage in the first block.
+ */
+bool img3_decrypt_data_iv(const img3_t *img, const uint8_t *key, unsigned key_bits,
+                          const uint8_t iv[16], uint8_t *out, uint32_t *out_len);
+
 /* Human-readable status, for logs and the app UI. */
 const char *img3_strerror(img3_status_t st);
 

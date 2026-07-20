@@ -97,7 +97,7 @@ static void list_tags(const uint8_t *buf, size_t len) {
     }
 }
 
-static int describe(const char *path, const char *keyhex, const char *outpath) {
+static int describe(const char *path, const char *keyhex, const char *ivhex, const char *outpath) {
     size_t len = 0;
     uint8_t *buf = slurp(path, &len);
     if (!buf) return 1;
@@ -152,9 +152,23 @@ static int describe(const char *path, const char *keyhex, const char *outpath) {
             free(buf);
             return 1;
         }
+        /* Prefer an explicitly supplied IV: the KBAG's is wrapped. */
+        uint8_t iv[16];
+        bool have_iv = false;
+        if (ivhex) {
+            if (parse_hex_key(ivhex, iv, sizeof iv) != 128) {
+                fprintf(stderr, "iv must be 32 hex characters\n");
+                free(buf);
+                return 1;
+            }
+            have_iv = true;
+        }
         uint8_t *plain = malloc(img.data_len);
         uint32_t n = 0;
-        if (plain && img3_decrypt_data(&img, key, bits, plain, &n)) {
+        bool ok = plain && (have_iv
+                    ? img3_decrypt_data_iv(&img, key, bits, iv, plain, &n)
+                    : img3_decrypt_data(&img, key, bits, plain, &n));
+        if (ok) {
             printf("decrypted   : %u bytes with a %u-bit key\n", n, bits);
             printf("first 32 bytes of plaintext:\n");
             hexdump(plain, n < 32 ? n : 32, "  ");
@@ -215,10 +229,11 @@ int main(int argc, char **argv) {
         if (argc < 3) { fprintf(stderr, "-s needs a file\n"); return 1; }
         return scan(argv[2]);
     }
-    const char *keyhex = NULL, *outpath = NULL;
+    const char *keyhex = NULL, *ivhex = NULL, *outpath = NULL;
     for (int i = 2; i + 1 < argc; i += 2) {
         if (strcmp(argv[i], "-k") == 0) keyhex = argv[i + 1];
+        else if (strcmp(argv[i], "-iv") == 0) ivhex = argv[i + 1];
         else if (strcmp(argv[i], "-o") == 0) outpath = argv[i + 1];
     }
-    return describe(argv[1], keyhex, outpath);
+    return describe(argv[1], keyhex, ivhex, outpath);
 }

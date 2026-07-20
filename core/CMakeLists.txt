@@ -14,6 +14,7 @@ add_library(emucore STATIC
     src/firmware/aes.c
     src/firmware/loader.c
     src/firmware/devicetree.c
+    src/firmware/lzss.c
 )
 target_include_directories(emucore PUBLIC include)
 
@@ -46,6 +47,10 @@ add_executable(test_devicetree tests/test_devicetree.c)
 target_link_libraries(test_devicetree PRIVATE emucore)
 add_test(NAME device_tree COMMAND test_devicetree)
 
+add_executable(test_lzss tests/test_lzss.c)
+target_link_libraries(test_lzss PRIVATE emucore)
+add_test(NAME lzss COMMAND test_lzss)
+
 add_executable(test_nand tests/test_nand.c)
 target_link_libraries(test_nand PRIVATE emucore)
 add_test(NAME nand_device COMMAND test_nand)
@@ -60,3 +65,6 @@ target_link_libraries(img3dump PRIVATE emucore)
 # where and why it stopped — the diagnostic that says what to build next.
 add_executable(runfw ../tools/runfw.c)
 target_link_libraries(runfw PRIVATE emucore)
+
+add_executable(unlzss ../tools/unlzss.c)
+target_link_libraries(unlzss PRIVATE emucore)

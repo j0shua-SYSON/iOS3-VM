@@ -44,8 +44,13 @@ const char *img3_strerror(img3_status_t st) {
 
 bool img3_decrypt_data(const img3_t *img, const uint8_t *key, unsigned key_bits,
                        uint8_t *out, uint32_t *out_len) {
-    if (!img || !img->data || !key || !out) return false;
-    if (!img->kbag.present) return false;          /* no IV to work with */
+    if (!img || !img->kbag.present) return false;  /* no IV to work with */
+    return img3_decrypt_data_iv(img, key, key_bits, img->kbag.iv, out, out_len);
+}
+
+bool img3_decrypt_data_iv(const img3_t *img, const uint8_t *key, unsigned key_bits,
+                          const uint8_t iv[16], uint8_t *out, uint32_t *out_len) {
+    if (!img || !img->data || !key || !out || !iv) return false;
 
     aes_ctx_t ctx;
     if (!aes_init(&ctx, key, key_bits)) return false;
@@ -55,7 +60,7 @@ bool img3_decrypt_data(const img3_t *img, const uint8_t *key, unsigned key_bits,
     uint32_t whole = img->data_len & ~(AES_BLOCK_SIZE - 1u);
     uint32_t tail  = img->data_len - whole;
 
-    if (whole && !aes_cbc_decrypt(&ctx, img->kbag.iv, img->data, out, whole))
+    if (whole && !aes_cbc_decrypt(&ctx, iv, img->data, out, whole))
         return false;
     if (tail) memcpy(out + whole, img->data + whole, tail);
 
