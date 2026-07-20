@@ -843,6 +843,48 @@ int main(int argc, char **argv) {
         }
     }
 
+    /*
+     * Clamp memSize to the kernel's static-map ceiling — the fix for the
+     * "sleh_abort at interrupt context" panic in early VM bring-up.
+     *
+     * arm_vm_init hardcodes the start of the DYNAMIC kernel address space at
+     * virtual_avail = 0xe0000000 (MEASURED: `movs r0,#0xe0; lsls r0,#24` at
+     * arm_vm_init+0x18c, passed to pmap_bootstrap). So the kernel's identity /
+     * physical-linear window is fixed at [gVirtBase, 0xe0000000) = 512 MB, and
+     * everything pmap_steal_memory hands out (zdata, the bootstrap zones) lives
+     * at 0xe0000000 and up.
+     *
+     * zone_bootstrap()'s zcram runs BEFORE pmap_init() (the vm_mem_bootstrap
+     * order is vm_page_bootstrap -> zone_bootstrap -> ... -> pmap_init), and for
+     * every element it calls zone_virtual_addr(), which treats any address in
+     * [gVirtBase, gVirtBase + mem_size) as identity-mapped and dereferences
+     * pv_head_table[(phys - vm_first_phys) >> 12]. Before pmap_init that table
+     * is all zero and vm_first_phys is 0, so the entry is NULL and [NULL+8]
+     * faults — the null-zone data abort at _zone_virtual_addr+0x2c.
+     *
+     * The ONLY thing that keeps this from firing is zone_virtual_addr's
+     * early-out: it returns the address untouched when (addr - gVirtBase) >=
+     * mem_size. Real S5L8900/S5L8920 devices ship <=256 MB, so mem_size never
+     * reaches 0xe0000000 and the steal region always early-outs. With mem_size
+     * > 512 MB the window swallows the steal region and the boot panics.
+     *
+     * The kernel cannot address DRAM past 0xe0000000 anyway, so advertising more
+     * is pointless as well as fatal. Cap it. (This is independent of where the
+     * RAM disk sits: virtual_avail is 0xe0000000 for a 12 MB or a 413 MB disk
+     * alike — placement does not change it, MEASURED.)
+     */
+    const uint32_t KERN_MEMSIZE_MAX = 0x20000000u;   /* 512 MB: gVirtBase..0xe0000000 */
+    if (ram_size > KERN_MEMSIZE_MAX) {
+        fprintf(stderr,
+                "note: capping guest RAM %u MB -> %u MB — xnu-1357 arm_vm_init fixes\n"
+                "      virtual_avail at 0xe0000000, so mem_size above 512 MB makes\n"
+                "      zone_bootstrap's early zone_virtual_addr() fault on an\n"
+                "      uninitialised pv_head_table (panic: sleh_abort at interrupt\n"
+                "      context). The kernel cannot use DRAM past 0xe0000000 anyway.\n",
+                ram_size >> 20, KERN_MEMSIZE_MAX >> 20);
+        ram_size = KERN_MEMSIZE_MAX;
+    }
+
     size_t len = 0;
     uint8_t *img = slurp(argv[1], &len);
     if (!img) return 1;
