@@ -1435,6 +1435,14 @@ int main(int argc, char **argv) {
     printf("  IFSR/IFAR      : 0x%08x / 0x%08x\n", mach.cpu.cp15.ifsr, mach.cpu.cp15.ifar);
     printf("  unmapped reads : %llu\n", (unsigned long long)mach.unmapped_reads);
     printf("  unmapped writes: %llu\n", (unsigned long long)mach.unmapped_writes);
+    for (unsigned v = 0; v < S5L8900_VIC_COUNT; v++)
+        printf("  VIC%u           : raw=%08x soft=%08x en=%08x sel=%08x  irq=%d fiq=%d\n",
+               v, mach.vic[v].raw, mach.vic[v].soft, mach.vic[v].enable,
+               mach.vic[v].select,
+               s5l_vic_irq(&mach.vic[v]), s5l_vic_fiq(&mach.vic[v]));
+    printf("  CLCD           : status=%08x mask=%08x scanning=%d\n",
+           mach.clcd.intstatus, mach.clcd.intmask, mach.clcd.scanning);
+    printf("  CPU lines      : irq=%d fiq=%d\n", mach.cpu.irq_line, mach.cpu.fiq_line);
 
     if (mach.unmapped_addr_count) {
         printf("\n  touched outside the memory map (page-granular):\n");
