@@ -32,6 +32,32 @@ static inline bool in_timer(uint32_t a) {
            (uint64_t)a < (uint64_t)S5L8900_TIMER_BASE + S5L8900_TIMER_SIZE;
 }
 
+/* ------------------------------------------------------- stub windows --- */
+
+bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
+                      const char *name) {
+    if (m->stub_count >= S5L_STUB_MAX || !size) return false;
+    /* Refuse to shadow an existing window: a stub that quietly overlays a real
+     * device model would be far harder to notice than a rejected call. */
+    for (unsigned i = 0; i < m->stub_count; i++) {
+        uint64_t a0 = m->stubs[i].base, a1 = a0 + m->stubs[i].size;
+        uint64_t b0 = base,             b1 = b0 + size;
+        if (b0 < a1 && a0 < b1) return false;
+    }
+    s5l_stub_t *s = &m->stubs[m->stub_count++];
+    memset(s, 0, sizeof *s);
+    s->base = base; s->size = size; s->name = name;
+    return true;
+}
+
+static s5l_stub_t *find_stub(s5l8900_t *m, uint32_t a) {
+    for (unsigned i = 0; i < m->stub_count; i++)
+        if (a >= m->stubs[i].base &&
+            (uint64_t)a < (uint64_t)m->stubs[i].base + m->stubs[i].size)
+            return &m->stubs[i];
+    return NULL;
+}
+
 /* ------------------------------------------------------------- reads --- */
 
 /* Record the first distinct out-of-map addresses so a wandering guest tells us
@@ -71,10 +97,17 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
                (uint64_t)addr < (uint64_t)S5L8900_NOR_BASE + m->nor.size) {
         v = s5l_nor_read(&m->nor, addr - S5L8900_NOR_BASE, bytes);
     } else {
-        m->unmapped_reads++;
-        note_unmapped(m, addr);
-        note_device(m, addr, 0, false);
-        return 0;
+        s5l_stub_t *s = find_stub(m, addr);
+        if (!s) {
+            m->unmapped_reads++;
+            note_unmapped(m, addr);
+            note_device(m, addr, 0, false);
+            return 0;
+        }
+        uint32_t off = (addr - s->base) >> 2;
+        s->reads++;
+        if (off < S5L_STUB_REGS) v = s->regs[off];
+        else { s->oob++; v = 0; }
     }
     note_device(m, addr, v, false);
     return v;
@@ -110,6 +143,17 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
          * jailbreak does — without a full SPI protocol model. */
         s5l_nor_write(&m->nor, addr - S5L8900_NOR_BASE, val, bytes);
         return;
+    }
+    {
+        s5l_stub_t *s = find_stub(m, addr);
+        if (s) {
+            uint32_t off = (addr - s->base) >> 2;
+            s->writes++;
+            note_device(m, addr, val, true);
+            if (off < S5L_STUB_REGS) s->regs[off] = val;
+            else s->oob++;
+            return;
+        }
     }
     m->unmapped_writes++;
     note_unmapped(m, addr);

@@ -216,6 +216,35 @@ const s5l_nor_entry_t *s5l_nor_find(const s5l_nor_t *n, uint32_t ident);
 #define S5L_UNMAPPED_LOG 32
 #define S5L_DEVLOG        256
 
+/* --------------------------------------------------------- stub windows ---
+ * A named, register-backed MMIO window for a peripheral we have identified but
+ * not yet modelled.
+ *
+ * This is a deliberate, bounded exception to this core's "trap what you don't
+ * implement" rule, and it is worth being precise about why. For an MMIO window
+ * there is no option that avoids making a claim: returning 0 for an unmapped
+ * read is *already* a guess, and a demonstrably dangerous one — a driver
+ * polling a status bit that reads 0 forever spun on one such window for
+ * 3.9 million reads, about 2% of an entire boot.
+ *
+ * A stub is therefore honest storage rather than invented behaviour: reads
+ * return what was last written, writes are recorded, and every window is named
+ * and counted so it appears in the report instead of hiding. What a stub must
+ * never do is fabricate a value the guest is waiting for. When a driver needs a
+ * bit to change on its own, that is a real device model, not a stub, and it
+ * belongs in its own file.
+ */
+#define S5L_STUB_MAX      16
+#define S5L_STUB_REGS     64          /* 4-byte registers kept per window */
+
+typedef struct {
+    uint32_t    base, size;
+    const char *name;
+    uint32_t    regs[S5L_STUB_REGS];
+    uint64_t    reads, writes;
+    uint64_t    oob;                  /* accesses past S5L_STUB_REGS */
+} s5l_stub_t;
+
 /* ------------------------------------------------------------- machine ---
  * Wires the CPU to RAM and the peripherals through one arm_bus_t.
  */
@@ -254,7 +283,21 @@ typedef struct {
      */
     uint32_t   cpu_hz, tb_hz;
     uint64_t   tb_accum;
+
+    /* Identified-but-unmodelled peripheral windows. See s5l_stub_t. */
+    s5l_stub_t stubs[S5L_STUB_MAX];
+    unsigned   stub_count;
 } s5l8900_t;
+
+/*
+ * Declare a stub window. `name` must be a string literal or otherwise outlive
+ * the machine. Returns false if the table is full or the window overlaps one
+ * already declared — silently shadowing a real device would be worse than
+ * refusing. Windows larger than S5L_STUB_REGS*4 are accepted; accesses beyond
+ * that are counted in `oob` rather than stored, so the shortfall is visible.
+ */
+bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
+                      const char *name);
 
 /* Advance the devices and refresh the CPU's interrupt lines. */
 void s5l8900_tick(s5l8900_t *m, uint32_t ticks);

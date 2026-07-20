@@ -203,6 +203,51 @@ static void test_timebase_runs_at_the_guest_ratio(void) {
     s5l8900_free(&b);
 }
 
+/*
+ * Stub windows are honest storage, not invented behaviour. The properties that
+ * matter are that they read back what was written (rather than the 0 that an
+ * unmapped read returns, which is what made a driver spin 3.9 million times),
+ * that they are counted rather than silent, and above all that one can never
+ * shadow a real device model.
+ */
+static void test_stub_window_stores_and_counts(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+
+    CHECK(s5l8900_add_stub(&m, 0x39a00000u, 0x1000u, "unknown-39a"),
+          "declaring a stub window should succeed");
+
+    /* Reads return what was written, not zero. */
+    m.bus.write32(m.bus.ctx, 0x39a00010u, 0xa5a5a5a5u);
+    CHECK(m.bus.read32(m.bus.ctx, 0x39a00010u) == 0xa5a5a5a5u,
+          "stub read=%08x expect the value written",
+          m.bus.read32(m.bus.ctx, 0x39a00010u));
+
+    /* Stubbed traffic must not be counted as unmapped — it is accounted to the
+     * window so it shows up by name in the report. */
+    CHECK(m.unmapped_reads == 0 && m.unmapped_writes == 0,
+          "stubbed access must not count as unmapped");
+    CHECK(m.stubs[0].reads == 1 && m.stubs[0].writes == 1,
+          "stub r=%llu w=%llu expect 1/1",
+          (unsigned long long)m.stubs[0].reads,
+          (unsigned long long)m.stubs[0].writes);
+
+    /* Beyond the backing registers, accesses are counted rather than stored,
+     * so the shortfall is visible instead of pretended away. */
+    (void)m.bus.read32(m.bus.ctx, 0x39a00000u + S5L_STUB_REGS * 4u);
+    CHECK(m.stubs[0].oob == 1, "out-of-range stub access should be counted");
+
+    /* Overlap must be refused: silently shadowing a modelled device would be
+     * far harder to notice than a rejected declaration. */
+    CHECK(!s5l8900_add_stub(&m, 0x39a00800u, 0x1000u, "overlapping"),
+          "an overlapping stub window must be refused");
+    CHECK(!s5l8900_add_stub(&m, S5L8900_UART0_BASE, 0x1000u, "over-uart") ||
+          m.bus.read32(m.bus.ctx, S5L8900_UART0_BASE + UART_UTRSTAT) & (1u << 2),
+          "a stub must never take precedence over a real device model");
+
+    s5l8900_free(&m);
+}
+
 static void test_vic_masks_and_routes(void) {
     s5l_vic_t v; s5l_vic_reset(&v);
     s5l_vic_set_line(&v, 5, true);
@@ -295,6 +340,7 @@ int main(void) {
     test_unmapped_access_counted();
     test_bounds_check_cannot_overflow();
     test_bare_metal_uart_hello();
+    test_stub_window_stores_and_counts();
     test_vic_masks_and_routes();
     test_timebase_runs_without_a_timer();
     test_timebase_runs_at_the_guest_ratio();
