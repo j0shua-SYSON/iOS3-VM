@@ -179,12 +179,79 @@ static void test_bx_branches(void) {
     CHECK(c.r[15] == 0x100, "pc=%08x expect 100 (BX branched)", c.r[15]);
 }
 
-static void test_ldrh_traps(void) {
-    /* LDRH r2,[r1] (0xe1d120b0) is an extra-load/store encoding not implemented
-     * in M1; it must return ARM_UNDEFINED, not corrupt r2 as data-processing. */
-    uint32_t p[] = { 0xe1d120b0 };
+static void test_swp_traps(void) {
+    /* SWP r0,r1,[r2] (0xe1020091) is in the extension space with bits[6:5]==00
+     * and is not implemented; it must trap rather than run as data-processing. */
+    uint32_t p[] = { 0xe1020091 };
     arm_cpu_t c; arm_status_t st = run_status(&c, p, 1, 1);
-    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for LDRH", (int)st);
+    CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for SWP", (int)st);
+}
+
+static void test_strh_ldrh(void) {
+    /* MOV r0,#0x1234-ish via halfword: store 0xAB and read it back as a halfword */
+    uint32_t p[] = { 0xe3a000ab /*MOV r0,#0xAB*/,
+                     0xe3a01b02 /*MOV r1,#0x800*/,
+                     0xe1c100b0 /*STRH r0,[r1]*/,
+                     0xe1d120b0 /*LDRH r2,[r1]*/ };
+    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    CHECK(c.r[2] == 0xab, "r2=%08x expect ab (LDRH)", c.r[2]);
+}
+
+static void test_ldrsb_sign_extends(void) {
+    /* store byte 0xFF, load it signed -> 0xFFFFFFFF */
+    uint32_t p[] = { 0xe3a000ff /*MOV r0,#0xFF*/,
+                     0xe3a01b02 /*MOV r1,#0x800*/,
+                     0xe5c10000 /*STRB r0,[r1]*/,
+                     0xe1d120d0 /*LDRSB r2,[r1]*/ };
+    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    CHECK(c.r[2] == 0xffffffffu, "r2=%08x expect ffffffff (LDRSB)", c.r[2]);
+}
+
+static void test_ldrsh_sign_extends(void) {
+    /* store halfword 0x8000, load it signed -> 0xFFFF8000 */
+    uint32_t p[] = { 0xe3a00902 /*MOV r0,#0x8000*/,
+                     0xe3a01b02 /*MOV r1,#0x800*/,
+                     0xe1c100b0 /*STRH r0,[r1]*/,
+                     0xe1d120f0 /*LDRSH r2,[r1]*/ };
+    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    CHECK(c.r[2] == 0xffff8000u, "r2=%08x expect ffff8000 (LDRSH)", c.r[2]);
+}
+
+static void test_stmia_ldmia(void) {
+    /* STMIA r1!,{r0,r2} then LDMIA r1,{r3,r4} round-trips both words. */
+    uint32_t p[] = { 0xe3a00011 /*MOV r0,#0x11*/,
+                     0xe3a02022 /*MOV r2,#0x22*/,
+                     0xe3a01b02 /*MOV r1,#0x800*/,
+                     0xe8a10005 /*STMIA r1!,{r0,r2}*/,
+                     0xe3a01b02 /*MOV r1,#0x800*/,
+                     0xe8910018 /*LDMIA r1,{r3,r4}*/ };
+    arm_cpu_t c; load_and_run(&c, p, 6, 6);
+    CHECK(c.r[3] == 0x11, "r3=%08x expect 11", c.r[3]);
+    CHECK(c.r[4] == 0x22, "r4=%08x expect 22", c.r[4]);
+}
+
+static void test_push_pop(void) {
+    /* The classic prologue/epilogue pair: STMDB sp!,{r0,r1} / LDMIA sp!,{r2,r3}.
+     * Also checks the stack pointer returns to where it started. */
+    uint32_t p[] = { 0xe3a0dc09 /*MOV sp,#0x900*/,
+                     0xe3a000aa /*MOV r0,#0xAA*/,
+                     0xe3a010bb /*MOV r1,#0xBB*/,
+                     0xe92d0003 /*STMDB sp!,{r0,r1}  (push)*/,
+                     0xe8bd000c /*LDMIA sp!,{r2,r3}  (pop)*/ };
+    arm_cpu_t c; load_and_run(&c, p, 5, 5);
+    CHECK(c.r[2] == 0xaa, "r2=%08x expect aa", c.r[2]);
+    CHECK(c.r[3] == 0xbb, "r3=%08x expect bb", c.r[3]);
+    CHECK(c.r[13] == 0x900, "sp=%08x expect 900 (balanced)", c.r[13]);
+}
+
+static void test_ldm_to_pc_branches(void) {
+    /* LDMIA sp!,{pc} must branch. Push 0x300 then pop it into PC. */
+    uint32_t p[] = { 0xe3a0dc09 /*MOV sp,#0x900*/,
+                     0xe3a00c03 /*MOV r0,#0x300*/,
+                     0xe92d0001 /*STMDB sp!,{r0}*/,
+                     0xe8bd8000 /*LDMIA sp!,{pc}*/ };
+    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    CHECK(c.r[15] == 0x300, "pc=%08x expect 300 (LDM to PC branched)", c.r[15]);
 }
 
 static void test_imm_dp_not_trapped(void) {
@@ -212,8 +279,14 @@ int main(void) {
     test_mul();
     test_orr_bic_mvn();
     test_bx_branches();
-    test_ldrh_traps();
+    test_swp_traps();
     test_imm_dp_not_trapped();
+    test_strh_ldrh();
+    test_ldrsb_sign_extends();
+    test_ldrsh_sign_extends();
+    test_stmia_ldmia();
+    test_push_pop();
+    test_ldm_to_pc_branches();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

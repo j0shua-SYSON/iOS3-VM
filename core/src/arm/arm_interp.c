@@ -267,6 +267,91 @@ static arm_status_t exec_single_transfer(arm_cpu_t *c, uint32_t pc, uint32_t ins
     return ARM_OK;
 }
 
+/* Extra load/store: LDRH/STRH/LDRSB/LDRSH (halfword and sign-extending forms).
+ * Encoding: cccc 000 P U I W L nnnn tttt iiii 1SH1 iiii, with SH != 00.
+ * I selects an 8-bit immediate offset (split across bits[11:8] and bits[3:0])
+ * versus a register offset in Rm. */
+static arm_status_t exec_extra_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn,
+                                        uint32_t *next) {
+    bool P = (insn >> 24) & 1u;
+    bool U = (insn >> 23) & 1u;
+    bool I = (insn >> 22) & 1u;
+    bool W = (insn >> 21) & 1u;
+    bool L = (insn >> 20) & 1u;
+    unsigned rn = (insn >> 16) & 0xf;
+    unsigned rd = (insn >> 12) & 0xf;
+    unsigned sh = (insn >> 5) & 3u;
+
+    uint32_t offset = I ? ((((insn >> 8) & 0xf) << 4) | (insn & 0xf))
+                        : reg_read(c, pc, insn & 0xf);
+    uint32_t base = reg_read(c, pc, rn);
+    uint32_t addr = P ? (U ? base + offset : base - offset) : base;
+
+    if (L) {
+        uint32_t val;
+        switch (sh) {
+            case 1: val = c->bus->read16(c->bus->ctx, addr); break;   /* LDRH  */
+            case 2: val = (uint32_t)(int32_t)(int8_t) c->bus->read8 (c->bus->ctx, addr); break; /* LDRSB */
+            case 3: val = (uint32_t)(int32_t)(int16_t)c->bus->read16(c->bus->ctx, addr); break; /* LDRSH */
+            default: return ARM_UNDEFINED;
+        }
+        c->r[rd] = val;
+        if (rd == 15) *next = val & ~3u;
+    } else {
+        if (sh != 1) return ARM_UNDEFINED;        /* LDRD/STRD: not yet */
+        c->bus->write16(c->bus->ctx, addr, (uint16_t)reg_read(c, pc, rd)); /* STRH */
+    }
+
+    if (!P) { addr = U ? base + offset : base - offset; c->r[rn] = addr; }
+    else if (W) { c->r[rn] = addr; }
+    return ARM_OK;
+}
+
+/* Block data transfer: LDM/STM in all four addressing modes.
+ * Encoding: cccc 100 P U S W L nnnn register_list(16).
+ * Registers always move in increasing register order at increasing addresses;
+ * P/U only decide where the run of addresses starts. */
+static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn,
+                                        uint32_t *next) {
+    bool P = (insn >> 24) & 1u;
+    bool U = (insn >> 23) & 1u;
+    bool S = (insn >> 22) & 1u;
+    bool W = (insn >> 21) & 1u;
+    bool L = (insn >> 20) & 1u;
+    unsigned rn = (insn >> 16) & 0xf;
+    uint32_t list = insn & 0xffffu;
+
+    /* S=1 means "use the user-mode register bank" or "restore CPSR from SPSR".
+     * Both need banked registers/SPSR, which this milestone does not model —
+     * trap rather than silently doing the wrong thing. */
+    if (S) return ARM_UNDEFINED;
+    if (list == 0) return ARM_UNDEFINED;     /* empty list is unpredictable */
+
+    unsigned n = 0;
+    for (unsigned i = 0; i < 16; i++) if (list & (1u << i)) n++;
+
+    uint32_t base = reg_read(c, pc, rn);
+    uint32_t addr, wb;
+    if (U) { addr = P ? base + 4u : base;                  wb = base + 4u * n; }
+    else   { addr = P ? base - 4u * n : base - 4u * n + 4u; wb = base - 4u * n; }
+
+    for (unsigned i = 0; i < 16; i++) {
+        if (!(list & (1u << i))) continue;
+        if (L) {
+            uint32_t v = c->bus->read32(c->bus->ctx, addr);
+            c->r[i] = v;
+            if (i == 15) *next = v & ~3u;    /* LDM with PC in the list branches */
+        } else {
+            c->bus->write32(c->bus->ctx, addr, reg_read(c, pc, i));
+        }
+        addr += 4u;
+    }
+
+    /* On LDM with Rn in the list, the loaded value wins over writeback. */
+    if (W && !(L && (list & (1u << rn)))) c->r[rn] = wb;
+    return ARM_OK;
+}
+
 static arm_status_t exec_multiply(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     bool A  = (insn >> 21) & 1u;  /* accumulate (MLA) */
     bool S  = (insn >> 20) & 1u;
@@ -308,15 +393,21 @@ arm_status_t arm_step(arm_cpu_t *c) {
         st = exec_multiply(c, pc, insn);
     } else if ((insn & 0x0c000000u) == 0x04000000u) {     /* single data transfer */
         st = exec_single_transfer(c, pc, insn, &next);
+    } else if ((insn & 0x0e000000u) == 0x08000000u) {     /* LDM / STM */
+        st = exec_block_transfer(c, pc, insn, &next);
+    } else if ((insn & 0x0e000000u) == 0x00000000u &&
+               (insn & 0x00000090u) == 0x00000090u &&
+               (insn & 0x00000060u) != 0x00000000u) {
+        /* bits[6:5] != 00 -> extra load/store (LDRH/STRH/LDRSB/LDRSH, LDRD/STRD) */
+        st = exec_extra_transfer(c, pc, insn, &next);
     } else if ((insn & 0x0e000000u) == 0x00000000u &&
                (insn & 0x00000090u) == 0x00000090u) {
-        /* Extra load/store (LDRH/STRH/LDRSB/LDRSH/LDRD/STRD), SWP, and the
-         * DSP/sync extension space: bits[27:25]==000, bit7==1, bit4==1. The
-         * bit25==0 requirement (mask 0x0e000000, not 0x0c000000) is essential:
-         * immediate data-processing sets bit25 and its imm8 may itself have
-         * bits 7 and 4 set (e.g. MOV r0,#0x90), so it must NOT be trapped here.
-         * MUL/MLA are handled above; the rest are unimplemented in M1 — trap
-         * them instead of corrupting Rd. */
+        /* Remaining extension space with bits[6:5]==00: SWP/SWPB and the DSP
+         * multiplies. bits[27:25]==000, bit7==1, bit4==1. The bit25==0
+         * requirement (mask 0x0e000000, not 0x0c000000) is essential: immediate
+         * data-processing sets bit25 and its imm8 may itself have bits 7 and 4
+         * set (e.g. MOV r0,#0x90), so it must NOT be trapped here. MUL/MLA are
+         * handled above; these are unimplemented — trap rather than corrupt Rd. */
         st = ARM_UNDEFINED;
     } else if ((insn & 0x0c000000u) == 0x00000000u) {     /* data processing / PSR */
         st = exec_data_processing(c, pc, insn, &next);

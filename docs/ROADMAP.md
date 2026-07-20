@@ -24,9 +24,14 @@ core on the phone.
 ### 🔵 M1 — ARMv6 interpreter *(in progress)*
 A complete, correct ARM1176 instruction interpreter validated against a growing
 unit-test suite.
-- Data-processing, branch, load/store, multiply — **done** (24 tests passing).
-- Remaining: block data transfer (LDM/STM), Thumb, PSR transfer (MRS/MSR),
-  coprocessor (CP15) for MMU control, SWI/exceptions, banked registers per mode.
+- **Done** (37 tests passing): data-processing with the full barrel shifter,
+  branch/BL, BX/BLX, single load/store, multiply, **LDM/STM in all four
+  addressing modes** (incl. push/pop and LDM-into-PC branching), and the
+  halfword/sign-extending loads (LDRH/STRH/LDRSB/LDRSH).
+- Unimplemented encodings deliberately return `ARM_UNDEFINED` rather than
+  silently corrupting state, so the harness tells us exactly what to add next.
+- Remaining: Thumb, PSR transfer (MRS/MSR) + banked registers per mode,
+  coprocessor (CP15) for MMU/cache control, SWI/exceptions, SWP, LDRD/STRD.
 
 **Observable:** the interpreter runs a known ARM test binary with bit-exact
 register/memory results.

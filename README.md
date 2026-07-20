@@ -49,7 +49,7 @@ can see.** No months in the dark.
 | | Milestone | State |
 |---|---|---|
 | **M0** | Toolchain online: core builds + tests in CI, iOS `.ipa` builds on a macOS runner, on-device self-test runs ARM code | ✅ **done** |
-| **M1** | Complete ARMv6 (ARM1176) interpreter, unit-tested | 🔵 in progress — *24 tests passing* |
+| **M1** | Complete ARMv6 (ARM1176) interpreter, unit-tested | 🔵 in progress — *37 tests passing* |
 | **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ⚪ |
 | **M3** | IMG3 + NAND/NOR: Apple's real **iBoot** runs | ⚪ |
 | **M4** | The real **XNU kernel** boots and logs | ⚪ |
