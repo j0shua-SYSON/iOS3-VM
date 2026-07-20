@@ -699,6 +699,43 @@ static void test_mmu_supersection(void) {
     CHECK(pa == 0x08001234u, "pa=%08x expect 08001234 (plain section)", pa);
 }
 
+static void test_thumb_blx_suffix_is_not_a_branch(void) {
+    /* Regression from booting real XNU: 0xE000-0xE7FF is an unconditional
+     * branch but 0xE800-0xEFFF is the SECOND half of a BLX pair, which returns
+     * to ARM state. Treating the whole 0xExxx range as a branch sent BLX to a
+     * garbage address, and the kernel executed a pointer table as code. */
+    uint16_t p[] = { 0xf000, 0xe802 };
+    arm_cpu_t c; load_thumb(&c, p, 2, 2);
+    CHECK((c.cpsr & ARM_CPSR_T) == 0, "BLX suffix must switch back to ARM state");
+    CHECK((c.r[15] & 3u) == 0, "pc=%08x must be word-aligned after BLX", c.r[15]);
+    CHECK(c.r[14] == 0x05, "lr=%08x expect 05 (return addr | Thumb bit)", c.r[14]);
+
+    /* A plain unconditional Thumb branch must still branch. */
+    uint16_t b[] = { 0xe000, 0x2007 };
+    arm_cpu_t c2; load_thumb(&c2, b, 2, 2);
+    CHECK((c2.cpsr & ARM_CPSR_T) != 0, "a plain branch must stay in Thumb");
+}
+
+static void test_user_bank_stm(void) {
+    /* STM with the S bit transfers the USER bank whatever mode we are in —
+     * how a kernel saves user context on exception entry. Real XNU uses
+     * "STMIA sp,{r0-r14}^". */
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    memset(g_ram, 0, sizeof g_ram);
+    arm_set_mode(&c, ARM_MODE_USR);
+    c.r[13] = 0xaaaa0000u; c.r[14] = 0xbbbb0000u;
+    arm_set_mode(&c, ARM_MODE_SVC);
+    c.r[13] = 0x800; c.r[14] = 0xcccc0000u;
+    m_w32(NULL, 0, 0xe8cd6000u);          /* STMIA sp,{r13,r14}^  (S bit set) */
+    c.r[15] = 0;
+    arm_step(&c);
+    CHECK(m_r32(NULL, 0x800) == 0xaaaa0000u,
+          "stored r13=%08x expect the USER bank aaaa0000", m_r32(NULL, 0x800));
+    CHECK(m_r32(NULL, 0x804) == 0xbbbb0000u,
+          "stored r14=%08x expect the USER bank bbbb0000", m_r32(NULL, 0x804));
+    CHECK(c.r[14] == 0xcccc0000u, "the SVC bank must be untouched");
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -757,6 +794,8 @@ int main(void) {
     test_thumb_rev();
     test_thumb_cps();
     test_mmu_supersection();
+    test_thumb_blx_suffix_is_not_a_branch();
+    test_user_bank_stm();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

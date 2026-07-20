@@ -103,6 +103,29 @@ void arm_set_mode(arm_cpu_t *c, uint32_t mode) {
     c->cpsr = (c->cpsr & ~ARM_CPSR_MODE_MASK) | mode;
 }
 
+/*
+ * Access a register as the USER bank sees it, whatever mode we are in. Only
+ * r8-r14 differ, and only for FIQ (r8-r12) and the privileged modes (r13-r14).
+ */
+static uint32_t reg_read_user(const arm_cpu_t *c, uint32_t pc, unsigned i) {
+    arm_bank_t cur = arm_bank_of_mode(c->cpsr);
+    if (i == 15) return pc + 8;
+    if (cur == ARM_BANK_USR) return c->r[i];
+    if (i == 13) return c->bank_r13[ARM_BANK_USR];
+    if (i == 14) return c->bank_r14[ARM_BANK_USR];
+    if (i >= 8 && i <= 12 && cur == ARM_BANK_FIQ) return c->usr_r8_12[i - 8];
+    return c->r[i];
+}
+
+static void reg_write_user(arm_cpu_t *c, unsigned i, uint32_t v) {
+    arm_bank_t cur = arm_bank_of_mode(c->cpsr);
+    if (cur == ARM_BANK_USR) { c->r[i] = v; return; }
+    if (i == 13) { c->bank_r13[ARM_BANK_USR] = v; return; }
+    if (i == 14) { c->bank_r14[ARM_BANK_USR] = v; return; }
+    if (i >= 8 && i <= 12 && cur == ARM_BANK_FIQ) { c->usr_r8_12[i - 8] = v; return; }
+    c->r[i] = v;
+}
+
 /* Enter an exception: bank in the handler mode, stash the return address in its
  * LR and the old CPSR in its SPSR, mask interrupts, and vector the PC.
  * CP15 SCTLR.V relocates the vector table to 0xFFFF0000. */
@@ -596,13 +619,17 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
 
     if (list == 0) return ARM_UNDEFINED;     /* empty list is unpredictable */
 
-    /* S=1 has two meanings. With PC in a load list it is an exception return
-     * (CPSR <- SPSR); otherwise it transfers the *user* bank, which needs more
-     * plumbing than we have, so that variant still traps. */
+    /*
+     * S=1 has two meanings. With PC in a load list it is an exception return
+     * (CPSR <- SPSR). Otherwise it transfers the USER bank regardless of the
+     * current mode — which is how a kernel saves and restores user context on
+     * exception entry. Real XNU does exactly that with "STMIA sp,{r0-r14}^".
+     */
     bool restore_cpsr = false;
+    bool user_bank    = false;
     if (S) {
         if (L && (list & (1u << 15))) restore_cpsr = true;
-        else return ARM_UNDEFINED;
+        else                          user_bank = true;
     }
 
     unsigned n = 0;
@@ -623,7 +650,8 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
         if (L) {
             loaded[i] = mem_r32(c, addr);
         } else {
-            mem_w32(c, addr, reg_read(c, pc, i));
+            mem_w32(c, addr, user_bank ? reg_read_user(c, pc, i)
+                                       : reg_read(c, pc, i));
         }
         if (c->abort_pending) return ARM_OK;
         addr += 4u;
@@ -632,6 +660,7 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
     if (L) {
         for (unsigned i = 0; i < 16; i++) {
             if (!(list & (1u << i))) continue;
+            if (user_bank) { reg_write_user(c, i, loaded[i]); continue; }
             c->r[i] = loaded[i];
             if (i == 15) *next = loaded[i] & ~3u;  /* LDM with PC branches */
         }
@@ -973,7 +1002,20 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
             *next = pc4 + ((uint32_t)(int32_t)(int8_t)(insn & 0xffu) << 1);
         return ARM_OK;
     }
-    case 0xe: {                              /* unconditional branch */
+    case 0xe: {
+        /*
+         * 0xE000-0xE7FF is an unconditional branch, but 0xE800-0xEFFF is the
+         * SECOND half of a BLX pair, which returns to ARM state. Treating the
+         * whole 0xExxx range as a branch sends BLX to a garbage address — real
+         * XNU hit this and ended up executing a table of pointers as code.
+         */
+        if (insn & 0x0800u) {                /* BLX suffix: back to ARM */
+            uint32_t target = (c->r[14] + ((uint32_t)(insn & 0x7ffu) << 1)) & ~3u;
+            c->r[14] = (pc + 2) | 1u;        /* return address, Thumb bit set */
+            c->cpsr &= ~ARM_CPSR_T;
+            *next = target;
+            return ARM_OK;
+        }
         int32_t off = (int32_t)((uint32_t)(insn & 0x7ffu) << 21) >> 20;  /* sign-extend, <<1 */
         *next = pc4 + (uint32_t)off;
         return ARM_OK;
@@ -1101,8 +1143,57 @@ arm_status_t arm_step(arm_cpu_t *c) {
             return ARM_OK;
         }
 
-        /* SETEND, RFE, SRS are not implemented yet: trap rather than execute
-         * something else by accident. */
+        /*
+         * SRS — Store Return State. Pushes the current mode's LR and SPSR onto
+         * the banked stack of the mode named in the instruction. XNU uses it on
+         * exception entry, paired with RFE to return.
+         *   1111 100 P U 1 W 0 1101 0000 0101 000 mode
+         */
+        if ((insn & 0xfe5fffe0u) == 0xf84d0500u) {
+            bool P = (insn >> 24) & 1u, U = (insn >> 23) & 1u, W = (insn >> 21) & 1u;
+            uint32_t mode = insn & ARM_CPSR_MODE_MASK;
+            arm_bank_t tb = arm_bank_of_mode(mode);
+            arm_bank_t cur = arm_bank_of_mode(c->cpsr);
+
+            /* The target mode's SP: live in r13 if that is the current bank. */
+            uint32_t sp = (tb == cur) ? c->r[13] : c->bank_r13[tb];
+            uint32_t base = U ? (P ? sp + 4u : sp) : (P ? sp - 8u : sp - 4u);
+
+            mem_w32(c, base,      c->r[14]);
+            mem_w32(c, base + 4u, (cur == ARM_BANK_USR) ? c->cpsr : c->spsr[cur]);
+            if (c->abort_pending) { c->r[15] = next; return ARM_OK; }
+
+            if (W) {
+                uint32_t wb = U ? sp + 8u : sp - 8u;
+                if (tb == cur) c->r[13] = wb; else c->bank_r13[tb] = wb;
+            }
+            c->r[15] = next;
+            return ARM_OK;
+        }
+
+        /*
+         * RFE — Return From Exception. Loads PC and CPSR from a base register.
+         *   1111 100 P U 0 W 1 nnnn 0000 1010 0000 0000
+         */
+        if ((insn & 0xfe50ffffu) == 0xf8100a00u) {
+            bool P = (insn >> 24) & 1u, U = (insn >> 23) & 1u, W = (insn >> 21) & 1u;
+            unsigned rn = (insn >> 16) & 0xfu;
+            uint32_t sp = c->r[rn];
+            uint32_t base = U ? (P ? sp + 4u : sp) : (P ? sp - 8u : sp - 4u);
+
+            uint32_t new_pc   = mem_r32(c, base);
+            uint32_t new_cpsr = mem_r32(c, base + 4u);
+            if (c->abort_pending) { c->r[15] = next; return ARM_OK; }
+
+            if (W) c->r[rn] = U ? sp + 8u : sp - 8u;
+            arm_set_mode(c, new_cpsr);
+            c->cpsr = (c->cpsr & ARM_CPSR_MODE_MASK) | (new_cpsr & ~ARM_CPSR_MODE_MASK);
+            c->r[15] = new_pc & ~1u;
+            return ARM_OK;
+        }
+
+        /* SETEND is not implemented yet: trap rather than execute something
+         * else by accident. */
         return ARM_UNDEFINED;
     }
 
