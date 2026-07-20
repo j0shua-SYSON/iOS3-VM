@@ -140,6 +140,12 @@ typedef struct arm_cpu {
      * the top of each arm_step and honoured unless masked by CPSR I/F. */
     bool irq_line;
     bool fiq_line;
+
+    /* ARMv6 exclusive monitor for LDREX/STREX. Every XNU atomic and every
+     * spinlock goes through these, so they are load-bearing rather than
+     * optional. One CPU means a single address tag is sufficient. */
+    bool     excl_valid;
+    uint32_t excl_addr;
 } arm_cpu_t;
 
 /*

@@ -246,6 +246,8 @@ void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
     cpu->abort_far = 0;
     cpu->irq_line = false;
     cpu->fiq_line = false;
+    cpu->excl_valid = false;
+    cpu->excl_addr = 0;
     /* On reset the ARM1176 enters SVC mode with IRQ+FIQ disabled and begins
      * execution from the reset vector (0x0, or 0xffff0000 with high vectors).
      * We start at 0x0; the machine layer relocates PC as needed. */
@@ -1298,6 +1300,25 @@ arm_status_t arm_step(arm_cpu_t *c) {
                (insn & 0x00000060u) != 0x00000000u) {
         /* bits[6:5] != 00 -> extra load/store (LDRH/STRH/LDRSB/LDRSH, LDRD/STRD) */
         st = exec_extra_transfer(c, pc, insn, &next);
+    } else if ((insn & 0x0ff00ff0u) == 0x01900f90u) {     /* LDREX Rd,[Rn] */
+        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        uint32_t addr = reg_read(c, pc, rn);
+        uint32_t v = mem_r32(c, addr);
+        if (!c->abort_pending) {
+            c->r[rd] = v;
+            c->excl_valid = true;      /* tag the address as exclusive */
+            c->excl_addr  = addr;
+        }
+    } else if ((insn & 0x0ff00ff0u) == 0x01800f90u) {     /* STREX Rd,Rm,[Rn] */
+        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        uint32_t addr = reg_read(c, pc, rn);
+        if (c->excl_valid && c->excl_addr == addr) {
+            mem_w32(c, addr, reg_read(c, pc, insn & 0xfu));
+            if (!c->abort_pending) c->r[rd] = 0;          /* 0 = stored */
+        } else {
+            c->r[rd] = 1;                                  /* 1 = failed */
+        }
+        c->excl_valid = false;         /* the monitor is consumed either way */
     } else if ((insn & 0x0e000000u) == 0x00000000u &&
                (insn & 0x00000090u) == 0x00000090u) {
         /* Remaining extension space with bits[6:5]==00: SWP/SWPB and the DSP

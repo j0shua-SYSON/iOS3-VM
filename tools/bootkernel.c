@@ -33,6 +33,266 @@ static uint8_t *slurp(const char *path, size_t *len_out) {
     return b;
 }
 
+/* ---------------------------------------------------------------------------
+ * Symbol table (LC_SYMTAB) reader.
+ *
+ * The kernelcache still carries its full nlist symbol table, so every address
+ * we print can be named. Without this a panic report is a list of hex numbers.
+ * ------------------------------------------------------------------------- */
+typedef struct { uint32_t value; const char *name; } ksym_t;
+static ksym_t   *ksyms;
+static unsigned  ksym_count;
+
+static uint32_t ld32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static int ksym_cmp(const void *a, const void *b) {
+    uint32_t x = ((const ksym_t *)a)->value, y = ((const ksym_t *)b)->value;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static void ksyms_load(const uint8_t *img, size_t len) {
+    if (len < 28) return;
+    uint32_t ncmds = ld32(img + 16);
+    size_t off = 28;
+    for (uint32_t i = 0; i < ncmds && off + 8 <= len; i++) {
+        uint32_t cmd = ld32(img + off), csz = ld32(img + off + 4);
+        if (!csz) break;
+        if (cmd == 2 /* LC_SYMTAB */ && off + 24 <= len) {
+            uint32_t symoff = ld32(img + off + 8), nsyms = ld32(img + off + 12);
+            uint32_t stroff = ld32(img + off + 16), strsize = ld32(img + off + 20);
+            if ((size_t)symoff + (size_t)nsyms * 12 > len) return;
+            if ((size_t)stroff + strsize > len) return;
+            ksyms = calloc(nsyms ? nsyms : 1, sizeof *ksyms);
+            if (!ksyms) return;
+            for (uint32_t k = 0; k < nsyms; k++) {
+                const uint8_t *e = img + symoff + k * 12;
+                uint32_t strx = ld32(e);
+                uint8_t  type = e[4];
+                uint32_t val  = ld32(e + 8);
+                if ((type & 0x0e) != 0x0e || !val) continue;   /* N_SECT only */
+                if (strx >= strsize) continue;
+                ksyms[ksym_count].value = val;
+                ksyms[ksym_count].name  = (const char *)(img + stroff + strx);
+                ksym_count++;
+            }
+            qsort(ksyms, ksym_count, sizeof *ksyms, ksym_cmp);
+            return;
+        }
+        off += csz;
+    }
+}
+
+/* Name an address as "sym+0x.."; returns a pointer to a rotating static buffer
+ * so several calls can appear in one printf. */
+static const char *ksym_at(uint32_t addr) {
+    static char buf[4][160];
+    static unsigned turn;
+    char *out = buf[turn++ & 3];
+    addr &= ~1u;                       /* drop the Thumb bit */
+    if (!ksym_count) { snprintf(out, 160, "?"); return out; }
+    unsigned lo = 0, hi = ksym_count;  /* last symbol with value <= addr */
+    while (lo < hi) { unsigned mid = (lo + hi) / 2;
+        if (ksyms[mid].value <= addr) lo = mid + 1; else hi = mid; }
+    if (!lo) { snprintf(out, 160, "?"); return out; }
+    const ksym_t *s = &ksyms[lo - 1];
+    uint32_t d = addr - s->value;
+    if (d > 0x8000u) { snprintf(out, 160, "?"); return out; }
+    if (d) snprintf(out, 160, "%s+0x%x", s->name, d);
+    else   snprintf(out, 160, "%s", s->name);
+    return out;
+}
+
+static uint32_t ksym_value(const char *name) {
+    for (unsigned i = 0; i < ksym_count; i++)
+        if (!strcmp(ksyms[i].name, name)) return ksyms[i].value;
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Reading guest memory from the host, bypassing the MMU.
+ *
+ * Every address the kernel hands to panic() lives in the flat kernel window,
+ * so the linear virt->phys relation is enough and cannot itself fault.
+ * ------------------------------------------------------------------------- */
+static s5l8900_t *g_mach;
+static uint32_t   g_virt_base, g_phys_base;
+
+static const uint8_t *guest_ptr(uint32_t va, uint32_t need) {
+    uint32_t pa = va - g_virt_base + g_phys_base;
+    if (va < g_virt_base) pa = va;                     /* already physical */
+    if (pa < g_mach->ram_base) return NULL;
+    uint32_t o = pa - g_mach->ram_base;
+    if (o >= g_mach->ram_size || g_mach->ram_size - o < need) return NULL;
+    return g_mach->ram + o;
+}
+
+/* Print the C string at a guest address, escaped, or say why we cannot. */
+static void print_guest_str(const char *label, uint32_t va) {
+    const uint8_t *p = guest_ptr(va, 1);
+    if (!p) { printf("  %s 0x%08x -> (not in RAM)\n", label, va); return; }
+    printf("  %s 0x%08x -> \"", label, va);
+    for (unsigned i = 0; i < 400 && p[i]; i++) {
+        uint8_t c = p[i];
+        if (c == '\n') printf("\\n");
+        else if (c == '\t') printf("\\t");
+        else if (c >= 0x20 && c < 0x7f) putchar((char)c);
+        else printf("\\x%02x", c);
+    }
+    printf("\"\n");
+}
+
+/* ------------------------------------------------------------------------
+ * DIAGNOSTIC INSTRUMENTATION (temporary; for finding the serial console).
+ *
+ * Two questions we cannot answer from outside:
+ *   1. Does the kernel ever touch the UART page at all?
+ *   2. How far down XNU's console-init chain does it actually get?
+ *
+ * (1) is answered by wrapping the bus callbacks — bootkernel owns the
+ *     arm_bus_t after s5l8900_init(), so it can interpose without touching
+ *     the core. Note that with the MMU on, an access to an *unmapped virtual*
+ *     address aborts inside the MMU and never reaches the bus, which is why
+ *     "zero unmapped physical accesses" proves nothing on its own.
+ *
+ * (2) is answered by watching the PC for the addresses of the pexpert
+ *     functions in the console path, taken from the kernel's own symbol
+ *     table (xnu-1357.5.30, iPhone1,2 7E18). Each is matched both at its
+ *     virtual address and at the physical alias it has before the MMU is on.
+ * ---------------------------------------------------------------------- */
+#define UARTPG 0x3cc00000u
+
+typedef struct { const char *name; uint32_t va; } milestone_t;
+
+/* Virtual addresses from the kernelcache symbol table (thumb bit cleared). */
+static const milestone_t MILESTONES[] = {
+    { "_arm_init_cpu",              0xc0062c58u },
+    { "_arm_vm_init",               0xc0062d60u },
+    { "_DTInit",                    0xc01a7474u },
+    { "_PE_init_platform",          0xc01a83ecu },
+    { "_pe_identify_machine",       0xc01a7f1cu },
+    { "_pe_arm_get_soc_base_phys",  0xc01a7c5cu },
+    { "_PE_parse_boot_argn",        0xc01a7a5au },
+    { "_PE_init_kprintf",           0xc01a8840u },
+    { "_serial_init",               0xc01a8a78u },
+    { "serial_init:soc_base_call",  0xc01a8af4u },
+    { "serial_init:RET0_no_soc",    0xc01a8afcu },
+    { "serial_init:found_node",     0xc01a8b84u },
+    { "serial_init:ml_io_map_call", 0xc01a8ba4u },
+    { "serial_init:RET1_ok",        0xc01a8b78u },
+    { "_ml_io_map",                 0xc006963cu },
+    { "_DTFindEntry",               0xc01a7738u },
+    { "_DTGetProperty",             0xc01a7620u },
+    { "_uart_putc",                 0xc01a89d4u },
+    { "uart_putc:past_init_gate",   0xc01a89f0u },
+    { "_serial_putc",               0xc01a87f2u },
+    { "_kprintf",                   0xc01a880cu },
+    { "_cnputc",                    0xc006d342u },
+    { "_conslog_putc",              0xc002290cu },
+    { "_switch_to_serial_console",  0xc005f018u },
+    { "_initialize_screen",         0xc0070380u },
+    { "_PE_initialize_console",     0xc01a85f0u },
+    { "_machine_startup",           0xc0209a40u },
+    { "_kernel_bootstrap",          0xc020862cu },
+    { "_bsd_init",                  0xc020ae14u },
+    { "_panic",                     0xc001c13cu },
+    { "_Debugger",                  0xc006abbcu },
+};
+#define NMILE ((unsigned)(sizeof MILESTONES / sizeof MILESTONES[0]))
+
+static struct {
+    /* bus interposition */
+    arm_bus_t   inner;              /* the machine's original callbacks */
+    s5l8900_t  *mach;
+    uint64_t    uart_hits;
+    unsigned    uart_log_n;
+    struct { uint32_t addr, val, pc; bool wr; unsigned bytes; } uart_log[64];
+
+    /* every distinct non-RAM page the guest reached, with the first PC */
+    unsigned    dev_page_n;
+    struct { uint32_t page, first_pc; uint64_t reads, writes; } dev_page[64];
+
+    /* milestones */
+    uint32_t    mile_pa[NMILE];
+    uint64_t    mile_hits[NMILE];
+    unsigned    mile_first[NMILE];
+
+    /* distinct MMU faults */
+    unsigned    fault_n;
+    struct { uint32_t far_, fsr, pc; bool prefetch; unsigned first_at; uint64_t n; } fault[48];
+} G;
+
+static void note_dev_page(uint32_t addr, uint32_t pc, bool wr) {
+    uint32_t pg = addr & ~0xfffu;
+    for (unsigned i = 0; i < G.dev_page_n; i++)
+        if (G.dev_page[i].page == pg) {
+            if (wr) G.dev_page[i].writes++; else G.dev_page[i].reads++;
+            return;
+        }
+    if (G.dev_page_n < 64) {
+        G.dev_page[G.dev_page_n].page = pg;
+        G.dev_page[G.dev_page_n].first_pc = pc;
+        G.dev_page[G.dev_page_n].reads  = wr ? 0 : 1;
+        G.dev_page[G.dev_page_n].writes = wr ? 1 : 0;
+        G.dev_page_n++;
+    }
+}
+
+/* RAM test mirrors the core's: anything else is a device or a hole. */
+static bool is_ram(uint32_t a, unsigned bytes) {
+    if (a < G.mach->ram_base) return false;
+    return (uint64_t)(a - G.mach->ram_base) + bytes <= (uint64_t)G.mach->ram_size;
+}
+
+static void spy(uint32_t addr, uint32_t val, unsigned bytes, bool wr) {
+    if (is_ram(addr, bytes)) return;
+    uint32_t pc = G.mach->cpu.r[15];
+    note_dev_page(addr, pc, wr);
+    if ((addr & ~0xfffu) == UARTPG) {
+        G.uart_hits++;
+        if (G.uart_log_n < 64) {
+            G.uart_log[G.uart_log_n].addr  = addr;
+            G.uart_log[G.uart_log_n].val   = val;
+            G.uart_log[G.uart_log_n].pc    = pc;
+            G.uart_log[G.uart_log_n].wr    = wr;
+            G.uart_log[G.uart_log_n].bytes = bytes;
+            G.uart_log_n++;
+        }
+    }
+}
+
+static uint32_t sr32(void *c, uint32_t a) { uint32_t v = G.inner.read32(c, a); spy(a, v, 4, false); return v; }
+static uint16_t sr16(void *c, uint32_t a) { uint16_t v = G.inner.read16(c, a); spy(a, v, 2, false); return v; }
+static uint8_t  sr8 (void *c, uint32_t a) { uint8_t  v = G.inner.read8 (c, a); spy(a, v, 1, false); return v; }
+static void sw32(void *c, uint32_t a, uint32_t v) { spy(a, v, 4, true); G.inner.write32(c, a, v); }
+static void sw16(void *c, uint32_t a, uint16_t v) { spy(a, v, 2, true); G.inner.write16(c, a, v); }
+static void sw8 (void *c, uint32_t a, uint8_t  v) { spy(a, v, 1, true); G.inner.write8 (c, a, v); }
+
+static void spy_install(s5l8900_t *m, uint32_t virt_base, uint32_t phys_base) {
+    memset(&G, 0, sizeof G);
+    G.mach  = m;
+    G.inner = m->bus;
+    m->bus.read32 = sr32; m->bus.read16 = sr16; m->bus.read8 = sr8;
+    m->bus.write32 = sw32; m->bus.write16 = sw16; m->bus.write8 = sw8;
+    for (unsigned i = 0; i < NMILE; i++)
+        G.mile_pa[i] = MILESTONES[i].va - virt_base + phys_base;
+}
+
+static void note_fault(uint32_t far_, uint32_t fsr, uint32_t pc, bool pref, unsigned at) {
+    for (unsigned i = 0; i < G.fault_n; i++)
+        if (G.fault[i].far_ == far_ && G.fault[i].pc == pc && G.fault[i].prefetch == pref) {
+            G.fault[i].n++; return;
+        }
+    if (G.fault_n < 48) {
+        G.fault[G.fault_n].far_ = far_; G.fault[G.fault_n].fsr = fsr;
+        G.fault[G.fault_n].pc = pc; G.fault[G.fault_n].prefetch = pref;
+        G.fault[G.fault_n].first_at = at; G.fault[G.fault_n].n = 1;
+        G.fault_n++;
+    }
+}
+
 static const char *status_name(arm_status_t s) {
     switch (s) {
         case ARM_OK:        return "OK";
@@ -55,6 +315,14 @@ int main(int argc, char **argv) {
     const char *dtpath = NULL;
     const char *cmdline = "debug=0x8 serial=1";
     bool stop_on_abort = false;
+    /*
+     * boot_args header. MEASURED, not guessed: pe_identify_machine() at
+     * 0xc01a7f22 does `ldrh r3,[r0,#2]; cmp r3,#6` and panics
+     * "pe_identify_machine: Epoch Mismatch" on anything else, so the halfword
+     * at boot_args+2 must be 6. Revision (+0) is not checked here; 1 works.
+     * Override with -r/-w to re-probe (-w 2 reproduces the original panic).
+     */
+    unsigned ba_rev = 1, ba_ver = 6;
 
     /* Walk the arguments one at a time: pair-stepping breaks as soon as a
      * single-argument flag like -a appears. */
@@ -66,6 +334,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-n")) steps     = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-d")) dtpath    = argv[++i];
         else if (!strcmp(argv[i], "-c")) cmdline   = argv[++i];
+        else if (!strcmp(argv[i], "-r")) ba_rev    = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-w")) ba_ver    = (unsigned)strtoul(argv[++i], NULL, 0);
     }
 
     size_t len = 0;
@@ -77,11 +347,15 @@ int main(int argc, char **argv) {
     if (mst != MACHO_OK) { fprintf(stderr, "macho: %s\n", macho_strerror(mst)); return 2; }
     if (!m.has_entry)    { fprintf(stderr, "no entry point in the image\n"); return 2; }
 
+    ksyms_load(img, len);
+    printf("symbols    : %u\n", ksym_count);
+
     /* Enough RAM to hold the kernel plus room for its page tables and heap. */
     const uint32_t ram_size = 128u << 20;
     s5l8900_t mach;
     if (!s5l8900_init(&mach, phys_base, ram_size)) { fprintf(stderr, "init failed\n"); return 1; }
     mach.trace_devices = true;
+    g_mach = &mach; g_virt_base = virt_base; g_phys_base = phys_base;
 
     printf("kernel     : %s (%zu bytes)\n", argv[1], len);
     printf("virt base  : 0x%08x   phys base : 0x%08x   RAM %u MB\n",
@@ -134,8 +408,8 @@ int main(int argc, char **argv) {
 #define PUT16(o, v) do { ba[o] = (uint8_t)(v); ba[(o)+1] = (uint8_t)((v) >> 8); } while (0)
 #define PUT32(o, v) do { ba[o] = (uint8_t)(v); ba[(o)+1] = (uint8_t)((v) >> 8); \
                          ba[(o)+2] = (uint8_t)((v) >> 16); ba[(o)+3] = (uint8_t)((v) >> 24); } while (0)
-    PUT16(0x00, 1);                    /* Revision  */
-    PUT16(0x02, 2);                    /* Version   */
+    PUT16(0x00, ba_rev);               /* Revision  */
+    PUT16(0x02, ba_ver);               /* Version   */
     PUT32(0x04, virt_base);
     PUT32(0x08, phys_base);
     PUT32(0x0c, ram_size);
@@ -164,14 +438,35 @@ int main(int argc, char **argv) {
     mach.cpu.r[15] = entry_pa;
     mach.cpu.r[0]  = ba_pa;            /* XNU takes boot_args in r0 */
 
+    /* Interpose on the bus so every non-RAM access is attributed to a PC. */
+    spy_install(&mach, virt_base, phys_base);
+
     /*
      * Ring buffer of recent execution. When the kernel faults we want the
      * instructions that led there, not the state a few million instructions
      * later once it is spinning in a handler.
      */
-#define KTRACE 160
-    struct { uint32_t pc, cpsr, r[16]; } tr[KTRACE];
+#define KTRACE 512
+    static struct { uint32_t pc, cpsr, r[16]; } tr[KTRACE];
     unsigned tw = 0, tcount = 0;
+
+    /*
+     * Watchpoints on the failure machinery itself. panic() takes its printf
+     * format in r0 and its arguments in r1..r3 then on the stack, so catching
+     * the entry instruction is enough to recover the message the kernel was
+     * trying to print — which is exactly what never reaches the UART.
+     */
+    struct wp { const char *name; uint32_t va; unsigned hits; };
+    struct wp wps[] = {
+        { "_panic",      ksym_value("_panic"),      0 },
+        { "_Debugger",   ksym_value("_Debugger"),   0 },
+        { "_kdb_printf", ksym_value("_kdb_printf"), 0 },
+        { "_printf",     ksym_value("_printf"),     0 },
+    };
+    const unsigned nwps = (unsigned)(sizeof wps / sizeof wps[0]);
+    for (unsigned i = 0; i < nwps; i++)
+        printf("watch      : %-12s vm 0x%08x\n", wps[i].name, wps[i].va);
+    printf("\n");
 
     arm_status_t st = ARM_OK;
     unsigned n = 0;
@@ -187,6 +482,69 @@ int main(int argc, char **argv) {
         tw = (tw + 1) % KTRACE;
         if (tcount < KTRACE) tcount++;
 
+        /* How far down the console-init chain did we get? Each milestone is
+         * matched at its virtual address and at its pre-MMU physical alias. */
+        {
+            uint32_t p = last_pc & ~1u;
+            for (unsigned i = 0; i < NMILE; i++) {
+                if (p != (MILESTONES[i].va & ~1u) && p != (G.mile_pa[i] & ~1u)) continue;
+                if (!G.mile_hits[i]) G.mile_first[i] = n;
+                G.mile_hits[i]++;
+                break;
+            }
+        }
+
+        /* Did we just land on one of the failure entry points? */
+        for (unsigned w = 0; w < nwps; w++) {
+            uint32_t va = wps[w].va;
+            if (!va) continue;
+            uint32_t pa = va - virt_base + phys_base;
+            if ((last_pc & ~1u) != (va & ~1u) && (last_pc & ~1u) != (pa & ~1u)) continue;
+            if (wps[w].hits++ >= 3) continue;    /* first few calls only */
+            printf("=== %s entered (call #%u) at instruction %u ===\n",
+                   wps[w].name, wps[w].hits, n);
+            printf("  called from lr 0x%08x  (%s)\n",
+                   mach.cpu.r[14], ksym_at(mach.cpu.r[14]));
+            printf("  r0 %08x  r1 %08x  r2 %08x  r3 %08x  sp %08x\n",
+                   mach.cpu.r[0], mach.cpu.r[1], mach.cpu.r[2],
+                   mach.cpu.r[3], mach.cpu.r[13]);
+            print_guest_str("format r0", mach.cpu.r[0]);
+            /* varargs that are themselves strings are worth resolving too */
+            uint32_t av[3] = { mach.cpu.r[1], mach.cpu.r[2], mach.cpu.r[3] };
+            for (int a = 0; a < 3; a++) {
+                const uint8_t *p = guest_ptr(av[a], 2);
+                if (p && p[0] >= 0x20 && p[0] < 0x7f) {
+                    char lbl[16]; snprintf(lbl, sizeof lbl, "arg r%d", a + 1);
+                    print_guest_str(lbl, av[a]);
+                }
+            }
+            /* Stack-passed varargs and the return chain live here. */
+            const uint8_t *sp = guest_ptr(mach.cpu.r[13], 64);
+            if (sp) {
+                printf("  stack:");
+                for (int k = 0; k < 8; k++) printf(" %08x", ld32(sp + k * 4));
+                printf("\n");
+            }
+            /* Where did we come from? Show the distinct functions on the way. */
+            printf("  recent call path (oldest first, one line per function):\n");
+            unsigned start = (tw + KTRACE - tcount) % KTRACE;
+            char seen[160]; seen[0] = '\0';
+            for (unsigned i = 0; i < tcount; i++) {
+                unsigned k = (start + i) % KTRACE;
+                const char *nm = ksym_at(tr[k].pc);
+                char base[160];
+                const char *bar = strchr(nm, '+');
+                snprintf(base, sizeof base, "%.*s",
+                         bar ? (int)(bar - nm) : (int)strlen(nm), nm);
+                if (strcmp(base, seen)) {
+                    printf("    %08x  %s\n", tr[k].pc, nm);
+                    snprintf(seen, sizeof seen, "%s", base);
+                }
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+
         uint32_t mode_before = mach.cpu.cpsr & ARM_CPSR_MODE_MASK;
         st = arm_step(&mach.cpu);
         if (st != ARM_OK) break;
@@ -197,6 +555,15 @@ int main(int argc, char **argv) {
          * exception fired earlier than the kernel expected. */
         {
             uint32_t mode_after = mach.cpu.cpsr & ARM_CPSR_MODE_MASK;
+            /* Record every distinct abort site. With the MMU on, an access to
+             * an unmapped VIRTUAL address faults here and never reaches the
+             * bus, so these are invisible in the unmapped-physical counters. */
+            if (mode_after == ARM_MODE_ABT && mode_before != ARM_MODE_ABT) {
+                bool pref = (mach.cpu.r[15] & 0xfffu) == 0x00cu;
+                note_fault(pref ? mach.cpu.cp15.ifar : mach.cpu.cp15.dfar,
+                           pref ? mach.cpu.cp15.ifsr : mach.cpu.cp15.dfsr,
+                           last_pc, pref, n);
+            }
             if (!first_exc && mode_after != mode_before &&
                 (mode_after == ARM_MODE_ABT || mode_after == ARM_MODE_UND ||
                  mode_after == ARM_MODE_IRQ || mode_after == ARM_MODE_FIQ)) {
@@ -244,7 +611,8 @@ int main(int argc, char **argv) {
     printf("  pc             : 0x%08x", last_pc);
     if (last_pc >= phys_base && last_pc < phys_base + ram_size)
         printf("  (vm 0x%08x)", last_pc - phys_base + virt_base);
-    printf("\n");
+    printf("  %s\n", ksym_at(last_pc >= phys_base && last_pc < virt_base
+                             ? last_pc - phys_base + virt_base : last_pc));
     printf("  cpsr           : 0x%08x (mode %02x%s)\n", mach.cpu.cpsr,
            mach.cpu.cpsr & ARM_CPSR_MODE_MASK,
            (mach.cpu.cpsr & ARM_CPSR_T) ? ", Thumb" : "");
@@ -261,6 +629,46 @@ int main(int argc, char **argv) {
         for (unsigned i = 0; i < mach.unmapped_addr_count; i++)
             printf("    0x%08x\n", mach.unmapped_addr[i]);
     }
+
+    /* ---------------- console-path diagnostics ---------------- */
+    printf("\n=== UART PAGE (0x%08x) ACCESSES: %llu ===\n",
+           UARTPG, (unsigned long long)G.uart_hits);
+    for (unsigned i = 0; i < G.uart_log_n; i++)
+        printf("    %s %s off 0x%02x  val 0x%08x  by pc 0x%08x %s\n",
+               G.uart_log[i].wr ? "WRITE" : "READ ",
+               G.uart_log[i].bytes == 4 ? "w" : G.uart_log[i].bytes == 2 ? "h" : "b",
+               G.uart_log[i].addr - UARTPG, G.uart_log[i].val, G.uart_log[i].pc,
+               ksym_at(G.uart_log[i].pc >= phys_base && G.uart_log[i].pc < virt_base
+                       ? G.uart_log[i].pc - phys_base + virt_base : G.uart_log[i].pc));
+
+    printf("\n=== ALL NON-RAM PHYSICAL PAGES TOUCHED (%u) ===\n", G.dev_page_n);
+    for (unsigned i = 0; i < G.dev_page_n; i++)
+        printf("    0x%08x  r=%-8llu w=%-8llu first pc 0x%08x %s\n",
+               G.dev_page[i].page, (unsigned long long)G.dev_page[i].reads,
+               (unsigned long long)G.dev_page[i].writes, G.dev_page[i].first_pc,
+               ksym_at(G.dev_page[i].first_pc >= phys_base && G.dev_page[i].first_pc < virt_base
+                       ? G.dev_page[i].first_pc - phys_base + virt_base
+                       : G.dev_page[i].first_pc));
+
+    printf("\n=== CONSOLE-INIT MILESTONES (xnu-1357.5.30 symbols) ===\n");
+    printf("    --- NEVER REACHED ---\n");
+    for (unsigned i = 0; i < NMILE; i++)
+        if (!G.mile_hits[i])
+            printf("    %-28s vm 0x%08x\n", MILESTONES[i].name, MILESTONES[i].va);
+    printf("    --- reached, with call counts and first instruction index ---\n");
+    for (unsigned i = 0; i < NMILE; i++)
+        if (G.mile_hits[i])
+            printf("    %-28s hits %-10llu first @ instr %u\n", MILESTONES[i].name,
+                   (unsigned long long)G.mile_hits[i], G.mile_first[i]);
+
+    printf("\n=== DISTINCT ABORT SITES (%u) ===\n", G.fault_n);
+    for (unsigned i = 0; i < G.fault_n; i++)
+        printf("    %s FAR 0x%08x FSR 0x%02x  pc 0x%08x %s  n=%llu first@%u\n",
+               G.fault[i].prefetch ? "IFETCH" : "DATA  ",
+               G.fault[i].far_, G.fault[i].fsr & 0xff, G.fault[i].pc,
+               ksym_at(G.fault[i].pc >= phys_base && G.fault[i].pc < virt_base
+                       ? G.fault[i].pc - phys_base + virt_base : G.fault[i].pc),
+               (unsigned long long)G.fault[i].n, G.fault[i].first_at);
 
     if (mach.uart0.tx_len)
         printf("\n=== KERNEL UART OUTPUT (%zu bytes) ===\n%s\n",
