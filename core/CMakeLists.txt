@@ -9,6 +9,7 @@ add_library(emucore STATIC
     src/soc/machine.c
     src/firmware/img3.c
     src/firmware/aes.c
+    src/firmware/loader.c
 )
 target_include_directories(emucore PUBLIC include)
 
@@ -32,3 +33,7 @@ add_test(NAME img3_parser COMMAND test_img3)
 add_executable(test_aes tests/test_aes.c)
 target_link_libraries(test_aes PRIVATE emucore)
 add_test(NAME aes_fips197 COMMAND test_aes)
+
+add_executable(test_loader tests/test_loader.c)
+target_link_libraries(test_loader PRIVATE emucore)
+add_test(NAME firmware_loader COMMAND test_loader)

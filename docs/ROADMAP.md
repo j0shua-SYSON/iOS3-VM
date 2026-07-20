@@ -94,6 +94,19 @@ on the phone."
   into the IMG3 parser: given a user-supplied key it decrypts the DATA payload
   using the KBAG's IV, passing any unaligned tail through unchanged. No
   OpenSSL, so the core keeps its zero-dependency property.
+- **Done: the firmware loader.** Parse -> decrypt -> place in guest RAM ->
+  execute. The full pipeline is proven end to end: an AES-encrypted IMG3 whose
+  payload is real ARM code is decrypted, loaded and run until it prints over
+  the emulated UART:
+
+  ```
+  [plain IMG3 -> guest said] iBoot
+  [encrypted IMG3 -> decrypted -> guest said] iBoot
+  ```
+
+  This is precisely the path Apple's LLB/iBoot will take; the only difference
+  is who wrote the payload. Mis-keyed, oversized, truncated and garbage images
+  are refused with a status rather than corrupting the machine.
 - Remaining: NOR + NAND with the FTL/VFL layers,
   device tree. Execute Apple's real low-level boot chain far enough to see
   **iBoot** serial output.
