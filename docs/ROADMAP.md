@@ -278,10 +278,34 @@ small operands the signed and unsigned answers agree.
 
 ### What is actually left in M4
 
-- **No root filesystem, so no userspace.** The kernel reaches `bsd_init` and
-  then has nothing to mount. `bootkernel` can already publish a RAM disk through
-  `/chosen/memory-map` and append `rd=md0`; what is missing is a root image the
-  3.1.3 kernel will accept.
+**Update (later in the session):** two boot-stopping walls past `bsd_init` were
+cleared and the boot now brings up the entire IOKit driver tree.
+
+1. **The interrupt storm.** The kernel raised a self-IPI on VIC software-interrupt
+   line 4 and read `VICADDRESS` (0xF00) to find the source; our stub returned 0,
+   which the PL192 driver decodes as spurious source 0, so the IPI was
+   acknowledged but never cleared and `_fleh_irq` re-fired forever. Fixed by
+   modelling `VICADDRESS` to return `source | 0x80000000`. Console output jumped
+   2177 → 8191 bytes.
+2. **`AppleS5L8900XADMFMC::start` panic** ("ADM startup failed"). The NAND/DMA
+   driver's `admStart` polls the ADM status register for a ready bit that never
+   sets in emulation. Since we boot from a RAM disk we do not need NAND, and the
+   driver's own `probe()` honours the boot-arg **`nand-enable-adm=0`** — with it,
+   the driver never matches and never panics. This is the standard boot recipe:
+   `-c "debug=0x8 serial=1 nand-enable-adm=0"`.
+
+With both cleared, the boot now starts MBX graphics, SDIO, PMU, the camera
+sensor, five UARTs and eight PL080 DMA channels, with a live kernel clock —
+then wedges in a tight IOKit-matching spin after the SDIO bus enumerates with no
+card (the guest clock freezes, so it is a loop, not slow progress). That spin is
+the current frontier.
+
+- **Still no root filesystem, so no userspace.** `bootkernel` publishes a RAM
+  disk through `/chosen/memory-map` and appends `rd=md0`, and the RAMDisk address
+  is confirmed virtual; what is missing is getting past the IOKit spin and then a
+  root image the 3.1.3 kernel accepts (the *restore* ramdisk leads to the restore
+  flow, not SpringBoard — the real HFSX rootfs is needed, which needs its
+  decryption key).
   **Next observable:** the kernel printing `Still waiting for root device` —
   which reads like a failure and is the opposite. It is what XNU prints when
   everything above the filesystem is up and healthy. (The string is present in
