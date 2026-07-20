@@ -561,7 +561,20 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
                     c->cpsr = (c->cpsr & ARM_CPSR_MODE_MASK) | (s & ~ARM_CPSR_MODE_MASK);
                 }
             }
-            *next = res & ~3u;   /* ARM-state ALUWritePC forces word alignment */
+            /*
+             * Align for the instruction set we are landing in, not the one we
+             * came from. When S is set the SPSR restore above has just put T
+             * back, so a handler returning to interrupted Thumb code must
+             * align to a halfword. Forcing word alignment silently rewinds the
+             * resume address by 2 whenever the interrupted Thumb instruction
+             * sat at an odd halfword, and the guest re-executes the preceding
+             * instruction — which is how a zone free ended up unlocking a
+             * mutex at address 1.
+             *
+             * Safe for the ordinary S==0 case: in ARM state T is clear, so the
+             * mask stays ~3u and MOV pc,Rm correctly does not interwork.
+             */
+            *next = res & ((c->cpsr & ARM_CPSR_T) ? ~1u : ~3u);
         }
     }
     return ARM_OK;

@@ -179,6 +179,55 @@ static void test_bx_branches(void) {
     CHECK(c.r[15] == 0x100, "pc=%08x expect 100 (BX branched)", c.r[15]);
 }
 
+/*
+ * Returning from an exception into Thumb code must land on the halfword the
+ * SPSR says, not on the word below it.
+ *
+ * This one cost a real boot. The kernel's decrementer FIQ interrupts Thumb
+ * code roughly half the time at an address that is 2 mod 4. Masking the
+ * resume address with ~3 rewinds it by two bytes, so the guest re-executes
+ * the *preceding* halfword. In xnu-1357 that turned a zone free into a jump
+ * onto the locked path's tail, which then unlocked a mutex whose pointer was
+ * a stale scratch value of 1 -- surfacing as a data abort at
+ * _lck_mtx_unlock+0x8 with DFAR 0x1, a mile from the actual bug.
+ *
+ * The tell was statistical: every single one of 761 exception returns landed
+ * 4-byte aligned, where hardware would be about half and half.
+ */
+static void test_exception_return_to_thumb_keeps_halfword(void) {
+    uint32_t p[] = { 0xe1b0f00e };   /* MOVS pc, lr */
+    arm_cpu_t c; load_and_run(&c, p, 1, 0);   /* load only; we set up state */
+
+    arm_set_mode(&c, ARM_MODE_FIQ);
+    c.spsr[arm_bank_of_mode(ARM_MODE_FIQ)] = ARM_MODE_SVC | ARM_CPSR_T;
+    c.r[14] = 0x0000101a;            /* Thumb, and 2 mod 4 */
+    c.r[15] = 0;
+    arm_step(&c);
+
+    CHECK(c.r[15] == 0x0000101a,
+          "pc=%08x expect 101a (a ~3 mask would rewind it to 1018)", c.r[15]);
+    CHECK((c.cpsr & ARM_CPSR_T) != 0, "should have resumed in Thumb state");
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC,
+          "mode=%02x expect SVC restored from SPSR",
+          c.cpsr & ARM_CPSR_MODE_MASK);
+}
+
+/* The same return into ARM code must still be word-aligned. */
+static void test_exception_return_to_arm_stays_word_aligned(void) {
+    uint32_t p[] = { 0xe1b0f00e };   /* MOVS pc, lr */
+    arm_cpu_t c; load_and_run(&c, p, 1, 0);
+
+    arm_set_mode(&c, ARM_MODE_FIQ);
+    c.spsr[arm_bank_of_mode(ARM_MODE_FIQ)] = ARM_MODE_SVC;  /* T clear */
+    c.r[14] = 0x0000101a;
+    c.r[15] = 0;
+    arm_step(&c);
+
+    CHECK(c.r[15] == 0x00001018, "pc=%08x expect 1018 (ARM state aligns to 4)",
+          c.r[15]);
+    CHECK((c.cpsr & ARM_CPSR_T) == 0, "should have resumed in ARM state");
+}
+
 static void test_swp_exchanges(void) {
     /* SWP is an atomic read-then-write: Rd gets the old memory word and the
      * new value comes from Rm. Getting the order wrong (writing before
@@ -837,6 +886,8 @@ int main(void) {
     test_mul();
     test_orr_bic_mvn();
     test_bx_branches();
+    test_exception_return_to_thumb_keeps_halfword();
+    test_exception_return_to_arm_stays_word_aligned();
     test_swp_exchanges();
     test_ldrexd_strexd_roundtrip();
     test_clrex_makes_strex_fail();

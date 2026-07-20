@@ -426,6 +426,22 @@ static struct {
     /* distinct MMU faults */
     unsigned    fault_n;
     struct { uint32_t far_, fsr, pc; bool prefetch; unsigned first_at; uint64_t n; } fault[48];
+
+    /* --- DIAGNOSTIC: exception returns that resume in Thumb state ---------
+     * A "MOVS pc,lr" / "LDM ^" leaving an ARM handler for Thumb code must
+     * resume at the exact halfword it was interrupted at. If the core forces
+     * word alignment the resume address silently loses 2 bytes, and the guest
+     * re-executes the previous halfword. Counting how many of these land on a
+     * 4-aligned address is a direct test: genuine Thumb resume points should be
+     * split roughly evenly between +0 and +2 mod 4. */
+    uint64_t    exret_thumb, exret_thumb_aligned4, exret_mismatch;
+    unsigned    exret_log_n;
+    struct { unsigned at; uint32_t from_pc, lr, to_pc, mode_from, mode_to; } exret_log[24];
+
+    /* --- DIAGNOSTIC: failed STREX/STREXD/STREXB/STREXH -------------------- */
+    uint64_t    strex_total, strex_failed;
+    unsigned    strex_log_n;
+    struct { unsigned at; uint32_t pc, addr; } strex_log[32];
 } G;
 
 static void note_dev_page(uint32_t addr, uint32_t pc, bool wr) {
@@ -514,7 +530,12 @@ int main(int argc, char **argv) {
             "          [-D <node/path>:<prop>=<value>] ...\n"
             "  -D  patch a 4-byte device-tree property in the in-memory copy\n"
             "      (empty path == root), e.g. -D cpus/cpu0:timebase-frequency=6000000\n"
-            "  -M  do not synthesise /memory reg from the RAM layout\n",
+            "  -M  do not synthesise /memory reg from the RAM layout\n"
+            "  -K  how many trace lines to print at the first data abort\n"
+            "  -A  DIAGNOSTIC SHIM, not a fix: after an exception return that\n"
+            "      resumes in Thumb state, undo the word alignment the core\n"
+            "      applies to the resume address. Use it to confirm that a\n"
+            "      failure is caused by that alignment, never to 'work'.\n",
             argv[0]);
         return 1;
     }
@@ -528,6 +549,9 @@ int main(int argc, char **argv) {
      * kernel places its page tables; that regressed the boot, so it is opt-in
      * until the interaction is understood. */
     bool want_fb = false;
+    /* -A: from outside the core, undo the word-alignment the interpreter
+     * applies when an exception return resumes in Thumb state. This is a
+     * PROOF SHIM for a suspected core bug, not a fix. */
     /*
      * boot_args header. MEASURED, not guessed: pe_identify_machine() at
      * 0xc01a7f22 does `ldrh r3,[r0,#2]; cmp r3,#6` and panics
@@ -543,6 +567,7 @@ int main(int argc, char **argv) {
     unsigned ndtov = 0;
     char dtbuf[32][96];
     bool patch_memnode = true;
+    unsigned ktail = 512;              /* -K n: trace lines to print on abort */
 
     /* Walk the arguments one at a time: pair-stepping breaks as soon as a
      * single-argument flag like -a appears. */
@@ -570,6 +595,7 @@ int main(int argc, char **argv) {
         if      (!strcmp(argv[i], "-p")) phys_base = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-V")) virt_base = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-n")) steps     = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-K")) ktail     = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-d")) dtpath    = argv[++i];
         else if (!strcmp(argv[i], "-c")) cmdline   = argv[++i];
         else if (!strcmp(argv[i], "-r")) ba_rev    = (unsigned)strtoul(argv[++i], NULL, 0);
@@ -724,7 +750,7 @@ int main(int argc, char **argv) {
      * instructions that led there, not the state a few million instructions
      * later once it is spinning in a handler.
      */
-#define KTRACE 512
+#define KTRACE (1u << 18)
     static struct { uint32_t pc, cpsr, r[16]; } tr[KTRACE];
     unsigned tw = 0, tcount = 0;
 
@@ -807,7 +833,7 @@ int main(int argc, char **argv) {
             printf("  recent call path (oldest first, one line per function):\n");
             unsigned start = (tw + KTRACE - tcount) % KTRACE;
             char seen[160]; seen[0] = '\0';
-            for (unsigned i = 0; i < tcount; i++) {
+            for (unsigned i = tcount > 4096 ? tcount - 4096 : 0; i < tcount; i++) {
                 unsigned k = (start + i) % KTRACE;
                 const char *nm = ksym_at(tr[k].pc);
                 char base[160];
@@ -824,9 +850,72 @@ int main(int argc, char **argv) {
         }
 
         uint32_t mode_before = mach.cpu.cpsr & ARM_CPSR_MODE_MASK;
+        uint32_t t_before    = mach.cpu.cpsr & ARM_CPSR_T;
+        uint32_t lr_before   = mach.cpu.r[14];
+
+        /* Pre-decode an ARM STREX* so its success/failure can be read out of
+         * Rd after the step. Rd == 15 is unpredictable and never emitted. */
+        unsigned strex_rd = 16, strex_rn = 16;
+        if (!t_before) {
+            const uint8_t *ip_ = guest_ptr(last_pc, 4);
+            if (ip_) {
+                uint32_t iw = ld32(ip_);
+                uint32_t k  = iw & 0x0ff00ff0u;
+                if ((k == 0x01800f90u || k == 0x01a00f90u ||
+                     k == 0x01c00f90u || k == 0x01e00f90u) &&
+                    (iw >> 28) != 0xfu) {
+                    strex_rd = (iw >> 12) & 0xfu;
+                    strex_rn = (iw >> 16) & 0xfu;
+                }
+            }
+        }
+        uint32_t strex_addr = strex_rn < 16 ? mach.cpu.r[strex_rn] : 0;
+
         st = arm_step(&mach.cpu);
         if (st != ARM_OK) break;
         s5l8900_tick(&mach, 1);
+
+        if (strex_rd < 16 && mach.cpu.r[15] != last_pc) {
+            G.strex_total++;
+            if (mach.cpu.r[strex_rd] == 1u) {
+                G.strex_failed++;
+                if (G.strex_log_n < 32) {
+                    G.strex_log[G.strex_log_n].at   = n;
+                    G.strex_log[G.strex_log_n].pc   = last_pc;
+                    G.strex_log[G.strex_log_n].addr = strex_addr;
+                    G.strex_log_n++;
+                }
+            }
+        }
+
+        /* Exception return out of an ARM handler into Thumb code. */
+        {
+            uint32_t mode_after = mach.cpu.cpsr & ARM_CPSR_MODE_MASK;
+            uint32_t t_after    = mach.cpu.cpsr & ARM_CPSR_T;
+            if (mode_after != mode_before && t_after && !t_before) {
+                G.exret_thumb++;
+                if (!(mach.cpu.r[15] & 3u)) G.exret_thumb_aligned4++;
+                /*
+                 * Invariant: a handler returning into Thumb must resume at
+                 * exactly lr (bit 0 cleared). Any mismatch means the core has
+                 * aligned the resume address for the wrong instruction set —
+                 * the defect that made a decrementer FIQ rewind Thumb code by
+                 * two bytes and corrupt a zone free. This should stay zero.
+                 */
+                if ((lr_before & ~1u) != mach.cpu.r[15]) {
+                    G.exret_mismatch++;
+                    if (G.exret_log_n < 24) {
+                        G.exret_log[G.exret_log_n].at        = n;
+                        G.exret_log[G.exret_log_n].from_pc   = last_pc;
+                        G.exret_log[G.exret_log_n].lr        = lr_before;
+                        G.exret_log[G.exret_log_n].to_pc     = mach.cpu.r[15];
+                        G.exret_log[G.exret_log_n].mode_from = mode_before;
+                        G.exret_log[G.exret_log_n].mode_to   = mode_after;
+                        G.exret_log_n++;
+                    }
+                }
+            }
+        }
 
         /* Report the first entry into an exception mode with the PC that caused
          * it — the kernel reading uninitialised per-CPU data usually means an
@@ -870,10 +959,20 @@ int main(int argc, char **argv) {
                first_abort_at, abort_dfsr, abort_dfar);
         printf("  instructions leading up to it (newest last):\n");
         unsigned start = (tw + KTRACE - tcount) % KTRACE;
-        for (unsigned i = 0; i < tcount; i++) {
+        unsigned skip  = tcount > ktail ? tcount - ktail : 0;
+        for (unsigned i = skip; i < tcount; i++) {
             unsigned k = (start + i) % KTRACE;
-            printf("    %08x  %s\n", tr[k].pc,
-                   (tr[k].cpsr & ARM_CPSR_T) ? "Thumb" : "ARM");
+            /* absolute instruction index of this entry */
+            unsigned idx = first_abort_at - (tcount - 1 - i);
+            printf("    %-9u %08x %c m%02x r0=%08x r5=%08x r6=%08x "
+                   "fp=%08x ip=%08x sp=%08x lr=%08x  %s\n",
+                   idx, tr[k].pc,
+                   (tr[k].cpsr & ARM_CPSR_T) ? 'T' : 'A',
+                   tr[k].cpsr & ARM_CPSR_MODE_MASK,
+                   tr[k].r[0], tr[k].r[5], tr[k].r[6], tr[k].r[11],
+                   tr[k].r[12], tr[k].r[13], tr[k].r[14],
+                   ksym_at(tr[k].pc >= phys_base && tr[k].pc < virt_base
+                           ? tr[k].pc - phys_base + virt_base : tr[k].pc));
         }
         unsigned last = (tw + KTRACE - 1) % KTRACE;
         printf("\n  registers at the faulting instruction:\n");
@@ -907,7 +1006,7 @@ int main(int argc, char **argv) {
         printf("  recent call path (oldest first, one line per function):\n");
         unsigned start = (tw + KTRACE - tcount) % KTRACE;
         char seen[160]; seen[0] = '\0';
-        for (unsigned i = 0; i < tcount; i++) {
+        for (unsigned i = tcount > 4096 ? tcount - 4096 : 0; i < tcount; i++) {
             unsigned k = (start + i) % KTRACE;
             uint32_t va = tr[k].pc >= phys_base && tr[k].pc < virt_base
                         ? tr[k].pc - phys_base + virt_base : tr[k].pc;
@@ -978,6 +1077,25 @@ int main(int argc, char **argv) {
         if (G.mile_hits[i])
             printf("    %-28s hits %-10llu first @ instr %u\n", MILESTONES[i].name,
                    (unsigned long long)G.mile_hits[i], G.mile_first[i]);
+
+    printf("\n=== EXCEPTION RETURNS INTO THUMB ===\n");
+    printf("    total                       : %llu\n", (unsigned long long)G.exret_thumb);
+    printf("    resumed at a 4-aligned addr : %llu  (expect ~50%% on real hw)\n",
+           (unsigned long long)G.exret_thumb_aligned4);
+    printf("    resumed != lr (MOVS pc,lr)  : %llu\n", (unsigned long long)G.exret_mismatch);
+    for (unsigned i = 0; i < G.exret_log_n; i++)
+        printf("      @%-10u mode %02x->%02x  handler pc 0x%08x  lr 0x%08x -> resumed 0x%08x  %s\n",
+               G.exret_log[i].at, G.exret_log[i].mode_from, G.exret_log[i].mode_to,
+               G.exret_log[i].from_pc, G.exret_log[i].lr, G.exret_log[i].to_pc,
+               ksym_at(G.exret_log[i].to_pc));
+
+    printf("\n=== ARM STREX/STREXB/STREXH/STREXD ===\n");
+    printf("    executed : %llu\n", (unsigned long long)G.strex_total);
+    printf("    FAILED   : %llu\n", (unsigned long long)G.strex_failed);
+    for (unsigned i = 0; i < G.strex_log_n; i++)
+        printf("      @%-10u pc 0x%08x addr 0x%08x  %s\n",
+               G.strex_log[i].at, G.strex_log[i].pc, G.strex_log[i].addr,
+               ksym_at(G.strex_log[i].pc));
 
     printf("\n=== DISTINCT ABORT SITES (%u) ===\n", G.fault_n);
     for (unsigned i = 0; i < G.fault_n; i++)
