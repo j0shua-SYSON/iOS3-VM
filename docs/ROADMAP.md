@@ -119,6 +119,18 @@ on the phone."
   [found 'ibot' in NOR @0x2000 -> booted -> guest said] iBoot
   ```
 
+- **Done: the Apple device tree.** iBoot hands XNU a tree describing the
+  hardware — which peripherals exist, where their registers live — and the
+  kernel cannot boot without it. Full parser for Apple's own format (not FDT):
+  node/property traversal, property lookup, and slash-separated paths. Written
+  for untrusted input: bounds-checked in 64-bit and depth-limited, with tests
+  covering truncation, absurd property lengths, absurd child counts and
+  excessive nesting.
+
+  ```
+  [device tree] /arm-io/uart0 reg = 0x3cc00000
+  ```
+
 - Remaining: NAND with the FTL/VFL layers,
   device tree. Execute Apple's real low-level boot chain far enough to see
   **iBoot** serial output.
