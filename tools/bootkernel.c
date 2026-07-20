@@ -265,6 +265,75 @@ static bool dt_set_reg(uint8_t *b, size_t len, const char *path,
     return true;
 }
 
+/* ---------------------------------------------------------------------------
+ * Adding an entry to /chosen/memory-map WITHOUT rebuilding the blob.
+ *
+ * The obvious problem: this flat format has no relocation table, every offset
+ * is implicit in the byte stream, so appending a property to a node in the
+ * middle of the tree means rewriting everything after it. That is why every
+ * other patch here is same-length and in place.
+ *
+ * It turns out no rebuild is needed. The shipped tree already carries sixteen
+ * placeholders in that node — MemoryMapReserved-0 .. MemoryMapReserved-15 —
+ * each with a value of exactly 8 zero bytes, which is exactly the shape of a
+ * memory-map entry ({address, size}). That is not a coincidence: it is how
+ * iBoot adds entries at run time. It finds a spare placeholder, overwrites the
+ * 32-byte name field with the real key, and fills in the two words. Name and
+ * value lengths are both unchanged, so the patch is same-length and in place.
+ *
+ * The one live entry in the shipped tree corroborates the format:
+ *   .DeviceTree = {0x00000000, 0x00009e60}   and 0x9e60 == 40544 == the exact
+ * size of devicetree.bin. Address zero because iBoot had not run yet.
+ *
+ * So we do what iBoot does. `claim` is CONFIRMED behaviour of the format, not
+ * a trick: renaming a reserved slot is the mechanism the slots exist for.
+ * ------------------------------------------------------------------------- */
+static bool dt_memmap_add(uint8_t *b, size_t len, const char *key,
+                          uint32_t addr, uint32_t size) {
+    size_t node = dtn_path(b, len, "chosen/memory-map");
+    if (node == DT_NONE) {
+        printf("  dt: /chosen/memory-map NOT FOUND — cannot add %s\n", key);
+        return false;
+    }
+    uint32_t np, nc;
+    size_t p = dtn_hdr(b, len, node, &np, &nc);
+    if (!p) return false;
+
+    size_t slot = 0;                       /* offset of the property record */
+    for (uint32_t i = 0; i < np; i++) {
+        if (p + 36 > len) return false;
+        char nm[DTNAME + 1];
+        memcpy(nm, b + p, DTNAME); nm[DTNAME] = '\0';
+        uint32_t l = ld32(b + p + 32) & 0x7fffffffu;
+        /* An existing entry with this key wins: re-running must be idempotent
+         * rather than burning a second placeholder each time. */
+        if (!strcmp(nm, key) && l == 8) { slot = p; break; }
+        if (!slot && l == 8 && !strncmp(nm, "MemoryMapReserved-", 18) &&
+            ld32(b + p + 36) == 0 && ld32(b + p + 40) == 0)
+            slot = p;                      /* first free placeholder; keep looking
+                                            * in case the real key already exists */
+        p += 36 + ((l + 3u) & ~3u);
+        if (p > len) return false;
+    }
+    if (!slot) {
+        printf("  dt: no free MemoryMapReserved-* placeholder for %s\n", key);
+        return false;
+    }
+    char old[DTNAME + 1];
+    memcpy(old, b + slot, DTNAME); old[DTNAME] = '\0';
+    memset(b + slot, 0, DTNAME);
+    memcpy(b + slot, key, strlen(key) < DTNAME ? strlen(key) : DTNAME - 1);
+    uint8_t *v = b + slot + 36;
+    uint32_t vals[2] = { addr, size };
+    for (int i = 0; i < 2; i++) {
+        v[i*4+0] = (uint8_t)vals[i];         v[i*4+1] = (uint8_t)(vals[i] >> 8);
+        v[i*4+2] = (uint8_t)(vals[i] >> 16); v[i*4+3] = (uint8_t)(vals[i] >> 24);
+    }
+    printf("  dt: /chosen/memory-map  %-18s -> %-10s {0x%08x,0x%08x}  (in place)\n",
+           old, key, addr, size);
+    return true;
+}
+
 /*
  * S5L8900 clock rates.
  *
@@ -455,8 +524,37 @@ static struct {
      * snapshot at an arbitrary stopping point does not answer that. */
     unsigned    prof_n, prof_dropped;
     struct { const char *fn; unsigned hits; } prof[1024];
+
+    /* --- DIAGNOSTIC: the single hottest unmodelled MMIO page ---------------
+     * One physical page absorbs ~2% of every instruction in a 200M boot. This
+     * probe answers, for that page alone: which word offsets, from which PCs,
+     * called from where, reading/writing what, and *when* -- so we can tell a
+     * loop that eventually gives up from one that never does. */
+    uint64_t    hot_now;                 /* instruction index, updated per step */
+    uint64_t    hot_r[1024], hot_w[1024];/* per word-offset access counts */
+    uint32_t    hot_last[1024];          /* last value read/written per offset */
+    uint32_t    hot_firstw[1024];        /* first value ever written per offset */
+    unsigned char hot_written[1024];
+    unsigned    hot_site_n;
+    struct { uint32_t pc, lr, off; bool wr; uint64_t n, first_at, last_at; } hot_site[64];
+    unsigned    hot_log_n;               /* first N accesses, verbatim */
+    struct { uint64_t at; uint32_t pc, lr, addr, val, r[6]; bool wr; unsigned bytes; } hot_log[80];
+    unsigned    hot_tail_w; uint64_t hot_tail_n;   /* last N accesses, verbatim */
+    struct { uint64_t at; uint32_t pc, lr, addr, val; bool wr; } hot_tail[64];
+    uint64_t    hot_bucket[40];          /* when, over the whole run */
+    uint64_t    hot_steps;               /* run length, for bucket scaling */
 } G;
 
+#define HOTPG 0x39a00000u
+
+/* --- EXPERIMENT (-P): a candidate model for the power block at 0x39a00000 ---
+ * Lives in the tool, not the core, so it can be tested without asserting
+ * anything about hardware in the emulator proper. Semantics come entirely from
+ * the traced AppleS5L8900XPowerController::start sequence:
+ *   0x0C <- bits to clear in STATE      (write-1-to-clear)
+ *   0x10 <- bits to set   in STATE      (write-1-to-set)
+ *   0x14 -> STATE, read-only
+ * plus plain storage for 0x00/0x04/0x08/0x24/0x28. */
 /* Attribute one sample to a function, keeping the table small and exact. */
 static void prof_sample(uint32_t va) {
     const char *nm = ksym_at(va);
@@ -499,10 +597,51 @@ static bool is_ram(uint32_t a, unsigned bytes) {
     return (uint64_t)(a - G.mach->ram_base) + bytes <= (uint64_t)G.mach->ram_size;
 }
 
+/* Record one access to the hot page in as much detail as we can afford. */
+static void note_hot(uint32_t addr, uint32_t val, unsigned bytes, bool wr) {
+    uint32_t pc = G.mach->cpu.r[15], lr = G.mach->cpu.r[14];
+    unsigned wi = (addr & 0xfffu) >> 2;
+    if (wr) G.hot_w[wi]++; else G.hot_r[wi]++;
+    G.hot_last[wi] = val;
+    if (wr && !G.hot_written[wi]) { G.hot_written[wi] = 1; G.hot_firstw[wi] = val; }
+
+    unsigned i;
+    for (i = 0; i < G.hot_site_n; i++)
+        if (G.hot_site[i].pc == pc && G.hot_site[i].lr == lr &&
+            G.hot_site[i].off == (addr & 0xfffu) && G.hot_site[i].wr == wr) break;
+    if (i == G.hot_site_n && G.hot_site_n < 64) {
+        G.hot_site[i].pc = pc; G.hot_site[i].lr = lr;
+        G.hot_site[i].off = addr & 0xfffu; G.hot_site[i].wr = wr;
+        G.hot_site[i].n = 0; G.hot_site[i].first_at = G.hot_now;
+        G.hot_site_n++;
+    }
+    if (i < G.hot_site_n) { G.hot_site[i].n++; G.hot_site[i].last_at = G.hot_now; }
+
+    if (G.hot_log_n < 80) {
+        unsigned k = G.hot_log_n++;
+        G.hot_log[k].at = G.hot_now; G.hot_log[k].pc = pc; G.hot_log[k].lr = lr;
+        G.hot_log[k].addr = addr; G.hot_log[k].val = val;
+        G.hot_log[k].wr = wr; G.hot_log[k].bytes = bytes;
+        for (unsigned q = 0; q < 6; q++) G.hot_log[k].r[q] = G.mach->cpu.r[q];
+    }
+    {
+        unsigned k = G.hot_tail_w;
+        G.hot_tail[k].at = G.hot_now; G.hot_tail[k].pc = pc; G.hot_tail[k].lr = lr;
+        G.hot_tail[k].addr = addr; G.hot_tail[k].val = val; G.hot_tail[k].wr = wr;
+        G.hot_tail_w = (k + 1) % 64; G.hot_tail_n++;
+    }
+    if (G.hot_steps) {
+        uint64_t b = G.hot_now * 40 / G.hot_steps;
+        if (b > 39) b = 39;
+        G.hot_bucket[b]++;
+    }
+}
+
 static void spy(uint32_t addr, uint32_t val, unsigned bytes, bool wr) {
     if (is_ram(addr, bytes)) return;
     uint32_t pc = G.mach->cpu.r[15];
     note_dev_page(addr, pc, wr);
+    if ((addr & ~0xfffu) == HOTPG) note_hot(addr, val, bytes, wr);
     if ((addr & ~0xfffu) == UARTPG) {
         G.uart_hits++;
         if (G.uart_log_n < 64) {
@@ -516,10 +655,16 @@ static void spy(uint32_t addr, uint32_t val, unsigned bytes, bool wr) {
     }
 }
 
-static uint32_t sr32(void *c, uint32_t a) { uint32_t v = G.inner.read32(c, a); spy(a, v, 4, false); return v; }
+static uint32_t sr32(void *c, uint32_t a) {
+    uint32_t v = G.inner.read32(c, a);
+    spy(a, v, 4, false); return v;
+}
 static uint16_t sr16(void *c, uint32_t a) { uint16_t v = G.inner.read16(c, a); spy(a, v, 2, false); return v; }
 static uint8_t  sr8 (void *c, uint32_t a) { uint8_t  v = G.inner.read8 (c, a); spy(a, v, 1, false); return v; }
-static void sw32(void *c, uint32_t a, uint32_t v) { spy(a, v, 4, true); G.inner.write32(c, a, v); }
+static void sw32(void *c, uint32_t a, uint32_t v) {
+    spy(a, v, 4, true);
+    G.inner.write32(c, a, v);
+}
 static void sw16(void *c, uint32_t a, uint16_t v) { spy(a, v, 2, true); G.inner.write16(c, a, v); }
 static void sw8 (void *c, uint32_t a, uint8_t  v) { spy(a, v, 1, true); G.inner.write8 (c, a, v); }
 
@@ -560,15 +705,28 @@ int main(int argc, char **argv) {
         fprintf(stderr,
             "usage: %s <kernel.macho> [-p <physbase>] [-V <virtbase>] [-n <steps>]\n"
             "          [-d <devicetree.bin>] [-c <cmdline>] [-a] [-M]\n"
+            "          [-r <ramdisk.img>] [-R <ram-MB>] [-X phys|virt|<addr>]\n"
             "          [-D <node/path>:<prop>=<value>] ...\n"
             "  -D  patch a 4-byte device-tree property in the in-memory copy\n"
             "      (empty path == root), e.g. -D cpus/cpu0:timebase-frequency=6000000\n"
+            "  -r  load a raw disk image into DRAM, publish it as the RAMDisk\n"
+            "      entry of /chosen/memory-map, and append rd=md0 to the cmdline\n"
+            "  -R  guest DRAM size in MB (default 128, the iPhone1,2 fitment)\n"
+            "  -X  what to write as the RAMDisk address: 'phys' (the physical\n"
+            "      address it was loaded at), 'virt' (the ml_static_ptovirt form,\n"
+            "      the default), or a literal address to use as a sentinel\n"
+            "  -b  boot_args Revision field (default 1)\n"
             "  -M  do not synthesise /memory reg from the RAM layout\n"
             "  -K  how many trace lines to print at the first data abort\n"
             "  -A  DIAGNOSTIC SHIM, not a fix: after an exception return that\n"
             "      resumes in Thumb state, undo the word alignment the core\n"
             "      applies to the resume address. Use it to confirm that a\n"
-            "      failure is caused by that alignment, never to 'work'.\n",
+            "      failure is caused by that alignment, never to 'work'.\n"
+            "  -P  EXPERIMENT, not a fix: model the S5L8900X power block at\n"
+            "      0x39a00000 inside this tool (0x0C write-1-to-clear,\n"
+            "      0x10 write-1-to-set, 0x14 = state). Proves what the\n"
+            "      AppleS5L8900XPowerController poll is waiting for. The real\n"
+            "      model belongs in the core; this switch only demonstrates it.\n",
             argv[0]);
         return 1;
     }
@@ -582,6 +740,7 @@ int main(int argc, char **argv) {
      * kernel places its page tables; that regressed the boot, so it is opt-in
      * until the interaction is understood. */
     bool want_fb = false;
+    uint32_t v_display = 0;   /* 0 = kernel text console draws; 1 = defer to IOMFB */
     /* -A: from outside the core, undo the word-alignment the interpreter
      * applies when an exception return resumes in Thumb state. This is a
      * PROOF SHIM for a suspected core bug, not a fix. */
@@ -590,9 +749,24 @@ int main(int argc, char **argv) {
      * 0xc01a7f22 does `ldrh r3,[r0,#2]; cmp r3,#6` and panics
      * "pe_identify_machine: Epoch Mismatch" on anything else, so the halfword
      * at boot_args+2 must be 6. Revision (+0) is not checked here; 1 works.
-     * Override with -r/-w to re-probe (-w 2 reproduces the original panic).
+     * Override with -b/-w to re-probe (-w 2 reproduces the original panic).
      */
     unsigned ba_rev = 1, ba_ver = 6;
+
+    /* -r / -R / -X: the RAM-disk root. */
+    const char *rdpath  = NULL;
+    uint32_t    ram_size = 128u << 20;     /* iPhone1,2 fitment; -R overrides */
+    /*
+     * Which form of the address goes into the device-tree property.
+     *
+     * RD_ADDR_VIRT is the default and the answer settled by experiment (see the
+     * report next to this flag's use): nothing between the property and the
+     * bcopy translates, and the copy is a plain dereference, so the value has
+     * to be a kernel virtual address. 'phys' and a literal sentinel exist so
+     * that conclusion can be re-derived rather than taken on faith.
+     */
+    enum { RD_ADDR_VIRT, RD_ADDR_PHYS, RD_ADDR_LITERAL } rd_form = RD_ADDR_VIRT;
+    uint32_t rd_literal = 0;
 
     /* -D <path>:<prop>=<value> overrides / adds a device-tree patch, so the
      * frequencies can be probed from the shell instead of by rebuilding. */
@@ -607,6 +781,7 @@ int main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-a")) { stop_on_abort = true; continue; }
         if (!strcmp(argv[i], "-F")) { want_fb = true; continue; }
+        if (!strcmp(argv[i], "-g")) { v_display = 1; continue; }  /* defer to IOMFB */
         if (!strcmp(argv[i], "-M")) { patch_memnode = false; continue; }
         if (i + 1 >= argc) break;
         if (!strcmp(argv[i], "-D")) {
@@ -631,8 +806,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-K")) ktail     = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-d")) dtpath    = argv[++i];
         else if (!strcmp(argv[i], "-c")) cmdline   = argv[++i];
-        else if (!strcmp(argv[i], "-r")) ba_rev    = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-b")) ba_rev    = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-w")) ba_ver    = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-r")) rdpath    = argv[++i];
+        else if (!strcmp(argv[i], "-R")) ram_size  = (uint32_t)strtoul(argv[++i], NULL, 0) << 20;
+        else if (!strcmp(argv[i], "-X")) {
+            const char *v = argv[++i];
+            if      (!strcmp(v, "phys")) rd_form = RD_ADDR_PHYS;
+            else if (!strcmp(v, "virt")) rd_form = RD_ADDR_VIRT;
+            else { rd_form = RD_ADDR_LITERAL; rd_literal = (uint32_t)strtoul(v, NULL, 0); }
+        }
     }
 
     size_t len = 0;
@@ -647,8 +830,9 @@ int main(int argc, char **argv) {
     ksyms_load(img, len);
     printf("symbols    : %u\n", ksym_count);
 
-    /* Enough RAM to hold the kernel plus room for its page tables and heap. */
-    const uint32_t ram_size = 128u << 20;
+    /* Enough RAM to hold the kernel plus room for its page tables and heap.
+     * 128 MB is what an iPhone1,2 actually has; -R raises it when a large
+     * RAM disk has to live in DRAM alongside everything else. */
     s5l8900_t mach;
     if (!s5l8900_init(&mach, phys_base, ram_size)) { fprintf(stderr, "init failed\n"); return 1; }
     mach.trace_devices = true;
@@ -686,30 +870,18 @@ int main(int argc, char **argv) {
      */
     uint32_t dt_pa = (m.vm_high - virt_base + phys_base + 0xfffu) & ~0xfffu;
     uint32_t dt_len = 0;
-    if (dtpath) {
-        size_t n = 0;
-        uint8_t *dt = slurp(dtpath, &n);
-        if (dt) {
-            dt_len = (uint32_t)n;
-            printf("devicetree : %s -> pa 0x%08x (%u bytes)\n", dtpath, dt_pa, dt_len);
-            /*
-             * Stand in for iBoot: the shipped tree is a template whose clock
-             * properties are all zero. Patch the in-memory copy only.
-             */
-            printf("  --- device-tree patches (iBoot would have done these) ---\n");
-            for (unsigned i = 0; i < NDTPATCH; i++)
-                dt_set_u32(dt, n, DT_PATCH[i].path, DT_PATCH[i].prop, DT_PATCH[i].val);
-            /* /memory reg: the real iBoot fills in the DRAM bank. Ours is
-             * zero, which would advertise a zero-sized bank. */
-            if (patch_memnode)
-                dt_set_reg(dt, n, "memory", "reg", phys_base, ram_size);
-            for (unsigned i = 0; i < ndtov; i++)
-                dt_set_u32(dt, n, dtov[i].path, dtov[i].prop, dtov[i].val);
-            printf("  ---------------------------------------------------------\n");
-            s5l8900_load(&mach, dt_pa, dt, n);
-            free(dt);
-        }
-    }
+
+    /* The tree has to be read before the layout is fixed, because the RAMDisk
+     * entry written into it names an address that depends on where everything
+     * else landed — and the tree's own length is part of that arithmetic. */
+    size_t dt_n = 0;
+    uint8_t *dt = dtpath ? slurp(dtpath, &dt_n) : NULL;
+    if (dt) dt_len = (uint32_t)dt_n;
+
+    /* Likewise the RAM disk: its size decides where topOfKernelData ends up. */
+    size_t rd_n = 0;
+    uint8_t *rd = rdpath ? slurp(rdpath, &rd_n) : NULL;
+    if (rdpath && !rd) { fprintf(stderr, "ramdisk: cannot read %s\n", rdpath); return 1; }
 
     /*
      * Reserve a linear framebuffer and advertise it in Boot_Video. With
@@ -724,6 +896,21 @@ int main(int argc, char **argv) {
     uint32_t ba_pa = (dt_pa + dt_len + 0xfffu) & ~0xfffu;
 
     /*
+     * The RAM disk goes immediately after boot_args and BELOW topOfKernelData.
+     *
+     * That placement is not cosmetic. topOfKernelData is the kernel's statement
+     * of where its pre-loaded data ends; everything above it is free DRAM that
+     * the VM will hand out and overwrite. A RAM disk parked above that line is
+     * a root filesystem being scribbled on by the page allocator. iBoot puts it
+     * below the line for exactly this reason, so we do too.
+     *
+     * mdevadd takes base and size as PAGE NUMBERS (addr >> 12), so both have to
+     * be page-multiples or the disk is silently truncated / misaligned.
+     */
+    uint32_t rd_pa = (ba_pa + 0x1000u + 0xfffu) & ~0xfffu;
+    uint32_t rd_len = (uint32_t)((rd_n + 0xfffu) & ~(size_t)0xfffu);
+
+    /*
      * topOfKernelData is where the kernel starts placing its own page tables,
      * so anything counted below it moves them. Placing the framebuffer here
      * and then advancing topOfKernelData past it is what made -F regress into
@@ -734,10 +921,120 @@ int main(int argc, char **argv) {
      * sits near the top of DRAM, far above the kernel's data. Do the same, and
      * leave topOfKernelData describing only the kernel's own data.
      */
-    uint32_t top_of_kernel_data = (ba_pa + 0x1000u + 0xfffu) & ~0xfffu;
+    /*
+     * MEASURED, and the thing that cost the most time here: topOfKernelData
+     * must be 16 KB aligned, not merely page aligned.
+     *
+     * The kernel derives its L1 translation-table base from this value, and an
+     * ARMv6 L1 table is 16 KB aligned by architecture — TTBR0[31:14] is the
+     * base and the low bits are attributes. Hand it a value that is only 4 KB
+     * aligned and the kernel writes its table at (say) 0x093e5000, TTBR0 comes
+     * out 0x093e5018, and the hardware walks from 0x093e4000 instead. The
+     * symptom is not a complaint; it is a prefetch abort on the instruction
+     * immediately after the MMU is switched on:
+     *
+     *   FIRST exception entry at instruction 39767: mode 13 -> 17,
+     *     caused by pc 0x080691b0, vectored to 0xffff000c  (IFSR 0x05)
+     *
+     * With no RAM disk the sum happened to land 16 KB aligned, which is why
+     * this never showed up before — and why the framebuffer regression noted
+     * above looked like a framebuffer problem.
+     */
+    uint32_t top_of_kernel_data = rd ? ((rd_pa + rd_len + 0x3fffu) & ~0x3fffu)
+                                     : ((ba_pa + 0x1000u + 0x3fffu) & ~0x3fffu);
     uint32_t fb_pa = want_fb
         ? ((phys_base + ram_size - fb_bytes) & ~0xfffu)   /* top of DRAM */
         : top_of_kernel_data;
+
+    if (rd && (uint64_t)top_of_kernel_data + fb_bytes > (uint64_t)phys_base + ram_size) {
+        fprintf(stderr, "ramdisk: %u MB image does not fit in %u MB of DRAM "
+                        "— raise -R\n", rd_len >> 20, ram_size >> 20);
+        return 1;
+    }
+
+    /*
+     * The address to publish in /chosen/memory-map:RAMDisk.
+     *
+     * SETTLED BY EXPERIMENT, not by reading source (no ARM XNU of this vintage
+     * is public). Three facts, each independently checkable:
+     *
+     *  1. _IOFindBSDRoot at 0xc01a1b5a..0xc01a1b6a is, verbatim,
+     *         movs r3,#0 ; ldr r1,[r0] ; ldr r2,[r0,#4]
+     *         movs r0,#1 ; lsrs r1,#12 ; lsrs r2,#12 ; rsbs r0,r0,#0
+     *         blx  _mdevadd
+     *     i.e. mdevadd(-1, parms[0]>>12, parms[1]>>12, 0). No translation, and
+     *     _ml_static_ptovirt does not appear anywhere in that function's
+     *     literal pool.
+     *  2. _mdevadd never touches _gPhysBase / _gVirtBase either; it stores the
+     *     page number straight into mdev[].mdBase.
+     *  3. phys==0 means mdevstrategy takes the non-mdPhys branch and does a
+     *     plain bcopy() from (mdBase << 12) — a kernel VIRTUAL dereference.
+     *
+     * So the value has to arrive already virtual. That the surrounding code
+     * calls ml_static_ptovirt on OTHER memory-map entries (IODTFreeLoaderInfo
+     * does, on its way to free them) is what makes this worth stating out loud:
+     * memory-map entries are physical BY CONVENTION, and RAMDisk is the one
+     * that is not, because nothing on its path ever converts it.
+     *
+     * -X re-runs the experiment: 'phys' plants the physical address, a literal
+     * plants a sentinel, and the _mdevadd watchpoint below prints what actually
+     * arrived in r1.
+     */
+    uint32_t rd_dt_addr = rd_form == RD_ADDR_PHYS    ? rd_pa
+                        : rd_form == RD_ADDR_LITERAL ? rd_literal
+                        : rd_pa - phys_base + virt_base;
+
+    if (dt) {
+        printf("devicetree : %s -> pa 0x%08x (%u bytes)\n", dtpath, dt_pa, dt_len);
+        /*
+         * Stand in for iBoot: the shipped tree is a template whose clock
+         * properties are all zero. Patch the in-memory copy only.
+         */
+        printf("  --- device-tree patches (iBoot would have done these) ---\n");
+        for (unsigned i = 0; i < NDTPATCH; i++)
+            dt_set_u32(dt, dt_n, DT_PATCH[i].path, DT_PATCH[i].prop, DT_PATCH[i].val);
+        /* /memory reg: the real iBoot fills in the DRAM bank. Ours is
+         * zero, which would advertise a zero-sized bank. */
+        if (patch_memnode)
+            dt_set_reg(dt, dt_n, "memory", "reg", phys_base, ram_size);
+        /* NOT touched: the shipped "DeviceTree" entry, whose address is still
+         * zero. IODTFreeLoaderInfo() runs ml_static_ptovirt() over that value
+         * and then ml_static_mfree()s the result, so filling it in changes what
+         * gets freed during early IOKit start. The boot currently gets to
+         * _bsd_init with it at zero; correcting it is a separate experiment,
+         * not something to smuggle into this one. */
+        if (rd)
+            dt_memmap_add(dt, dt_n, "RAMDisk", rd_dt_addr, rd_len);
+        for (unsigned i = 0; i < ndtov; i++)
+            dt_set_u32(dt, dt_n, dtov[i].path, dtov[i].prop, dtov[i].val);
+        printf("  ---------------------------------------------------------\n");
+        s5l8900_load(&mach, dt_pa, dt, dt_n);
+        free(dt);
+    }
+
+    if (rd) {
+        s5l8900_load(&mach, rd_pa, rd, rd_n);
+        printf("ramdisk    : %s -> pa 0x%08x  %u bytes (%u padded)\n",
+               rdpath, rd_pa, (unsigned)rd_n, rd_len);
+        printf("             DT RAMDisk = {0x%08x, 0x%08x}  (%s)\n",
+               rd_dt_addr, rd_len,
+               rd_form == RD_ADDR_PHYS ? "physical" :
+               rd_form == RD_ADDR_LITERAL ? "literal sentinel" :
+               "virtual, ml_static_ptovirt form");
+        free(rd);
+    }
+
+    /*
+     * Root-device selector. IOFindBSDRoot compares rdBootVar[0..1] against
+     * "md" and rdBootVar[3] against NUL, so the token has to be exactly
+     * "md<digit>" — mdevlookup then resolves the minor number.
+     */
+    char cmdbuf[512];
+    if (rd && !strstr(cmdline, "rd=")) {
+        snprintf(cmdbuf, sizeof cmdbuf, "%s%srd=md0",
+                 cmdline, *cmdline ? " " : "");
+        cmdline = cmdbuf;
+    }
 
     uint8_t ba[0x138];
     memset(ba, 0, sizeof ba);
@@ -753,10 +1050,26 @@ int main(int argc, char **argv) {
      * for its page tables. Passing the virtual form made TTBR0 come out as
      * 0xc07dc018 and the MMU walk unmapped memory. */
     PUT32(0x10, top_of_kernel_data);
-    /* Boot_Video: no framebuffer yet, but give it a sane 320x480 geometry
-     * rather than zeros, which some early code divides by. */
+    /*
+     * Boot_Video. v_baseAddr must point at a real buffer so _initialize_screen
+     * has somewhere to draw; the geometry is always sane (some early code
+     * divides by it) even when no framebuffer is advertised.
+     *
+     * v_display is subtle and cost a while to get right. It is NOT "is there a
+     * display" — it selects the console MODE. _PE_create_console branches on
+     * it: non-zero picks kPEGraphicsMode, which sets gc_graphics_boot, and then
+     * _vcattach returns immediately when gc_graphics_boot is set, so the kernel
+     * text console is never acquired and nothing is ever drawn. Zero picks
+     * kPETextMode, and the kernel paints its boot log into the framebuffer.
+     * So for the kernel to draw, v_display must be 0. It goes back to 1 only
+     * once IOMobileFramebuffer takes over scanout. Left as a flag (-g) rather
+     * than a constant because both values are correct at different times.
+     *
+     * Note serial=1 is the second gate: it routes cnputc to the UART instead
+     * of the video console, so a graphics boot log also needs serial dropped.
+     */
     PUT32(0x14, want_fb ? fb_pa : 0u); /* v_baseAddr */
-    PUT32(0x18, want_fb ? 1u : 0u);    /* v_display */
+    PUT32(0x18, want_fb ? v_display : 0u); /* v_display: mode select, see above */
     PUT32(0x1c, FB_W * FB_BPP);        /* v_rowBytes */
     PUT32(0x20, FB_W);                 /* v_width    */
     PUT32(0x24, FB_H);                 /* v_height   */
@@ -799,6 +1112,15 @@ int main(int argc, char **argv) {
         { "_Debugger",   ksym_value("_Debugger"),   0 },
         { "_kdb_printf", ksym_value("_kdb_printf"), 0 },
         { "_printf",     ksym_value("_printf"),     0 },
+        /*
+         * The root-device path. _mdevadd is the one that settles the
+         * physical-vs-virtual question: whatever the device tree said arrives
+         * in r1 as a PAGE NUMBER, and if anything between the property and
+         * here had translated it, r1 would differ from (planted addr >> 12).
+         */
+        { "_IOFindBSDRoot", ksym_value("_IOFindBSDRoot"), 0 },
+        { "_mdevadd",       ksym_value("_mdevadd"),       0 },
+        { "_mdevlookup",    ksym_value("_mdevlookup"),    0 },
     };
     const unsigned nwps = (unsigned)(sizeof wps / sizeof wps[0]);
     for (unsigned i = 0; i < nwps; i++)
@@ -811,7 +1133,9 @@ int main(int argc, char **argv) {
     unsigned first_abort_at = 0, first_exc = 0;
     uint32_t abort_dfar = 0, abort_dfsr = 0;
 
+    G.hot_steps = steps;
     for (; n < steps; n++) {
+        G.hot_now = n;
         last_pc = mach.cpu.r[15];
         tr[tw].pc = last_pc;
         tr[tw].cpsr = mach.cpu.cpsr;
@@ -1137,6 +1461,60 @@ int main(int argc, char **argv) {
                ksym_at(G.dev_page[i].first_pc >= phys_base && G.dev_page[i].first_pc < virt_base
                        ? G.dev_page[i].first_pc - phys_base + virt_base
                        : G.dev_page[i].first_pc));
+
+    /* ------------------------------------------------ the hot MMIO page --- */
+    printf("\n=== HOT PAGE 0x%08x: PER-REGISTER ===\n", HOTPG);
+    printf("    off    reads      writes     lastval    firstwrite\n");
+    for (unsigned i = 0; i < 1024; i++) {
+        char fw[16];
+        if (!G.hot_r[i] && !G.hot_w[i]) continue;
+        if (G.hot_written[i]) snprintf(fw, sizeof fw, "0x%08x", G.hot_firstw[i]);
+        else                  snprintf(fw, sizeof fw, "-");
+        printf("    0x%03x  %-10llu %-10llu 0x%08x %s\n", i * 4,
+               (unsigned long long)G.hot_r[i], (unsigned long long)G.hot_w[i],
+               G.hot_last[i], fw);
+    }
+
+    printf("\n=== HOT PAGE 0x%08x: ACCESS SITES (pc/lr/off) ===\n", HOTPG);
+    for (unsigned i = 0; i < G.hot_site_n; i++)
+        printf("    %s off 0x%03x  n=%-10llu pc 0x%08x  lr 0x%08x  instr %llu..%llu\n",
+               G.hot_site[i].wr ? "W" : "R", G.hot_site[i].off,
+               (unsigned long long)G.hot_site[i].n, G.hot_site[i].pc, G.hot_site[i].lr,
+               (unsigned long long)G.hot_site[i].first_at,
+               (unsigned long long)G.hot_site[i].last_at);
+
+    printf("\n=== HOT PAGE 0x%08x: FIRST %u ACCESSES ===\n", HOTPG, G.hot_log_n);
+    for (unsigned i = 0; i < G.hot_log_n; i++)
+        printf("    @%-10llu %s%u 0x%08x (off 0x%03x) val 0x%08x  pc 0x%08x lr 0x%08x"
+               "  r0-5 %08x %08x %08x %08x %08x %08x\n",
+               (unsigned long long)G.hot_log[i].at,
+               G.hot_log[i].wr ? "W" : "R", G.hot_log[i].bytes * 8,
+               G.hot_log[i].addr, G.hot_log[i].addr & 0xfff, G.hot_log[i].val,
+               G.hot_log[i].pc, G.hot_log[i].lr,
+               G.hot_log[i].r[0], G.hot_log[i].r[1], G.hot_log[i].r[2],
+               G.hot_log[i].r[3], G.hot_log[i].r[4], G.hot_log[i].r[5]);
+
+    printf("\n=== HOT PAGE 0x%08x: LAST ACCESSES (of %llu) ===\n", HOTPG,
+           (unsigned long long)G.hot_tail_n);
+    {
+        unsigned cnt = G.hot_tail_n < 64 ? (unsigned)G.hot_tail_n : 64;
+        unsigned start = (G.hot_tail_w + 64 - cnt) % 64;
+        for (unsigned i = 0; i < cnt; i++) {
+            unsigned k = (start + i) % 64;
+            printf("    @%-10llu %s 0x%08x (off 0x%03x) val 0x%08x  pc 0x%08x lr 0x%08x\n",
+                   (unsigned long long)G.hot_tail[k].at, G.hot_tail[k].wr ? "W" : "R",
+                   G.hot_tail[k].addr, G.hot_tail[k].addr & 0xfff, G.hot_tail[k].val,
+                   G.hot_tail[k].pc, G.hot_tail[k].lr);
+        }
+    }
+
+    printf("\n=== HOT PAGE 0x%08x: ACCESSES OVER TIME (40 buckets) ===\n", HOTPG);
+    for (unsigned i = 0; i < 40; i++)
+        if (G.hot_bucket[i])
+            printf("    instr %10llu..%-10llu  %llu\n",
+                   (unsigned long long)(steps / 40 * i),
+                   (unsigned long long)(steps / 40 * (i + 1)),
+                   (unsigned long long)G.hot_bucket[i]);
 
     printf("\n=== CONSOLE-INIT MILESTONES (xnu-1357.5.30 symbols) ===\n");
     printf("    --- NEVER REACHED ---\n");
