@@ -1,19 +1,30 @@
 //
-//  iOS3-VM — root view controller (on-device emulator self-test).
+//  iOS3-VM — root view controller.
 //
-//  Runs the real S5L8900 machine model on the phone: a bare-metal ARM payload
-//  printing over the emulated UART, and a timer interrupt reaching a guest
-//  handler. Also reports the runtime facts the dynarec depends on (CS_DEBUGGED
-//  and whether a plain RWX page can be mapped).
+//  The screen is now the point. The top of the view is the guest's 320x480
+//  framebuffer; underneath it is the guest's UART, which is where an operating
+//  system announces itself. Between them is a status line showing that the
+//  emulator is doing work rather than being a picture of an emulator.
+//
+//  The self-tests that used to be this whole screen still run, once, at launch,
+//  and print into the console: they are the proof that the ARM core, the MMU,
+//  the bus, the UART, the VIC and the timer all work on *this* device, and that
+//  is worth keeping even now that there is something to look at.
 //
 //  Copyright (c) 2026 j0shua-SYSON. MIT licensed.
 //
 #import "EmulatorViewController.h"
+#import "VMEngine.h"
+#import "VMFramebufferView.h"
+#import "VMGuest.h"
+
+#import <QuartzCore/QuartzCore.h>
+#import <math.h>
+#import <stdlib.h>
+#import <string.h>
 #import <sys/mman.h>
 #import <sys/utsname.h>
 #import <unistd.h>
-#import <string.h>
-#import "soc.h"
 
 // csops() reports our own code-signing flags. A jailbreak that enables "JIT in
 // apps" sets CS_DEBUGGED, which is what permits unsigned executable memory.
@@ -21,28 +32,193 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 #define CS_OPS_STATUS 0
 #define CS_DEBUGGED   0x10000000
 
+// Scrollback kept in the console. The guest prints one short line per frame
+// forever, so this cannot be unbounded.
+static const NSUInteger kConsoleScrollback = 12000;
+
+// Declared up front so every call below is checked against a prototype.
+@interface EmulatorViewController ()
+- (void)startEmulator;
+- (void)tick:(CADisplayLink *)sender;
+- (void)append:(NSString *)line;
+- (void)appendConsole:(NSString *)text;
+- (void)reportEnvironment;
+- (void)runUartDemo;
+- (void)runInterruptDemo;
+- (void)runMmuDemo;
+- (void)appDidEnterBackground;
+- (void)appWillEnterForeground;
+@end
+
 @implementation EmulatorViewController {
-    UITextView *_log;
+    VMFramebufferView *_screen;
+    UILabel           *_stats;
+    UITextView        *_console;
+    NSMutableString   *_consoleText;
+
+    VMEngine          *_engine;
+    CADisplayLink     *_link;
+    uint8_t           *_frame;        // main thread's copy of the guest's pixels
+    NSUInteger         _ticks;
 }
+
+#pragma mark - Lifecycle
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor blackColor];
 
-    _log = [[UITextView alloc] initWithFrame:self.view.bounds];
-    _log.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    _log.backgroundColor = [UIColor blackColor];
-    _log.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.5 alpha:1.0];
-    _log.font = [UIFont fontWithName:@"Menlo" size:12] ?: [UIFont systemFontOfSize:12];
-    _log.editable = NO;
-    _log.textContainerInset = UIEdgeInsetsMake(56, 16, 40, 16);
-    [self.view addSubview:_log];
+    _consoleText = [NSMutableString string];
 
-    [self runSelfTest];
+    _screen = [[VMFramebufferView alloc] initWithFrame:CGRectZero];
+    _screen.layer.borderWidth = 1.0;
+    _screen.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1.0].CGColor;
+    [self.view addSubview:_screen];
+
+    _stats = [[UILabel alloc] initWithFrame:CGRectZero];
+    _stats.backgroundColor = [UIColor clearColor];
+    _stats.textColor = [UIColor colorWithWhite:0.62 alpha:1.0];
+    _stats.font = [UIFont fontWithName:@"Menlo" size:11]
+                  ?: [UIFont systemFontOfSize:11];
+    _stats.text = @"starting…";
+    [self.view addSubview:_stats];
+
+    _console = [[UITextView alloc] initWithFrame:CGRectZero];
+    _console.backgroundColor = [UIColor blackColor];
+    _console.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.5 alpha:1.0];
+    _console.font = [UIFont fontWithName:@"Menlo" size:10]
+                    ?: [UIFont systemFontOfSize:10];
+    _console.editable = NO;
+    _console.textContainerInset = UIEdgeInsetsMake(6, 12, 12, 12);
+    [self.view addSubview:_console];
+
+    [self append:@"iOS3-VM  ·  on-device self-test"];
+    [self append:@"================================\n"];
+    [self reportEnvironment];
+    [self append:@"\n-- emulated S5L8900 --"];
+    [self runUartDemo];
+    [self runInterruptDemo];
+    [self runMmuDemo];
+    [self append:@"\n-- guest framebuffer --"];
+
+    [self startEmulator];
+}
+
+- (void)startEmulator {
+    _frame = calloc(1, VM_FB_BYTES);
+    if (!_frame) { [self append:@"[vm] out of memory for the frame buffer"]; return; }
+
+    _engine = [[VMEngine alloc] init];
+    if (![_engine start]) {
+        [self append:@"[vm] emulator failed to start"];
+        [self appendConsole:[_engine takePendingConsoleText]];
+        return;
+    }
+
+    // 30 Hz is plenty: the guest cannot repaint 320x480 anywhere near that
+    // fast, so a higher rate would only re-upload identical pixels.
+    //
+    // The display link retains this controller, so -dealloc below will never
+    // actually run. That is deliberate rather than overlooked: this is the
+    // root view controller and it is meant to live for the life of the
+    // process. The cleanup is written out anyway so that the day this screen
+    // becomes one of several, the right thing already happens.
+    _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+    _link.preferredFramesPerSecond = 30;
+    [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+
+    // Interpreting flat out in the background is a good way to be terminated,
+    // and nobody is looking at the screen anyway.
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserver:self selector:@selector(appDidEnterBackground)
+               name:UIApplicationDidEnterBackgroundNotification object:nil];
+    [nc addObserver:self selector:@selector(appWillEnterForeground)
+               name:UIApplicationWillEnterForegroundNotification object:nil];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [_link invalidate];
+    [_engine stop];
+    free(_frame);
+}
+
+- (void)appDidEnterBackground { [_engine setPaused:YES]; _link.paused = YES; }
+- (void)appWillEnterForeground { _link.paused = NO; [_engine setPaused:NO]; }
+
+#pragma mark - Layout
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+
+    CGRect b = self.view.bounds;
+    UIEdgeInsets safe = self.view.safeAreaInsets;
+    CGFloat top    = safe.top + 8.0;
+    CGFloat bottom = safe.bottom + 8.0;
+    CGFloat available = b.size.height - top - bottom;
+    if (available < 120.0) available = 120.0;
+
+    // Give the guest's screen the top ~60%, then fit 320x480 inside that
+    // without distortion. The layer's contentsGravity would do this anyway;
+    // doing it here too means the view's own aspect is already correct, so
+    // there is no interpretation of contentsScale that can stretch the image.
+    CGFloat band  = floor(available * 0.60);
+    CGFloat scale = fmin(b.size.width / (CGFloat)VM_FB_WIDTH,
+                         band / (CGFloat)VM_FB_HEIGHT);
+    CGFloat w = floor((CGFloat)VM_FB_WIDTH  * scale);
+    CGFloat h = floor((CGFloat)VM_FB_HEIGHT * scale);
+    _screen.frame = CGRectMake(floor((b.size.width - w) * 0.5),
+                               top + floor((band - h) * 0.5), w, h);
+
+    CGFloat y = top + band + 6.0;
+    _stats.frame = CGRectMake(14.0, y, b.size.width - 28.0, 16.0);
+    y += 20.0;
+
+    CGFloat consoleH = b.size.height - bottom - y;
+    if (consoleH < 40.0) consoleH = 40.0;
+    _console.frame = CGRectMake(0.0, y, b.size.width, consoleH);
+}
+
+#pragma mark - Presentation
+
+- (void)tick:(CADisplayLink *)sender {
+    (void)sender;
+
+    BOOL argb = NO;
+    if (_frame && [_engine copyFrameInto:_frame capacity:VM_FB_BYTES argb:&argb])
+        [_screen presentPixels:_frame
+                         width:VM_FB_WIDTH
+                        height:VM_FB_HEIGHT
+                        stride:VM_FB_WIDTH * VM_FB_BPP
+                          argb:argb];
+
+    [self appendConsole:[_engine takePendingConsoleText]];
+
+    // The status line reads as noise if it changes 30 times a second.
+    if ((++_ticks % 8) == 0) _stats.text = [_engine statusLine];
 }
 
 - (void)append:(NSString *)line {
-    _log.text = [_log.text stringByAppendingString:[line stringByAppendingString:@"\n"]];
+    [self appendConsole:[line stringByAppendingString:@"\n"]];
+}
+
+- (void)appendConsole:(NSString *)text {
+    if (!text.length) return;
+
+    // Only follow the tail if the user has not scrolled up to read something.
+    CGFloat slack = _console.contentSize.height - _console.contentOffset.y
+                  - _console.bounds.size.height;
+    BOOL followTail = (slack < 40.0);
+
+    [_consoleText appendString:text];
+    if (_consoleText.length > kConsoleScrollback) {
+        [_consoleText deleteCharactersInRange:
+            NSMakeRange(0, _consoleText.length - kConsoleScrollback)];
+    }
+    _console.text = _consoleText;
+
+    if (followTail && _consoleText.length)
+        [_console scrollRangeToVisible:NSMakeRange(_consoleText.length - 1, 1)];
 }
 
 #pragma mark - Environment
@@ -65,9 +241,12 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
     [self append:[NSString stringWithFormat:@"RWX mmap    : %@",
                   rwx ? @"YES  (dynarec-ready)" : @"no"]];
     if (rwx) munmap(page, 4096);
+
+    [self append:[NSString stringWithFormat:@"footprint   : %.1f MB at launch",
+                  [VMEngine physFootprintBytes] / 1048576.0]];
 }
 
-#pragma mark - Emulator demos
+#pragma mark - Emulator self-tests
 
 // A bare-metal payload: load the UART base from a literal and print "HI\n".
 - (void)runUartDemo {
@@ -162,20 +341,6 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
     [self append:[NSString stringWithFormat:@"[mmu]  0x80001234 -> 0x%08x (fsr %u)  %@",
                   pa, fsr, (fsr == 0 && pa == 0x00201234u) ? @"OK" : @"FAIL"]];
     s5l8900_free(&m);
-}
-
-- (void)runSelfTest {
-    [self append:@"iOS3-VM  ·  on-device self-test"];
-    [self append:@"================================\n"];
-    [self reportEnvironment];
-    [self append:@"\n-- emulated S5L8900 --"];
-    [self runUartDemo];
-    [self runInterruptDemo];
-    [self runMmuDemo];
-    [self append:@"\n--------------------------------"];
-    [self append:@"ARMv6 core, MMU, bus, UART, VIC and"];
-    [self append:@"timer all running on this device."];
-    [self append:@"Next: M3 — real Apple firmware."];
 }
 
 @end

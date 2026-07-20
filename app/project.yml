@@ -20,6 +20,15 @@ targets:
       # Compile the platform-independent emulator core straight into the app.
       - path: ../core/src
         name: core
+    # Linked explicitly rather than relying on module auto-linking: the display
+    # path calls into CoreGraphics (CGImageCreate) and QuartzCore (CALayer
+    # filters) directly, and "it happened to link via UIKit" is not something to
+    # discover on a CI runner.
+    dependencies:
+      - sdk: Foundation.framework
+      - sdk: UIKit.framework
+      - sdk: CoreGraphics.framework
+      - sdk: QuartzCore.framework
     settings:
       base:
         PRODUCT_NAME: iOS3VM
@@ -29,6 +38,10 @@ targets:
         HEADER_SEARCH_PATHS:
           - $(SRCROOT)/../core/include
         GCC_C_LANGUAGE_STANDARD: c11
+        # Stated rather than inherited: the Objective-C sources are written for
+        # ARC, and would leak (or double-free) under manual retain/release.
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_ENABLE_MODULES: YES
         TARGETED_DEVICE_FAMILY: "1,2"
         ENABLE_BITCODE: NO
         # Signing is handled after the build by ldid fake-signing (see CI).
