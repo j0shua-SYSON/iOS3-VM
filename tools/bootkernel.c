@@ -764,6 +764,7 @@ int main(int argc, char **argv) {
     bool want_fb = false;
     uint32_t v_display = 0;   /* 0 = kernel text console draws; 1 = defer to IOMFB */
     bool want_mbx = false;    /* -g keeps the (unmodelled, hang-prone) MBX GPU driver */
+    bool no_kpatch = false;   /* -K disables the post-load kernel patches */
     /* -A: from outside the core, undo the word-alignment the interpreter
      * applies when an exception return resumes in Thumb state. This is a
      * PROOF SHIM for a suspected core bug, not a fix. */
@@ -805,6 +806,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-a")) { stop_on_abort = true; continue; }
         if (!strcmp(argv[i], "-F")) { want_fb = true; continue; }
         if (!strcmp(argv[i], "-g")) { v_display = 1; want_mbx = true; continue; }  /* defer to IOMFB, keep MBX */
+        if (!strcmp(argv[i], "-K")) { no_kpatch = true; continue; }  /* no kernel patches */
         if (!strcmp(argv[i], "-M")) { patch_memnode = false; continue; }
         if (i + 1 >= argc) break;
         if (!strcmp(argv[i], "-D")) {
@@ -876,6 +878,44 @@ int main(int argc, char **argv) {
         s5l8900_load(&mach, pa, img + s->fileoff, s->filesize);
         printf("  load %-16s vm 0x%08x -> pa 0x%08x  %u bytes\n",
                s->name, s->vmaddr, pa, s->filesize);
+    }
+
+    /*
+     * Kernel patches applied in guest RAM after load — what a jailbroken iBoot
+     * would do to the kernel image before jumping to it, and legitimate here
+     * because the guest is ours to modify (jailbreaking the guest is a project
+     * goal). Each patch names the byte it expects to find so a wrong offset or
+     * a different kernel build fails loudly instead of corrupting code.
+     *
+     * IORTC wait: bsd_init calls IOKitInitializeTime, which does
+     *   waitForService(resourceMatching("IORTC"), &{tv_sec=30}) before
+     *   vfsinit / IOFindBSDRoot. The resource is published only by
+     *   ApplePCF50635PMURTC, and we do not model the PCF50635 PMU on I2C, so it
+     *   is never published and the boot thread sleeps the full 30 s. At our
+     *   timebase that is ~12.4 billion instructions, and running it out does not
+     *   even help (the config threads block permanently in driver start()s
+     *   awaiting unmodelled hardware, so the post-timeout path re-stalls). Zero
+     *   the tv_sec immediate (movs r3,#0x1e -> movs r3,#0) so the wait returns
+     *   at once; the boot then reaches IOFindBSDRoot and mounts md0.
+     *   The proper fix is to model the PMU RTC so it publishes IORTC; until then
+     *   this one byte is the difference between "idle forever" and "BSD root".
+     */
+    if (!no_kpatch) {
+        struct { uint32_t va; uint8_t want, set; const char *why; } kp[] = {
+            { 0xc0175b3eu, 0x1e, 0x00, "IORTC wait tv_sec 30->0 (reach IOFindBSDRoot)" },
+        };
+        for (unsigned i = 0; i < sizeof kp / sizeof kp[0]; i++) {
+            uint32_t pa = kp[i].va - virt_base + phys_base;
+            uint8_t  got = mach.bus.read8(mach.bus.ctx, pa);
+            if (got != kp[i].want) {
+                printf("  kpatch SKIP %08x: found %02x expected %02x (%s)\n",
+                       kp[i].va, got, kp[i].want, kp[i].why);
+                continue;
+            }
+            mach.bus.write8(mach.bus.ctx, pa, kp[i].set);
+            printf("  kpatch %08x: %02x -> %02x  %s\n",
+                   kp[i].va, kp[i].want, kp[i].set, kp[i].why);
+        }
     }
 
     uint32_t entry_pa = m.entry - virt_base + phys_base;
