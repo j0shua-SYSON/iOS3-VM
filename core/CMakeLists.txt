@@ -4,6 +4,8 @@ add_library(emucore STATIC
     src/arm/arm_interp.c
     src/mmu.c
     src/soc/uart.c
+    src/soc/vic.c
+    src/soc/timer.c
     src/soc/machine.c
 )
 target_include_directories(emucore PUBLIC include)

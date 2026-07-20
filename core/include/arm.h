@@ -130,6 +130,11 @@ typedef struct arm_cpu {
     bool     abort_pending;
     uint32_t abort_fsr;
     uint32_t abort_far;
+
+    /* Interrupt request lines, driven by the interrupt controller. Sampled at
+     * the top of each arm_step and honoured unless masked by CPSR I/F. */
+    bool irq_line;
+    bool fiq_line;
 } arm_cpu_t;
 
 /*

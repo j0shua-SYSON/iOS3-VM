@@ -31,6 +31,10 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
     }
     if (in_dev(addr, S5L8900_UART0_BASE))
         return s5l_uart_read(&m->uart0, addr - S5L8900_UART0_BASE);
+    if (in_dev(addr, S5L8900_VIC0_BASE))
+        return s5l_vic_read(&m->vic0, addr - S5L8900_VIC0_BASE);
+    if (in_dev(addr, S5L8900_TIMER_BASE))
+        return s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
 
     m->unmapped_reads++;
     return 0;
@@ -45,6 +49,14 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
     }
     if (in_dev(addr, S5L8900_UART0_BASE)) {
         s5l_uart_write(&m->uart0, addr - S5L8900_UART0_BASE, val);
+        return;
+    }
+    if (in_dev(addr, S5L8900_VIC0_BASE)) {
+        s5l_vic_write(&m->vic0, addr - S5L8900_VIC0_BASE, val);
+        return;
+    }
+    if (in_dev(addr, S5L8900_TIMER_BASE)) {
+        s5l_timer_write(&m->timer, addr - S5L8900_TIMER_BASE, val);
         return;
     }
     m->unmapped_writes++;
@@ -67,6 +79,8 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
     m->ram_size = ram_size;
 
     s5l_uart_reset(&m->uart0);
+    s5l_vic_reset(&m->vic0);
+    s5l_timer_reset(&m->timer);
 
     m->bus.ctx = m;
     m->bus.read32 = r32; m->bus.read16 = r16; m->bus.read8 = r8;
@@ -86,12 +100,22 @@ void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
     memcpy(&m->ram[addr - m->ram_base], data, len);
 }
 
+void s5l8900_tick(s5l8900_t *m, uint32_t ticks) {
+    /* Devices advance, then the controller recomputes what the CPU sees. */
+    bool timer_irq = s5l_timer_tick(&m->timer, ticks);
+    s5l_vic_set_line(&m->vic0, S5L8900_IRQ_TIMER, timer_irq);
+
+    m->cpu.irq_line = s5l_vic_irq(&m->vic0);
+    m->cpu.fiq_line = s5l_vic_fiq(&m->vic0);
+}
+
 unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
     arm_status_t st = ARM_OK;
     unsigned n = 0;
     for (; n < max_steps; n++) {
         st = arm_step(&m->cpu);
         if (st != ARM_OK) break;
+        s5l8900_tick(m, 1);
     }
     if (status) *status = st;
     return n;

@@ -57,6 +57,51 @@ void     s5l_uart_reset(s5l_uart_t *u);
 uint32_t s5l_uart_read(s5l_uart_t *u, uint32_t off);
 void     s5l_uart_write(s5l_uart_t *u, uint32_t off, uint32_t val);
 
+/* ---------------------------------------------------------------- VIC ---
+ * PL190-style vectored interrupt controller. Devices assert lines into `raw`;
+ * the controller ORs in software interrupts, masks by `enable`, and routes each
+ * line to IRQ or FIQ according to `select`.
+ */
+#define VIC_IRQSTATUS    0x00u
+#define VIC_FIQSTATUS    0x04u
+#define VIC_RAWINTR      0x08u
+#define VIC_INTSELECT    0x0cu
+#define VIC_INTENABLE    0x10u
+#define VIC_INTENCLEAR   0x14u
+#define VIC_SOFTINT      0x18u
+#define VIC_SOFTINTCLEAR 0x1cu
+
+typedef struct { uint32_t raw, enable, select, soft; } s5l_vic_t;
+
+void     s5l_vic_reset(s5l_vic_t *v);
+uint32_t s5l_vic_read(s5l_vic_t *v, uint32_t off);
+void     s5l_vic_write(s5l_vic_t *v, uint32_t off, uint32_t val);
+void     s5l_vic_set_line(s5l_vic_t *v, unsigned line, bool level);
+bool     s5l_vic_irq(const s5l_vic_t *v);
+bool     s5l_vic_fiq(const s5l_vic_t *v);
+
+/* -------------------------------------------------------------- timer ---
+ * A periodic down-counter. NOTE: this register layout is provisional — it is
+ * enough to drive our own payloads and exercise the interrupt path, and will be
+ * replaced with the real S5L8900 timer block when we run Apple firmware at M3.
+ */
+#define TIMER_CTRL       0x00u
+#define TIMER_RELOAD     0x04u
+#define TIMER_VALUE      0x08u
+#define TIMER_INTSTAT    0x0cu   /* read: pending; write: clear */
+#define TIMER_CTRL_ENABLE (1u << 0)
+#define TIMER_CTRL_INT_EN (1u << 1)
+
+#define S5L8900_IRQ_TIMER 5u     /* VIC line the timer drives */
+
+typedef struct { uint32_t ctrl, reload, value, intstat; } s5l_timer_t;
+
+void s5l_timer_reset(s5l_timer_t *t);
+uint32_t s5l_timer_read(s5l_timer_t *t, uint32_t off);
+void s5l_timer_write(s5l_timer_t *t, uint32_t off, uint32_t val);
+/* Advance by `ticks`; returns true while an interrupt is pending. */
+bool s5l_timer_tick(s5l_timer_t *t, uint32_t ticks);
+
 /* ------------------------------------------------------------- machine ---
  * Wires the CPU to RAM and the peripherals through one arm_bus_t.
  */
@@ -66,10 +111,15 @@ typedef struct {
     uint8_t   *ram;
     uint32_t   ram_base;
     uint32_t   ram_size;
-    s5l_uart_t uart0;
+    s5l_uart_t  uart0;
+    s5l_vic_t   vic0;
+    s5l_timer_t timer;
     uint64_t   unmapped_reads;   /* visibility: accesses outside the map */
     uint64_t   unmapped_writes;
 } s5l8900_t;
+
+/* Advance the devices and refresh the CPU's interrupt lines. */
+void s5l8900_tick(s5l8900_t *m, uint32_t ticks);
 
 /* ram_base/ram_size define where RAM appears. Returns false on allocation
  * failure. Call s5l8900_free() when done. */

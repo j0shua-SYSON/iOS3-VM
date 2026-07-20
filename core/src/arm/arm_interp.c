@@ -182,6 +182,8 @@ void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
     cpu->abort_pending = false;
     cpu->abort_fsr = 0;
     cpu->abort_far = 0;
+    cpu->irq_line = false;
+    cpu->fiq_line = false;
     /* On reset the ARM1176 enters SVC mode with IRQ+FIQ disabled and begins
      * execution from the reset vector (0x0, or 0xffff0000 with high vectors).
      * We start at 0x0; the machine layer relocates PC as needed. */
@@ -423,7 +425,20 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
 
     if (writes) {
         c->r[rd] = res;
-        if (rd == 15) *next = res & ~3u; /* ARM-state ALUWritePC forces word alignment */
+        if (rd == 15) {
+            /* Writing PC with S set is an exception return (the classic
+             * "SUBS pc, lr, #4" ending an IRQ handler): CPSR comes from the
+             * current mode's SPSR, which also undoes the flag update above. */
+            if (S) {
+                arm_bank_t b = arm_bank_of_mode(c->cpsr);
+                if (b != ARM_BANK_USR) {
+                    uint32_t s = c->spsr[b];
+                    arm_set_mode(c, s);
+                    c->cpsr = (c->cpsr & ARM_CPSR_MODE_MASK) | (s & ~ARM_CPSR_MODE_MASK);
+                }
+            }
+            *next = res & ~3u;   /* ARM-state ALUWritePC forces word alignment */
+        }
     }
     return ARM_OK;
 }
@@ -597,6 +612,25 @@ static arm_status_t exec_multiply(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
 
 arm_status_t arm_step(arm_cpu_t *c) {
     uint32_t pc   = c->r[15];
+
+    /* Sample the interrupt lines before fetching. FIQ outranks IRQ. The return
+     * address convention is "next instruction + 4", so handlers return with
+     * SUBS pc, lr, #4. */
+    if (c->fiq_line && !(c->cpsr & ARM_CPSR_F)) {
+        uint32_t vec;
+        c->cycles++;
+        take_exception(c, ARM_VEC_FIQ, ARM_MODE_FIQ, pc + 4, true, &vec);
+        c->r[15] = vec;
+        return ARM_OK;
+    }
+    if (c->irq_line && !(c->cpsr & ARM_CPSR_I)) {
+        uint32_t vec;
+        c->cycles++;
+        take_exception(c, ARM_VEC_IRQ, ARM_MODE_IRQ, pc + 4, false, &vec);
+        c->r[15] = vec;
+        return ARM_OK;
+    }
+
     /* Instruction fetch is translated too; a fault here is a prefetch abort. */
     uint32_t fetch_pa;
     uint32_t fetch_fsr = arm_mmu_translate(c, pc, false, cpu_is_priv(c), &fetch_pa);

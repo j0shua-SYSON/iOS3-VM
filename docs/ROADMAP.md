@@ -38,8 +38,8 @@ unit-test suite.
   silently corrupting state, so the harness tells us exactly what to add next.
   (CP15 is the documented exception: unmodelled config registers read as zero
   instead of trapping, since kernels probe that space widely.)
-- Remaining: Thumb, IRQ/FIQ delivery and abort exceptions, SWP, LDRD/STRD,
-  user-bank `LDM ^`. **MMU page-table walking** uses the CP15 state landed here
+- Remaining: Thumb, SWP, LDRD/STRD, user-bank `LDM ^`. (IRQ/FIQ delivery and
+  abort exceptions are done.) **MMU page-table walking** uses the CP15 state landed here
   but belongs to M2.
 
 **Observable:** the interpreter runs a known ARM test binary with bit-exact
@@ -63,8 +63,16 @@ register/memory results.
     [guest said] HI
   ```
 
-- Remaining: VIC (interrupt controller), timers, GPIO and clock; then surface
-  the UART stream in the iOS app.
+- **Done: the interrupt path.** A PL190-style VIC masks and routes numbered
+  lines to IRQ or FIQ; a periodic timer drives one. The CPU samples both lines
+  before each fetch and takes a real exception, and handlers return with
+  `SUBS pc, lr, #4` (which restores CPSR from SPSR):
+
+  ```
+  [timer IRQ -> handler -> return] uart="T", resumed at pc=00000100
+  ```
+
+- Remaining: GPIO and clock; then surface the UART stream in the iOS app.
 
 **Observable:** text from guest code appears on the iPhone screen. First "it runs
 on the phone."

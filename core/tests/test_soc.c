@@ -95,12 +95,95 @@ static void test_bare_metal_uart_hello(void) {
     s5l8900_free(&m);
 }
 
+static void test_vic_masks_and_routes(void) {
+    s5l_vic_t v; s5l_vic_reset(&v);
+    s5l_vic_set_line(&v, 5, true);
+    CHECK(!s5l_vic_irq(&v), "line asserted but disabled should not raise IRQ");
+    s5l_vic_write(&v, VIC_INTENABLE, 1u << 5);
+    CHECK(s5l_vic_irq(&v), "enabled line should raise IRQ");
+    s5l_vic_write(&v, VIC_INTSELECT, 1u << 5);
+    CHECK(!s5l_vic_irq(&v) && s5l_vic_fiq(&v), "select should route the line to FIQ");
+    s5l_vic_write(&v, VIC_INTSELECT, 0);
+    s5l_vic_write(&v, VIC_INTENCLEAR, 1u << 5);
+    CHECK(!s5l_vic_irq(&v), "cleared enable should drop IRQ");
+}
+
+/*
+ * The full interrupt path: timer counts down -> VIC masks/routes it -> the CPU
+ * takes an IRQ exception -> the guest handler prints 'T' and returns with
+ * SUBS pc, lr, #4, landing back in the interrupted spin loop.
+ *
+ *   0x18: B 0x40          ; IRQ vector
+ *   0x40: MOV r1,#'T'
+ *   0x44: STR r1,[r0,#0x20]
+ *   0x48: MOV r1,#1
+ *   0x4c: STR r1,[r2,#0x0c]  ; clear timer interrupt
+ *   0x50: SUBS pc,lr,#4      ; return from IRQ (restores CPSR from SPSR)
+ *   0x100: B .               ; main loop
+ */
+static void test_timer_interrupt_reaches_handler(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+
+    /* B 0x40 from 0x18: target = pc + 8 + off  ->  0x40 = 0x18 + 8 + off */
+    const uint32_t branch = 0xea000000u | (((0x40u - 0x18u - 8u) / 4u) & 0x00ffffffu);
+    s5l8900_load(&m, 0x18, &branch, 4);
+
+    /* The handler disables the timer so exactly one interrupt fires; that lets
+     * us assert precisely where the CPU ends up after returning. */
+    const uint32_t handler[] = {
+        0xe3a01054u,   /* MOV r1,#0x54 'T'      */
+        0xe5801020u,   /* STR r1,[r0,#0x20]     */
+        0xe3a01000u,   /* MOV r1,#0             */
+        0xe5821000u,   /* STR r1,[r2,#0x00]  disable timer */
+        0xe3a01001u,   /* MOV r1,#1             */
+        0xe582100cu,   /* STR r1,[r2,#0x0c]  clear timer interrupt */
+        0xe25ef004u    /* SUBS pc,lr,#4      return from IRQ */
+    };
+    s5l8900_load(&m, 0x40, handler, sizeof handler);
+
+    const uint32_t spin = 0xeafffffeu;              /* B . */
+    s5l8900_load(&m, 0x100, &spin, 4);
+
+    /* Program the controller and timer the way guest setup code would. */
+    m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE, 1u << S5L8900_IRQ_TIMER);
+    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER_RELOAD, 4);
+    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER_CTRL,
+                  TIMER_CTRL_ENABLE | TIMER_CTRL_INT_EN);
+
+    /* Start in SYS mode with IRQs unmasked, spinning at 0x100. */
+    m.cpu.r[15] = 0x100;
+    m.cpu.r[0]  = S5L8900_UART0_BASE;
+    m.cpu.r[2]  = S5L8900_TIMER_BASE;
+    m.cpu.cpsr  = ARM_MODE_SYS;                     /* I and F clear */
+
+    arm_status_t st = ARM_OK;
+    s5l8900_run(&m, 200, &st);
+
+    CHECK(st == ARM_OK, "status=%d expect ARM_OK", (int)st);
+    m.uart0.tx[m.uart0.tx_len] = '\0';
+    CHECK(strcmp(m.uart0.tx, "T") == 0,
+          "uart=\"%s\" expect exactly one 'T' (handler ran once)", m.uart0.tx);
+    /* Having returned via SUBS pc,lr,#4 we must be back in the interrupted
+     * mode, at the interrupted instruction. */
+    CHECK((m.cpu.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SYS,
+          "mode=%02x expect back in SYS after IRQ return",
+          m.cpu.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK(m.cpu.r[15] == 0x100, "pc=%08x expect 100 (resumed the spin loop)",
+          m.cpu.r[15]);
+    printf("  [timer IRQ -> handler -> return] uart=\"%s\", resumed at pc=%08x\n",
+           m.uart0.tx, m.cpu.r[15]);
+    s5l8900_free(&m);
+}
+
 int main(void) {
     printf("iOS3-VM S5L8900 machine tests\n");
     test_ram_readback();
     test_uart_status_is_ready();
     test_unmapped_access_counted();
     test_bare_metal_uart_hello();
+    test_vic_masks_and_routes();
+    test_timer_interrupt_reaches_handler();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
