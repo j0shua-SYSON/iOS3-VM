@@ -175,6 +175,101 @@ static void test_garbage_refused(void) {
     s5l8900_free(&m);
 }
 
+/* ------------------------------------------------------------- NOR flash */
+
+static void test_nor_scan_and_find(void) {
+    /* Put two images in flash the way a factory flasher would, then let the
+     * scanner build the directory and look one up by ident.
+     *
+     * This doubles as a regression test: the first container is 42 bytes, i.e.
+     * not a multiple of 4. An earlier scanner advanced by exactly the container
+     * size and so fell permanently off the word grid, making every later image
+     * invisible. Keep the first image's size unaligned. */
+    s5l8900_t m;
+    s5l8900_init(&m, 0, 1u << 20);
+
+    img_begin(0x696c6c62u);                        /* 'illb' */
+    img_tag(0x44415441u, "LLBPAYLOAD", 10);
+    img_finish();
+    s5l_nor_program(&m.nor, 0x0000, g_img, g_len);
+
+    img_begin(0x69626f74u);                        /* 'ibot' */
+    img_tag(0x44415441u, PAYLOAD, (uint32_t)sizeof PAYLOAD);
+    img_finish();
+    s5l_nor_program(&m.nor, 0x1000, g_img, g_len);
+
+    unsigned n = s5l_nor_scan(&m.nor);
+    CHECK(n == 2, "scanned %u images, expect 2", n);
+
+    const s5l_nor_entry_t *llb = s5l_nor_find(&m.nor, 0x696c6c62u);
+    const s5l_nor_entry_t *ibot = s5l_nor_find(&m.nor, 0x69626f74u);
+    CHECK(llb && llb->offset == 0x0000, "llb not found at 0");
+    CHECK(ibot && ibot->offset == 0x1000, "ibot not found at 0x1000");
+    CHECK(s5l_nor_find(&m.nor, 0x64747265u) == NULL, "found a 'dtre' that is not there");
+    s5l8900_free(&m);
+}
+
+static void test_nor_is_memory_mapped(void) {
+    s5l8900_t m;
+    s5l8900_init(&m, 0, 1u << 16);
+    uint32_t marker = 0xcafebabeu;
+    s5l_nor_program(&m.nor, 0x40, &marker, 4);
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_NOR_BASE + 0x40) == 0xcafebabeu,
+          "NOR not readable through the bus");
+    /* NOR is read-only: a guest write must not take effect, and must not be
+     * miscounted as an unmapped access. */
+    m.bus.write32(m.bus.ctx, S5L8900_NOR_BASE + 0x40, 0);
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_NOR_BASE + 0x40) == 0xcafebabeu,
+          "guest write modified read-only NOR");
+    CHECK(m.unmapped_writes == 0, "NOR write counted as unmapped");
+    s5l8900_free(&m);
+}
+
+static void test_nor_scan_rejects_corrupt_header(void) {
+    /* A container whose declared size runs past the flash must be ignored,
+     * not trusted — NOR contents are user-supplied. */
+    s5l8900_t m;
+    s5l8900_init(&m, 0, 1u << 16);
+    img_begin(0x69626f74u);
+    img_tag(0x44415441u, "x", 1);
+    img_finish();
+    /* Claim a fullSize far larger than the flash. */
+    g_img[4] = 0xff; g_img[5] = 0xff; g_img[6] = 0xff; g_img[7] = 0x7f;
+    s5l_nor_program(&m.nor, 0, g_img, g_len);
+    CHECK(s5l_nor_scan(&m.nor) == 0, "corrupt container was accepted");
+    s5l8900_free(&m);
+}
+
+/* The M3 boot-chain shape in miniature: locate iBoot in NOR by ident, load it
+ * out of flash, and execute it. */
+static void test_boot_from_nor(void) {
+    s5l8900_t m;
+    s5l8900_init(&m, 0, 1u << 20);
+
+    img_begin(0x69626f74u);
+    img_tag(0x44415441u, PAYLOAD, (uint32_t)sizeof PAYLOAD);
+    img_finish();
+    s5l_nor_program(&m.nor, 0x2000, g_img, g_len);
+    s5l_nor_scan(&m.nor);
+
+    const s5l_nor_entry_t *e = s5l_nor_find(&m.nor, 0x69626f74u);
+    CHECK(e != NULL, "iBoot not found in NOR");
+    if (!e) { s5l8900_free(&m); return; }
+
+    fw_image_t info;
+    fw_status_t st = fw_boot_img3(&m, &m.nor.data[e->offset], e->size,
+                                  NULL, 0, 0x1000, &info);
+    CHECK(st == FW_OK, "boot from NOR failed: %s", fw_strerror(st));
+
+    arm_status_t ast = ARM_OK;
+    s5l8900_run(&m, 64, &ast);
+    m.uart0.tx[m.uart0.tx_len] = '\0';
+    CHECK(strcmp(m.uart0.tx, "iBoot") == 0, "uart=\"%s\" expect iBoot", m.uart0.tx);
+    printf("  [found '%s' in NOR @0x%x -> booted -> guest said] %s\n",
+           info.ident_str, e->offset, m.uart0.tx);
+    s5l8900_free(&m);
+}
+
 int main(void) {
     printf("iOS3-VM firmware loader tests\n");
     test_plain_image_boots();
@@ -182,6 +277,10 @@ int main(void) {
     test_encrypted_without_key_is_refused();
     test_oversized_payload_refused();
     test_garbage_refused();
+    test_nor_scan_and_find();
+    test_nor_is_memory_mapped();
+    test_nor_scan_rejects_corrupt_header();
+    test_boot_from_nor();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

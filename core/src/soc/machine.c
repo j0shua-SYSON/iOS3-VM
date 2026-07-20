@@ -42,6 +42,9 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         return s5l_vic_read(&m->vic0, addr - S5L8900_VIC0_BASE);
     if (in_dev(addr, S5L8900_TIMER_BASE))
         return s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
+    if (addr >= S5L8900_NOR_BASE &&
+        (uint64_t)addr < (uint64_t)S5L8900_NOR_BASE + m->nor.size)
+        return s5l_nor_read(&m->nor, addr - S5L8900_NOR_BASE, bytes);
 
     m->unmapped_reads++;
     return 0;
@@ -66,6 +69,10 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         s5l_timer_write(&m->timer, addr - S5L8900_TIMER_BASE, val);
         return;
     }
+    if (addr >= S5L8900_NOR_BASE &&
+        (uint64_t)addr < (uint64_t)S5L8900_NOR_BASE + m->nor.size) {
+        return;                     /* NOR is read-only to the guest */
+    }
     m->unmapped_writes++;
 }
 
@@ -88,6 +95,7 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
     s5l_uart_reset(&m->uart0);
     s5l_vic_reset(&m->vic0);
     s5l_timer_reset(&m->timer);
+    if (!s5l_nor_init(&m->nor, S5L8900_NOR_SIZE)) { free(m->ram); m->ram = NULL; return false; }
 
     m->bus.ctx = m;
     m->bus.read32 = r32; m->bus.read16 = r16; m->bus.read8 = r8;
@@ -100,6 +108,7 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
 void s5l8900_free(s5l8900_t *m) {
     free(m->ram);
     m->ram = NULL;
+    s5l_nor_free(&m->nor);
 }
 
 void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {

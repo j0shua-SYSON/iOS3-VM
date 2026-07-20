@@ -107,7 +107,19 @@ on the phone."
   This is precisely the path Apple's LLB/iBoot will take; the only difference
   is who wrote the payload. Mis-keyed, oversized, truncated and garbage images
   are refused with a status rather than corrupting the machine.
-- Remaining: NOR + NAND with the FTL/VFL layers,
+- **Done: NOR flash.** The images the boot chain starts from live here. Reads
+  are memory-mapped and read-only to the guest; the image directory is built by
+  *scanning* for IMG3 containers rather than parsing a guessed-at Apple image
+  table (the real layout could not be verified from a primary source, and
+  guessing would be a silent source of wrong behaviour). Corrupt headers whose
+  declared size runs past the flash are ignored. The boot-chain shape now works
+  end to end — locate iBoot in flash by ident, load it, run it:
+
+  ```
+  [found 'ibot' in NOR @0x2000 -> booted -> guest said] iBoot
+  ```
+
+- Remaining: NAND with the FTL/VFL layers,
   device tree. Execute Apple's real low-level boot chain far enough to see
   **iBoot** serial output.
 *Requires the user to supply their own iPhone OS 3.1.3 IPSW + the public

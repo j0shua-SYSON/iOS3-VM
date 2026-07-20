@@ -102,6 +102,46 @@ void s5l_timer_write(s5l_timer_t *t, uint32_t off, uint32_t val);
 /* Advance by `ticks`; returns true while an interrupt is pending. */
 bool s5l_timer_tick(s5l_timer_t *t, uint32_t ticks);
 
+/* ----------------------------------------------------------- NOR flash ---
+ * On the S5L8900 the low-level boot images (LLB, iBoot, the device tree, the
+ * boot logo) live in a small NOR flash reached over SPI. We model it as a
+ * read-only memory-mapped region plus a directory built by *scanning* for IMG3
+ * containers.
+ *
+ * Scanning is deliberate: Apple's exact NOR image-table layout for this SoC
+ * could not be verified from a primary source, and guessing a structure would
+ * be a silent source of wrong behaviour. Scanning for the IMG3 magic works
+ * whatever the surrounding directory format turns out to be, and can be
+ * replaced with a real table reader once the layout is confirmed against a
+ * genuine dump.
+ */
+#define S5L8900_NOR_BASE 0x24000000u
+#define S5L8900_NOR_SIZE 0x00100000u   /* 1 MiB */
+#define S5L_NOR_MAX_IMAGES 16
+
+typedef struct {
+    uint32_t ident;     /* IMG3 ident, e.g. 'illb', 'ibot', 'dtre' */
+    uint32_t offset;    /* byte offset within the NOR              */
+    uint32_t size;      /* container size (fullSize)               */
+} s5l_nor_entry_t;
+
+typedef struct {
+    uint8_t        *data;
+    uint32_t        size;
+    s5l_nor_entry_t images[S5L_NOR_MAX_IMAGES];
+    unsigned        image_count;
+} s5l_nor_t;
+
+bool     s5l_nor_init(s5l_nor_t *n, uint32_t size);
+void     s5l_nor_free(s5l_nor_t *n);
+uint32_t s5l_nor_read(const s5l_nor_t *n, uint32_t off, unsigned bytes);
+/* Copy `len` bytes into the NOR at `off` (as a flasher would). */
+void     s5l_nor_program(s5l_nor_t *n, uint32_t off, const void *src, size_t len);
+/* Rebuild the image directory by scanning for IMG3 containers. */
+unsigned s5l_nor_scan(s5l_nor_t *n);
+/* Find a scanned image by ident; returns NULL if absent. */
+const s5l_nor_entry_t *s5l_nor_find(const s5l_nor_t *n, uint32_t ident);
+
 /* ------------------------------------------------------------- machine ---
  * Wires the CPU to RAM and the peripherals through one arm_bus_t.
  */
@@ -114,6 +154,7 @@ typedef struct {
     s5l_uart_t  uart0;
     s5l_vic_t   vic0;
     s5l_timer_t timer;
+    s5l_nor_t   nor;
     uint64_t   unmapped_reads;   /* visibility: accesses outside the map */
     uint64_t   unmapped_writes;
 } s5l8900_t;
