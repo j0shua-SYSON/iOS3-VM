@@ -559,6 +559,88 @@ static void test_abort_restores_base_register(void) {
     CHECK(c.cp15.dfar == 0x00100000u, "dfar=%08x expect 00100000", c.cp15.dfar);
 }
 
+/* --------------------------------------------------------------- Thumb --- */
+
+/* Load 16-bit Thumb halfwords at `base` and run from there in Thumb state. */
+static void load_thumb(arm_cpu_t *c, const uint16_t *prog, size_t n, int steps) {
+    memset(g_ram, 0, sizeof g_ram);
+    for (size_t i = 0; i < n; i++) m_w16(NULL, (uint32_t)(i*2), prog[i]);
+    arm_reset(c, &g_bus);
+    c->cpsr = (c->cpsr & ~0x1fu) | ARM_MODE_SYS;
+    c->cpsr |= ARM_CPSR_T;
+    c->r[15] = 0;
+    for (int i = 0; i < steps; i++) if (arm_step(c) != ARM_OK) break;
+}
+
+static void test_thumb_mov_add(void) {
+    /* MOV r0,#40 ; MOV r1,#2 ; ADD r0,r0,r1 */
+    uint16_t p[] = { 0x2028, 0x2102, 0x1840 };
+    arm_cpu_t c; load_thumb(&c, p, 3, 3);
+    CHECK(c.r[0] == 42, "r0=%u expect 42", c.r[0]);
+    CHECK(c.r[15] == 6, "pc=%u expect 6 (2 bytes per instruction)", c.r[15]);
+}
+
+static void test_thumb_lsl_flags(void) {
+    /* MOV r0,#1 ; LSL r1,r0,#31 -> N set */
+    uint16_t p[] = { 0x2001, 0x07c1 };
+    arm_cpu_t c; load_thumb(&c, p, 2, 2);
+    CHECK(c.r[1] == 0x80000000u, "r1=%08x expect 80000000", c.r[1]);
+    CHECK((c.cpsr & ARM_CPSR_N) != 0, "N should be set");
+}
+
+static void test_thumb_push_pop(void) {
+    /* SP=0x900 ; r0=0xAA ; r1=0xBB ; PUSH {r0,r1} ; POP {r2,r3} */
+    uint16_t p[] = { 0x20aa,        /* MOV r0,#0xAA */
+                     0x21bb,        /* MOV r1,#0xBB */
+                     0xb403,        /* PUSH {r0,r1} */
+                     0xbc0c };      /* POP  {r2,r3} */
+    arm_cpu_t c; load_thumb(&c, p, 4, 0);
+    c.r[13] = 0x900;
+    for (int i = 0; i < 4; i++) arm_step(&c);
+    CHECK(c.r[2] == 0xaa, "r2=%08x expect aa", c.r[2]);
+    CHECK(c.r[3] == 0xbb, "r3=%08x expect bb", c.r[3]);
+    CHECK(c.r[13] == 0x900, "sp=%08x expect 900 (balanced)", c.r[13]);
+}
+
+static void test_thumb_conditional_branch(void) {
+    /* MOV r0,#1 ; CMP r0,#1 ; BNE +4 (not taken) ; MOV r1,#7 */
+    uint16_t p[] = { 0x2001, 0x2801, 0xd101, 0x2107 };
+    arm_cpu_t c; load_thumb(&c, p, 4, 4);
+    CHECK(c.r[1] == 7, "r1=%u expect 7 (BNE not taken)", c.r[1]);
+}
+
+static void test_arm_to_thumb_and_back(void) {
+    /* ARM: set r0 = 0x10|1 and BX to it, landing in Thumb at 0x10.
+     * Thumb at 0x10: MOV r1,#5 ; then BX r2 with r2 = 0x20 (back to ARM).
+     * ARM at 0x20: MOV r3,#9. */
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0x00, 0xe3a00011);      /* MOV r0,#0x11        */
+    m_w32(NULL, 0x04, 0xe3a02020);      /* MOV r2,#0x20        */
+    m_w32(NULL, 0x08, 0xe12fff10);      /* BX  r0  -> Thumb    */
+    m_w16(NULL, 0x10, 0x2105);          /* Thumb: MOV r1,#5    */
+    m_w16(NULL, 0x12, 0x4710);          /* Thumb: BX r2 -> ARM */
+    m_w32(NULL, 0x20, 0xe3a03009);      /* ARM:   MOV r3,#9    */
+
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    c.cpsr = (c.cpsr & ~0x1fu) | ARM_MODE_SYS;
+    for (int i = 0; i < 6; i++) arm_step(&c);
+
+    CHECK(c.r[1] == 5, "r1=%u expect 5 (Thumb code ran)", c.r[1]);
+    CHECK(c.r[3] == 9, "r3=%u expect 9 (returned to ARM)", c.r[3]);
+    CHECK((c.cpsr & ARM_CPSR_T) == 0, "T bit should be clear back in ARM state");
+}
+
+static void test_thumb_bl_pair(void) {
+    /* BL is a 32-bit pair in Thumb. The halves combine into one 22-bit offset:
+     * target = (PC_of_first + 4) + (offset << 1). With offset 2 that is
+     * 4 + 4 = 8. LR must be the address after the pair, with the Thumb bit set
+     * so the eventual BX LR returns to Thumb state. */
+    uint16_t p[] = { 0xf000, 0xf802 };
+    arm_cpu_t c; load_thumb(&c, p, 2, 2);
+    CHECK(c.r[15] == 0x08, "pc=%08x expect 08", c.r[15]);
+    CHECK(c.r[14] == 0x05, "lr=%08x expect 05 (return addr | Thumb bit)", c.r[14]);
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -607,6 +689,12 @@ int main(void) {
     test_media_space_traps();
     test_apx_makes_mapping_read_only();
     test_abort_restores_base_register();
+    test_thumb_mov_add();
+    test_thumb_lsl_flags();
+    test_thumb_push_pop();
+    test_thumb_conditional_branch();
+    test_arm_to_thumb_and_back();
+    test_thumb_bl_pair();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

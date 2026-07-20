@@ -21,10 +21,10 @@ The whole toolchain proven end-to-end before any emulation:
 **Observable:** green CI badges; the app prints `r0 = 42` computed by our CPU
 core on the phone.
 
-### 🔵 M1 — ARMv6 interpreter *(in progress)*
+### ✅ M1 — ARMv6 interpreter *(done)*
 A complete, correct ARM1176 instruction interpreter validated against a growing
 unit-test suite.
-- **Done** (83 CPU tests passing): data-processing with the full barrel shifter,
+- **Done** (96 CPU tests passing): data-processing with the full barrel shifter,
   branch/BL, BX/BLX, single load/store, multiply, **LDM/STM in all four
   addressing modes** (incl. push/pop and LDM-into-PC branching), the
   halfword/sign-extending loads (LDRH/STRH/LDRSB/LDRSH), **banked registers and
@@ -38,9 +38,13 @@ unit-test suite.
   silently corrupting state, so the harness tells us exactly what to add next.
   (CP15 is the documented exception: unmodelled config registers read as zero
   instead of trapping, since kernels probe that space widely.)
-- Remaining: Thumb, SWP, LDRD/STRD, user-bank `LDM ^`. (IRQ/FIQ delivery and
-  abort exceptions are done.) **MMU page-table walking** uses the CP15 state landed here
-  but belongs to M2.
+- **The Thumb (16-bit) instruction set**, including ARM↔Thumb interworking via
+  BX/BLX and the T bit, PUSH/POP, the BL half-pair, and conditional branches.
+  iPhone OS userland is Thumb-compiled, so this is required for M5.
+- Both instruction sets share the same barrel shifter, ALU flag logic, memory
+  accessors and exception entry, so their semantics cannot drift apart.
+- Still unimplemented (they trap): SWP, LDRD/STRD, user-bank `LDM ^`, the media
+  instructions, and the Thumb CPS/SETEND/REV group.
 
 **Observable:** the interpreter runs a known ARM test binary with bit-exact
 register/memory results.

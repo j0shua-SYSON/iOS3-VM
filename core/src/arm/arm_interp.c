@@ -346,13 +346,18 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
      * MRS, MSR, CLZ, ...) — it must NOT fall through to the comparison cases,
      * or e.g. BX would silently execute as TEQ and never branch. */
     if (opcode >= 0x8 && opcode <= 0xb && !S) {
+        /* Bit 0 of the target selects the instruction set: set means Thumb. */
         if ((insn & 0x0ffffff0u) == 0x012fff10u) {          /* BX Rm */
-            *next = reg_read(c, pc, insn & 0xf) & ~1u;      /* Thumb bit ignored (ARM-only for now) */
+            uint32_t t = reg_read(c, pc, insn & 0xf);
+            if (t & 1u) c->cpsr |= ARM_CPSR_T;
+            *next = t & ~1u;
             return ARM_OK;
         }
         if ((insn & 0x0ffffff0u) == 0x012fff30u) {          /* BLX Rm */
+            uint32_t t = reg_read(c, pc, insn & 0xf);
             c->r[14] = pc + 4;
-            *next = reg_read(c, pc, insn & 0xf) & ~1u;
+            if (t & 1u) c->cpsr |= ARM_CPSR_T;
+            *next = t & ~1u;
             return ARM_OK;
         }
 
@@ -651,6 +656,288 @@ static arm_status_t exec_multiply(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
 
 /* ------------------------------------------------------------------- step */
 
+/* ==================================================================== Thumb */
+/*
+ * The Thumb (16-bit) instruction set. iPhone OS userland — SpringBoard and
+ * most of the frameworks — is Thumb-compiled for code density, so this is not
+ * optional for reaching a home screen.
+ *
+ * Thumb reuses every helper above (barrel shifter, ALU flag logic, translated
+ * memory accessors, exception entry), so semantics cannot drift between the two
+ * instruction sets. Reading r15 in Thumb yields the instruction address + 4,
+ * and with bit 1 cleared for PC-relative loads.
+ */
+#define TB(n)  ((insn >> (n)) & 7u)          /* 3-bit register field at bit n */
+
+static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
+                               uint32_t *next) {
+    const uint32_t pc4 = pc + 4;             /* r15 as read by the instruction */
+
+    switch (insn >> 12) {
+    case 0x0: case 0x1: {
+        if ((insn & 0xf800u) == 0x1800u) {   /* ADD/SUB register or 3-bit imm */
+            unsigned rd = TB(0), rs = TB(3);
+            uint32_t op2 = (insn & (1u << 10)) ? (uint32_t)TB(6) : c->r[TB(6)];
+            c->r[rd] = (insn & (1u << 9)) ? alu_sub(c, c->r[rs], op2, 1, true)
+                                          : alu_add(c, c->r[rs], op2, 0, true);
+            return ARM_OK;
+        }
+        /* LSL/LSR/ASR by immediate */
+        unsigned rd = TB(0), rs = TB(3), amount = (insn >> 6) & 0x1fu;
+        unsigned type = (insn >> 11) & 3u;
+        bool carry = get_flag(c, ARM_CPSR_C);
+        uint32_t res = barrel_shift(c->r[rs], type, amount, false, &carry);
+        c->r[rd] = res;
+        alu_logic_flags(c, res, carry, true);
+        return ARM_OK;
+    }
+    case 0x2: case 0x3: {                    /* MOV/CMP/ADD/SUB 8-bit immediate */
+        unsigned rd = (insn >> 8) & 7u;
+        uint32_t imm = insn & 0xffu;
+        switch ((insn >> 11) & 3u) {
+            case 0: c->r[rd] = imm; alu_logic_flags(c, imm, get_flag(c, ARM_CPSR_C), true); break;
+            case 1: alu_sub(c, c->r[rd], imm, 1, true); break;              /* CMP */
+            case 2: c->r[rd] = alu_add(c, c->r[rd], imm, 0, true); break;
+            default: c->r[rd] = alu_sub(c, c->r[rd], imm, 1, true); break;
+        }
+        return ARM_OK;
+    }
+    case 0x4: {
+        if ((insn & 0xfc00u) == 0x4000u) {   /* ALU operations */
+            unsigned rd = TB(0), rs = TB(3);
+            uint32_t a = c->r[rd], b = c->r[rs];
+            bool carry = get_flag(c, ARM_CPSR_C);
+            switch ((insn >> 6) & 0xfu) {
+                case 0x0: c->r[rd] = a & b; alu_logic_flags(c, c->r[rd], carry, true); break; /* AND */
+                case 0x1: c->r[rd] = a ^ b; alu_logic_flags(c, c->r[rd], carry, true); break; /* EOR */
+                case 0x2: c->r[rd] = barrel_shift(a, 0, b & 0xffu, true, &carry);
+                          alu_logic_flags(c, c->r[rd], carry, true); break;                   /* LSL */
+                case 0x3: c->r[rd] = barrel_shift(a, 1, b & 0xffu, true, &carry);
+                          alu_logic_flags(c, c->r[rd], carry, true); break;                   /* LSR */
+                case 0x4: c->r[rd] = barrel_shift(a, 2, b & 0xffu, true, &carry);
+                          alu_logic_flags(c, c->r[rd], carry, true); break;                   /* ASR */
+                case 0x5: c->r[rd] = alu_add(c, a, b, get_flag(c, ARM_CPSR_C), true); break;  /* ADC */
+                case 0x6: c->r[rd] = alu_sub(c, a, b, get_flag(c, ARM_CPSR_C), true); break;  /* SBC */
+                case 0x7: c->r[rd] = barrel_shift(a, 3, b & 0xffu, true, &carry);
+                          alu_logic_flags(c, c->r[rd], carry, true); break;                   /* ROR */
+                case 0x8: alu_logic_flags(c, a & b, carry, true); break;                      /* TST */
+                case 0x9: c->r[rd] = alu_sub(c, 0, b, 1, true); break;                        /* NEG */
+                case 0xa: alu_sub(c, a, b, 1, true); break;                                   /* CMP */
+                case 0xb: alu_add(c, a, b, 0, true); break;                                   /* CMN */
+                case 0xc: c->r[rd] = a | b; alu_logic_flags(c, c->r[rd], carry, true); break; /* ORR */
+                case 0xd: c->r[rd] = a * b;
+                          set_flag(c, ARM_CPSR_N, (c->r[rd] >> 31) & 1u);
+                          set_flag(c, ARM_CPSR_Z, c->r[rd] == 0); break;                      /* MUL */
+                case 0xe: c->r[rd] = a & ~b; alu_logic_flags(c, c->r[rd], carry, true); break;/* BIC */
+                default:  c->r[rd] = ~b; alu_logic_flags(c, c->r[rd], carry, true); break;    /* MVN */
+            }
+            return ARM_OK;
+        }
+        if ((insn & 0xfc00u) == 0x4400u) {   /* Hi-register ops and BX/BLX */
+            unsigned rd = (unsigned)TB(0) | ((insn >> 4) & 8u);
+            unsigned rs = (unsigned)TB(3) | ((insn >> 3) & 8u);
+            uint32_t sv = (rs == 15) ? pc4 : c->r[rs];
+            switch ((insn >> 8) & 3u) {
+                case 0:                                        /* ADD */
+                    if (rd == 15) *next = ((c->r[15] + sv) & ~1u);
+                    else c->r[rd] += sv;
+                    return ARM_OK;
+                case 1: alu_sub(c, (rd == 15) ? pc4 : c->r[rd], sv, 1, true); return ARM_OK; /* CMP */
+                case 2:                                        /* MOV */
+                    if (rd == 15) *next = sv & ~1u;
+                    else c->r[rd] = sv;
+                    return ARM_OK;
+                default:                                       /* BX / BLX */
+                    if (insn & (1u << 7)) c->r[14] = (pc + 2) | 1u;   /* BLX */
+                    if (!(sv & 1u)) c->cpsr &= ~ARM_CPSR_T;           /* back to ARM */
+                    *next = sv & ~1u;
+                    return ARM_OK;
+            }
+        }
+        /* PC-relative load: LDR Rd,[PC,#imm8*4] — PC is word-aligned first. */
+        unsigned rd = (insn >> 8) & 7u;
+        uint32_t addr = (pc4 & ~3u) + ((insn & 0xffu) << 2);
+        uint32_t v = mem_r32(c, addr);
+        if (c->abort_pending) return ARM_OK;
+        c->r[rd] = v;
+        return ARM_OK;
+    }
+    case 0x5: {
+        unsigned rd = TB(0), rb = TB(3), ro = TB(6);
+        uint32_t addr = c->r[rb] + c->r[ro];
+        if (insn & (1u << 9)) {              /* sign-extended byte/halfword */
+            uint32_t v;
+            switch ((insn >> 10) & 3u) {
+                case 0:
+                    mem_w16(c, addr, (uint16_t)c->r[rd]);            /* STRH  */
+                    return ARM_OK;
+                case 1:
+                    v = (uint32_t)(int32_t)(int8_t)mem_r8(c, addr);  /* LDRSB */
+                    break;
+                case 2:
+                    v = mem_r16(c, addr);                            /* LDRH  */
+                    break;
+                default:
+                    v = (uint32_t)(int32_t)(int16_t)mem_r16(c, addr);/* LDRSH */
+                    break;
+            }
+            if (c->abort_pending) return ARM_OK;
+            c->r[rd] = v;
+            return ARM_OK;
+        }
+        bool load = (insn >> 11) & 1u, byte = (insn >> 10) & 1u;
+        if (load) {
+            uint32_t v = byte ? mem_r8(c, addr) : mem_r32(c, addr);
+            if (c->abort_pending) return ARM_OK;
+            c->r[rd] = v;
+        } else {
+            if (byte) mem_w8(c, addr, (uint8_t)c->r[rd]);
+            else      mem_w32(c, addr, c->r[rd]);
+        }
+        return ARM_OK;
+    }
+    case 0x6: case 0x7: {                    /* load/store word or byte, imm5 */
+        unsigned rd = TB(0), rb = TB(3), off = (insn >> 6) & 0x1fu;
+        bool byte = (insn >> 12) & 1u, load = (insn >> 11) & 1u;
+        uint32_t addr = c->r[rb] + (byte ? off : (off << 2));
+        if (load) {
+            uint32_t v = byte ? mem_r8(c, addr) : mem_r32(c, addr);
+            if (c->abort_pending) return ARM_OK;
+            c->r[rd] = v;
+        } else {
+            if (byte) mem_w8(c, addr, (uint8_t)c->r[rd]);
+            else      mem_w32(c, addr, c->r[rd]);
+        }
+        return ARM_OK;
+    }
+    case 0x8: {                              /* load/store halfword, imm5 */
+        unsigned rd = TB(0), rb = TB(3);
+        uint32_t addr = c->r[rb] + (((insn >> 6) & 0x1fu) << 1);
+        if (insn & (1u << 11)) {
+            uint32_t v = mem_r16(c, addr);
+            if (c->abort_pending) return ARM_OK;
+            c->r[rd] = v;
+        } else {
+            mem_w16(c, addr, (uint16_t)c->r[rd]);
+        }
+        return ARM_OK;
+    }
+    case 0x9: {                              /* SP-relative load/store */
+        unsigned rd = (insn >> 8) & 7u;
+        uint32_t addr = c->r[13] + ((insn & 0xffu) << 2);
+        if (insn & (1u << 11)) {
+            uint32_t v = mem_r32(c, addr);
+            if (c->abort_pending) return ARM_OK;
+            c->r[rd] = v;
+        } else {
+            mem_w32(c, addr, c->r[rd]);
+        }
+        return ARM_OK;
+    }
+    case 0xa: {                              /* ADD Rd, PC/SP, #imm8*4 */
+        unsigned rd = (insn >> 8) & 7u;
+        uint32_t imm = (insn & 0xffu) << 2;
+        c->r[rd] = (insn & (1u << 11)) ? c->r[13] + imm : (pc4 & ~3u) + imm;
+        return ARM_OK;
+    }
+    case 0xb: {
+        if ((insn & 0xff00u) == 0xb000u) {   /* ADD/SUB SP, #imm7*4 */
+            uint32_t imm = (insn & 0x7fu) << 2;
+            c->r[13] = (insn & (1u << 7)) ? c->r[13] - imm : c->r[13] + imm;
+            return ARM_OK;
+        }
+        if ((insn & 0xf600u) == 0xb400u) {   /* PUSH / POP */
+            uint32_t list = insn & 0xffu;
+            bool load = (insn >> 11) & 1u, extra = (insn >> 8) & 1u;
+            if (load) {                       /* POP: ascending from SP */
+                uint32_t sp = c->r[13], loaded[8]; uint32_t pcv = 0;
+                for (unsigned i = 0; i < 8; i++) {
+                    if (!(list & (1u << i))) continue;
+                    loaded[i] = mem_r32(c, sp);
+                    if (c->abort_pending) return ARM_OK;
+                    sp += 4;
+                }
+                if (extra) { pcv = mem_r32(c, sp); if (c->abort_pending) return ARM_OK; sp += 4; }
+                for (unsigned i = 0; i < 8; i++) if (list & (1u << i)) c->r[i] = loaded[i];
+                c->r[13] = sp;
+                if (extra) {                  /* POP {..,pc} may switch to ARM */
+                    if (!(pcv & 1u)) c->cpsr &= ~ARM_CPSR_T;
+                    *next = pcv & ~1u;
+                }
+            } else {                          /* PUSH: descending, LR pushed last */
+                unsigned n = extra ? 1u : 0u;
+                for (unsigned i = 0; i < 8; i++) if (list & (1u << i)) n++;
+                uint32_t sp = c->r[13] - 4u * n, addr = sp;
+                for (unsigned i = 0; i < 8; i++) {
+                    if (!(list & (1u << i))) continue;
+                    mem_w32(c, addr, c->r[i]);
+                    if (c->abort_pending) return ARM_OK;
+                    addr += 4;
+                }
+                if (extra) { mem_w32(c, addr, c->r[14]); if (c->abort_pending) return ARM_OK; }
+                c->r[13] = sp;
+            }
+            return ARM_OK;
+        }
+        return ARM_UNDEFINED;                 /* CPS, SETEND, REV, BKPT: later */
+    }
+    case 0xc: {                              /* STMIA / LDMIA Rb!, {rlist} */
+        unsigned rb = (insn >> 8) & 7u;
+        uint32_t list = insn & 0xffu, addr = c->r[rb];
+        if (list == 0) return ARM_UNDEFINED;
+        if (insn & (1u << 11)) {
+            uint32_t loaded[8];
+            for (unsigned i = 0; i < 8; i++) {
+                if (!(list & (1u << i))) continue;
+                loaded[i] = mem_r32(c, addr);
+                if (c->abort_pending) return ARM_OK;
+                addr += 4;
+            }
+            for (unsigned i = 0; i < 8; i++) if (list & (1u << i)) c->r[i] = loaded[i];
+            if (!(list & (1u << rb))) c->r[rb] = addr;
+        } else {
+            for (unsigned i = 0; i < 8; i++) {
+                if (!(list & (1u << i))) continue;
+                mem_w32(c, addr, c->r[i]);
+                if (c->abort_pending) return ARM_OK;
+                addr += 4;
+            }
+            c->r[rb] = addr;
+        }
+        return ARM_OK;
+    }
+    case 0xd: {
+        unsigned cond = (insn >> 8) & 0xfu;
+        if (cond == 0xf) {                   /* SWI */
+            take_exception(c, ARM_VEC_SWI, ARM_MODE_SVC, pc + 2, false, next);
+            return ARM_OK;
+        }
+        if (cond == 0xe) return ARM_UNDEFINED;   /* permanently undefined */
+        if (arm_cond_passed(c, cond))
+            *next = pc4 + ((uint32_t)(int32_t)(int8_t)(insn & 0xffu) << 1);
+        return ARM_OK;
+    }
+    case 0xe: {                              /* unconditional branch */
+        int32_t off = (int32_t)((uint32_t)(insn & 0x7ffu) << 21) >> 20;  /* sign-extend, <<1 */
+        *next = pc4 + (uint32_t)off;
+        return ARM_OK;
+    }
+    default: {                               /* 0xf: BL/BLX, a 32-bit pair */
+        if (!(insn & (1u << 11))) {          /* first half: LR = PC + (off<<12) */
+            int32_t off = (int32_t)((uint32_t)(insn & 0x7ffu) << 21) >> 9;
+            c->r[14] = pc4 + (uint32_t)off;
+            return ARM_OK;
+        }
+        uint32_t target = c->r[14] + ((uint32_t)(insn & 0x7ffu) << 1);
+        c->r[14] = (pc + 2) | 1u;            /* return address, Thumb bit set */
+        *next = target & ~1u;
+        return ARM_OK;
+    }
+    }
+}
+
+#undef TB
+
 arm_status_t arm_step(arm_cpu_t *c) {
     uint32_t pc   = c->r[15];
 
@@ -684,6 +971,26 @@ arm_status_t arm_step(arm_cpu_t *c) {
         c->r[15] = vec;
         return ARM_OK;
     }
+    /* Thumb: 16-bit instructions, PC advances by 2. Dispatch before the ARM
+     * decoder — the two instruction sets share every helper below. */
+    if (c->cpsr & ARM_CPSR_T) {
+        uint16_t tinsn = c->bus->read16(c->bus->ctx, fetch_pa);
+        uint32_t tnext = pc + 2;
+        c->cycles++;
+        arm_status_t tst = thumb_step(c, pc, tinsn, &tnext);
+        if (c->abort_pending) {
+            uint32_t vec;
+            c->abort_pending = false;
+            c->cp15.dfsr = c->abort_fsr;
+            c->cp15.dfar = c->abort_far;
+            take_exception(c, ARM_VEC_DATA_ABORT, ARM_MODE_ABT, pc + 8, false, &vec);
+            c->r[15] = vec;
+            return ARM_OK;
+        }
+        if (tst == ARM_OK) c->r[15] = tnext;
+        return tst;
+    }
+
     uint32_t insn = c->bus->read32(c->bus->ctx, fetch_pa);
     uint32_t next = pc + 4;
     arm_status_t st = ARM_OK;
