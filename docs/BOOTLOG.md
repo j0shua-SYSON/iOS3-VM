@@ -461,11 +461,18 @@ just mounted, and `execve` gets remarkably far.
 
 **pid 1 executes user-mode code and makes system calls.** `_panic` is never
 reached. The run does not end on a guest failure at all — it ends because *we*
-stopped. The kernel took an undefined-instruction trap into `_vfp_trap`, whose job
-is to deal with the VFP instruction that faulted, and the encoding it reached is
-one the interpreter does not implement. Per M1's rule, an unimplemented encoding
-returns `ARM_UNDEFINED` and halts the machine *at* the instruction rather than
-executing something plausible. The emulator named its own gap.
+stopped.
+
+XNU does not leave VFP enabled: `_init_vfp` grants CP10/CP11 access once, and
+after that the gate is `FPEXC.EN` alone, cleared per thread. So the first VFP
+instruction any thread executes is *supposed* to take an Undefined exception,
+which `_fleh_undef` → `_sleh_undef` → `_vfp_trap` → `_vfp_switch` turns into
+"enable VFP and re-run it". That whole path now works. What stops us is the
+instruction `_vfp_switch` itself uses: `0xecb10a20` decodes as
+`VLDMIA r1!, {s0-s31}`, the load-multiple that restores a thread's VFP register
+file — and the interpreter does not implement it. Per M1's rule an unimplemented
+encoding returns `ARM_UNDEFINED` and halts the machine *at* the instruction
+rather than executing something plausible. The emulator named its own gap.
 
 Keep the scale honest: five BSD system calls and twelve Mach traps is not a
 userland. Nothing has been logged by userspace, no daemon has started, and

@@ -108,12 +108,17 @@ stopped after 234,731,493 instructions: UNDEFINED INSTRUCTION
   lr 0xc006ae0d (_vfp_trap+0x38)
 ```
 
-**pid 1 is executing user-mode code and making system calls.** That is the first
-half of M5's first criterion. Then the run ends — not on a guest panic, but
-because *we* stopped: the kernel took an undefined-instruction trap into
-`_vfp_trap`, and the VFP encoding it went to emulate is one the interpreter does
-not implement, so the machine halts at the instruction instead of guessing. That
-is the M1 rule working exactly as designed, and it is the next thing to build.
+**pid 1 is executing user-mode code and making system calls.** That is M5's first
+criterion. Then the run ends — not on a guest panic, but because *we* stopped.
+
+XNU does not leave VFP on: the first VFP instruction a thread executes is
+*supposed* to take an Undefined exception, and the kernel turns VFP on and re-runs
+it. That path now works — the trap is vectored to the guest, and `_sleh_undef`
+routes it to `_vfp_trap`. What halts us is what `_vfp_trap` does next: `0xecb10a20`
+decodes as `VLDMIA r1!, {s0-s31}`, the VFP load-multiple that restores the
+register file, and the interpreter does not implement it. So it stops *at* the
+instruction rather than computing something plausible — M1's rule working exactly
+as designed. VFP is the next thing to build.
 
 Keep the scale honest: **five system calls is not a userland.** SpringBoard needs
 daemons, a display controller (`AppleH1CLCD`), a panel ID, and a multitouch

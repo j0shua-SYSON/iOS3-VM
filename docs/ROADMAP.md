@@ -476,13 +476,22 @@ stopped after 234,731,493 instructions: UNDEFINED INSTRUCTION
 ```
 
 Fifteen pages validate cleanly, no page is ever invalidated, twenty-four SWIs are
-taken, twelve Mach traps and five BSD system calls are serviced. Then the kernel
-takes an undefined-instruction trap into `_vfp_trap` — the handler whose job is to
-emulate or execute the VFP instruction that faulted — and the encoding it reaches
-is one **our interpreter does not implement**, so the machine halts at the
-instruction rather than computing something plausible. That is M1's rule doing its
-job: the emulator named the gap instead of corrupting state that would fail
-somewhere else.
+taken, twelve Mach traps and five BSD system calls are serviced. Then it stops on
+VFP.
+
+XNU does not leave VFP enabled. `_init_vfp` grants CP10/CP11 full access once, and
+from then on the gate is `FPEXC.EN` alone, cleared per thread — so **the first VFP
+instruction a thread executes is supposed to take an Undefined exception**, which
+the kernel handles by enabling VFP and re-running it. `d021205` made us vector
+exactly those to the guest, using `_sleh_undef`'s own six encoding masks as the
+discriminator so that a genuinely unimplemented encoding still names itself rather
+than being swallowed by the guest's handler. That path now works.
+
+What halts the machine is the *next* instruction along it: `0xecb10a20` decodes as
+`VLDMIA r1!, {s0-s31}` — the VFP load-multiple by which `_vfp_switch` restores a
+thread's register file — and the interpreter does not implement it. Per M1's rule
+it returns `ARM_UNDEFINED` and stops *at* the instruction instead of computing
+something plausible. The emulator named its own gap.
 
 **This is progress, and it is not M5.** Five system calls is not a userland. No
 daemon has started, nothing has been logged by userspace, and SpringBoard needs a
@@ -490,9 +499,11 @@ display controller and a panel that do not exist yet.
 
 ### The M5 work item list, as it now stands
 
-- **VFP arithmetic in the interpreter.** This is the current wall, and it was
-  predicted: `e2d6c44` listed the VFP undefined trap as a known gap left
-  deliberately unfixed. It is now reachable, which is this project's usual shape.
+- **VFP in the interpreter** — starting with the load/store-multiple forms
+  (`VLDM`/`VSTM`), because that is what the kernel's own context switch uses,
+  before any arithmetic. This is the current wall, and it was predicted: `e2d6c44`
+  listed the VFP undefined trap as a known gap left deliberately unfixed. It
+  became reachable the moment userspace ran, which is this project's usual shape.
 - **Nothing symbolizes userspace.** Every diagnostic here resolves against the
   kernelcache. The instant launchd retires an instruction, the milestone table,
   the profiler and the kext symbolizer all go quiet — which is exactly the
