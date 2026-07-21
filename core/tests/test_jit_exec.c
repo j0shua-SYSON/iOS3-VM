@@ -39,12 +39,17 @@ static jit_buf_t g_buf;
 /* Assemble `n` words into the arena and call them as long f(long, long). */
 static long call_fn(const uint32_t *words, size_t n, long a, long b) {
     union { void *p; long (*fn)(long, long); } u;
-    uint32_t *dst = jit_buf_take(&g_buf, n);
+    uint32_t *dst;
+    if (!words || n == 0 || n > SIZE_MAX / sizeof(uint32_t)) return -1;
+    dst = jit_buf_take(&g_buf, n);
     if (!dst) return -1;
-    jit_buf_begin_write(&g_buf);
-    memcpy(dst, words, n * 4u);
-    jit_buf_end_write(&g_buf);
-    jit_buf_commit(&g_buf, dst, n * 4u);
+    if (!jit_buf_begin_write(&g_buf)) return -1;
+    memcpy(dst, words, n * sizeof *dst);
+    if (!jit_buf_end_write(&g_buf)) {
+        (void)jit_buf_free(&g_buf);
+        return -1;
+    }
+    if (!jit_buf_commit(&g_buf, dst, n * sizeof *dst)) return -1;
     u.p = (void *)dst;
     return u.fn(a, b);
 }
@@ -249,20 +254,29 @@ static void test_executes_memory_and_branches(void) {
         a64_add_reg(&ce, A64_W, 0, 0, 1, A64_LSL, 0);
         a64_ret(&ce, 30);
         cdst = jit_buf_take(&g_buf, ce.n);
-        if (cdst) {
+        if (!cdst) {
+            CHECK(false, "allocate emitted callee");
+        } else if (!jit_buf_begin_write(&g_buf)) {
+            CHECK(false, "open emitted-callee write scope");
+        } else {
             a64_emit_t e2;
             uint32_t w2[32];
-            jit_buf_begin_write(&g_buf);
             memcpy(cdst, callee, ce.n * 4u);
-            jit_buf_end_write(&g_buf);
-            jit_buf_commit(&g_buf, cdst, ce.n * 4u);
-            a64_init(&e2, w2, 32);
-            a64_stp_pre(&e2, A64_SZ_D, 29, 30, A64_SP, -16);
-            a64_mov_imm(&e2, A64_X, 16, (uint64_t)(uintptr_t)cdst);
-            a64_blr(&e2, 16);
-            a64_ldp_post(&e2, A64_SZ_D, 29, 30, A64_SP, 16);
-            a64_ret(&e2, 30);
-            CHECK(call_fn(w2, e2.n, 40, 2) == 42, "blr x16 to an emitted callee");
+            if (!jit_buf_end_write(&g_buf)) {
+                CHECK(false, "close emitted-callee write scope");
+                (void)jit_buf_free(&g_buf);
+            } else if (!jit_buf_commit(&g_buf, cdst, ce.n * 4u)) {
+                CHECK(false, "commit emitted callee");
+            } else {
+                a64_init(&e2, w2, 32);
+                a64_stp_pre(&e2, A64_SZ_D, 29, 30, A64_SP, -16);
+                a64_mov_imm(&e2, A64_X, 16, (uint64_t)(uintptr_t)cdst);
+                a64_blr(&e2, 16);
+                a64_ldp_post(&e2, A64_SZ_D, 29, 30, A64_SP, 16);
+                a64_ret(&e2, 30);
+                CHECK(call_fn(w2, e2.n, 40, 2) == 42,
+                      "blr x16 to an emitted callee");
+            }
         }
     }
 }
@@ -318,15 +332,28 @@ static void lockstep_state(const char *what, const void *prog, size_t n, bool th
 
     seed(&jit, prog, n, thumb);
     code = jit_buf_take(&g_buf, 1024);
-    if (!code) { printf("  SKIP %s: arena exhausted\n", what); return; }
-    jit_buf_begin_write(&g_buf);
+    if (!code) {
+        g_fail++; printf("  FAIL %s: executable arena exhausted\n", what);
+        return;
+    }
+    if (!jit_buf_begin_write(&g_buf)) {
+        g_fail++; printf("  FAIL %s: could not open write scope\n", what);
+        return;
+    }
     if (!jit_translate(&jit, 0, code, 1024, &blk)) {
-        jit_buf_end_write(&g_buf);
+        if (!jit_buf_end_write(&g_buf)) (void)jit_buf_free(&g_buf);
         g_fail++; printf("  FAIL %s: not translated\n", what);
         return;
     }
-    jit_buf_end_write(&g_buf);
-    jit_buf_commit(&g_buf, code, blk.code_words * 4u);
+    if (!jit_buf_end_write(&g_buf)) {
+        (void)jit_buf_free(&g_buf);
+        g_fail++; printf("  FAIL %s: could not close write scope\n", what);
+        return;
+    }
+    if (!jit_block_commit(&g_buf, &blk)) {
+        g_fail++; printf("  FAIL %s: code-buffer commit failed\n", what);
+        return;
+    }
 
     seed(&ref, prog, n, thumb);
     for (i = 0; i < blk.insn_count; i++) {
@@ -334,7 +361,7 @@ static void lockstep_state(const char *what, const void *prog, size_t n, bool th
     }
 
     seed(&jit, prog, n, thumb);
-    rc = jit_enter(&blk, &jit);
+    rc = jit_enter(&g_buf, &blk, &jit);
     CHECK(rc == JIT_EXIT_NEXT || rc == JIT_EXIT_INTERPRET, "%s: exit %d", what, rc);
 
     for (i = 0; i < 16; i++)
@@ -361,6 +388,55 @@ static void lockstep(const char *what, const uint32_t *prog, size_t n) {
 }
 static void lockstep16(const char *what, const uint16_t *prog, size_t n) {
     lockstep_state(what, prog, n, true);
+}
+
+/* The register target of BX/BLX is known only at execution time. A value whose
+ * low bits are 10 must be replayed by the interpreter without retiring the
+ * instruction or partially applying BLX's link/state changes. */
+static void check_thumb_invalid_branch_fallback(const char *what,
+                                                uint16_t insn) {
+    arm_cpu_t jit;
+    jit_block_t blk;
+    uint32_t *code;
+    uint32_t before_r[16], before_cpsr;
+    uint64_t before_cycles;
+    int rc;
+
+    seed(&jit, &insn, 1, true);
+    jit.r[0] = 0x102u;
+    code = jit_buf_take(&g_buf, 1024);
+    if (!code) {
+        g_fail++; printf("  FAIL %s: executable arena exhausted\n", what);
+        return;
+    }
+    if (!jit_buf_begin_write(&g_buf)) {
+        g_fail++; printf("  FAIL %s: could not open write scope\n", what);
+        return;
+    }
+    if (!jit_translate(&jit, 0, code, 1024, &blk)) {
+        (void)jit_buf_end_write(&g_buf);
+        g_fail++; printf("  FAIL %s: not translated\n", what);
+        return;
+    }
+    if (!jit_buf_end_write(&g_buf) || !jit_block_commit(&g_buf, &blk)) {
+        g_fail++; printf("  FAIL %s: could not close/commit block\n", what);
+        return;
+    }
+
+    memcpy(before_r, jit.r, sizeof before_r);
+    before_cpsr = jit.cpsr;
+    before_cycles = jit.cycles;
+    rc = jit_enter(&g_buf, &blk, &jit);
+    CHECK(rc == JIT_EXIT_INTERPRET, "%s: exit %d expect interpreter", what, rc);
+    CHECK(memcmp(before_r, jit.r, sizeof before_r) == 0,
+          "%s: invalid target changed a guest register", what);
+    CHECK(jit.cpsr == before_cpsr,
+          "%s: invalid target changed CPSR %08x -> %08x",
+          what, before_cpsr, jit.cpsr);
+    CHECK(jit.cycles == before_cycles,
+          "%s: invalid target retired cycles %llu -> %llu", what,
+          (unsigned long long)before_cycles,
+          (unsigned long long)jit.cycles);
 }
 
 static void test_blocks_match_the_interpreter(void) {
@@ -431,6 +507,9 @@ static void test_thumb_blocks_match_the_interpreter(void) {
       lockstep16("thumb blx pair (returns to ARM)", p, 2); }
     { uint16_t p[] = { 0xe002 };
       lockstep16("thumb unconditional branch", p, 1); }
+
+    check_thumb_invalid_branch_fallback("thumb bx invalid 0b10 target", 0x4700u);
+    check_thumb_invalid_branch_fallback("thumb blx invalid 0b10 target", 0x4780u);
 }
 
 int main(void) {
@@ -452,7 +531,10 @@ int main(void) {
     test_blocks_match_the_interpreter();
     test_thumb_blocks_match_the_interpreter();
 
-    jit_buf_free(&g_buf);
+    if (!jit_buf_free(&g_buf)) {
+        g_fail++;
+        printf("  FAIL main: could not release executable arena\n");
+    }
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

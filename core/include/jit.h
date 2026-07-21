@@ -88,6 +88,15 @@ typedef struct {
     jit_end_t end_reason;
     uint32_t *code;          /* first emitted word                             */
     size_t    code_words;
+    /* Set only by jit_block_commit(). jit_enter() binds all of this metadata
+     * to the owning arena generation and current write epoch. */
+    uintptr_t committed_arena;
+    uintptr_t committed_code;
+    uint64_t  committed_generation;
+    uint64_t  committed_write_epoch;
+    size_t    committed_code_words;
+    unsigned  committed_insn_count;
+    bool      committed;
 } jit_block_t;
 
 /* Guest instruction cap per block (docs/dynarec.md §3.2 rule 6). */
@@ -142,42 +151,66 @@ uint32_t jit_mem_store32(arm_cpu_t *cpu, uint32_t va, uint32_t value);
 uint32_t jit_mem_store16(arm_cpu_t *cpu, uint32_t va, uint32_t value);
 
 /* --------------------------------------------------------- code buffers --
- * A four-function shim so the memory policy is swappable without touching the
- * translator (docs/dynarec.md §8.2): plain RWX on a jailbroken A9, MAP_JIT +
- * pthread_jit_write_protect_np on macOS and A12+, mprotect flipping elsewhere,
- * and a plain heap buffer on hosts that cannot execute arm64 at all.
+ * A small shim so the memory policy is swappable without touching the
+ * translator (docs/dynarec.md §8.2): plain RWX on a jailbroken A9/Linux,
+ * MAP_JIT + pthread_jit_write_protect_np on macOS, and a plain heap buffer on
+ * hosts that cannot execute arm64 at all. The pthread toggle is unavailable on
+ * iOS; if its plain-RWX policy is unavailable, allocation fails and the caller
+ * keeps interpreting.
  */
-typedef struct {
+typedef struct jit_buf {
     void  *base;
     size_t size;
     size_t used;         /* bump allocator; flush resets it (§3.7)   */
+    uint64_t generation; /* changes whenever this object is reallocated */
+    uint64_t write_epoch; /* changes on every outermost write scope      */
     bool   executable;   /* false on a non-arm64 host: emit and inspect only */
     bool   dual_mapped;  /* reserved for the W^X path                */
-    bool   jit_protect;  /* uses pthread_jit_write_protect_np        */
+    bool   jit_protect;  /* macOS pthread_jit_write_protect_np policy */
+    unsigned  write_depth; /* nested write scopes for this arena       */
+    uintptr_t write_owner; /* macOS pthread token while depth is nonzero */
 } jit_buf_t;
 
-/* True on a host where emitted arm64 code can be executed at all. */
+/* True when this build has an arm64 execution backend. Executable-memory
+ * permission remains a runtime property: jit_buf_alloc() must also succeed. */
 bool jit_host_can_execute(void);
 
+/* `b` must be initially zero-initialized. After its first allocation, reuse it
+ * only after jit_buf_free(): the retained generation is part of stale-block
+ * rejection and must not be cleared manually. */
 bool jit_buf_alloc(jit_buf_t *b, size_t bytes);
-void jit_buf_free(jit_buf_t *b);
-/* Bracket every write to the arena. On a W^X host these toggle the mapping. */
-void jit_buf_begin_write(jit_buf_t *b);
-void jit_buf_end_write(jit_buf_t *b);
+/* Returns false rather than unmapping an open macOS arena from a thread other
+ * than its writer.  Freeing NULL or an already inactive arena succeeds. */
+bool jit_buf_free(jit_buf_t *b);
+/* Bracket every write to the arena. Scopes may be nested and may overlap
+ * scopes for other arenas on the same thread. On macOS, where the hardware
+ * toggle is thread-wide, the outermost scope performs the actual transition.
+ * For a macOS MAP_JIT arena, a scope must end (or be abandoned by free) on
+ * the thread that opened it. These calls are not a substitute for the code
+ * cache's external lock. */
+bool jit_buf_begin_write(jit_buf_t *b);
+bool jit_buf_end_write(jit_buf_t *b);
 /* Make freshly written bytes visible to the instruction stream (§8.3).
  * MUST be called for every write to the arena, including a single patched
- * branch word, before that code is executed. */
-void jit_buf_commit(jit_buf_t *b, void *start, size_t len);
+ * branch word, before that code is executed. Returns false unless at least one
+ * write scope completed, or for an empty range/range not wholly contained in
+ * the bump-allocated portion of the arena. */
+bool jit_buf_commit(jit_buf_t *b, void *start, size_t len);
+/* Commit one translated block and bind it to this allocation generation and
+ * write epoch. Opening any later outermost write scope conservatively
+ * invalidates every committed block in the arena until it is recommitted. */
+bool jit_block_commit(jit_buf_t *b, jit_block_t *blk);
 /* Bump-allocate `words` 32-bit words, 16-byte aligned. NULL when exhausted. */
 uint32_t *jit_buf_take(jit_buf_t *b, size_t words);
 /* Human-readable description of the policy actually in force. */
 const char *jit_buf_policy(const jit_buf_t *b);
 
 /*
- * Enter a translated block. Only meaningful when b->executable; on every other
- * host this returns JIT_EXIT_INTERPRET without doing anything, so callers keep
- * working (slowly) on the dev box.
+ * Enter a translated block. The block must have been committed through
+ * jit_block_commit() against `arena`; range, generation, write-epoch and
+ * closed-write-state checks fail safely to JIT_EXIT_INTERPRET. On a non-arm64
+ * host this always returns JIT_EXIT_INTERPRET, so callers keep working slowly.
  */
-int jit_enter(const jit_block_t *blk, arm_cpu_t *cpu);
+int jit_enter(const jit_buf_t *arena, const jit_block_t *blk, arm_cpu_t *cpu);
 
 #endif /* IOS3VM_JIT_H */

@@ -101,6 +101,11 @@ static bool jit_priv(const arm_cpu_t *c) {
 
 #define JIT_PAGE_MASK 0xfffu
 
+static inline uint32_t jit_legacy_rotate_word(uint32_t v, unsigned offset) {
+    unsigned n = (offset & 3u) * 8u;
+    return n ? (v >> n) | (v << (32u - n)) : v;
+}
+
 /* Resolve every page touched by a crossing access before performing any bus
  * transaction. The JIT replays a faulting instruction in the interpreter, so
  * an early MMIO read or write here would otherwise happen twice. */
@@ -120,7 +125,17 @@ static bool jit_pretranslate_crossing(arm_cpu_t *c, uint32_t va, unsigned n,
 }
 
 uint64_t jit_mem_load32(arm_cpu_t *c, uint32_t va) {
+    uint32_t original = va;
     uint32_t pa;
+    if ((va & 3u) != 0u) {
+        /* A fault is replayed by the interpreter, which records DFSR/DFAR.
+         * With legacy U=0/A=0 semantics ARM word loads align down and rotate
+         * the fetched word by the discarded byte offset. */
+        if ((c->cp15.sctlr & ARM_SCTLR_A) != 0u)
+            return (uint64_t)1 << 32;
+        if ((c->cp15.sctlr & ARM_SCTLR_U) == 0u)
+            va &= ~3u;
+    }
     /* Same page-crossing split as the interpreter's mem_r32: a word straddling
      * a 4 KB boundary lives in two pages that need translating separately.
      * Preflight both translations so a second-page fault cannot double an
@@ -132,14 +147,23 @@ uint64_t jit_mem_load32(arm_cpu_t *c, uint32_t va) {
         for (unsigned i = 0; i < 4u; i++) {
             val |= (uint32_t)c->bus->read8(c->bus->ctx, pas[i]) << (8u * i);
         }
-        return val;
+        return jit_legacy_rotate_word(val, original - va);
     }
     if (arm_mmu_translate(c, va, ARM_ACCESS_READ, jit_priv(c), &pa))
         return (uint64_t)1 << 32;
-    return c->bus->read32(c->bus->ctx, pa);
+    return jit_legacy_rotate_word(c->bus->read32(c->bus->ctx, pa), original - va);
 }
 uint64_t jit_mem_load16(arm_cpu_t *c, uint32_t va) {
     uint32_t pa;
+    if ((va & 1u) != 0u) {
+        if ((c->cp15.sctlr & ARM_SCTLR_A) != 0u)
+            return (uint64_t)1 << 32;
+        /* U=0/A=0 odd halfwords are UNPREDICTABLE, not legacy values that
+         * callers can consume. Request interpreter replay so it refuses the
+         * instruction through the normal undefined path. */
+        if ((c->cp15.sctlr & ARM_SCTLR_U) == 0u)
+            return (uint64_t)1 << 32;
+    }
     if (((va & JIT_PAGE_MASK) + 2u) > JIT_PAGE_MASK + 1u) {
         uint32_t pas[2], val = 0;
         if (!jit_pretranslate_crossing(c, va, 2u, ARM_ACCESS_READ, pas))
@@ -160,6 +184,10 @@ static uint64_t jit_helper_load8(arm_cpu_t *c, uint32_t va) {
 }
 uint32_t jit_mem_store32(arm_cpu_t *c, uint32_t va, uint32_t val) {
     uint32_t pa;
+    if ((va & 3u) != 0u) {
+        if ((c->cp15.sctlr & ARM_SCTLR_A) != 0u) return 1u;
+        if ((c->cp15.sctlr & ARM_SCTLR_U) == 0u) va &= ~3u;
+    }
     if (((va & JIT_PAGE_MASK) + 4u) > JIT_PAGE_MASK + 1u) {
         uint32_t pas[4];
         if (!jit_pretranslate_crossing(c, va, 4u, ARM_ACCESS_WRITE, pas))
@@ -174,6 +202,10 @@ uint32_t jit_mem_store32(arm_cpu_t *c, uint32_t va, uint32_t val) {
 }
 uint32_t jit_mem_store16(arm_cpu_t *c, uint32_t va, uint32_t val) {
     uint32_t pa;
+    if ((va & 1u) != 0u) {
+        if ((c->cp15.sctlr & ARM_SCTLR_A) != 0u) return 1u;
+        if ((c->cp15.sctlr & ARM_SCTLR_U) == 0u) return 1u;
+    }
     if (((va & JIT_PAGE_MASK) + 2u) > JIT_PAGE_MASK + 1u) {
         uint32_t pas[2];
         if (!jit_pretranslate_crossing(c, va, 2u, ARM_ACCESS_WRITE, pas))
@@ -848,7 +880,15 @@ static thumb_form_t thumb_classify(uint16_t insn) {
         if ((insn & 0xfc00u) == 0x4400u) {
             unsigned op = (insn >> 8) & 3u;
             unsigned rd = tb3(insn, 0) | ((insn >> 4) & 8u);
-            if (op == 3u) return TT_BX;
+            if (op == 3u) {
+                unsigned rs = tb3(insn, 3) | ((insn >> 3) & 8u);
+                /* ARM1176 makes BLX pc UNPREDICTABLE while retaining BX pc.
+                 * Decline the former so the interpreter remains the single
+                 * authority for the trap; accepting it here would make JIT
+                 * enablement silently change guest-visible control flow. */
+                if ((insn & (1u << 7)) != 0u && rs == 15u) return TT_NONE;
+                return TT_BX;
+            }
             /* Rd == 15 writes PC; see the DECLINED list. 0.01%. */
             return (rd == 15u) ? TT_NONE : TT_HIREG;
         }
@@ -1088,9 +1128,22 @@ static void emit_thumb_bx(jit_t *t, uint16_t insn) {
     a64_emit_t *e = &t->e;
     unsigned rs = tb3(insn, 3) | ((insn >> 3) & 8u);
     unsigned wsv;
+    size_t valid_target;
 
     if (rs == 15u) { wsv = JIT_HOST_S0; a64_mov_imm(e, A64_W, wsv, t->pc + 4u); }
     else           { wsv = load_greg(t, rs, JIT_HOST_S0); }
+
+    /* A target ending in binary 10 is neither a valid Thumb address nor a
+     * word-aligned ARM address. ARM1176 defines this BX/BLX case as
+     * UNPREDICTABLE, and the interpreter deliberately traps it. Test before
+     * changing LR or CPSR.T; on that rare path return to the current guest PC
+     * so the dispatcher can replay the instruction in the interpreter. */
+    a64_and_imm(e, A64_W, JIT_HOST_S2, wsv, 3u);
+    a64_subs_imm(e, A64_W, A64_ZR, JIT_HOST_S2, 2u, false);
+    valid_target = e->n;
+    a64_bcond(e, A64_NE, 0);
+    emit_exit(t, t->pc, JIT_EXIT_INTERPRET, t->index);
+    a64_bind(e, valid_target);
 
     if (insn & (1u << 7)) emit_thumb_link(t);        /* BLX: LR = (pc+2)|1 */
     emit_set_thumb_bit(t, wsv);                      /* T := target[0]     */

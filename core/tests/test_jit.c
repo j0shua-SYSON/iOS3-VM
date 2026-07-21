@@ -32,11 +32,12 @@ static int g_pass = 0, g_fail = 0;
 #define RAM_SIZE (1u << 20)
 static uint8_t g_ram[RAM_SIZE];
 static unsigned g_read8_calls, g_write8_calls;
-static uint32_t m_r32(void *c, uint32_t a){ (void)c; uint32_t v; memcpy(&v,&g_ram[a&(RAM_SIZE-1)],4); return v; }
-static uint16_t m_r16(void *c, uint32_t a){ (void)c; uint16_t v; memcpy(&v,&g_ram[a&(RAM_SIZE-1)],2); return v; }
+static unsigned g_read16_calls, g_write16_calls, g_read32_calls, g_write32_calls;
+static uint32_t m_r32(void *c, uint32_t a){ (void)c; uint32_t v; g_read32_calls++; memcpy(&v,&g_ram[a&(RAM_SIZE-1)],4); return v; }
+static uint16_t m_r16(void *c, uint32_t a){ (void)c; uint16_t v; g_read16_calls++; memcpy(&v,&g_ram[a&(RAM_SIZE-1)],2); return v; }
 static uint8_t  m_r8 (void *c, uint32_t a){ (void)c; g_read8_calls++; return g_ram[a&(RAM_SIZE-1)]; }
-static void m_w32(void *c, uint32_t a, uint32_t v){ (void)c; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,4); }
-static void m_w16(void *c, uint32_t a, uint16_t v){ (void)c; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,2); }
+static void m_w32(void *c, uint32_t a, uint32_t v){ (void)c; g_write32_calls++; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,4); }
+static void m_w16(void *c, uint32_t a, uint16_t v){ (void)c; g_write16_calls++; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,2); }
 static void m_w8 (void *c, uint32_t a, uint8_t  v){ (void)c; g_write8_calls++; g_ram[a&(RAM_SIZE-1)]=v; }
 static const arm_bus_t g_bus = { NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8 };
 
@@ -69,18 +70,27 @@ static bool xlate(arm_cpu_t *c, uint32_t at, const uint32_t *prog, size_t n,
 static void jit_split_setup(arm_cpu_t *c, bool map_second) {
     const uint32_t l1 = 0x4000u, l2 = 0x5000u;
     memset(g_ram, 0, sizeof g_ram);
-    m_w32(NULL, l1 + (0x000u << 2), (3u << 10) | 2u);       /* VA 0 identity */
+    m_w32(NULL, l1 + (0x000u << 2), (3u << 10) | 8u | 2u);  /* Normal identity */
     m_w32(NULL, l1 + (0x800u << 2), l2 | 1u);               /* coarse table  */
-    m_w32(NULL, l2 + (0u << 2), SPLIT_PA0 | (3u << 4) | 2u);
+    m_w32(NULL, l2 + (0u << 2), SPLIT_PA0 | (3u << 4) | 8u | 2u);
     if (map_second)
-        m_w32(NULL, l2 + (1u << 2), SPLIT_PA1 | (3u << 4) | 2u);
+        m_w32(NULL, l2 + (1u << 2), SPLIT_PA1 | (3u << 4) | 8u | 2u);
     arm_reset(c, &g_bus);
     c->cpsr = (c->cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS;
     c->cp15.ttbr0 = l1;
     c->cp15.dacr = 1u;
-    c->cp15.sctlr |= ARM_SCTLR_M | ARM_SCTLR_XP;
+    c->cp15.sctlr |= ARM_SCTLR_M | ARM_SCTLR_XP | ARM_SCTLR_U;
     c->r[15] = 0;
     g_read8_calls = g_write8_calls = 0;
+    g_read16_calls = g_write16_calls = g_read32_calls = g_write32_calls = 0;
+}
+
+static void jit_map_normal_identity(arm_cpu_t *c) {
+    const uint32_t l1 = 0x4000u;
+    m_w32(NULL, l1, (3u << 10) | 8u | 2u);       /* Normal, full access */
+    c->cp15.ttbr0 = l1;
+    c->cp15.dacr = 1u;                            /* domain 0 Client */
+    c->cp15.sctlr |= ARM_SCTLR_M | ARM_SCTLR_XP;
 }
 
 static void test_memory_helpers_cross_pages_without_replay_side_effects(void) {
@@ -170,6 +180,62 @@ static void test_memory_helpers_cross_pages_without_replay_side_effects(void) {
     CHECK(g_read8_calls == 2u,
           "JIT + replay caused %u first-page reads expect exactly 2", g_read8_calls);
     CHECK(c.r[1] == 0xdeadbeefu, "faulting replay changed destination to %08x", c.r[1]);
+}
+
+static void test_memory_helpers_honor_sctlr_u_and_a(void) {
+    arm_cpu_t c;
+    uint64_t loaded;
+
+    memset(g_ram, 0, sizeof g_ram);
+    arm_reset(&c, &g_bus);
+    c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS;
+    c.cp15.sctlr &= ~(ARM_SCTLR_A | ARM_SCTLR_U);
+    m_w32(NULL, 0x800u, 0x11223344u);
+    g_read32_calls = g_write32_calls = 0u;
+    loaded = jit_mem_load32(&c, 0x801u);
+    CHECK((loaded >> 32) == 0u && (uint32_t)loaded == 0x44112233u,
+          "legacy JIT load32=%llx expect rotated 44112233",
+          (unsigned long long)loaded);
+    CHECK(jit_mem_store32(&c, 0x803u, 0xa1b2c3d4u) == 0u &&
+          m_r32(NULL, 0x800u) == 0xa1b2c3d4u,
+          "legacy JIT store32 did not align down");
+
+    m_w16(NULL, 0x800u, 0x1234u);
+    g_read16_calls = g_write16_calls = 0u;
+    loaded = jit_mem_load16(&c, 0x801u);
+    CHECK((loaded >> 32) == 1u && g_read16_calls == 0u,
+          "legacy odd JIT load16=%llx reads=%u, expect replay without a read",
+          (unsigned long long)loaded, g_read16_calls);
+    CHECK(jit_mem_store16(&c, 0x801u, 0x5678u) != 0u &&
+          g_write16_calls == 0u && m_r16(NULL, 0x800u) == 0x1234u,
+          "legacy odd JIT store16 did not request side-effect-free replay");
+
+    g_ram[0x801u] = 0x11u; g_ram[0x802u] = 0x22u;
+    g_ram[0x803u] = 0x33u; g_ram[0x804u] = 0x44u;
+    jit_map_normal_identity(&c);
+    c.cp15.sctlr = (c.cp15.sctlr & ~ARM_SCTLR_A) | ARM_SCTLR_U;
+    loaded = jit_mem_load32(&c, 0x801u);
+    CHECK((loaded >> 32) == 0u && (uint32_t)loaded == 0x44332211u,
+          "U=1 JIT load32=%llx expect unaligned 44332211",
+          (unsigned long long)loaded);
+    loaded = jit_mem_load16(&c, 0x801u);
+    CHECK((loaded >> 32) == 0u && (uint32_t)loaded == 0x2211u,
+          "U=1 JIT load16=%llx expect unaligned 2211",
+          (unsigned long long)loaded);
+
+    c.cp15.sctlr |= ARM_SCTLR_A;
+    g_read32_calls = g_write32_calls = 0u;
+    loaded = jit_mem_load32(&c, 0x801u);
+    CHECK((loaded >> 32) == 1u && g_read32_calls == 0u,
+          "A=1 JIT load32 fault=%llu reads=%u",
+          (unsigned long long)(loaded >> 32), g_read32_calls);
+    m_w32(NULL, 0x800u, 0x55667788u);
+    g_write32_calls = 0u;
+    CHECK(jit_mem_store32(&c, 0x801u, 0xdeadbeefu) != 0u &&
+          m_r32(NULL, 0x800u) == 0x55667788u,
+          "A=1 JIT store32 wrote before interpreter replay");
+    CHECK(g_write32_calls == 0u, "A=1 JIT store32 issued %u bus writes",
+          g_write32_calls);
 }
 
 /* How many times `w` appears in the emitted code. */
@@ -496,6 +562,8 @@ static void test_thumb_state_transitions(void) {
     CHECK(xlate16(&c, 0, p, 1, &b, CODE_WORDS), "BX r3 translated");
     CHECK(b.end_reason == JIT_END_BRANCH, "BX ends the block");
     CHECK(b.insn_count == 1, "insn_count=%u expect 1", b.insn_count);
+    CHECK(count_word(&b, 0x52800020u) == 1,
+          "BX must emit an invalid-target interpreter exit");
     CHECK(count_word(&b, W_T_FROM_R3) == 1, "bfi w10,w22,#5,#1 sets T from the target");
     CHECK(count_word(&b, 0x121f7ac9u) == 1, "and w9,w22,#0xfffffffe clears bit 0");
     CHECK(count_word(&b, W_MOV_PC_S0) == 1, "the resume PC comes from a register");
@@ -504,6 +572,8 @@ static void test_thumb_state_transitions(void) {
     /* BLX r3: the same, plus LR = (pc + 2) | 1 with the Thumb bit SET. */
     p[0] = 0x4798u;
     CHECK(xlate16(&c, 0, p, 1, &b, CODE_WORDS), "BLX r3 translated");
+    CHECK(count_word(&b, 0x52800020u) == 1,
+          "BLX must emit an invalid-target interpreter exit");
     CHECK(count_word(&b, W_T_FROM_R3) == 1, "BLX r3 sets T from the target");
     CHECK(count_word(&b, 0x5280006au) == 1, "movz w10,#3 is (pc+2)|1");
     CHECK(count_word(&b, 0xb9003b8au) == 1, "str w10,[x28,#56] writes LR");
@@ -513,6 +583,14 @@ static void test_thumb_state_transitions(void) {
     CHECK(xlate16(&c, 0, p, 1, &b, CODE_WORDS), "BX pc translated");
     CHECK(count_word(&b, 0x52800089u) == 1, "movz w9,#4 materialises pc + 4");
     CHECK(count_word(&b, 0x331b012au) == 1, "bfi w10,w9,#5,#1 still sets T from bit 0");
+
+    /* BLX pc is UNPREDICTABLE on ARM1176. It must remain an interpreter trap,
+     * not become a JIT-only branch-and-link to pc+4. Bits[2:0] are SBZ but all
+     * eight encodings are covered by the exhaustive decoder parity test. */
+    p[0] = 0x47f8u;
+    CHECK(!xlate16(&c, 0, p, 1, &b, CODE_WORDS), "BLX pc must be declined");
+    CHECK(b.insn_count == 0, "declined BLX pc emitted %u guest instructions",
+          b.insn_count);
 
     /* BLX suffix (0xe800): always returns to ARM, so T is cleared with WZR,
      * the target is masked to a word boundary, and LR keeps the Thumb bit. */
@@ -1011,30 +1089,48 @@ static void test_store_sequence(void) {
 /* ========================================================= code buffers == */
 
 static void test_code_buffer(void) {
-    jit_buf_t buf;
+    jit_buf_t buf = {0};
     uint32_t *a, *b2;
-    CHECK(jit_buf_alloc(&buf, 1024), "arena allocated");
+    if (!jit_buf_alloc(&buf, 1024)) {
+        printf("  SKIP %s: host policy refused a JIT arena\n", __func__);
+        return;
+    }
+    CHECK(true, "arena allocated");
     CHECK(buf.size >= 1024 && (buf.size % 0x4000u) == 0, "arena rounded to 16 KB");
     CHECK(jit_buf_policy(&buf) != NULL, "policy: %s", jit_buf_policy(&buf));
     a = jit_buf_take(&buf, 3);
     b2 = jit_buf_take(&buf, 3);
-    CHECK(a != NULL && b2 != NULL, "two allocations");
+    if (!a || !b2) {
+        CHECK(false, "two small code-buffer allocations failed");
+        CHECK(jit_buf_free(&buf), "cleanup after allocation failure");
+        return;
+    }
+    CHECK(true, "two allocations");
     CHECK((((uintptr_t)a) & 15u) == 0 && (((uintptr_t)b2) & 15u) == 0, "16-byte aligned");
-    CHECK(b2 >= a + 3, "allocations do not overlap");
+    CHECK((uintptr_t)b2 >= (uintptr_t)a + 3u * sizeof *a,
+          "allocations do not overlap");
     CHECK(jit_buf_take(&buf, buf.size) == NULL, "over-large request refused");
-    jit_buf_begin_write(&buf);
+    if (!jit_buf_begin_write(&buf)) {
+        CHECK(false, "could not open code buffer for writing");
+        CHECK(jit_buf_free(&buf), "cleanup after begin-write failure");
+        return;
+    }
     a[0] = 0xd503201fu;
-    jit_buf_end_write(&buf);
-    jit_buf_commit(&buf, a, 4);
-    jit_buf_free(&buf);
+    if (!jit_buf_end_write(&buf)) {
+        CHECK(false, "could not close code-buffer write scope");
+        CHECK(jit_buf_free(&buf), "cleanup after end-write failure");
+        return;
+    }
+    CHECK(jit_buf_commit(&buf, a, 4), "committed code range");
+    CHECK(jit_buf_free(&buf), "freed arena");
     CHECK(buf.base == NULL, "freed");
     CHECK(jit_buf_take(&buf, 1) == NULL, "no allocation from a freed arena");
     /* On the x86 dev box this is false, and jit_enter must be a no-op. */
     if (!jit_host_can_execute()) {
         jit_block_t blk;
         memset(&blk, 0, sizeof blk);
-        CHECK(jit_enter(&blk, NULL) == JIT_EXIT_INTERPRET,
-              "jit_enter falls back where arm64 cannot run");
+        CHECK(jit_enter(&buf, &blk, NULL) == JIT_EXIT_INTERPRET,
+               "jit_enter falls back where arm64 cannot run");
     }
 }
 
@@ -1070,6 +1166,7 @@ int main(void) {
     test_load_sequence();
     test_store_sequence();
     test_memory_helpers_cross_pages_without_replay_side_effects();
+    test_memory_helpers_honor_sctlr_u_and_a();
     test_code_buffer();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

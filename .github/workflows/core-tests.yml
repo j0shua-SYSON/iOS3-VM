@@ -49,14 +49,12 @@ jobs:
     #   macos-14 / macos-15 (Apple Silicon, arm64) — the ONLY place emitted
     #     code is actually executed, which is the only way to show the
     #     encodings compute the right answers rather than merely being
-    #     well-formed. The gate is at runtime, not in CMake: test_jit_exec
-    #     asks jit_host_can_execute() and then whether executable memory can
-    #     be obtained, and exits 0 with "SKIP:" if either answer is no. So a
-    #     runner without MAP_JIT cannot turn this job red for an environmental
-    #     reason — only a wrong encoding can.
+    #     well-formed. The gate is at runtime, not in CMake: test_jit_exec asks
+    #     whether the host can execute and obtain executable memory. The
+    #     explicit verdict step rejects a macOS skip or plain-RWX fallback:
+    #     losing MAP_JIT execution coverage is itself a CI failure.
     #
-    # Read the log rather than just the status: "SKIP" on a macos runner would
-    # mean the execution coverage silently disappeared.
+    # Ubuntu's expected x86 skip remains allowed and is checked exactly.
     name: jit (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -78,8 +76,34 @@ jobs:
       - name: Test
         run: ctest --test-dir build-jit --output-on-failure
 
-      - name: Show the execution-test verdict
-        run: ./build-jit/core/test_jit_exec
+      - name: Verify the JIT memory and execution verdicts
+        run: |
+          set -euo pipefail
+          set +e
+          memory_output="$(./build-jit/core/test_jit_mem 2>&1)"
+          memory_status=$?
+          output="$(./build-jit/core/test_jit_exec 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$memory_output"
+          printf '%s\n' "$output"
+          test "$memory_status" -eq 0
+          test "$status" -eq 0
+          grep -Eq '[1-9][0-9]* passed, 0 failed' <<<"$memory_output"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if grep -Fq 'SKIP:' <<<"$memory_output"; then
+              echo 'Required macOS MAP_JIT memory-policy coverage was skipped.' >&2
+              exit 1
+            fi
+            if grep -Fq 'SKIP:' <<<"$output"; then
+              echo 'The required macOS arm64 JIT execution coverage was skipped.' >&2
+              exit 1
+            fi
+            grep -Fq 'code buffer policy: MAP_JIT + pthread_jit_write_protect_np' <<<"$output"
+            grep -Eq '[1-9][0-9]* passed, 0 failed' <<<"$output"
+          else
+            grep -Fq 'SKIP: not an arm64 host' <<<"$output"
+          fi
 
       - name: Configure and build with the JIT off
         # The default build must stay green and unchanged; this is the guard
@@ -103,6 +127,7 @@ jobs:
         run: |
           cmake -S . -B build-san \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DIOS3VM_JIT=ON \
             -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
 
       - name: Build
@@ -127,6 +152,7 @@ jobs:
         run: |
           cmake -S . -B build-strict \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DIOS3VM_JIT=ON \
             -DCMAKE_C_FLAGS="-Wall -Wextra -Werror"
 
       - name: Build

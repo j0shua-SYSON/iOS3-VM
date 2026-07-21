@@ -69,15 +69,22 @@ if(IOS3VM_JIT)
     target_link_libraries(test_jit PRIVATE emucore)
     add_test(NAME jit_translator COMMAND test_jit)
 
-    # The only test that executes emitted code. Skips itself (exit 0) unless
-    # the host is arm64 AND executable memory can be obtained, so it is safe to
-    # register unconditionally: on x86 it reports SKIP, on the GitHub Actions
-    # macos-14/macos-15 Apple Silicon runners it really runs.
+    # Boundary tests for the host-memory shim. Build jit_mem.c directly so this
+    # target stays tiny and does not pull in the translator or machine core.
+    add_executable(test_jit_mem tests/test_jit_mem.c src/jit/jit_mem.c)
+    target_include_directories(test_jit_mem PRIVATE include)
+    add_test(NAME jit_memory COMMAND test_jit_mem)
+
+    # The only test that executes emitted code. It exits successfully with a
+    # SKIP verdict unless the host is arm64 and executable memory is available,
+    # so it is safe to register everywhere. Hosted CI additionally requires the
+    # macOS runners to execute through MAP_JIT rather than skip or fall back.
     add_executable(test_jit_exec tests/test_jit_exec.c)
     target_link_libraries(test_jit_exec PRIVATE emucore)
     add_test(NAME jit_execution COMMAND test_jit_exec)
-    set_tests_properties(jit_execution PROPERTIES
-        PASS_REGULAR_EXPRESSION "SKIP:|0 failed")
+    # Deliberately do not set PASS_ or SKIP_REGULAR_EXPRESSION: either can
+    # override a non-zero process result. The workflow separately validates
+    # that macOS really executed MAP_JIT code instead of taking a skip path.
 endif()
 
 # --- unit tests -------------------------------------------------------------
