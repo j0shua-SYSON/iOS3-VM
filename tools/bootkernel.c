@@ -18,6 +18,7 @@
  */
 #include "ksyms.h"
 #include "macho.h"
+#include "snapshot.h"
 #include "soc.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -513,6 +514,35 @@ static const milestone_t MILESTONES[] = {
     { "_thread_bootstrap_return",   0xc006871cu },
     { "_unix_syscall",              0xc01541a8u },
     { "_bsdinit_task",              0xc0110868u },
+    /* Which exception the userspace image is actually taking. A first-level
+     * handler count that climbs without _unix_syscall ever being reached means
+     * pid 1 is spinning on a fault rather than making progress. */
+    { "_fleh_swi",                  0xc00680a0u },
+    { "_fleh_undef",                0xc0067ff8u },
+    { "_fleh_prefabt",              0xc006828cu },
+    { "_fleh_dataabt",              0xc0068338u },
+    { "_sleh_undef",                0xc006c184u },
+    { "_sleh_abort",                0xc006c538u },
+    { "_vm_fault",                  0xc003e6f0u },
+    { "_exception_triage",          0xc001c708u },
+    { "_mach_msg_overwrite_trap",   0xc001899cu },
+    { "_cs_invalid_page",           0xc0121e5eu },
+    { "_psignal",                   0xc0127278u },
+    { "_exit1",                     0xc011f63cu },
+    /* Three PCs inside cs_validate_page (0xc013af54), which is the verdict on
+     * one page of a signed executable. They separate the three ways it can say
+     * no, and only one of them is our bug:
+     *   no_hash_exit  0xc013b11a — no blob covers this page, or the code
+     *                              directory has no hash slot for it: policy.
+     *   hashing       0xc013b0ca — SHA1Init, i.e. it found a hash and is about
+     *                              to compute the page's own.
+     *   bad_hash      0xc013b0f8 — the bcmp failed. The page we handed the
+     *                              kernel is not the page the signature was
+     *                              made over, which is a data-path bug on our
+     *                              side, not a signing policy we can opt out of. */
+    { "cs_validate:no_hash_exit",   0xc013b11au },
+    { "cs_validate:hashing",        0xc013b0cau },
+    { "cs_validate:bad_hash",       0xc013b0f8u },
     { "_panic",                     0xc001c13cu },
     { "_Debugger",                  0xc006abbcu },
 };
@@ -781,6 +811,31 @@ int main(int argc, char **argv) {
             "          [-d <devicetree.bin>] [-c <cmdline>] [-a] [-M]\n"
             "          [-r <ramdisk.img>] [-R <ram-MB>] [-X phys|virt|<addr>]\n"
             "          [-D <node/path>:<prop>=<value>] ...\n"
+            "          [--snapshot-at <insn> <file>] ... [--restore <file>]\n"
+            "  --snapshot-at <insn> <file>\n"
+            "      write the whole machine to <file> the moment the retired-\n"
+            "      instruction counter reaches <insn>. Up to 8 checkpoints; the\n"
+            "      count is the machine's own (mach.cpu.cycles), which is part of\n"
+            "      the snapshot, so the trigger point is ABSOLUTE — a run that\n"
+            "      restored at 200000000 still fires --snapshot-at 300000000 at\n"
+            "      the same instruction a run from zero would have.\n"
+            "  --restore <file>\n"
+            "      start from a saved machine instead of from the kernel entry\n"
+            "      point, so a long boot is paid for once. The machine is built\n"
+            "      exactly as for a fresh boot and then overwritten, which means\n"
+            "      A RESTORED RUN STILL NEEDS THE SAME -d / -r / -R (and -p/-V)\n"
+            "      AS THE RUN THAT SAVED IT: snapshot_load refuses with\n"
+            "      SNAP_ERR_GEOMETRY unless the pre-restore setup allocated the\n"
+            "      same-size RAM at the same base. -c and the kernel image do not\n"
+            "      change geometry, but pass the same ones anyway — the report\n"
+            "      header echoes them and a mismatched header describes a machine\n"
+            "      that is not the one being run.\n"
+            "      NOTE the host-side diagnostics below (trace ring, milestone\n"
+            "      hit counts, sampled profile, hot-page log) are NOT machine\n"
+            "      state and are not restored; they start fresh and therefore\n"
+            "      cover only the window since the restore. Instruction INDICES\n"
+            "      are absolute either way. Use tools/snapboot for a report that\n"
+            "      is a pure function of the machine.\n"
             "  -D  patch a 4-byte device-tree property in the in-memory copy\n"
             "      (empty path == root), e.g. -D cpus/cpu0:timebase-frequency=6000000\n"
             "  -r  load a raw disk image into DRAM, publish it as the RAMDisk\n"
@@ -856,6 +911,24 @@ int main(int argc, char **argv) {
     bool patch_memnode = true;
     unsigned ktail = 512;              /* -T n: trace lines to print on abort */
 
+    /*
+     * Snapshot / restore (core/include/snapshot.h).
+     *
+     * --restore <file>            start from a saved machine instead of from the
+     *                             kernel entry point.
+     * --snapshot-at <insn> <file> save the whole machine the moment the retired-
+     *                             instruction counter reaches <insn>.
+     *
+     * Both are keyed on mach.cpu.cycles, the machine's OWN retired-instruction
+     * count, which is part of the snapshot. That is what makes a trigger point
+     * absolute across processes: a run restored at 200,000,000 sees cycles ==
+     * 200000000 and will still fire a checkpoint requested for 300,000,000 at
+     * exactly the instruction the original run would have.
+     */
+    const char *restore_path = NULL;
+    struct { uint64_t at; const char *path; } snaps[8];
+    unsigned nsnaps = 0;
+
     /* Walk the arguments one at a time: pair-stepping breaks as soon as a
      * single-argument flag like -a appears. */
     for (int i = 2; i < argc; i++) {
@@ -865,6 +938,16 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-K")) { no_kpatch = true; continue; }  /* no kernel patches */
         if (!strcmp(argv[i], "-M")) { patch_memnode = false; continue; }
         if (!strcmp(argv[i], "-L")) { want_kextmap = true; continue; }
+        /* Three-argument flag: must be recognised before the two-argument
+         * guard below, which would otherwise stop the walk on the last pair. */
+        if (!strcmp(argv[i], "--snapshot-at") && i + 2 < argc) {
+            if (nsnaps < 8) {
+                snaps[nsnaps].at   = strtoull(argv[i + 1], NULL, 0);
+                snaps[nsnaps].path = argv[i + 2];
+                nsnaps++;
+            }
+            i += 2; continue;
+        }
         if (i + 1 >= argc) break;
         if (!strcmp(argv[i], "-D")) {
             if (ndtov >= 32) { i++; continue; }
@@ -883,6 +966,7 @@ int main(int argc, char **argv) {
             continue;
         }
         if      (!strcmp(argv[i], "-p")) phys_base = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--restore")) restore_path = argv[++i];
         else if (!strcmp(argv[i], "-V")) virt_base = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-n")) steps     = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-T")) ktail     = (unsigned)strtoul(argv[++i], NULL, 0);
@@ -1276,6 +1360,38 @@ int main(int argc, char **argv) {
     spy_install(&mach, virt_base, phys_base);
 
     /*
+     * --restore: replace everything built above with a saved machine.
+     *
+     * ORDER MATTERS, and it is the reason this is not up next to the kernel
+     * load. spy_install() memsets its own diagnostics and captures the CURRENT
+     * bus vtable as G.inner before overwriting mach.bus with the spy callbacks;
+     * restoring first and installing the spy afterwards would work, but doing
+     * it in this order also proves the property snapshot.h advertises — the
+     * load preserves host-owned pointers (the RAM allocation, the bus vtable,
+     * cpu->bus) and overwrites only their CONTENTS, so the spy stays interposed
+     * across a restore and the device-page/UART attribution keeps working.
+     *
+     * Everything the setup above did to guest RAM (kernel segments, the kpatch,
+     * the patched device tree, the RAM disk, boot_args) is simply overwritten
+     * by the snapshot's RAM image — which is correct, because the snapshot was
+     * taken from a machine that already had all of it. What the setup is still
+     * needed for is GEOMETRY: snapshot_load refuses with SNAP_ERR_GEOMETRY
+     * unless s5l8900_init() was called with the same ram_base/ram_size, so a
+     * restored run must repeat the same -R (and, since -r changes nothing about
+     * geometry but everything about what a mismatched log would mean, the same
+     * -d/-r/-c too).
+     */
+    if (restore_path) {
+        snapshot_status_t rs = snapshot_load(&mach, restore_path);
+        if (rs != SNAP_OK) {
+            fprintf(stderr, "restore %s: %s\n", restore_path, snapshot_strerror(rs));
+            return 3;
+        }
+        printf("restored   : %s at %llu retired instructions  (pc 0x%08x)\n\n",
+               restore_path, (unsigned long long)mach.cpu.cycles, mach.cpu.r[15]);
+    }
+
+    /*
      * Ring buffer of recent execution. When the kernel faults we want the
      * instructions that led there, not the state a few million instructions
      * later once it is spinning in a handler.
@@ -1312,8 +1428,18 @@ int main(int argc, char **argv) {
     printf("\n");
 
     arm_status_t st = ARM_OK;
-    unsigned n = 0;
-    uint32_t last_pc = entry_pa;
+    /*
+     * ABSOLUTE, not relative. n is an instruction INDEX, and every diagnostic
+     * that records one — the milestone "first @ instr", the sampled profile's
+     * every-1024 phase, the hot-page time buckets, the abort/FIQ/STREX logs —
+     * only means anything if the index a restored run prints is the index the
+     * original run would have printed for the same instruction. mach.cpu.cycles
+     * is the machine's own retired-instruction count and IS part of the
+     * snapshot, so starting from it makes the numbering identical. On a fresh
+     * boot it is zero and this is the old `n = 0`.
+     */
+    unsigned n = (unsigned)mach.cpu.cycles;
+    uint32_t last_pc = restore_path ? mach.cpu.r[15] : entry_pa;
     unsigned first_abort_at = 0, first_exc = 0;
     uint32_t abort_dfar = 0, abort_dfsr = 0;
 
@@ -1530,6 +1656,32 @@ int main(int argc, char **argv) {
             abort_dfsr = mach.cpu.cp15.dfsr;
             abort_dfar = mach.cpu.cp15.dfar;
             if (stop_on_abort) { n++; break; }
+        }
+
+        /*
+         * --snapshot-at: checkpoints, taken last in the body so the machine is
+         * exactly one retired instruction past where it was at the top.
+         *
+         * Keyed on mach.cpu.cycles and NOT on n. The two are equal here, but
+         * only cycles is snapshotted: it is the machine's own counter, so a
+         * checkpoint requested for instruction 300,000,000 fires at the same
+         * instruction whether the process started at 0 or restored at
+         * 200,000,000. Keying on a host-side loop variable would make the
+         * trigger relative to the process, which is precisely the property
+         * that would make two snapshots incomparable.
+         */
+        for (unsigned s = 0; s < nsnaps; s++) {
+            if (snaps[s].at != mach.cpu.cycles) continue;
+            snapshot_status_t ss = snapshot_save(&mach, snaps[s].path);
+            printf("snapshot   : @%llu -> %s: %s\n",
+                   (unsigned long long)mach.cpu.cycles, snaps[s].path,
+                   snapshot_strerror(ss));
+            fflush(stdout);
+            if (ss != SNAP_OK) {
+                fprintf(stderr, "snapshot %s: %s\n",
+                        snaps[s].path, snapshot_strerror(ss));
+                return 4;
+            }
         }
     }
 
