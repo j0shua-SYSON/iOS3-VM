@@ -16,6 +16,7 @@
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
+#include "ksyms.h"
 #include "macho.h"
 #include "soc.h"
 #include <stdio.h>
@@ -34,83 +35,88 @@ static uint8_t *slurp(const char *path, size_t *len_out) {
 }
 
 /* ---------------------------------------------------------------------------
- * Symbol table (LC_SYMTAB) reader.
+ * Address naming.
  *
- * The kernelcache still carries its full nlist symbol table, so every address
- * we print can be named. Without this a panic report is a list of hex numbers.
+ * Both sources — the kernel's own LC_SYMTAB and the prelinked kext load map in
+ * __PRELINK_INFO — live in core/src/firmware/ksyms.c so that machoinfo can
+ * print the same map without booting anything. Everything here is the thin
+ * layer above it: a rotating buffer so several names can appear in one printf,
+ * and the physical/virtual normalisation, because before the MMU comes on the
+ * guest executes at the physical alias of every symbol.
+ *
+ * The point of the kext half: a hot PC at 0xc0778123 used to be reported as an
+ * unsymbolized address and cost a whole diagnosis cycle to attribute. It is
+ * now "com.apple.driver.AppleMBX+0x122" the first time it is printed.
  * ------------------------------------------------------------------------- */
 #define DTNAME 32                 /* device-tree property names are char[32] */
 
-typedef struct { uint32_t value; const char *name; } ksym_t;
-static ksym_t   *ksyms;
-static unsigned  ksym_count;
+static ksyms_t  KS;
+static uint32_t g_virt_base, g_phys_base;
 
 static uint32_t ld32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static int ksym_cmp(const void *a, const void *b) {
-    uint32_t x = ((const ksym_t *)a)->value, y = ((const ksym_t *)b)->value;
-    return x < y ? -1 : x > y ? 1 : 0;
+/* Kernel virtual form of a PC we caught. Idempotent: an address that is
+ * already virtual is above virt_base and passes straight through, so call
+ * sites that convert by hand are harmless. */
+static uint32_t to_va(uint32_t a) {
+    if (g_virt_base && a >= g_phys_base && a < g_virt_base)
+        return a - g_phys_base + g_virt_base;
+    return a;
 }
 
-static void ksyms_load(const uint8_t *img, size_t len) {
-    if (len < 28) return;
-    uint32_t ncmds = ld32(img + 16);
-    size_t off = 28;
-    for (uint32_t i = 0; i < ncmds && off + 8 <= len; i++) {
-        uint32_t cmd = ld32(img + off), csz = ld32(img + off + 4);
-        if (!csz) break;
-        if (cmd == 2 /* LC_SYMTAB */ && off + 24 <= len) {
-            uint32_t symoff = ld32(img + off + 8), nsyms = ld32(img + off + 12);
-            uint32_t stroff = ld32(img + off + 16), strsize = ld32(img + off + 20);
-            if ((size_t)symoff + (size_t)nsyms * 12 > len) return;
-            if ((size_t)stroff + strsize > len) return;
-            ksyms = calloc(nsyms ? nsyms : 1, sizeof *ksyms);
-            if (!ksyms) return;
-            for (uint32_t k = 0; k < nsyms; k++) {
-                const uint8_t *e = img + symoff + k * 12;
-                uint32_t strx = ld32(e);
-                uint8_t  type = e[4];
-                uint32_t val  = ld32(e + 8);
-                if ((type & 0x0e) != 0x0e || !val) continue;   /* N_SECT only */
-                if (strx >= strsize) continue;
-                ksyms[ksym_count].value = val;
-                ksyms[ksym_count].name  = (const char *)(img + stroff + strx);
-                ksym_count++;
-            }
-            qsort(ksyms, ksym_count, sizeof *ksyms, ksym_cmp);
-            return;
-        }
-        off += csz;
-    }
-}
-
-/* Name an address as "sym+0x.."; returns a pointer to a rotating static buffer
- * so several calls can appear in one printf. */
 static const char *ksym_at(uint32_t addr) {
-    static char buf[4][160];
+    static char buf[4][192];
     static unsigned turn;
     char *out = buf[turn++ & 3];
-    addr &= ~1u;                       /* drop the Thumb bit */
-    if (!ksym_count) { snprintf(out, 160, "?"); return out; }
-    unsigned lo = 0, hi = ksym_count;  /* last symbol with value <= addr */
-    while (lo < hi) { unsigned mid = (lo + hi) / 2;
-        if (ksyms[mid].value <= addr) lo = mid + 1; else hi = mid; }
-    if (!lo) { snprintf(out, 160, "?"); return out; }
-    const ksym_t *s = &ksyms[lo - 1];
-    uint32_t d = addr - s->value;
-    if (d > 0x8000u) { snprintf(out, 160, "?"); return out; }
-    if (d) snprintf(out, 160, "%s+0x%x", s->name, d);
-    else   snprintf(out, 160, "%s", s->name);
-    return out;
+    return ksyms_resolve(&KS, to_va(addr), out, sizeof buf[0]);
 }
 
-static uint32_t ksym_value(const char *name) {
-    for (unsigned i = 0; i < ksym_count; i++)
-        if (!strcmp(ksyms[i].name, name)) return ksyms[i].value;
-    return 0;
+static uint32_t ksym_value(const char *name) { return ksyms_value(&KS, name); }
+
+/* The load map, printed by -L and by machoinfo -k. */
+static void dump_kext_map(void) {
+    printf("=== PRELINKED KEXT LOAD MAP (__PRELINK_TEXT 0x%08x..0x%08x) ===\n",
+           KS.prelink_lo, KS.prelink_hi);
+    printf("    %-44s %-10s %-10s %-9s %s\n",
+           "bundle identifier", "load addr", "end", "size", "kmod_info");
+    for (unsigned i = 0; i < KS.nkext; i++) {
+        const kext_t *k = &KS.kext[i];
+        if (!k->has_exec) continue;
+        printf("    %-44s 0x%08x 0x%08x %-9u 0x%08x\n",
+               k->bundle, k->addr, k->addr + k->size, k->size, k->kmod_info);
+    }
+    printf("    --- no executable (KPI pseudo-extensions, never a hot PC) ---\n");
+    for (unsigned i = 0; i < KS.nkext; i++)
+        if (!KS.kext[i].has_exec) printf("    %s\n", KS.kext[i].bundle);
+}
+
+/*
+ * Say out loud what we can and cannot name. A profile that reports a bare
+ * address is the failure mode this whole module exists to remove, so if the
+ * kext map did not parse, the boot log has to shout about it rather than
+ * quietly go back to printing hex.
+ */
+static void report_symbol_sources(void) {
+    printf("symbols    : %u kernel symbols (%s)\n",
+           KS.nsym, ksyms_strerror(KS.sym_status));
+    if (KS.prelink_status == KSYMS_OK) {
+        printf("kexts      : %u prelinked, %u with code, 0x%08x..0x%08x\n",
+               KS.nkext, KS.nkext_exec, KS.prelink_lo, KS.prelink_hi);
+        if (KS.detail[0]) printf("  ! %s\n", KS.detail);
+    } else {
+        printf("\n"
+               "  ############################################################\n"
+               "  # KEXT LOAD MAP UNAVAILABLE — hot PCs inside a prelinked   #\n"
+               "  # driver will print as bare addresses again.               #\n"
+               "  #   %s\n"
+               "  #   %s\n"
+               "  ############################################################\n\n",
+               ksyms_strerror(KS.prelink_status),
+               KS.detail[0] ? KS.detail : "(no further detail)");
+    }
 }
 
 /* ===========================================================================
@@ -413,7 +419,6 @@ static const struct { const char *path, *prop; uint32_t val; } DT_PATCH[] = {
  * so the linear virt->phys relation is enough and cannot itself fault.
  * ------------------------------------------------------------------------- */
 static s5l8900_t *g_mach;
-static uint32_t   g_virt_base, g_phys_base;
 
 static const uint8_t *guest_ptr(uint32_t va, uint32_t need) {
     uint32_t pa = va - g_virt_base + g_phys_base;
@@ -547,6 +552,20 @@ static struct {
     unsigned    prof_n, prof_dropped;
     struct { const char *fn; unsigned hits; } prof[1024];
 
+    /*
+     * The same samples keyed by EXACT pc, not by function.
+     *
+     * Needed because a prelinked kext has no symbol table (the kernelcache
+     * builder strips LC_SYMTAB from every kext), so the function-level profile
+     * can only say "com.apple.driver.AppleMBX" — true, and still not enough to
+     * find the poll. The exact PC turns that into AppleMBX+0x122, which is an
+     * address to disassemble. Open-addressed so a sample costs a hash and a
+     * probe; capacity is a power of two and never grows.
+     */
+#define PCHASH 8192u
+    unsigned    pc_n, pc_dropped;
+    struct { uint32_t va; unsigned hits; } pc_hist[PCHASH];
+
     /* --- DIAGNOSTIC: the single hottest unmodelled MMIO page ---------------
      * One physical page absorbs ~2% of every instruction in a 200M boot. This
      * probe answers, for that page alone: which word offsets, from which PCs,
@@ -577,8 +596,25 @@ static struct {
  *   0x10 <- bits to set   in STATE      (write-1-to-set)
  *   0x14 -> STATE, read-only
  * plus plain storage for 0x00/0x04/0x08/0x24/0x28. */
+/* Attribute one sample to an exact PC. Cheap: no name is resolved here, only
+ * at report time. */
+static void pc_sample(uint32_t va) {
+    va &= ~1u;
+    uint32_t h = va * 2654435761u;             /* Knuth multiplicative */
+    for (unsigned probe = 0; probe < 64; probe++) {
+        unsigned i = (h >> 13) + probe;
+        i &= PCHASH - 1u;
+        if (G.pc_hist[i].hits && G.pc_hist[i].va != va) continue;
+        if (!G.pc_hist[i].hits) { G.pc_hist[i].va = va; G.pc_n++; }
+        G.pc_hist[i].hits++;
+        return;
+    }
+    G.pc_dropped++;                             /* never silently: reported */
+}
+
 /* Attribute one sample to a function, keeping the table small and exact. */
 static void prof_sample(uint32_t va) {
+    pc_sample(va);
     const char *nm = ksym_at(va);
     const char *bar = strchr(nm, '+');
     static char names[1024][96];
@@ -733,6 +769,8 @@ int main(int argc, char **argv) {
             "      (empty path == root), e.g. -D cpus/cpu0:timebase-frequency=6000000\n"
             "  -r  load a raw disk image into DRAM, publish it as the RAMDisk\n"
             "      entry of /chosen/memory-map, and append rd=md0 to the cmdline\n"
+            "  -L  print the prelinked kext load map (bundle id, load address,\n"
+            "      size) read out of __PRELINK_INFO, then exit without booting\n"
             "  -R  guest DRAM size in MB (default 128, the iPhone1,2 fitment)\n"
             "  -X  what to write as the RAMDisk address: 'phys' (the physical\n"
             "      address it was loaded at), 'virt' (the ml_static_ptovirt form,\n"
@@ -765,6 +803,7 @@ int main(int argc, char **argv) {
     uint32_t v_display = 0;   /* 0 = kernel text console draws; 1 = defer to IOMFB */
     bool want_mbx = false;    /* -g keeps the (unmodelled, hang-prone) MBX GPU driver */
     bool no_kpatch = false;   /* -K disables the post-load kernel patches */
+    bool want_kextmap = false;/* -L prints the kext load map and exits */
     /* -A: from outside the core, undo the word-alignment the interpreter
      * applies when an exception return resumes in Thumb state. This is a
      * PROOF SHIM for a suspected core bug, not a fix. */
@@ -808,6 +847,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-g")) { v_display = 1; want_mbx = true; continue; }  /* defer to IOMFB, keep MBX */
         if (!strcmp(argv[i], "-K")) { no_kpatch = true; continue; }  /* no kernel patches */
         if (!strcmp(argv[i], "-M")) { patch_memnode = false; continue; }
+        if (!strcmp(argv[i], "-L")) { want_kextmap = true; continue; }
         if (i + 1 >= argc) break;
         if (!strcmp(argv[i], "-D")) {
             if (ndtov >= 32) { i++; continue; }
@@ -885,6 +925,11 @@ int main(int argc, char **argv) {
         ram_size = KERN_MEMSIZE_MAX;
     }
 
+    /* Needed by ksym_at() to fold a pre-MMU physical PC back to its virtual
+     * address, so set them as soon as they are known — before the first name
+     * is ever printed, not after the machine exists. */
+    g_virt_base = virt_base; g_phys_base = phys_base;
+
     size_t len = 0;
     uint8_t *img = slurp(argv[1], &len);
     if (!img) return 1;
@@ -894,8 +939,20 @@ int main(int argc, char **argv) {
     if (mst != MACHO_OK) { fprintf(stderr, "macho: %s\n", macho_strerror(mst)); return 2; }
     if (!m.has_entry)    { fprintf(stderr, "no entry point in the image\n"); return 2; }
 
-    ksyms_load(img, len);
-    printf("symbols    : %u\n", ksym_count);
+    /*
+     * Symbols BEFORE the machine: -L only needs the image, and refusing to
+     * spin up a 512 MB machine to print a table keeps the flag usable while a
+     * long boot is running.
+     */
+    ksyms_load(&KS, img, len);
+    report_symbol_sources();
+    if (want_kextmap) {
+        printf("\n");
+        dump_kext_map();
+        ksyms_free(&KS);
+        free(img);
+        return 0;
+    }
 
     /* Enough RAM to hold the kernel plus room for its page tables and heap.
      * 128 MB is what an iPhone1,2 actually has; -R raises it when a large
@@ -1665,6 +1722,68 @@ int main(int argc, char **argv) {
         }
     }
 
+    /*
+     * Which prelinked kext the time went to.
+     *
+     * This is the report that ends the recurring diagnosis cycle. When a
+     * driver spins, its samples spread across the handful of PCs in one poll
+     * loop, so no single function dominates while the KEXT plainly does —
+     * which is exactly what used to read as "66.9% in one unsymbolized kext"
+     * and cost a whole cycle to attribute by hand. Tallied before the top-PC
+     * list below consumes entries.
+     */
+    if (KS.nkext_exec) {
+        static unsigned per_kext[KSYMS_MAX_KEXTS];
+        unsigned total = 0, attributed = 0;
+        for (unsigned i = 0; i < PCHASH; i++) {
+            if (!G.pc_hist[i].hits) continue;
+            total += G.pc_hist[i].hits;
+            const kext_t *k = ksyms_kext_at(&KS, G.pc_hist[i].va);
+            if (!k) continue;
+            per_kext[(unsigned)(k - KS.kext)] += G.pc_hist[i].hits;
+            attributed += G.pc_hist[i].hits;
+        }
+        printf("\n=== TIME BY PRELINKED KEXT ===\n");
+        printf("    %.1f%% of samples are inside a prelinked kext; the rest is "
+               "the kernel proper\n", total ? 100.0 * attributed / total : 0.0);
+        for (unsigned rank = 0; rank < 10; rank++) {
+            unsigned best = 0, bi = KS.nkext_exec;
+            for (unsigned i = 0; i < KS.nkext_exec; i++)
+                if (per_kext[i] > best) { best = per_kext[i]; bi = i; }
+            if (bi == KS.nkext_exec || !best) break;
+            printf("    %5.1f%%  %-46s 0x%08x+0x%x\n",
+                   total ? 100.0 * best / total : 0.0, KS.kext[bi].bundle,
+                   KS.kext[bi].addr, KS.kext[bi].size);
+            per_kext[bi] = 0;
+        }
+    }
+
+    /*
+     * The same samples by exact PC. A kext carries no symbol table, so this is
+     * the finest name available inside one: 0xc0778122 prints as
+     * com.apple.driver.AppleMBX+0x122 — an address to disassemble rather than
+     * a mystery to bisect.
+     */
+    printf("\n=== HOTTEST INDIVIDUAL PCs (same samples, exact address) ===\n");
+    {
+        unsigned total = 0;
+        for (unsigned i = 0; i < PCHASH; i++) total += G.pc_hist[i].hits;
+        printf("    %u samples over %u distinct PCs\n", total, G.pc_n);
+        if (G.pc_dropped)
+            printf("    WARNING: %u samples dropped (hash full) — this list is "
+                   "NOT complete\n", G.pc_dropped);
+        for (unsigned rank = 0; rank < 16; rank++) {
+            unsigned best = 0, bi = PCHASH;
+            for (unsigned i = 0; i < PCHASH; i++)
+                if (G.pc_hist[i].hits > best) { best = G.pc_hist[i].hits; bi = i; }
+            if (bi == PCHASH || !best) break;
+            printf("    %5.1f%%  0x%08x  %-52s %u samples\n",
+                   total ? 100.0 * best / total : 0.0,
+                   G.pc_hist[bi].va, ksym_at(G.pc_hist[bi].va), best);
+            G.pc_hist[bi].hits = 0;   /* consume */
+        }
+    }
+
     printf("\n=== FIQ COST ===\n");
     printf("    entries              : %u\n", G.fiq_n);
     printf("    instructions in FIQ  : %llu (%.1f%% of the run)\n",
@@ -1732,6 +1851,7 @@ int main(int argc, char **argv) {
     }
 
     s5l8900_free(&mach);
+    ksyms_free(&KS);
     free(img);
     return 0;
 }

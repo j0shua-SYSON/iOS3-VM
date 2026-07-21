@@ -18,6 +18,7 @@ add_library(emucore STATIC
     src/firmware/devicetree.c
     src/firmware/lzss.c
     src/firmware/macho.c
+    src/firmware/ksyms.c
 )
 target_include_directories(emucore PUBLIC include)
 
@@ -53,6 +54,10 @@ add_test(NAME device_tree COMMAND test_devicetree)
 add_executable(test_lzss tests/test_lzss.c)
 target_link_libraries(test_lzss PRIVATE emucore)
 add_test(NAME lzss COMMAND test_lzss)
+
+add_executable(test_ksyms tests/test_ksyms.c)
+target_link_libraries(test_ksyms PRIVATE emucore)
+add_test(NAME ksyms COMMAND test_ksyms)
 
 add_executable(test_nand tests/test_nand.c)
 target_link_libraries(test_nand PRIVATE emucore)

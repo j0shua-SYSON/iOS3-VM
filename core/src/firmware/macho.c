@@ -73,6 +73,20 @@ macho_status_t macho_parse(const uint8_t *buf, size_t len, macho_t *out) {
                 if (end > out->vm_high) out->vm_high = (uint32_t)end;
             }
             out->segment_count++;
+        } else if (cmd == LC_SYMTAB) {
+            if (cmdsize < 24) return MACHO_ERR_MALFORMED;
+            uint32_t symoff  = rd32(buf + off + 8);
+            uint32_t nsyms   = rd32(buf + off + 12);
+            uint32_t stroff  = rd32(buf + off + 16);
+            uint32_t strsize = rd32(buf + off + 20);
+            /* Validate here so no consumer has to re-derive the bounds. */
+            if ((uint64_t)symoff + (uint64_t)nsyms * 12 > (uint64_t)len)
+                return MACHO_ERR_MALFORMED;
+            if ((uint64_t)stroff + strsize > (uint64_t)len)
+                return MACHO_ERR_MALFORMED;
+            out->symoff = symoff; out->nsyms = nsyms;
+            out->stroff = stroff; out->strsize = strsize;
+            out->has_symtab = true;
         } else if (cmd == LC_UNIXTHREAD) {
             /*
              * The initial thread state. For ARM the flavour is followed by a
@@ -91,4 +105,10 @@ macho_status_t macho_parse(const uint8_t *buf, size_t len, macho_t *out) {
 
     if (out->vm_low == 0xffffffffu) out->vm_low = 0;
     return MACHO_OK;
+}
+
+const macho_segment_t *macho_segment(const macho_t *m, const char *name) {
+    for (unsigned i = 0; i < m->segment_count; i++)
+        if (!strcmp(m->segments[i].name, name)) return &m->segments[i];
+    return NULL;
 }

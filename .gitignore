@@ -24,6 +24,9 @@ keys.json
 *.img
 ios3vm_nand_*.img
 
+# Agent scratch worktrees (created inside the repo by isolated subagents)
+/.claude/worktrees/
+
 # Editor / OS cruft
 .DS_Store
 .vscode/

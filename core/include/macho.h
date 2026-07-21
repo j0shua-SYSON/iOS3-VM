@@ -25,6 +25,7 @@
 #define MH_EXECUTE        2u
 
 #define LC_SEGMENT        0x01u
+#define LC_SYMTAB         0x02u
 #define LC_UNIXTHREAD     0x05u
 
 #define MACHO_MAX_SEGMENTS 16u
@@ -48,6 +49,16 @@ typedef struct {
     uint32_t entry;          /* initial PC from LC_UNIXTHREAD */
     uint32_t entry_sp;       /* initial SP, if the thread state carries one */
 
+    /*
+     * LC_SYMTAB. The kernelcache is not stripped, so this is what turns a
+     * panic (or a hot PC in a profile) from hex into names. Extents are
+     * validated against the buffer here, once, so every consumer can trust
+     * them — see ksyms.c, the only one so far.
+     */
+    bool     has_symtab;
+    uint32_t symoff, nsyms;  /* nlist_32 array: 12 bytes per entry */
+    uint32_t stroff, strsize;
+
     uint32_t vm_low;         /* lowest  vmaddr across segments */
     uint32_t vm_high;        /* highest vmaddr + vmsize        */
 } macho_t;
@@ -63,5 +74,8 @@ typedef enum {
 
 macho_status_t macho_parse(const uint8_t *buf, size_t len, macho_t *out);
 const char *macho_strerror(macho_status_t st);
+
+/* The segment with this exact name, or NULL. */
+const macho_segment_t *macho_segment(const macho_t *m, const char *name);
 
 #endif /* IOS3VM_MACHO_H */
