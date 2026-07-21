@@ -1,9 +1,10 @@
 /*
  * iOS3-VM — ARMv6 -> arm64 dynamic recompiler, block translator.
  *
- * This is stage J2 of docs/dynarec.md: the skeleton. It exists only when the
- * project is configured with -DIOS3VM_JIT=ON, and even then it is inert until
- * something calls it. Nothing in the interpreter's boot path references it.
+ * Stages J2 and J4 of docs/dynarec.md: the skeleton, and Thumb translation.
+ * It exists only when the project is configured with -DIOS3VM_JIT=ON, and even
+ * then it is inert until something calls it — there is still no code cache, so
+ * nothing in the interpreter's boot path references it.
  *
  * THE STRUCTURAL RULE (docs/dynarec.md §2), which everything here obeys:
  *
@@ -33,6 +34,7 @@
 #define JIT_HOST_S0      9u   /* translator scratch       */
 #define JIT_HOST_S1     10u
 #define JIT_HOST_S2     11u
+#define JIT_HOST_S3     12u   /* shifter carry-out, live across S0/S1 use */
 #define JIT_HOST_PCOUT   8u   /* resume PC at a block exit  */
 #define JIT_HOST_HELPER 16u   /* IP0: helper address        */
 
@@ -96,10 +98,17 @@ typedef struct {
  * so a divergence can be bisected by feature instead of by address
  * (docs/dynarec.md §2). Denying everything must leave the boot bit-identical;
  * that is the property that makes the JIT safe to enable incrementally.
+ *
+ * The three classes are instruction-set independent: a Thumb data-processing
+ * instruction is denied by JIT_DENY_DP exactly as its ARM counterpart is, so
+ * bisecting by feature works the same way in both states. JIT_DENY_THUMB is
+ * the extra axis — it denies the whole Thumb decoder without touching ARM,
+ * which is what isolates a Thumb-specific divergence in one run.
  */
 #define JIT_DENY_DP       (1u << 0)
 #define JIT_DENY_LDST     (1u << 1)
 #define JIT_DENY_BRANCH   (1u << 2)
+#define JIT_DENY_THUMB    (1u << 3)
 #define JIT_DENY_ALL      0xffffffffu
 void     jit_set_deny(uint32_t mask);
 uint32_t jit_get_deny(void);
@@ -109,6 +118,11 @@ uint32_t jit_get_deny(void);
  *
  * Reads guest instructions through arm_mmu_translate()/cpu->bus exactly as
  * arm_step() would, but performs no guest side effects: translation is pure.
+ *
+ * The instruction set is taken from CPSR.T at the moment of the call and is
+ * fixed for the whole block, which is why JIT_BLK_THUMB is part of the key: a
+ * block never spans a change of instruction state, because every instruction
+ * that can change it ends the block.
  *
  * Returns false if not a single instruction could be translated, in which case
  * out->insn_count is 0 and the caller must interpret. A block with

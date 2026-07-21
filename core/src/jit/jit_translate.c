@@ -1,10 +1,16 @@
 /*
- * iOS3-VM — ARMv6 -> arm64 block translator (stage J2 skeleton).
+ * iOS3-VM — ARMv6 -> arm64 block translator.
  *
- * Translates a straight-line run of ARM instructions into arm64, stopping at
- * the first thing it does not handle and leaving that instruction to the
- * interpreter. See core/include/jit.h for the structural rule and
+ * Translates a straight-line run of ARM or Thumb instructions into arm64,
+ * stopping at the first thing it does not handle and leaving that instruction
+ * to the interpreter. See core/include/jit.h for the structural rule and
  * docs/dynarec.md for the design this implements.
+ *
+ * The file is in two halves. This one is ARM (docs/dynarec.md's J2/J3); the
+ * Thumb half begins at the "Thumb" banner below and carries its own commentary
+ * on the flag rule and the ARM/Thumb state boundary, because those are where
+ * it differs. A block is one instruction set or the other, never both: the
+ * block key records which (§3.3) and every state change ends a block (§3.2).
  *
  * ============================ FLAG MAPPING ================================
  *
@@ -38,6 +44,9 @@
  *       translate-time constant, i.e. a register operand with a non-zero
  *       immediate shift. The rotated-immediate case *is* a constant and is
  *       folded (§5.2(4)); the register case is not, so it is not attempted.
+ *       (Thumb's LSLS/LSRS/ASRS by an immediate cannot be deferred this way —
+ *       they always set C and are 2.48% of retired instructions — so the Thumb
+ *       half computes the carry-out into a register instead. See there.)
  *     - the Q flag: no saturating instruction is translated, so nothing here
  *       can set it. QADD/QSUB/QDADD/QDSUB fall back.
  *     - lazy/deferred flag evaluation, deliberately: the interpreter is eager
@@ -49,9 +58,11 @@
  * on a translation fault they read nothing, write nothing, and report the
  * fault. The emitted code then exits the block with JIT_EXIT_ABORT and the
  * *interpreter* re-executes that one instruction, faults identically, and
- * takes the data abort through take_exception(). Because only the
- * no-writeback form (P == 1, W == 0) is translated, the guest has observed
- * nothing at that point, so re-execution is exact. The consequence is that
+ * takes the data abort through take_exception(). Because no translated access
+ * has a writeback form (ARM is P == 1, W == 0 only; no Thumb 16-bit
+ * single-access encoding writes back at all) and the destination register is
+ * written only after the fault check, the guest has observed nothing at that
+ * point, so re-execution is exact. The consequence is that
  * the base-restored abort model and the exception-return alignment rule
  * (docs/dynarec.md §7.3, §7.4 — the bug that once unlocked a mutex at address
  * 1) exist in exactly one place in this codebase, forever.
@@ -92,6 +103,11 @@ static uint64_t jit_helper_load32(arm_cpu_t *c, uint32_t va) {
     if (arm_mmu_translate(c, va, false, jit_priv(c), &pa)) return (uint64_t)1 << 32;
     return c->bus->read32(c->bus->ctx, pa);
 }
+static uint64_t jit_helper_load16(arm_cpu_t *c, uint32_t va) {
+    uint32_t pa;
+    if (arm_mmu_translate(c, va, false, jit_priv(c), &pa)) return (uint64_t)1 << 32;
+    return c->bus->read16(c->bus->ctx, pa);
+}
 static uint64_t jit_helper_load8(arm_cpu_t *c, uint32_t va) {
     uint32_t pa;
     if (arm_mmu_translate(c, va, false, jit_priv(c), &pa)) return (uint64_t)1 << 32;
@@ -101,6 +117,12 @@ static uint32_t jit_helper_store32(arm_cpu_t *c, uint32_t va, uint32_t val) {
     uint32_t pa;
     if (arm_mmu_translate(c, va, true, jit_priv(c), &pa)) return 1u;
     c->bus->write32(c->bus->ctx, pa, val);
+    return 0u;
+}
+static uint32_t jit_helper_store16(arm_cpu_t *c, uint32_t va, uint32_t val) {
+    uint32_t pa;
+    if (arm_mmu_translate(c, va, true, jit_priv(c), &pa)) return 1u;
+    c->bus->write16(c->bus->ctx, pa, (uint16_t)val);
     return 0u;
 }
 static uint32_t jit_helper_store8(arm_cpu_t *c, uint32_t va, uint32_t val) {
@@ -118,6 +140,7 @@ typedef struct {
     uint32_t    pc;       /* VA of the instruction being translated          */
     unsigned    index;    /* guest instructions retired before this one      */
     bool        priv;
+    bool        thumb;    /* block is Thumb; fixed for the whole block (§3.3) */
     size_t      epi[2 * JIT_MAX_INSNS + 8];  /* branches awaiting the epilogue */
     unsigned    n_epi;
 } jit_t;
@@ -221,6 +244,24 @@ static void emit_exit(jit_t *t, uint32_t resume_pc, unsigned reason, unsigned re
     a64_b(e, 0);                       /* bound to the epilogue at the end */
 }
 
+/*
+ * The same exit, for a branch whose target is only known at run time — every
+ * Thumb BX/BLX, and the BL/BLX suffix pair, whose target is LR-relative.
+ * `wpc` must already hold the resume address with bit 0 cleared; the T bit is
+ * a separate, explicit update (emit_set_thumb_bit) because the two are
+ * different pieces of architectural state and conflating them is precisely
+ * how an interworking bug hides.
+ */
+static void emit_exit_reg(jit_t *t, unsigned wpc, unsigned reason, unsigned retired) {
+    a64_emit_t *e = &t->e;
+    a64_mov_reg(e, A64_W, JIT_HOST_PCOUT, wpc);
+    a64_movz(e, A64_W, 0, reason, 0);
+    a64_movz(e, A64_W, 1, retired, 0);
+    if (t->n_epi < sizeof t->epi / sizeof t->epi[0]) t->epi[t->n_epi++] = e->n;
+    else t->e.bad = true;
+    a64_b(e, 0);
+}
+
 /* ------------------------------------------------------------ operand 2 -- */
 
 typedef struct {
@@ -275,6 +316,10 @@ static unsigned op2_reg(jit_t *t, const op2_t *o, unsigned scratch) {
     return load_greg(t, o->rm, scratch);
 }
 
+/* Defined with the Thumb code below, which needs the general form. */
+typedef enum { TF_C_PRESERVE = 0, TF_C_REG } tflag_c_t;
+static void emit_nz_flags(jit_t *t, unsigned wres, tflag_c_t mode, unsigned wcarry);
+
 /*
  * N and Z from the result, C from the shifter carry-out, V preserved — the
  * A32 logical-flag rule that A64's ANDS does not implement (§5.2(1)).
@@ -283,13 +328,9 @@ static void emit_logic_flags(jit_t *t, unsigned wres, const op2_t *o) {
     a64_emit_t *e = &t->e;
     if (o->carry_unaffected) {
         /* C keeps its incoming value; V is preserved. Save both, recompute
-         * N/Z, splice them back. */
-        a64_mrs_nzcv(e, JIT_HOST_S0);
-        a64_ubfx(e, A64_X, JIT_HOST_S0, JIT_HOST_S0, 28, 2);
-        a64_ands_reg(e, A64_W, A64_ZR, wres, wres, A64_LSL, 0);
-        a64_mrs_nzcv(e, JIT_HOST_S1);
-        a64_bfi(e, A64_X, JIT_HOST_S1, JIT_HOST_S0, 28, 2);
-        a64_msr_nzcv(e, JIT_HOST_S1);
+         * N/Z, splice them back — the same sequence Thumb needs, so there is
+         * one copy of it. */
+        emit_nz_flags(t, wres, TF_C_PRESERVE, 0);
     } else {
         /* Rotated immediate: the carry-out is bit 31 of the rotated constant,
          * known here. Only V has to survive. */
@@ -483,28 +524,31 @@ static bool ldst_supported(uint32_t insn) {
     return true;
 }
 
-static void emit_ldst(jit_t *t, uint32_t insn) {
+/* Access width for the memory helpers, and how a loaded value is widened. */
+typedef enum { JM_B = 0, JM_H = 1, JM_W = 2 } jmem_t;
+typedef enum { JX_ZERO = 0, JX_SIGN } jext_t;
+
+/*
+ * cpu->r[15] must be exact at any faultable instruction: the interpreter
+ * re-executes that one instruction on a fault and LR_abt is pc + 8 in both
+ * instruction sets (arm_interp.c takes the Thumb data abort with pc + 8 too).
+ */
+static void emit_pc_for_fault(jit_t *t) {
+    a64_mov_imm (&t->e, A64_W, JIT_HOST_PCOUT, t->pc);
+    a64_str_uimm(&t->e, A64_SZ_W, JIT_HOST_PCOUT, JIT_HOST_CPU, OFF_R(15));
+}
+
+/*
+ * Call a memory helper for an access whose guest address is already in w1 and,
+ * for a store, whose value is already in w2; then commit a load's result into
+ * guest register `rd`.
+ *
+ * Shared by the ARM and Thumb paths so there is one fault protocol, not two.
+ */
+static void emit_mem_call(jit_t *t, bool load, jmem_t sz, jext_t ext, unsigned rd) {
     a64_emit_t *e = &t->e;
-    bool     U  = (insn >> 23) & 1u, B = (insn >> 22) & 1u, L = (insn >> 20) & 1u;
-    unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
-    uint32_t imm = insn & 0xfffu;
-    unsigned wbase;
-    size_t   ok_site;
+    size_t    ok_site;
     uintptr_t helper;
-
-    /* cpu->r[15] must be exact at any faultable instruction, because the
-     * interpreter re-executes this one on a fault and LR_abt is pc + 8. */
-    a64_mov_imm(e, A64_W, JIT_HOST_PCOUT, t->pc);
-    a64_str_uimm(e, A64_SZ_W, JIT_HOST_PCOUT, JIT_HOST_CPU, OFF_R(15));
-
-    wbase = load_greg(t, rn, JIT_HOST_S0);
-    if (U) a64_add_imm(e, A64_W, 1, wbase, imm, false);
-    else   a64_sub_imm(e, A64_W, 1, wbase, imm, false);
-
-    if (!L) {
-        unsigned wval = load_greg(t, rd, JIT_HOST_S1);
-        a64_mov_reg(e, A64_W, 2, wval);
-    }
 
     /* NZCV does not survive a C call (§4.4). */
     a64_mrs_nzcv(e, JIT_HOST_S0);
@@ -518,8 +562,10 @@ static void emit_ldst(jit_t *t, uint32_t insn) {
         union { uint64_t (*ld)(arm_cpu_t *, uint32_t);
                 uint32_t (*st)(arm_cpu_t *, uint32_t, uint32_t);
                 uintptr_t v; } u;
-        if (L) u.ld = B ? jit_helper_load8  : jit_helper_load32;
-        else   u.st = B ? jit_helper_store8 : jit_helper_store32;
+        if (load) u.ld = (sz == JM_B) ? jit_helper_load8
+                       : (sz == JM_H) ? jit_helper_load16 : jit_helper_load32;
+        else      u.st = (sz == JM_B) ? jit_helper_store8
+                       : (sz == JM_H) ? jit_helper_store16 : jit_helper_store32;
         helper = u.v;
     }
     /* A BL cannot reach an arbitrary host address from the code arena, so the
@@ -533,16 +579,39 @@ static void emit_ldst(jit_t *t, uint32_t insn) {
     /* Fault? Loads report it in bit 32, stores in bits 31:0. Branch over the
      * exit stub on the (overwhelmingly common) success path. */
     ok_site = e->n;
-    if (L) a64_tbz(e, 0, 32, 0);
-    else   a64_cbz(e, A64_W, 0, 0);
+    if (load) a64_tbz(e, 0, 32, 0);
+    else      a64_cbz(e, A64_W, 0, 0);
     emit_exit(t, t->pc, JIT_EXIT_ABORT, t->index);
     a64_bind(e, ok_site);
 
-    if (L) {
+    if (load) {
         unsigned wd = dest_greg(rd);
-        a64_mov_reg(e, A64_W, wd, 0);
+        /* The helper already zero-extends; only LDRSB/LDRSH need more. */
+        if (ext == JX_SIGN && sz == JM_B)      a64_sbfx(e, A64_W, wd, 0, 0, 8);
+        else if (ext == JX_SIGN && sz == JM_H) a64_sbfx(e, A64_W, wd, 0, 0, 16);
+        else                                   a64_mov_reg(e, A64_W, wd, 0);
         commit_greg(t, rd, wd);
     }
+}
+
+static void emit_ldst(jit_t *t, uint32_t insn) {
+    a64_emit_t *e = &t->e;
+    bool     U  = (insn >> 23) & 1u, B = (insn >> 22) & 1u, L = (insn >> 20) & 1u;
+    unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+    uint32_t imm = insn & 0xfffu;
+    unsigned wbase;
+
+    emit_pc_for_fault(t);
+
+    wbase = load_greg(t, rn, JIT_HOST_S0);
+    if (U) a64_add_imm(e, A64_W, 1, wbase, imm, false);
+    else   a64_sub_imm(e, A64_W, 1, wbase, imm, false);
+
+    if (!L) {
+        unsigned wval = load_greg(t, rd, JIT_HOST_S1);
+        a64_mov_reg(e, A64_W, 2, wval);
+    }
+    emit_mem_call(t, L, B ? JM_B : JM_W, JX_ZERO, rd);
 }
 
 /* ------------------------------------------------------------- branches -- */
@@ -558,9 +627,622 @@ static void emit_branch(jit_t *t, uint32_t insn) {
     emit_exit(t, target, JIT_EXIT_NEXT, t->index + 1u);
 }
 
+/* ================================================================= Thumb ==
+ *
+ * 68.95% of the instructions the real 3.1.3 kernel retires during init are
+ * Thumb (docs/dynarec.md §1.3), so this is not an extension of the ARM
+ * translator — it is the majority of the workload. The subset below was chosen
+ * by measuring, not by guessing: every encoding class was histogrammed over
+ * the first 20,000,000 retired instructions of the real kernelcache and the
+ * classes are implemented in descending order of that share. What is declined
+ * is declined because implementing it would mean writing a *second* copy of
+ * semantics the interpreter already owns, and each decline is listed with the
+ * share it costs at the bottom of this comment.
+ *
+ * ------------------------------- FLAGS ------------------------------------
+ *
+ * The single largest difference from the ARM translator: **almost every
+ * Thumb-1 data-processing instruction sets N/Z/C/V unconditionally**, with no
+ * S bit to opt out. There is no conditional-execution wrapper either — the
+ * only conditional 16-bit instruction is B<cond> — so a Thumb block is
+ * straight-line code with a flag update after nearly every instruction.
+ *
+ * The A32 rule the flags must follow is the interpreter's alu_logic_flags():
+ * N and Z from the result, C from the barrel-shifter carry-out, V *preserved*.
+ * A64's ANDS forces C = 0 and V = 0, so emit_nz_flags() splices them back.
+ * Where the ARM translator could refuse a shifter carry-out it did not know at
+ * translate time, Thumb cannot: LSLS/LSRS/ASRS by an immediate are 2.48% of
+ * retired instructions and always set C. So the carry-out is computed
+ * explicitly into a register (UBFX of the *source*, before the destination is
+ * written, because Rd == Rs is the common case) and inserted with BFI.
+ *
+ * ---------------------- ARM/THUMB STATE TRANSITIONS -----------------------
+ *
+ * This is the highest-risk area in the file and it is handled by three rules.
+ *
+ * 1. A BLOCK NEVER SPANS A STATE CHANGE. Every instruction that can write the
+ *    T bit or PC ends the block (§3.2 rules 1 and 2). The block key carries
+ *    JIT_BLK_THUMB, so the successor is looked up — and, later, translated —
+ *    in whatever state the exit left behind.
+ *
+ * 2. THE T BIT IS WRITTEN EXPLICITLY, NEVER INFERRED. emit_set_thumb_bit()
+ *    inserts bit 0 of the branch target into CPSR bit 5 with a single BFI,
+ *    which is exactly the interpreter's rule: it clears T when the target is
+ *    even and leaves it alone when odd, and we start from T == 1, so
+ *    `T := target[0]` is the same function. For BLX (immediate) the new state
+ *    is a translate-time constant (always ARM), so WZR is inserted instead.
+ *    The epilogue re-reads cpu->cpsr when it splices NZCV back, so a T update
+ *    made in the body survives.
+ *
+ * 3. THE JIT CONTAINS NO EXCEPTION-RETURN LOGIC AT ALL (§7.4). SWI, POP {..,pc}
+ *    and every hi-register form that writes PC are declined, so the alignment
+ *    rule that once resumed a Thumb handler two bytes early — and unlocked a
+ *    mutex at address 1 — still exists in exactly one place in this codebase.
+ *
+ * PC as an operand is free: Thumb reads r15 as pc + 4, word-aligned for the
+ * PC-relative load and the PC form of ADD Rd,PC (§7.5), and both are
+ * translate-time constants materialised with MOVZ/MOVK.
+ *
+ * ----------------------------- DECLINED -----------------------------------
+ * Measured share of all retired instructions in the 20M-instruction run:
+ *
+ *   POP {..,pc}                     1.38%  writes PC and can switch state;
+ *                                          it is an exception-return-shaped
+ *                                          path and belongs to the interpreter
+ *   PUSH / POP without pc           1.76%  base-restored abort model (§7.3):
+ *   LDMIA / STMIA Rb!,{list}        1.24%  the interpreter buffers every word
+ *                                          and commits only after all accesses
+ *                                          succeed. Reimplementing that here
+ *                                          would be a second implementation of
+ *                                          the one thing §7.3 says must have
+ *                                          only one. Needs a state helper
+ *                                          (full register sync + a call into
+ *                                          the interpreter), which is J5.
+ *   ALU shift-by-register           0.06%  A32 shifts by Rs[7:0] with distinct
+ *                                          answers at 0, 32 and >32; A64's
+ *                                          LSLV is modulo 32 (§5.2(2)).
+ *   hi-register form writing PC     0.01%  the interpreter's ADD pc,Rm adds
+ *                                          r[15] rather than pc + 4; that is a
+ *                                          divergence from hardware and this
+ *                                          file will not bake a second copy of
+ *                                          it in (§5.4).
+ *   SWI, BKPT, CPS, SETEND, REV*    0.00%  not retired at all in the measured
+ *                                          run; mode changes and the undefined
+ *                                          space belong to the interpreter.
+ *
+ * IT BLOCKS AND THUMB-2 ARE DECLINED EXPLICITLY, not by omission. `IT` is
+ * ARMv7 (0xbf__), it does not exist on this ARMv6 core, and the interpreter
+ * does not implement it — so it lands in the 0xb__ default here and ends the
+ * block, which is the only safe answer: a translator that quietly ignored an
+ * `IT` would execute up to four following instructions unconditionally. The
+ * 32-bit Thumb-2 encodings occupy 0xe800-0xffff, which on ARMv6 *is* the
+ * BL/BLX prefix-suffix space, and that is exactly how both this file and
+ * thumb_step() decode it. When ARMv7 arrives (§12) this decision has to be
+ * revisited in both engines at once, not just here.
+ */
+
+/* 3-bit register field at bit `n`. */
+static unsigned tb3(uint16_t insn, unsigned n) { return (unsigned)((insn >> n) & 7u); }
+
+/* The Thumb forms this file translates. TT_NONE means "the interpreter's". */
+typedef enum {
+    TT_NONE = 0,
+    TT_SHIFT_IMM,     /* LSL/LSR/ASR Rd,Rs,#imm5            000 op imm5 s d  */
+    TT_ADDSUB,        /* ADD/SUB Rd,Rs,Rn|#imm3             00011 I op n s d */
+    TT_IMM8,          /* MOV/CMP/ADD/SUB Rd,#imm8           001 op d imm8    */
+    TT_ALU,           /* the 010000 ALU group                                */
+    TT_HIREG,         /* hi-register ADD/CMP/MOV, Rd != 15  010001 op h1h2   */
+    TT_BX,            /* BX / BLX Rm                        01000111 L h2 m  */
+    TT_LDR_PC,        /* LDR Rd,[PC,#imm8*4]                01001 d imm8     */
+    TT_LDST_REG,      /* the 0101 register-offset group                      */
+    TT_LDST_IMM,      /* word/byte imm5 (0110/0111), halfword imm5 (1000)    */
+    TT_LDST_SP,       /* LDR/STR Rd,[SP,#imm8*4]            1001 L d imm8    */
+    TT_ADD_PCSP,      /* ADD Rd,PC|SP,#imm8*4               1010 S d imm8    */
+    TT_ADJ_SP,        /* ADD/SUB SP,#imm7*4                 10110000 S imm7  */
+    TT_EXTEND,        /* SXTH/SXTB/UXTH/UXTB                10110010 op s d  */
+    TT_BCOND,         /* B<cond> #imm8                      1101 cond imm8   */
+    TT_B,             /* B #imm11                           11100 imm11      */
+    TT_BLX_SUFFIX,    /* BLX suffix, returns to ARM         11101 imm11      */
+    TT_BL_PREFIX,     /* BL/BLX prefix: LR = pc+4+imm       11110 imm11      */
+    TT_BL_SUFFIX      /* BL suffix, stays Thumb             11111 imm11      */
+} thumb_form_t;
+
+/* Which deny class (docs/dynarec.md §2) a form belongs to. */
+static uint32_t thumb_deny_class(thumb_form_t f) {
+    switch (f) {
+        case TT_LDR_PC: case TT_LDST_REG: case TT_LDST_IMM: case TT_LDST_SP:
+            return JIT_DENY_LDST;
+        case TT_BX: case TT_BCOND: case TT_B:
+        case TT_BLX_SUFFIX: case TT_BL_PREFIX: case TT_BL_SUFFIX:
+            return JIT_DENY_BRANCH;
+        default:
+            return JIT_DENY_DP;
+    }
+}
+/* Which forms write PC and therefore end the block (§3.2 rule 1). */
+static bool thumb_form_ends_block(thumb_form_t f) {
+    return f == TT_BX || f == TT_BCOND || f == TT_B
+        || f == TT_BLX_SUFFIX || f == TT_BL_SUFFIX;
+}
+
+/*
+ * Classify one 16-bit Thumb instruction, in the same order as thumb_step() so
+ * the two cannot disagree about what an encoding *is*. Decide here, emit
+ * later: a form that is not translated must leave nothing in the buffer.
+ */
+static thumb_form_t thumb_classify(uint16_t insn) {
+    switch (insn >> 12) {
+    case 0x0: case 0x1:
+        return ((insn & 0xf800u) == 0x1800u) ? TT_ADDSUB : TT_SHIFT_IMM;
+    case 0x2: case 0x3:
+        return TT_IMM8;
+    case 0x4:
+        if ((insn & 0xfc00u) == 0x4000u) {
+            unsigned op = (insn >> 6) & 0xfu;
+            /* LSL/LSR/ASR/ROR by a register: A32 distinguishes shift amounts
+             * 0, 32 and > 32; A64's LSLV is modulo 32 (§5.2(2)). 0.06%. */
+            if (op == 0x2u || op == 0x3u || op == 0x4u || op == 0x7u) return TT_NONE;
+            return TT_ALU;
+        }
+        if ((insn & 0xfc00u) == 0x4400u) {
+            unsigned op = (insn >> 8) & 3u;
+            unsigned rd = tb3(insn, 0) | ((insn >> 4) & 8u);
+            if (op == 3u) return TT_BX;
+            /* Rd == 15 writes PC; see the DECLINED list. 0.01%. */
+            return (rd == 15u) ? TT_NONE : TT_HIREG;
+        }
+        return TT_LDR_PC;
+    case 0x5: return TT_LDST_REG;
+    case 0x6: case 0x7: case 0x8: return TT_LDST_IMM;
+    case 0x9: return TT_LDST_SP;
+    case 0xa: return TT_ADD_PCSP;
+    case 0xb:
+        if ((insn & 0xff00u) == 0xb000u) return TT_ADJ_SP;
+        if ((insn & 0xff00u) == 0xb200u) return TT_EXTEND;
+        return TT_NONE;                       /* PUSH/POP, REV, CPS, SETEND  */
+    case 0xc: return TT_NONE;                 /* LDMIA/STMIA (§7.3)          */
+    case 0xd: {
+        unsigned cond = (insn >> 8) & 0xfu;
+        /* 0xf is SWI (an exception entry) and 0xe is permanently undefined. */
+        if (cond >= 0xeu) return TT_NONE;
+        return TT_BCOND;
+    }
+    case 0xe: return (insn & 0x0800u) ? TT_BLX_SUFFIX : TT_B;
+    default:  return (insn & 0x0800u) ? TT_BL_SUFFIX  : TT_BL_PREFIX;
+    }
+}
+
+/* ------------------------------------------------------- Thumb flag rule -- */
+
+/*
+ * TF_C_PRESERVE — C keeps its incoming value (no shifter is involved).
+ * TF_C_REG      — C is bit 0 of a register the caller has already computed.
+ *
+ * N and Z from `wres`, V preserved, C either preserved or taken from bit 0 of
+ * `wcarry`. This is alu_logic_flags() (arm_interp.c) expressed in A64, and it
+ * is emitted after nearly every Thumb data-processing instruction.
+ *
+ *   mrs  x9,  nzcv              ; the incoming flags
+ *   ubfx x9,  x9, #28, #2       ; save V (and C, when C is preserved)
+ *   ands wzr, wres, wres        ; N,Z from the result — A64 also zeroes C,V
+ *   mrs  x10, nzcv
+ *   bfi  x10, x9, #28, #2       ; put them back
+ *   bfi  x10, wcarry, #29, #1   ; TF_C_REG only
+ *   msr  nzcv, x10
+ *
+ * `wcarry` must be a register the sequence does not itself use, which is why
+ * JIT_HOST_S3 exists: S0 and S1 are both live inside this sequence.
+ */
+static void emit_nz_flags(jit_t *t, unsigned wres, tflag_c_t mode, unsigned wcarry) {
+    a64_emit_t *e = &t->e;
+    unsigned width = (mode == TF_C_PRESERVE) ? 2u : 1u;
+    a64_mrs_nzcv(e, JIT_HOST_S0);
+    a64_ubfx(e, A64_X, JIT_HOST_S0, JIT_HOST_S0, 28, width);
+    a64_ands_reg(e, A64_W, A64_ZR, wres, wres, A64_LSL, 0);
+    a64_mrs_nzcv(e, JIT_HOST_S1);
+    a64_bfi(e, A64_X, JIT_HOST_S1, JIT_HOST_S0, 28, width);
+    if (mode == TF_C_REG) a64_bfi(e, A64_X, JIT_HOST_S1, wcarry, 29, 1);
+    a64_msr_nzcv(e, JIT_HOST_S1);
+}
+
+/*
+ * cpu->cpsr.T := bit 0 of `wsrc` (pass A64_ZR for "definitely ARM").
+ *
+ *   ldr w10, [x28, #64]
+ *   bfi w10, wsrc, #5, #1
+ *   str w10, [x28, #64]
+ *
+ * Uses S1 rather than S0 so a caller can keep the branch target in S0.
+ */
+static void emit_set_thumb_bit(jit_t *t, unsigned wsrc) {
+    a64_emit_t *e = &t->e;
+    a64_ldr_uimm(e, A64_SZ_W, JIT_HOST_S1, JIT_HOST_CPU, OFF_CPSR);
+    a64_bfi(e, A64_W, JIT_HOST_S1, wsrc, 5, 1);
+    a64_str_uimm(e, A64_SZ_W, JIT_HOST_S1, JIT_HOST_CPU, OFF_CPSR);
+}
+
+/* LR = (pc + 2) | 1 — the Thumb return address, with the interworking bit. */
+static void emit_thumb_link(jit_t *t) {
+    a64_emit_t *e = &t->e;
+    a64_mov_imm (e, A64_W, JIT_HOST_S1, (t->pc + 2u) | 1u);
+    a64_str_uimm(e, A64_SZ_W, JIT_HOST_S1, JIT_HOST_CPU, OFF_R(14));
+}
+
+/* ------------------------------------------------------- Thumb emission -- */
+
+/* LSL/LSR/ASR Rd,Rs,#imm5 — 000 op(2) imm5 Rs Rd. Always sets N,Z,C; V kept. */
+static void emit_thumb_shift(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned rd = tb3(insn, 0), rs = tb3(insn, 3);
+    unsigned amt = (insn >> 6) & 0x1fu, type = (insn >> 11) & 3u;
+    unsigned wsrc = load_greg(t, rs, JIT_HOST_S0);
+    unsigned wd   = dest_greg(rd);
+
+    if (type == 0u && amt == 0u) {
+        /* LSL #0 is a plain move; barrel_shift() leaves the carry alone. */
+        a64_mov_reg(e, A64_W, wd, wsrc);
+        emit_nz_flags(t, wd, TF_C_PRESERVE, 0);
+        return;
+    }
+    /* The carry-out is read from the SOURCE before the destination is written,
+     * because Rd == Rs is the common case and would otherwise destroy it. */
+    switch (type) {
+    case 0:  /* LSL #1..31: carry = val[32 - amt] */
+        a64_ubfx(e, A64_W, JIT_HOST_S3, wsrc, 32u - amt, 1);
+        a64_lsl_imm(e, A64_W, wd, wsrc, amt);
+        break;
+    case 1:  /* LSR: #0 encodes #32, giving 0 with carry = val[31] */
+        if (amt == 0u) {
+            a64_ubfx(e, A64_W, JIT_HOST_S3, wsrc, 31, 1);
+            a64_mov_reg(e, A64_W, wd, A64_ZR);
+        } else {
+            a64_ubfx(e, A64_W, JIT_HOST_S3, wsrc, amt - 1u, 1);
+            a64_lsr_imm(e, A64_W, wd, wsrc, amt);
+        }
+        break;
+    default: /* ASR: #0 encodes #32, giving the sign bit smeared, carry val[31] */
+        if (amt == 0u) {
+            a64_ubfx(e, A64_W, JIT_HOST_S3, wsrc, 31, 1);
+            a64_asr_imm(e, A64_W, wd, wsrc, 31);
+        } else {
+            a64_ubfx(e, A64_W, JIT_HOST_S3, wsrc, amt - 1u, 1);
+            a64_asr_imm(e, A64_W, wd, wsrc, amt);
+        }
+        break;
+    }
+    emit_nz_flags(t, wd, TF_C_REG, JIT_HOST_S3);
+}
+
+/* ADD/SUB Rd,Rs,Rn|#imm3 — 00011 I op Rn/imm3 Rs Rd. Flags map exactly. */
+static void emit_thumb_addsub(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned rd = tb3(insn, 0), rs = tb3(insn, 3);
+    unsigned wd = dest_greg(rd), wsrc = load_greg(t, rs, JIT_HOST_S0);
+    bool     sub = (insn >> 9) & 1u;
+    if (insn & (1u << 10)) {                       /* 3-bit immediate */
+        uint32_t imm = tb3(insn, 6);
+        if (sub) a64_subs_imm(e, A64_W, wd, wsrc, imm, false);
+        else     a64_adds_imm(e, A64_W, wd, wsrc, imm, false);
+    } else {
+        unsigned wm = load_greg(t, tb3(insn, 6), JIT_HOST_S1);
+        if (sub) a64_subs_reg(e, A64_W, wd, wsrc, wm, A64_LSL, 0);
+        else     a64_adds_reg(e, A64_W, wd, wsrc, wm, A64_LSL, 0);
+    }
+}
+
+/* MOV/CMP/ADD/SUB Rd,#imm8 — 001 op(2) Rd imm8. */
+static void emit_thumb_imm8(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned rd  = (insn >> 8) & 7u, wd = dest_greg(rd);
+    uint32_t imm = insn & 0xffu;
+    switch ((insn >> 11) & 3u) {
+    case 0:  /* MOV: N,Z from the immediate; C and V untouched. */
+        a64_mov_imm(e, A64_W, wd, imm);
+        emit_nz_flags(t, wd, TF_C_PRESERVE, 0);
+        break;
+    case 1:  a64_subs_imm(e, A64_W, A64_ZR, wd, imm, false); break;  /* CMP */
+    case 2:  a64_adds_imm(e, A64_W, wd, wd, imm, false);     break;  /* ADD */
+    default: a64_subs_imm(e, A64_W, wd, wd, imm, false);     break;  /* SUB */
+    }
+}
+
+/*
+ * The 010000 ALU group: op(4) Rs Rd, operating on Rd and Rs only. The four
+ * register-shift forms were refused by thumb_classify(); the rest are here.
+ */
+static void emit_thumb_alu(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned op = (insn >> 6) & 0xfu;
+    unsigned rd = tb3(insn, 0), rs = tb3(insn, 3);
+    unsigned wa = load_greg(t, rd, JIT_HOST_S0);
+    unsigned wb = load_greg(t, rs, JIT_HOST_S1);
+    unsigned wd = dest_greg(rd);
+
+    switch (op) {
+    case 0x0: a64_and_reg(e, A64_W, wd, wa, wb, A64_LSL, 0);            /* AND */
+              emit_nz_flags(t, wd, TF_C_PRESERVE, 0); break;
+    case 0x1: a64_eor_reg(e, A64_W, wd, wa, wb, A64_LSL, 0);            /* EOR */
+              emit_nz_flags(t, wd, TF_C_PRESERVE, 0); break;
+    case 0x5: a64_adcs(e, A64_W, wd, wa, wb); break;                    /* ADC */
+    case 0x6: a64_sbcs(e, A64_W, wd, wa, wb); break;                    /* SBC */
+    case 0x8: /* TST: the result is discarded, but the fixup must read it. */
+              a64_and_reg(e, A64_W, JIT_HOST_S2, wa, wb, A64_LSL, 0);
+              emit_nz_flags(t, JIT_HOST_S2, TF_C_PRESERVE, 0); break;
+    case 0x9: a64_subs_reg(e, A64_W, wd, A64_ZR, wb, A64_LSL, 0); break;/* NEG */
+    case 0xa: a64_subs_reg(e, A64_W, A64_ZR, wa, wb, A64_LSL, 0); break;/* CMP */
+    case 0xb: a64_adds_reg(e, A64_W, A64_ZR, wa, wb, A64_LSL, 0); break;/* CMN */
+    case 0xc: a64_orr_reg(e, A64_W, wd, wa, wb, A64_LSL, 0);            /* ORR */
+              emit_nz_flags(t, wd, TF_C_PRESERVE, 0); break;
+    case 0xd: /* MUL sets N and Z only; C is left alone on ARMv6 (§5.4) and
+               * V is preserved, which is what TF_C_PRESERVE does. */
+              a64_mul(e, A64_W, wd, wa, wb);
+              emit_nz_flags(t, wd, TF_C_PRESERVE, 0); break;
+    case 0xe: a64_bic_reg(e, A64_W, wd, wa, wb, A64_LSL, 0);            /* BIC */
+              emit_nz_flags(t, wd, TF_C_PRESERVE, 0); break;
+    case 0xf: a64_mvn_reg(e, A64_W, wd, wb);                            /* MVN */
+              emit_nz_flags(t, wd, TF_C_PRESERVE, 0); break;
+    default:  t->e.bad = true; return;
+    }
+    /* CMP/CMN/TST write no register. */
+    if (op != 0x8u && op != 0xau && op != 0xbu) commit_greg(t, rd, wd);
+}
+
+/* Hi-register ADD/CMP/MOV — 010001 op(2) H1 H2 Rs Rd, with Rd != 15. */
+static void emit_thumb_hireg(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned rd = tb3(insn, 0) | ((insn >> 4) & 8u);
+    unsigned rs = tb3(insn, 3) | ((insn >> 3) & 8u);
+    unsigned op = (insn >> 8) & 3u;
+    unsigned wb;
+
+    if (rs == 15u) {   /* reading r15 in Thumb yields pc + 4 — a constant */
+        wb = JIT_HOST_S1;
+        a64_mov_imm(e, A64_W, wb, t->pc + 4u);
+    } else {
+        wb = load_greg(t, rs, JIT_HOST_S1);
+    }
+    if (op == 1u) {                                   /* CMP: the only one
+                                                       * that touches flags */
+        unsigned wa = load_greg(t, rd, JIT_HOST_S0);
+        a64_subs_reg(e, A64_W, A64_ZR, wa, wb, A64_LSL, 0);
+        return;
+    }
+    {
+        unsigned wd = dest_greg(rd);
+        if (op == 0u) {                               /* ADD, no flags */
+            unsigned wa = load_greg(t, rd, JIT_HOST_S0);
+            a64_add_reg(e, A64_W, wd, wa, wb, A64_LSL, 0);
+        } else {                                      /* MOV, no flags */
+            a64_mov_reg(e, A64_W, wd, wb);
+        }
+        commit_greg(t, rd, wd);
+    }
+}
+
+/*
+ * BX / BLX Rm — 01000111 L H2 Rm 000. The interworking instruction, and the
+ * one place a Thumb block's successor state is decided at run time.
+ */
+static void emit_thumb_bx(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned rs = tb3(insn, 3) | ((insn >> 3) & 8u);
+    unsigned wsv;
+
+    if (rs == 15u) { wsv = JIT_HOST_S0; a64_mov_imm(e, A64_W, wsv, t->pc + 4u); }
+    else           { wsv = load_greg(t, rs, JIT_HOST_S0); }
+
+    if (insn & (1u << 7)) emit_thumb_link(t);        /* BLX: LR = (pc+2)|1 */
+    emit_set_thumb_bit(t, wsv);                      /* T := target[0]     */
+    a64_and_imm(e, A64_W, JIT_HOST_S0, wsv, 0xfffffffeu);
+    emit_exit_reg(t, JIT_HOST_S0, JIT_EXIT_NEXT, t->index + 1u);
+}
+
+/* LDR Rd,[PC,#imm8*4] — 01001 Rd imm8. The address is a constant (§7.5). */
+static void emit_thumb_ldr_pc(jit_t *t, uint16_t insn) {
+    unsigned rd   = (insn >> 8) & 7u;
+    uint32_t addr = ((t->pc + 4u) & ~3u) + ((uint32_t)(insn & 0xffu) << 2);
+    emit_pc_for_fault(t);
+    a64_mov_imm(&t->e, A64_W, 1, addr);
+    emit_mem_call(t, true, JM_W, JX_ZERO, rd);
+}
+
+/*
+ * The 0101 register-offset group. Bit 9 selects between the plain
+ * word/byte forms and the halfword/sign-extended ones, exactly as
+ * thumb_step() does; getting that split wrong turns a STRH into a LDR.
+ */
+static void emit_thumb_ldst_reg(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned rd = tb3(insn, 0), rb = tb3(insn, 3), ro = tb3(insn, 6);
+    bool     load;
+    jmem_t   sz;
+    jext_t   ext = JX_ZERO;
+
+    if (insn & (1u << 9)) {
+        switch ((insn >> 10) & 3u) {
+            case 0:  load = false; sz = JM_H; break;                  /* STRH  */
+            case 1:  load = true;  sz = JM_B; ext = JX_SIGN; break;   /* LDRSB */
+            case 2:  load = true;  sz = JM_H; break;                  /* LDRH  */
+            default: load = true;  sz = JM_H; ext = JX_SIGN; break;   /* LDRSH */
+        }
+    } else {
+        load = (insn >> 11) & 1u;
+        sz   = ((insn >> 10) & 1u) ? JM_B : JM_W;
+    }
+
+    emit_pc_for_fault(t);
+    {
+        unsigned wb = load_greg(t, rb, JIT_HOST_S0);
+        unsigned wo = load_greg(t, ro, JIT_HOST_S1);
+        a64_add_reg(e, A64_W, 1, wb, wo, A64_LSL, 0);
+    }
+    if (!load) {
+        unsigned wv = load_greg(t, rd, JIT_HOST_S1);
+        a64_mov_reg(e, A64_W, 2, wv);
+    }
+    emit_mem_call(t, load, sz, ext, rd);
+}
+
+/* Immediate-offset load/store: word/byte (0110/0111) and halfword (1000). */
+static void emit_thumb_ldst_imm(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned rd = tb3(insn, 0), rb = tb3(insn, 3);
+    unsigned off = (insn >> 6) & 0x1fu;
+    bool     load;
+    jmem_t   sz;
+    uint32_t scaled;
+
+    if ((insn >> 12) == 0x8u) {                       /* halfword, imm5 * 2 */
+        load = (insn >> 11) & 1u; sz = JM_H; scaled = off << 1;
+    } else if ((insn >> 12) & 1u) {                   /* byte, imm5         */
+        load = (insn >> 11) & 1u; sz = JM_B; scaled = off;
+    } else {                                          /* word, imm5 * 4     */
+        load = (insn >> 11) & 1u; sz = JM_W; scaled = off << 2;
+    }
+
+    emit_pc_for_fault(t);
+    {
+        unsigned wb = load_greg(t, rb, JIT_HOST_S0);
+        a64_add_imm(e, A64_W, 1, wb, scaled, false);
+    }
+    if (!load) {
+        unsigned wv = load_greg(t, rd, JIT_HOST_S1);
+        a64_mov_reg(e, A64_W, 2, wv);
+    }
+    emit_mem_call(t, load, sz, JX_ZERO, rd);
+}
+
+/* LDR/STR Rd,[SP,#imm8*4] — 1001 L Rd imm8. SP is pinned in x27. */
+static void emit_thumb_ldst_sp(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned rd = (insn >> 8) & 7u;
+    bool     load = (insn >> 11) & 1u;
+    emit_pc_for_fault(t);
+    a64_add_imm(e, A64_W, 1, JIT_HOST_SP, (uint32_t)(insn & 0xffu) << 2, false);
+    if (!load) {
+        unsigned wv = load_greg(t, rd, JIT_HOST_S1);
+        a64_mov_reg(e, A64_W, 2, wv);
+    }
+    emit_mem_call(t, load, JM_W, JX_ZERO, rd);
+}
+
+/* ADD Rd,PC|SP,#imm8*4 — 1010 S Rd imm8. No flags. */
+static void emit_thumb_add_pcsp(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned rd  = (insn >> 8) & 7u, wd = dest_greg(rd);
+    uint32_t imm = (uint32_t)(insn & 0xffu) << 2;
+    if (insn & (1u << 11)) a64_add_imm(e, A64_W, wd, JIT_HOST_SP, imm, false);
+    else                   a64_mov_imm(e, A64_W, wd, ((t->pc + 4u) & ~3u) + imm);
+}
+
+/* ADD/SUB SP,#imm7*4 — 10110000 S imm7. No flags. */
+static void emit_thumb_adj_sp(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    uint32_t imm = (uint32_t)(insn & 0x7fu) << 2;
+    if (insn & (1u << 7)) a64_sub_imm(e, A64_W, JIT_HOST_SP, JIT_HOST_SP, imm, false);
+    else                  a64_add_imm(e, A64_W, JIT_HOST_SP, JIT_HOST_SP, imm, false);
+}
+
+/* SXTH/SXTB/UXTH/UXTB — 10110010 op(2) Rs Rd. No flags. */
+static void emit_thumb_extend(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned rd = tb3(insn, 0), wd = dest_greg(rd);
+    unsigned ws = load_greg(t, tb3(insn, 3), JIT_HOST_S0);
+    switch ((insn >> 6) & 3u) {
+        case 0:  a64_sbfx(e, A64_W, wd, ws, 0, 16); break;   /* SXTH */
+        case 1:  a64_sbfx(e, A64_W, wd, ws, 0, 8);  break;   /* SXTB */
+        case 2:  a64_ubfx(e, A64_W, wd, ws, 0, 16); break;   /* UXTH */
+        default: a64_ubfx(e, A64_W, wd, ws, 0, 8);  break;   /* UXTB */
+    }
+}
+
+/*
+ * B<cond> — 1101 cond imm8, both edges static. Two exits, exactly as the ARM
+ * conditional branch has, so chaining can later patch them independently.
+ */
+static void emit_thumb_bcond(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    unsigned cond = (insn >> 8) & 0xfu;
+    uint32_t target = t->pc + 4u
+                    + ((uint32_t)(int32_t)(int8_t)(insn & 0xffu) << 1);
+    size_t skip = e->n;
+    a64_bcond(e, a64_invert_cond((a64_cond_t)cond), 0);
+    emit_exit(t, target, JIT_EXIT_NEXT, t->index + 1u);
+    a64_bind(e, skip);
+    emit_exit(t, t->pc + 2u, JIT_EXIT_NEXT, t->index + 1u);
+}
+
+/* B #imm11 — 11100 imm11, sign-extended and doubled from pc + 4. */
+static void emit_thumb_b(jit_t *t, uint16_t insn) {
+    int32_t off = (int32_t)((uint32_t)(insn & 0x7ffu) << 21) >> 20;
+    emit_exit(t, t->pc + 4u + (uint32_t)off, JIT_EXIT_NEXT, t->index + 1u);
+}
+
+/*
+ * The second half of a BL or BLX pair. Both take their target from LR, which
+ * the prefix halfword loaded, so the target is a run-time value even though
+ * the *state* change is a translate-time constant:
+ *
+ *   BLX suffix (11101): target = (LR + imm11*2) & ~3, and execution returns
+ *                       to ARM — hence WZR into the T bit.
+ *   BL  suffix (11111): target = (LR + imm11*2) & ~1, still Thumb, so T is
+ *                       not touched at all.
+ *
+ * LR is read before it is overwritten with the return address; doing it the
+ * other way round branches to the instruction after the call, forever.
+ */
+static void emit_thumb_bl_suffix(jit_t *t, uint16_t insn, bool to_arm) {
+    a64_emit_t *e = &t->e;
+    uint32_t imm = (uint32_t)(insn & 0x7ffu) << 1;
+    a64_ldr_uimm(e, A64_SZ_W, JIT_HOST_S0, JIT_HOST_CPU, OFF_R(14));
+    a64_add_imm (e, A64_W, JIT_HOST_S0, JIT_HOST_S0, imm, false);
+    a64_and_imm (e, A64_W, JIT_HOST_S0, JIT_HOST_S0,
+                 to_arm ? 0xfffffffcu : 0xfffffffeu);
+    emit_thumb_link(t);
+    if (to_arm) emit_set_thumb_bit(t, A64_ZR);
+    emit_exit_reg(t, JIT_HOST_S0, JIT_EXIT_NEXT, t->index + 1u);
+}
+
+/* The first half: LR = pc + 4 + sign_extend(imm11) << 12. A constant. */
+static void emit_thumb_bl_prefix(jit_t *t, uint16_t insn) {
+    a64_emit_t *e = &t->e;
+    int32_t off = (int32_t)((uint32_t)(insn & 0x7ffu) << 21) >> 9;
+    a64_mov_imm (e, A64_W, JIT_HOST_S0, t->pc + 4u + (uint32_t)off);
+    a64_str_uimm(e, A64_SZ_W, JIT_HOST_S0, JIT_HOST_CPU, OFF_R(14));
+}
+
 /* ----------------------------------------------------------- dispatcher -- */
 
 typedef enum { TR_FALLBACK = 0, TR_CONTINUE, TR_ENDS_BLOCK } tr_result_t;
+
+static tr_result_t translate_thumb_one(jit_t *t, uint16_t insn) {
+    thumb_form_t f = thumb_classify(insn);
+    if (f == TT_NONE) return TR_FALLBACK;
+    if (g_deny & thumb_deny_class(f)) return TR_FALLBACK;
+
+    switch (f) {
+        case TT_SHIFT_IMM:  emit_thumb_shift(t, insn);          break;
+        case TT_ADDSUB:     emit_thumb_addsub(t, insn);         break;
+        case TT_IMM8:       emit_thumb_imm8(t, insn);           break;
+        case TT_ALU:        emit_thumb_alu(t, insn);            break;
+        case TT_HIREG:      emit_thumb_hireg(t, insn);          break;
+        case TT_BX:         emit_thumb_bx(t, insn);             break;
+        case TT_LDR_PC:     emit_thumb_ldr_pc(t, insn);         break;
+        case TT_LDST_REG:   emit_thumb_ldst_reg(t, insn);       break;
+        case TT_LDST_IMM:   emit_thumb_ldst_imm(t, insn);       break;
+        case TT_LDST_SP:    emit_thumb_ldst_sp(t, insn);        break;
+        case TT_ADD_PCSP:   emit_thumb_add_pcsp(t, insn);       break;
+        case TT_ADJ_SP:     emit_thumb_adj_sp(t, insn);         break;
+        case TT_EXTEND:     emit_thumb_extend(t, insn);         break;
+        case TT_BCOND:      emit_thumb_bcond(t, insn);          break;
+        case TT_B:          emit_thumb_b(t, insn);              break;
+        case TT_BLX_SUFFIX: emit_thumb_bl_suffix(t, insn, true);  break;
+        case TT_BL_SUFFIX:  emit_thumb_bl_suffix(t, insn, false); break;
+        case TT_BL_PREFIX:  emit_thumb_bl_prefix(t, insn);      break;
+        default:            t->e.bad = true;                    break;
+    }
+    return thumb_form_ends_block(f) ? TR_ENDS_BLOCK : TR_CONTINUE;
+}
 
 /*
  * Classify one ARM instruction, in the same order as arm_step()'s decode so
@@ -652,9 +1334,10 @@ bool jit_translate(arm_cpu_t *cpu, uint32_t va, uint32_t *code,
     out->code       = code;
     out->end_reason = JIT_END_FALLBACK;
 
-    /* Thumb is 69% of the real workload and is stage J4; until then every
-     * Thumb block is the interpreter's. */
-    if (out->key.flags & JIT_BLK_THUMB) return false;
+    t.thumb = (out->key.flags & JIT_BLK_THUMB) != 0;
+    /* The escape hatch for a Thumb-specific divergence: one run with the whole
+     * Thumb decoder off, which must leave the boot bit-identical. */
+    if (t.thumb && (g_deny & JIT_DENY_THUMB)) return false;
 
     if (arm_mmu_translate(cpu, va, false, t.priv, &pa)) {
         out->end_reason = JIT_END_FETCH_FAULT;
@@ -666,7 +1349,7 @@ bool jit_translate(arm_cpu_t *cpu, uint32_t va, uint32_t *code,
     emit_prologue(&t);
 
     for (;;) {
-        uint32_t ipa, insn;
+        uint32_t ipa;
         tr_result_t r;
 
         if (t.index >= JIT_MAX_INSNS)                 { end = JIT_END_LIMIT; break; }
@@ -676,15 +1359,18 @@ bool jit_translate(arm_cpu_t *cpu, uint32_t va, uint32_t *code,
         if (arm_mmu_translate(cpu, t.pc, false, t.priv, &ipa)) {
             end = JIT_END_FETCH_FAULT; break;
         }
-        insn = cpu->bus->read32(cpu->bus->ctx, ipa);
 
-        r = translate_one(&t, insn);
+        /* A 16-bit Thumb instruction is 2-byte aligned, so it can never
+         * straddle the 4 KB boundary the check above stops at. */
+        if (t.thumb) r = translate_thumb_one(&t, cpu->bus->read16(cpu->bus->ctx, ipa));
+        else         r = translate_one(&t, cpu->bus->read32(cpu->bus->ctx, ipa));
+
         if (r == TR_FALLBACK) { end = JIT_END_FALLBACK; break; }
         if (!a64_ok(&t.e))    { out->end_reason = JIT_END_CODE_FULL; return false; }
 
         t.index++;
         out->native_count++;
-        t.pc += 4u;
+        t.pc += t.thumb ? 2u : 4u;
         if (r == TR_ENDS_BLOCK) { end = JIT_END_BRANCH; break; }
     }
 

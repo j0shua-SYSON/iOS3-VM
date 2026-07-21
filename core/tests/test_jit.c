@@ -147,14 +147,466 @@ static void test_code_buffer_exhaustion(void) {
     CHECK(b.code_words <= 120, "stayed inside the buffer (%u words)", (unsigned)b.code_words);
 }
 
-static void test_thumb_is_not_translated(void) {
-    uint32_t p[] = { 0xe3a00001 };
+/* ==================================================================== Thumb */
+/*
+ * Thumb is 68.95% of what the real kernel retires, so these are the tests that
+ * decide whether the JIT can carry a boot. They are in the same two families
+ * as the ARM ones — block shape, and byte-exact emitted words — with a third
+ * that exists only here: the ARM/Thumb state boundary (docs/dynarec.md §7.4),
+ * which is the part of this file most likely to be wrong in a way that only
+ * shows up thousands of instructions later.
+ */
+
+static void load16(arm_cpu_t *c, uint32_t at, const uint16_t *prog, size_t n) {
+    size_t i;
+    memset(g_ram, 0, sizeof g_ram);
+    for (i = 0; i < n; i++) m_w16(NULL, at + (uint32_t)(i * 2), prog[i]);
+    arm_reset(c, &g_bus);
+    c->cpsr = (c->cpsr & ~0x1fu) | ARM_MODE_SYS | ARM_CPSR_T;
+}
+static bool xlate16(arm_cpu_t *c, uint32_t at, const uint16_t *prog, size_t n,
+                    jit_block_t *blk, size_t cap) {
+    load16(c, at, prog, n);
+    memset(g_code, 0, sizeof g_code);
+    return jit_translate(c, at, g_code, cap, blk);
+}
+
+/* 0xe7fe is `B .` — a Thumb branch to itself, the terminator these use. */
+#define T_SELF 0xe7feu
+
+static void test_thumb_block_shape(void) {
     arm_cpu_t c; jit_block_t b;
-    load(&c, 0, p, 1);
-    c.cpsr |= ARM_CPSR_T;
-    CHECK(!jit_translate(&c, 0, g_code, CODE_WORDS, &b), "thumb declined");
-    CHECK((b.key.flags & JIT_BLK_THUMB) != 0, "thumb flag recorded");
+    {   /* MOVS r0,#1 ; ADD r0,#1 ; B . */
+        uint16_t p[] = { 0x2001, 0x3001, T_SELF };
+        CHECK(xlate16(&c, 0, p, 3, &b, CODE_WORDS), "translated");
+        CHECK(b.insn_count == 3, "insn_count=%u expect 3", b.insn_count);
+        CHECK(b.native_count == 3, "native_count=%u expect 3", b.native_count);
+        CHECK(b.end_reason == JIT_END_BRANCH, "end_reason=%d expect BRANCH", (int)b.end_reason);
+        CHECK((b.key.flags & JIT_BLK_THUMB) != 0, "thumb flag recorded");
+    }
+    {   /* PUSH {lr} is not translated: the block must stop *before* it. */
+        uint16_t p[] = { 0x2001, 0xb500, 0x2002 };
+        CHECK(xlate16(&c, 0, p, 3, &b, CODE_WORDS), "translated");
+        CHECK(b.insn_count == 1, "insn_count=%u expect 1", b.insn_count);
+        CHECK(b.end_reason == JIT_END_FALLBACK, "end_reason=%d expect FALLBACK", (int)b.end_reason);
+        CHECK(count_word(&b, 0x52800020u) == 1, "movz w0,#JIT_EXIT_INTERPRET");
+        CHECK(count_word(&b, 0x52800048u) == 1, "movz w8,#2 resumes at the PUSH");
+    }
+    {   /* Thumb steps by two, so a block starting at 0xffc covers exactly two
+         * instructions before the 4 KB page changes. */
+        uint16_t p[] = { 0x1c00, 0x1c00, 0x1c00, 0x1c00 };
+        CHECK(xlate16(&c, 0xffc, p, 4, &b, CODE_WORDS), "translated");
+        CHECK(b.insn_count == 2, "insn_count=%u expect 2", b.insn_count);
+        CHECK(b.end_reason == JIT_END_PAGE, "end_reason=%d expect PAGE", (int)b.end_reason);
+    }
+    {   /* The 64-instruction cap applies per instruction, not per byte. */
+        uint16_t p[80];
+        unsigned i;
+        for (i = 0; i < 80; i++) p[i] = 0x1c00;   /* ADDS r0,r0,#0 */
+        CHECK(xlate16(&c, 0, p, 80, &b, CODE_WORDS), "translated");
+        CHECK(b.insn_count == JIT_MAX_INSNS, "insn_count=%u expect %u",
+              b.insn_count, JIT_MAX_INSNS);
+        CHECK(b.end_reason == JIT_END_LIMIT, "end_reason=%d expect LIMIT", (int)b.end_reason);
+    }
+}
+
+/*
+ * Every Thumb encoding this file refuses. Each must produce a zero-instruction
+ * block, because "not implemented" has to mean "interpreter" and never "close
+ * enough" — and for the block-transfer and PC-writing forms below, "close
+ * enough" would mean a second copy of the base-restored abort model and of the
+ * exception-return alignment rule.
+ */
+static void test_thumb_refused_encodings(void) {
+    static const struct { uint16_t insn; const char *what; } CASES[] = {
+        { 0xb500u, "PUSH {lr}          (base-restored abort model, §7.3)" },
+        { 0xb401u, "PUSH {r0}" },
+        { 0xbc01u, "POP  {r0}" },
+        { 0xbd00u, "POP  {pc}          (writes PC and can switch state)" },
+        { 0xc802u, "LDMIA r0!,{r1}" },
+        { 0xc002u, "STMIA r0!,{r1}" },
+        { 0x4088u, "LSL r0,r1          (shift by register, §5.2(2))" },
+        { 0x40c8u, "LSR r0,r1" },
+        { 0x4108u, "ASR r0,r1" },
+        { 0x41c8u, "ROR r0,r1" },
+        { 0x4687u, "MOV pc,r0          (hi-register write to PC)" },
+        { 0x4487u, "ADD pc,r0" },
+        { 0xdf00u, "SWI #0             (exception entry)" },
+        { 0xde00u, "permanently undefined (cond 0xe)" },
+        { 0xbe00u, "BKPT #0" },
+        { 0xb672u, "CPSID i            (mode change)" },
+        { 0xb650u, "SETEND le" },
+        { 0xba08u, "REV r0,r1" },
+        { 0xba48u, "REV16 r0,r1" },
+        { 0xbac8u, "REVSH r0,r1" },
+        /* ARMv7 space. These do not exist on this core and the interpreter
+         * does not implement them, but they must be declined *explicitly*: a
+         * translator that treated IT as a no-op would run up to four following
+         * instructions unconditionally. */
+        { 0xbf08u, "IT EQ              (ARMv7; must end the block)" },
+        { 0xbf14u, "ITE NE" },
+        { 0xbf00u, "NOP hint" },
+        { 0xb910u, "CBNZ r0,.+4        (ARMv7)" }
+    };
+    arm_cpu_t c; jit_block_t b;
+    unsigned i;
+    for (i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        bool ok = xlate16(&c, 0, &CASES[i].insn, 1, &b, CODE_WORDS);
+        CHECK(!ok && b.insn_count == 0, "%s must fall back", CASES[i].what);
+    }
+}
+
+/* One guest instruction, its exact host body, in the pinned registers. */
+static void test_thumb_bodies_are_exact(void) {
+    static const struct { uint16_t guest; uint32_t host; const char *what; } CASES[] = {
+        { 0x202au, 0x52800553u, "MOVS r0,#42     -> movz w19,#42"         },
+        { 0x2805u, 0x7100167fu, "CMP  r0,#5      -> cmp  w19,#5"          },
+        { 0x3001u, 0x31000673u, "ADD  r0,#1      -> adds w19,w19,#1"      },
+        { 0x3801u, 0x71000673u, "SUB  r0,#1      -> subs w19,w19,#1"      },
+        { 0x1888u, 0x2b150293u, "ADD  r0,r1,r2   -> adds w19,w20,w21"     },
+        { 0x1e48u, 0x71000693u, "SUB  r0,r1,#1   -> subs w19,w20,#1"      },
+        { 0x4008u, 0x0a140273u, "AND  r0,r1      -> and  w19,w19,w20"     },
+        { 0x4248u, 0x6b1403f3u, "NEG  r0,r1      -> subs w19,wzr,w20"     },
+        { 0x4288u, 0x6b14027fu, "CMP  r0,r1      -> cmp  w19,w20"         },
+        { 0x4348u, 0x1b147e73u, "MUL  r0,r1      -> mul  w19,w19,w20"     },
+        { 0x43c8u, 0x2a3403f3u, "MVN  r0,r1      -> mvn  w19,w20"         },
+        { 0x4148u, 0x3a140273u, "ADC  r0,r1      -> adcs w19,w19,w20"     },
+        { 0x4188u, 0x7a140273u, "SBC  r0,r1      -> sbcs w19,w19,w20"     },
+        { 0x4485u, 0x0b13037bu, "ADD  sp,r0 (hi) -> add  w27,w27,w19"     },
+        { 0x4608u, 0x2a1403f3u, "MOV  r0,r1(hi)  -> mov  w19,w20"         },
+        { 0xb2c8u, 0x53001e93u, "UXTB r0,r1      -> ubfx w19,w20,#0,#8"   },
+        { 0xb288u, 0x53003e93u, "UXTH r0,r1      -> ubfx w19,w20,#0,#16"  },
+        { 0xb248u, 0x13001e93u, "SXTB r0,r1      -> sbfx w19,w20,#0,#8"   },
+        { 0xb208u, 0x13003e93u, "SXTH r0,r1      -> sbfx w19,w20,#0,#16"  },
+        { 0xb002u, 0x1100237bu, "ADD  sp,#8      -> add  w27,w27,#8"      },
+        { 0xb082u, 0x5100237bu, "SUB  sp,#8      -> sub  w27,w27,#8"      },
+        { 0xa801u, 0x11001373u, "ADD  r0,sp,#4   -> add  w19,w27,#4"      },
+        { 0xa001u, 0x52800113u, "ADD  r0,pc,#4   -> movz w19,#8"          },
+        { 0x00c8u, 0x531d7293u, "LSLS r0,r1,#3   -> lsl  w19,w20,#3"      },
+        { 0x0888u, 0x53027e93u, "LSRS r0,r1,#2   -> lsr  w19,w20,#2"      },
+        { 0x1108u, 0x13047e93u, "ASRS r0,r1,#4   -> asr  w19,w20,#4"      }
+    };
+    arm_cpu_t c; jit_block_t b;
+    unsigned i;
+    for (i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        uint16_t p[2]; p[0] = CASES[i].guest; p[1] = T_SELF;
+        if (!xlate16(&c, 0, p, 2, &b, CODE_WORDS)) {
+            g_fail++; printf("  FAIL %s: not translated\n", CASES[i].what); continue;
+        }
+        if (count_word(&b, CASES[i].host) != 1) {
+            g_fail++; printf("  FAIL %s: expected host word %08x once\n",
+                             CASES[i].what, CASES[i].host);
+            dump(&b);
+        } else g_pass++;
+    }
+}
+
+/*
+ * Thumb-1 sets flags with no S bit, and LSLS/LSRS/ASRS set C from a
+ * barrel-shifter carry-out that is NOT a translate-time constant — the case
+ * the ARM translator is allowed to refuse and this one is not. The carry must
+ * be read out of the SOURCE before the destination is written, because
+ * Rd == Rs is the ordinary case.
+ */
+static void test_thumb_shift_carry(void) {
+    arm_cpu_t c; jit_block_t b;
+    uint16_t p[2]; p[1] = T_SELF;
+
+    p[0] = 0x00c8u;                              /* LSLS r0,r1,#3 */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "LSLS translated");
+    CHECK(count_word(&b, 0x531d768cu) == 1, "ubfx w12,w20,#29,#1 takes the carry-out");
+    CHECK(count_word(&b, 0xb363018au) == 1, "bfi x10,x12,#29,#1 inserts it into C");
+    CHECK(count_word(&b, 0xd35c7129u) == 1, "ubfx x9,x9,#28,#1 saves V only");
+
+    p[0] = 0x0048u;                              /* LSLS r0,r1,#1 */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "LSLS #1 translated");
+    CHECK(count_word(&b, 0x531f7e8cu) == 1, "ubfx w12,w20,#31,#1");
+
+    /* LSR #0 encodes LSR #32: the result is zero and C is bit 31. */
+    p[0] = 0x0808u;                              /* LSRS r0,r1,#32 */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "LSRS #32 translated");
+    CHECK(count_word(&b, 0x531f7e8cu) == 1, "ubfx w12,w20,#31,#1 is the carry");
+    CHECK(count_word(&b, 0x2a1f03f3u) == 1, "mov w19,wzr is the result");
+
+    /* ASR #0 encodes ASR #32: the sign bit smeared, C is bit 31. */
+    p[0] = 0x1008u;                              /* ASRS r0,r1,#32 */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "ASRS #32 translated");
+    CHECK(count_word(&b, 0x131f7e93u) == 1, "asr w19,w20,#31 is the result");
+
+    /* LSL #0 is a move: the carry is untouched, so C is PRESERVED, which is
+     * the two-bit save, not the one-bit one. */
+    p[0] = 0x0008u;                              /* LSLS r0,r1,#0 */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "LSLS #0 translated");
+    CHECK(count_word(&b, 0xd35c7529u) == 1, "ubfx x9,x9,#28,#2 preserves C and V");
+    CHECK(count_word(&b, 0xd35c7129u) == 0, "and does not use the one-bit form");
+
+    /* ADDS/SUBS/CMP map exactly and must carry no fixup at all. */
+    p[0] = 0x1888u;                              /* ADD r0,r1,r2 */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "ADD translated");
+    CHECK(count_word(&b, 0x6a13027fu) == 0, "arithmetic needs no logical fixup");
+
+    /* MOV #imm8 and the logical ALU ops preserve C and V. */
+    p[0] = 0x202au;                              /* MOVS r0,#42 */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "MOVS translated");
+    CHECK(count_word(&b, 0xd35c7529u) == 1, "MOVS #imm8 preserves C and V");
+    CHECK(count_word(&b, 0x6a13027fu) == 1, "ands wzr,w19,w19 recomputes N,Z");
+
+    /* TST discards its result, so the fixup reads it from the scratch. */
+    p[0] = 0x4208u;                              /* TST r0,r1 */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "TST translated");
+    CHECK(count_word(&b, 0x0a14026bu) == 1, "and w11,w19,w20 into the scratch");
+    CHECK(count_word(&b, 0x6a0b017fu) == 1, "ands wzr,w11,w11 from the scratch");
+}
+
+/*
+ * THE STATE BOUNDARY. Everything that can leave Thumb state is here, and the
+ * assertions are deliberately both positive and negative: an instruction that
+ * must NOT touch the T bit is checked for the absence of the write, because a
+ * spurious state change is silent until the next fetch decodes garbage.
+ *
+ * The T bit is CPSR bit 5, so the write is `bfi w10, <src>, #5, #1` around a
+ * load and store of cpu->cpsr at offset 64.
+ */
+#define W_LDR_CPSR   0xb940438au   /* ldr w10, [x28, #64]      */
+#define W_STR_CPSR   0xb900438au   /* str w10, [x28, #64]      */
+#define W_T_FROM_R3  0x331b02cau   /* bfi w10, w22, #5, #1     */
+#define W_T_CLEAR    0x331b03eau   /* bfi w10, wzr, #5, #1     */
+#define W_MOV_PC_S0  0x2a0903e8u   /* mov w8, w9  (exit_reg)   */
+
+static void test_thumb_state_transitions(void) {
+    arm_cpu_t c; jit_block_t b;
+    uint16_t p[2];
+
+    /* BX r3: T := r3[0], target = r3 & ~1, no link register write. */
+    p[0] = 0x4718u;
+    CHECK(xlate16(&c, 0, p, 1, &b, CODE_WORDS), "BX r3 translated");
+    CHECK(b.end_reason == JIT_END_BRANCH, "BX ends the block");
+    CHECK(b.insn_count == 1, "insn_count=%u expect 1", b.insn_count);
+    CHECK(count_word(&b, W_T_FROM_R3) == 1, "bfi w10,w22,#5,#1 sets T from the target");
+    CHECK(count_word(&b, 0x121f7ac9u) == 1, "and w9,w22,#0xfffffffe clears bit 0");
+    CHECK(count_word(&b, W_MOV_PC_S0) == 1, "the resume PC comes from a register");
+    CHECK(count_word(&b, 0xb9003b89u) == 0, "BX writes no link register");
+
+    /* BLX r3: the same, plus LR = (pc + 2) | 1 with the Thumb bit SET. */
+    p[0] = 0x4798u;
+    CHECK(xlate16(&c, 0, p, 1, &b, CODE_WORDS), "BLX r3 translated");
+    CHECK(count_word(&b, W_T_FROM_R3) == 1, "BLX r3 sets T from the target");
+    CHECK(count_word(&b, 0x5280006au) == 1, "movz w10,#3 is (pc+2)|1");
+    CHECK(count_word(&b, 0xb9003b8au) == 1, "str w10,[x28,#56] writes LR");
+
+    /* BX pc: r15 reads pc + 4, which is even, so this leaves Thumb for ARM. */
+    p[0] = 0x4778u;
+    CHECK(xlate16(&c, 0, p, 1, &b, CODE_WORDS), "BX pc translated");
+    CHECK(count_word(&b, 0x52800089u) == 1, "movz w9,#4 materialises pc + 4");
+    CHECK(count_word(&b, 0x331b012au) == 1, "bfi w10,w9,#5,#1 still sets T from bit 0");
+
+    /* BLX suffix (0xe800): always returns to ARM, so T is cleared with WZR,
+     * the target is masked to a word boundary, and LR keeps the Thumb bit. */
+    p[0] = 0xe800u;
+    CHECK(xlate16(&c, 0, p, 1, &b, CODE_WORDS), "BLX suffix translated");
+    CHECK(b.end_reason == JIT_END_BRANCH, "BLX suffix ends the block");
+    CHECK(count_word(&b, W_T_CLEAR) == 1, "bfi w10,wzr,#5,#1 forces ARM state");
+    CHECK(count_word(&b, 0xb9403b89u) == 1, "ldr w9,[x28,#56] reads LR first");
+    CHECK(count_word(&b, 0x121e7529u) == 1, "and w9,w9,#0xfffffffc word-aligns it");
+    CHECK(count_word(&b, 0xb9003b8au) == 1, "str w10,[x28,#56] then overwrites LR");
+
+    /* BL suffix (0xf800): stays in Thumb, so the T bit must NOT be written.
+     * The epilogue also loads cpu->cpsr, so the discriminator is the BFI. */
+    p[0] = 0xf800u;
+    CHECK(xlate16(&c, 0, p, 1, &b, CODE_WORDS), "BL suffix translated");
+    CHECK(b.end_reason == JIT_END_BRANCH, "BL suffix ends the block");
+    CHECK(count_word(&b, W_T_CLEAR) == 0, "BL suffix does not clear T");
+    CHECK(count_word(&b, 0x121f7929u) == 1, "and w9,w9,#0xfffffffe keeps halfword alignment");
+    CHECK(count_word(&b, W_STR_CPSR) == 1, "only the epilogue writes cpu->cpsr");
+
+    /* BL prefix (0xf000): a pure LR write. It is not a branch, so the block
+     * continues into the suffix. */
+    p[0] = 0xf000u; p[1] = 0xf800u;
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "BL pair translated");
+    CHECK(b.insn_count == 2, "insn_count=%u expect 2 (prefix then suffix)", b.insn_count);
+    CHECK(count_word(&b, 0x52800089u) == 1, "movz w9,#4 is LR = pc + 4 + 0");
+    CHECK(count_word(&b, 0xb9003b89u) == 1, "str w9,[x28,#56] writes LR");
+
+    /* Plain Thumb branches change no state whatsoever. */
+    p[0] = 0xe000u;
+    CHECK(xlate16(&c, 0, p, 1, &b, CODE_WORDS), "B translated");
+    CHECK(count_word(&b, 0x52800088u) == 1, "movz w8,#4 is pc + 4");
+    CHECK(count_word(&b, W_T_CLEAR) == 0, "B does not touch T");
+    CHECK(count_word(&b, W_LDR_CPSR) == 1, "cpu->cpsr is read once, by the epilogue");
+}
+
+/* B<cond> has two static edges, exactly like its ARM counterpart (§3.5). */
+static void test_thumb_conditional_branch(void) {
+    arm_cpu_t c; jit_block_t b;
+    uint16_t p[1];
+    p[0] = 0xd002u;                              /* BEQ .+4 -> target 8 */
+    CHECK(xlate16(&c, 0, p, 1, &b, CODE_WORDS), "BEQ translated");
+    CHECK(b.insn_count == 1 && b.end_reason == JIT_END_BRANCH, "ends at the branch");
+    CHECK(count_word(&b, 0x540000a1u) == 1, "b.ne +5 skips the taken exit");
+    CHECK(count_word(&b, 0x52800108u) == 1, "movz w8,#8 (taken target)");
+    CHECK(count_word(&b, 0x52800048u) == 1, "movz w8,#2 (fall-through)");
+
+    /* A backward BNE, which is what every Thumb loop ends with. */
+    p[0] = 0xd1feu;                              /* BNE .-4 from 4 -> 4 */
+    CHECK(xlate16(&c, 4, p, 1, &b, CODE_WORDS), "BNE translated");
+    CHECK(count_word(&b, 0x52800088u) == 1, "movz w8,#4 (backward target)");
+    CHECK(count_word(&b, 0x540000a0u) == 1, "b.eq +5 skips it");
+}
+
+/*
+ * Thumb memory: the PC-relative load folds its address to a constant, the
+ * halfword and sign-extended forms reach the right helper, and every access
+ * publishes cpu->r[15] first because the interpreter re-executes the faulting
+ * instruction and LR_abt is pc + 8 in Thumb too.
+ */
+static void test_thumb_memory(void) {
+    arm_cpu_t c; jit_block_t b;
+    uint16_t p[2]; p[1] = T_SELF;
+
+    p[0] = 0x6848u;                              /* LDR r0,[r1,#4] */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "LDR imm5 translated");
+    CHECK(count_word(&b, 0x11001281u) == 1, "add w1,w20,#4 computes the address");
+    CHECK(count_word(&b, 0xb9003f88u) == 2, "str w8,[x28,#60] publishes cpu->r[15]");
+    CHECK(count_word(&b, 0xd63f0200u) == 1, "blr x16 calls the helper");
+    CHECK(count_word(&b, 0x2a0003f3u) == 1, "mov w19,w0 commits r0 after the check");
+
+    p[0] = 0x70c8u;                              /* STRB r0,[r1,#3] */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "STRB imm5 translated");
+    CHECK(count_word(&b, 0x11000e81u) == 1, "add w1,w20,#3");
+    CHECK(count_word(&b, 0x2a1303e2u) == 1, "mov w2,w19 passes the stored value");
+    CHECK(count_word(&b, 0x52800040u) == 1, "movz w0,#JIT_EXIT_ABORT on the fault path");
+
+    p[0] = 0x8848u;                              /* LDRH r0,[r1,#2] */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "LDRH imm5 translated");
+    CHECK(count_word(&b, 0x11000a81u) == 1, "add w1,w20,#2 (imm5 scaled by 2)");
+
+    p[0] = 0x4802u;                              /* LDR r0,[pc,#8] */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "LDR pc-relative translated");
+    CHECK(count_word(&b, 0x52800181u) == 1, "movz w1,#12 folds (pc+4 & ~3) + 8");
+
+    p[0] = 0x9801u;                              /* LDR r0,[sp,#4] */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "LDR sp-relative translated");
+    CHECK(count_word(&b, 0x11001361u) == 1, "add w1,w27,#4 uses the pinned SP");
+
+    p[0] = 0x5688u;                              /* LDRSB r0,[r1,r2] */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "LDRSB translated");
+    CHECK(count_word(&b, 0x0b150281u) == 1, "add w1,w20,w21 is the register offset");
+    CHECK(count_word(&b, 0x13001c13u) == 1, "sbfx w19,w0,#0,#8 sign-extends the byte");
+
+    p[0] = 0x5e88u;                              /* LDRSH r0,[r1,r2] */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "LDRSH translated");
+    CHECK(count_word(&b, 0x13003c13u) == 1, "sbfx w19,w0,#0,#16 sign-extends the halfword");
+
+    p[0] = 0x5288u;                              /* STRH r0,[r1,r2] */
+    CHECK(xlate16(&c, 0, p, 2, &b, CODE_WORDS), "STRH translated");
+    CHECK(count_word(&b, 0x2a1303e2u) == 1, "mov w2,w19 passes the stored halfword");
+}
+
+/*
+ * EXHAUSTIVE: all 65,536 halfwords, checked against the interpreter.
+ *
+ * The dev box cannot run emitted code, but it can run the oracle, and three
+ * properties are checkable without executing anything — and each of them is a
+ * bug this project has already paid for once:
+ *
+ *   1. If the translator accepts an encoding, the interpreter must implement
+ *      it. Accepting something the interpreter traps as ARM_UNDEFINED would
+ *      turn a fault into silent wrong execution.
+ *   2. If the interpreter moves PC anywhere other than pc + 2, the translator
+ *      must have ended the block there. This is the property that 0xe800 —
+ *      the BLX suffix that looks like an unconditional branch — violated in
+ *      the interpreter once, sending real XNU into a table of pointers.
+ *   3. An instruction the translator continues past must not have changed
+ *      CPSR.T or the mode, because the rest of the block was translated on the
+ *      assumption that it did not.
+ *
+ * Registers are all zero here, so a branch target is 0 and a store address is
+ * 0; that is deliberate, since it makes every encoding executable exactly once
+ * with no faults.
+ */
+static void test_thumb_decode_agrees_with_the_interpreter(void) {
+    const uint32_t STATE = ARM_CPSR_T | ARM_CPSR_MODE_MASK;
+    arm_cpu_t c; jit_block_t b;
+    unsigned accepted = 0, bad_undef = 0, bad_flow = 0, bad_state = 0;
+    uint32_t i;
+
+    memset(g_ram, 0, sizeof g_ram);
+    for (i = 0; i < 0x10000u; i++) {
+        uint16_t insn = (uint16_t)i;
+        uint32_t cpsr_before;
+        bool ends;
+
+        m_w16(NULL, 0, insn);
+        m_w16(NULL, 2, T_SELF);
+
+        arm_reset(&c, &g_bus);
+        c.cpsr = (c.cpsr & ~0x1fu) | ARM_MODE_SYS | ARM_CPSR_T;
+        if (!jit_translate(&c, 0, g_code, CODE_WORDS, &b) || b.insn_count == 0)
+            continue;
+        accepted++;
+        /* The second halfword is `B .`, which always translates and always
+         * ends the block: so a one-instruction block means this encoding
+         * ended it, and a two-instruction one means it did not. */
+        ends = (b.insn_count == 1);
+
+        arm_reset(&c, &g_bus);
+        c.cpsr = (c.cpsr & ~0x1fu) | ARM_MODE_SYS | ARM_CPSR_T;
+        cpsr_before = c.cpsr;
+        if (arm_step(&c) != ARM_OK) {
+            if (bad_undef++ < 4) printf("    %04x: accepted but the interpreter traps\n", insn);
+            continue;
+        }
+        if (!ends && c.r[15] != 2u) {
+            if (bad_flow++ < 4)
+                printf("    %04x: interpreter went to %08x but the block continued\n",
+                       insn, c.r[15]);
+        }
+        if (!ends && (c.cpsr & STATE) != (cpsr_before & STATE)) {
+            if (bad_state++ < 4)
+                printf("    %04x: changed CPSR to %08x but the block continued\n",
+                       insn, c.cpsr);
+        }
+    }
+    CHECK(accepted > 30000u, "%u of 65536 Thumb encodings translated", accepted);
+    CHECK(bad_undef == 0, "%u accepted encodings the interpreter does not implement", bad_undef);
+    CHECK(bad_flow  == 0, "%u accepted encodings wrote PC without ending the block", bad_flow);
+    CHECK(bad_state == 0, "%u accepted encodings changed CPSR without ending the block", bad_state);
+}
+
+/* The deny mask works the same way in Thumb as in ARM, plus one axis of its own. */
+static void test_thumb_deny(void) {
+    /* MOVS r0,#1 ; LDR r0,[r1,#0] ; B . */
+    uint16_t p[] = { 0x2001, 0x6808, T_SELF };
+    arm_cpu_t c; jit_block_t b;
+
+    jit_set_deny(JIT_DENY_THUMB);
+    CHECK(!xlate16(&c, 0, p, 3, &b, CODE_WORDS), "whole Thumb decoder denied");
     CHECK(b.insn_count == 0, "nothing translated");
+    CHECK((b.key.flags & JIT_BLK_THUMB) != 0, "thumb flag still recorded");
+
+    jit_set_deny(JIT_DENY_ALL);
+    CHECK(!xlate16(&c, 0, p, 3, &b, CODE_WORDS), "deny-all declines Thumb too");
+    CHECK(b.insn_count == 0, "nothing translated");
+
+    jit_set_deny(JIT_DENY_LDST);
+    CHECK(xlate16(&c, 0, p, 3, &b, CODE_WORDS), "translated with LDST denied");
+    CHECK(b.insn_count == 1, "insn_count=%u expect 1", b.insn_count);
+
+    jit_set_deny(JIT_DENY_BRANCH);
+    CHECK(xlate16(&c, 0, p, 3, &b, CODE_WORDS), "translated with BRANCH denied");
+    CHECK(b.insn_count == 2, "insn_count=%u expect 2", b.insn_count);
+
+    jit_set_deny(0);
+    CHECK(xlate16(&c, 0, p, 3, &b, CODE_WORDS), "translated with nothing denied");
+    CHECK(b.insn_count == 3, "insn_count=%u expect 3", b.insn_count);
+    /* JIT_DENY_THUMB must not affect ARM. */
+    {
+        uint32_t a[] = { 0xe3a00001, 0xeafffffe };
+        jit_set_deny(JIT_DENY_THUMB);
+        CHECK(xlate(&c, 0, a, 2, &b, CODE_WORDS), "ARM unaffected by DENY_THUMB");
+        CHECK(b.insn_count == 2, "insn_count=%u expect 2", b.insn_count);
+        jit_set_deny(0);
+    }
 }
 
 /* ==================================== the interpreter fallback is total == */
@@ -446,7 +898,15 @@ int main(void) {
     test_block_ends_at_page_boundary();
     test_block_length_cap();
     test_code_buffer_exhaustion();
-    test_thumb_is_not_translated();
+    test_thumb_block_shape();
+    test_thumb_refused_encodings();
+    test_thumb_bodies_are_exact();
+    test_thumb_shift_carry();
+    test_thumb_state_transitions();
+    test_thumb_conditional_branch();
+    test_thumb_memory();
+    test_thumb_decode_agrees_with_the_interpreter();
+    test_thumb_deny();
     test_deny_all_translates_nothing();
     test_deny_one_class();
     test_refused_encodings();

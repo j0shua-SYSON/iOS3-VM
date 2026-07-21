@@ -279,12 +279,24 @@ static void m_w16(void *c, uint32_t a, uint16_t v){ (void)c; memcpy(&g_ram[a&(RA
 static void m_w8 (void *c, uint32_t a, uint8_t  v){ (void)c; g_ram[a&(RAM_SIZE-1)]=v; }
 static const arm_bus_t g_bus = { NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8 };
 
-static void seed(arm_cpu_t *c, const uint32_t *prog, size_t n) {
+/*
+ * `prog` is an array of 32-bit ARM words or, when `thumb`, of 16-bit halfwords.
+ * r0..r7 get distinct values with bits set at both ends of the word, which is
+ * what makes a shifter carry-out observable.
+ */
+static void seed(arm_cpu_t *c, const void *prog, size_t n, bool thumb) {
     size_t i;
     memset(g_ram, 0, sizeof g_ram);
-    for (i = 0; i < n; i++) m_w32(NULL, (uint32_t)(i * 4), prog[i]);
+    if (thumb) {
+        const uint16_t *p = (const uint16_t *)prog;
+        for (i = 0; i < n; i++) m_w16(NULL, (uint32_t)(i * 2), p[i]);
+    } else {
+        const uint32_t *p = (const uint32_t *)prog;
+        for (i = 0; i < n; i++) m_w32(NULL, (uint32_t)(i * 4), p[i]);
+    }
     arm_reset(c, &g_bus);
     c->cpsr = (c->cpsr & ~0x1fu) | ARM_MODE_SYS;
+    if (thumb) c->cpsr |= ARM_CPSR_T;
     for (i = 0; i < 13; i++) c->r[i] = (uint32_t)(0x11111111u * (i + 1));
     c->r[13] = 0x8000;
     c->r[14] = 0xdead0000u;
@@ -297,14 +309,14 @@ static void seed(arm_cpu_t *c, const uint32_t *prog, size_t n) {
  * docs/dynarec.md §9.2 in miniature, and it is the test that would catch a
  * wrong flag rule or a mis-plumbed register.
  */
-static void lockstep(const char *what, const uint32_t *prog, size_t n) {
+static void lockstep_state(const char *what, const void *prog, size_t n, bool thumb) {
     arm_cpu_t ref, jit;
     jit_block_t blk;
     uint32_t *code;
     unsigned i;
     int rc;
 
-    seed(&jit, prog, n);
+    seed(&jit, prog, n, thumb);
     code = jit_buf_take(&g_buf, 1024);
     if (!code) { printf("  SKIP %s: arena exhausted\n", what); return; }
     jit_buf_begin_write(&g_buf);
@@ -316,12 +328,12 @@ static void lockstep(const char *what, const uint32_t *prog, size_t n) {
     jit_buf_end_write(&g_buf);
     jit_buf_commit(&g_buf, code, blk.code_words * 4u);
 
-    seed(&ref, prog, n);
+    seed(&ref, prog, n, thumb);
     for (i = 0; i < blk.insn_count; i++) {
         if (arm_step(&ref) != ARM_OK) { g_fail++; printf("  FAIL %s: interpreter trapped\n", what); return; }
     }
 
-    seed(&jit, prog, n);
+    seed(&jit, prog, n, thumb);
     rc = jit_enter(&blk, &jit);
     CHECK(rc == JIT_EXIT_NEXT || rc == JIT_EXIT_INTERPRET, "%s: exit %d", what, rc);
 
@@ -332,6 +344,23 @@ static void lockstep(const char *what, const uint32_t *prog, size_t n) {
           what, jit.cpsr, ref.cpsr);
     CHECK(ref.cycles == jit.cycles, "%s: cycles = %llu, interpreter says %llu",
           what, (unsigned long long)jit.cycles, (unsigned long long)ref.cycles);
+    /* Guest RAM too: a store of the wrong width, or to the wrong address, is
+     * invisible to a register comparison. g_ram currently holds the JIT's
+     * result, so snapshot it, re-run the interpreter, and diff. */
+    {
+        static uint8_t jit_ram[RAM_SIZE];
+        memcpy(jit_ram, g_ram, sizeof jit_ram);
+        seed(&ref, prog, n, thumb);
+        for (i = 0; i < blk.insn_count; i++) (void)arm_step(&ref);
+        CHECK(memcmp(jit_ram, g_ram, sizeof jit_ram) == 0,
+              "%s: guest memory differs from the interpreter's", what);
+    }
+}
+static void lockstep(const char *what, const uint32_t *prog, size_t n) {
+    lockstep_state(what, prog, n, false);
+}
+static void lockstep16(const char *what, const uint16_t *prog, size_t n) {
+    lockstep_state(what, prog, n, true);
 }
 
 static void test_blocks_match_the_interpreter(void) {
@@ -351,6 +380,59 @@ static void test_blocks_match_the_interpreter(void) {
       lockstep("block ends before an unhandled ldm", p, 2); }     /* fallback   */
 }
 
+/*
+ * The same comparison for Thumb, which is 68.95% of the real workload. The
+ * last four are the ones that matter most: they cross the ARM/Thumb boundary,
+ * where the JIT and the interpreter must agree not only on r15 but on CPSR.T,
+ * and where this project has already been bitten once (docs/dynarec.md §7.4).
+ */
+static void test_thumb_blocks_match_the_interpreter(void) {
+    { uint16_t p[] = { 0x2001, 0x1808, 0x4008, 0xe7fe };
+      lockstep16("thumb movs/adds/ands", p, 4); }
+    { uint16_t p[] = { 0x00c8, 0x095a, 0x106c, 0xe7fe };
+      lockstep16("thumb lsls/lsrs/asrs set C from the shifter", p, 4); }
+    { uint16_t p[] = { 0x0808, 0x1008, 0xe7fe };
+      lockstep16("thumb lsr #32 / asr #32", p, 3); }
+    { uint16_t p[] = { 0x4148, 0x4188, 0x4348, 0x4248, 0x43c8, 0xe7fe };
+      lockstep16("thumb adc/sbc/mul/neg/mvn", p, 6); }
+    { uint16_t p[] = { 0x2000, 0x2800, 0xd000 };
+      lockstep16("thumb cmp then beq (taken)", p, 3); }
+    { uint16_t p[] = { 0x2001, 0x2800, 0xd000 };
+      lockstep16("thumb cmp then beq (not taken)", p, 3); }
+    { uint16_t p[] = { 0x4669, 0xb2c8, 0x4288, 0xe7fe };
+      lockstep16("thumb mov-from-sp, uxtb, hi-register cmp", p, 4); }
+    { uint16_t p[] = { 0xb082, 0xb002, 0xa801, 0xe7fe };
+      lockstep16("thumb sub sp / add sp / add rd,sp", p, 4); }
+    { uint16_t p[] = { 0x9001, 0x9a01, 0xe7fe };
+      lockstep16("thumb sp-relative store then load", p, 3); }
+    { uint16_t p[] = { 0x4669, 0x7048, 0x784a, 0x8048, 0x884b, 0xe7fe };
+      lockstep16("thumb byte and halfword access", p, 6); }
+    /* Store 0xeeeeeeee first, so the sign-extended loads actually see a
+     * negative byte and halfword rather than the zeroed RAM. */
+    { uint16_t p[] = { 0x4669, 0x2200, 0x43c0, 0x5088, 0x5688, 0x5e8b, 0xe7fe };
+      lockstep16("thumb ldrsb / ldrsh sign extension", p, 7); }
+    { uint16_t p[] = { 0x4800, 0xe7fe, 0x1234, 0x5678 };
+      lockstep16("thumb pc-relative load", p, 4); }
+    { uint16_t p[] = { 0x2001, 0xb500 };
+      lockstep16("thumb block ends before an unhandled push", p, 2); }
+
+    /* ---- the state boundary ---- */
+    { uint16_t p[] = { 0x4700 };
+      lockstep16("thumb bx r0 (odd target: stays Thumb)", p, 1); }
+    { uint16_t p[] = { 0x4708 };
+      lockstep16("thumb bx r1 (even target: returns to ARM)", p, 1); }
+    { uint16_t p[] = { 0x4780 };
+      lockstep16("thumb blx r0 (writes lr with the Thumb bit)", p, 1); }
+    { uint16_t p[] = { 0x4778 };
+      lockstep16("thumb bx pc (pc+4 is even: returns to ARM)", p, 1); }
+    { uint16_t p[] = { 0xf000, 0xf802 };
+      lockstep16("thumb bl pair (stays Thumb)", p, 2); }
+    { uint16_t p[] = { 0xf000, 0xe802 };
+      lockstep16("thumb blx pair (returns to ARM)", p, 2); }
+    { uint16_t p[] = { 0xe002 };
+      lockstep16("thumb unconditional branch", p, 1); }
+}
+
 int main(void) {
     printf("jit execution tests\n");
     if (!jit_host_can_execute()) {
@@ -368,6 +450,7 @@ int main(void) {
     test_executes_flags();
     test_executes_memory_and_branches();
     test_blocks_match_the_interpreter();
+    test_thumb_blocks_match_the_interpreter();
 
     jit_buf_free(&g_buf);
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
