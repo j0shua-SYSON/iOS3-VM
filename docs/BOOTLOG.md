@@ -4,8 +4,23 @@ An annotated walk through one real boot of Apple's iPhone OS 3.1.3 kernel on
 iOS3-VM: from the reset vector to the last driver that starts, with the emulated
 device behind each stage.
 
-Everything here is from actual runs. Reproduce it with your own IPSW (see
-[BOOT_CHAIN.md](BOOT_CHAIN.md)):
+> **The stage-by-stage narrative is historical; the frontier note is current.**
+> The original run below ended at a missing VFP `VLDMIA`. Current real firmware
+> has crossed that wall and the later `0xe1630381` ARMv5TE multiply stop. A resume
+> chain then reached the 2.9 B configured cap and wrote checkpoints at 2.4, 2.7
+> and 2.85 B, with no panic or emulator undefined stop. A diagnostic continuation
+> reached 2,944,340,624 instructions and stopped on ARMv6 `UXTB16`
+> (`0xe6cf3073`) in user mode. The complete paired-extend implementation then
+> replayed through that stop, wrote a 2.97 B checkpoint and reached a clean
+> 2.98 B cap. It still did not prove a SpringBoard frame. Free pages dipped to
+> 97 and ended at 214 against a target of 250. The installable app
+> runs a synthetic guest through CoreGraphics and has no real-boot session,
+> touch, audio or guest networking.
+
+Everything here is from actual historical runs. The command below is the recipe,
+not a promise of byte-identical current output: the stopping point and log are
+tied to that run's source/configuration, and current output may differ. Supply
+your own IPSW-derived inputs (see [BOOT_CHAIN.md](BOOT_CHAIN.md)):
 
 ```sh
 build/core/bootkernel firmware/kernel.macho \
@@ -18,17 +33,28 @@ build/core/bootkernel firmware/kernel.macho \
 Three parts of that command line are not preferences:
 
 - **`-R 512`.** `arm_vm_init` hardcodes `virtual_avail = 0xe0000000`, so the
-  kernel's physical-linear window is exactly 512 MB. Advertising more makes
+  kernel's physical-linear window is exactly 512 MiB. Advertising more makes
   `zone_virtual_addr` stop early-outing and index a `pv_head_table` that is
   still all zeros during `zone_bootstrap` — a null-zone dereference at ~34 M
-  instructions that looks nothing like a RAM-size problem.
+  instructions that looks nothing like a RAM-size problem. The physical window
+  is exactly `[0x08000000, 0x28000000)` and NOR begins at `0x28000000`; current
+  machine initialization rejects the historical 768 MiB configurations before
+  execution.
 - **`nand-enable-adm=0`.** `AppleS5L8900XADMFMC::start` polls a NAND/DMA ready bit
   that never sets here and panics. The driver's own `probe()` honours this
   boot-arg, so it simply never matches. We boot from a RAM disk; we do not need
   NAND.
-- **`-r firmware/rootfs.img`.** The real, decrypted 413 MB HFSX root filesystem
+- **`-r firmware/rootfs.img`.** The real, decrypted 413 MiB
+  (433,274,880-byte) HFSX root filesystem
   from the IPSW, published through `/chosen/memory-map` as `RAMDisk` with `rd=md0`
   appended to the command line.
+
+The loader does not retain a second image-sized host buffer. It opens and sizes
+the source, proves the kernel/device-tree/boot-args/RAM-disk/framebuffer ranges
+are contained and pairwise disjoint, allocates guest DRAM once, and streams the
+rootfs directly into its final range through the retained handle. Source
+metadata is checked around the transfer. The roughly 445 MiB grown RAM disk
+therefore lives inside the 512 MiB guest allocation instead of beside it.
 
 Three more workarounds are applied automatically and echoed in the run header —
 the IORTC 30-second wait patched to zero, the `mbx` node's `compatible` string
@@ -48,10 +74,11 @@ narrative depends on them.
 
 ## Stage 0 — what stands in for iBoot
 
-We do not run iBoot to hand off to the kernel; we do what iBoot does. That is a
-deliberate, and stated, simplification: the interesting target is XNU, and
-standing in for the bootloader is the shortest path to it that does not fake
-anything the kernel can observe.
+We do not run iBoot to hand off to the kernel. `bootkernel` recreates a subset of
+the handoff inputs: loaded segments, boot arguments, device-tree properties and
+RAM-disk metadata. This deliberate simplification gets to XNU quickly, but it is
+not equivalent to executing iBoot, and the guest can observe the synthesized and
+patched inputs described above.
 
 The kernelcache is a real, decrypted, LZSS-expanded ARMv6 Mach-O. Its segments
 are placed at their own preferred addresses, physical = virtual − 0xb8000000:
@@ -315,12 +342,12 @@ IOSDIOController::enumerateSlot(): CMD5 failed with SDIO device on slot 0
 AppleS5L8900XSDIO::enumerateCards(): Unable to enumerate SDIO device
 ```
 
-4,595 bytes, and every one of them from an unmodified Apple kext. Three lines are
-worth naming: `AppleMobileFileIntegrity` — the code-signing enforcer — starts
-cleanly; `AppleMultitouchZ2SPI` starts and asks for DMA, which is the driver half
-of M5's touch input already alive and waiting for a device; and the SDIO
-enumeration **fails correctly**, because nothing is soldered to the slot we
-model. A driver that reports a timeout has been given a working bus.
+4,595 bytes from unmodified Apple kernel and kext code. Three lines are worth
+naming: `AppleMobileFileIntegrity` — the code-signing enforcer — starts cleanly;
+`AppleMultitouchZ2SPI` reaches its bootloading/DMA request, which proves execution
+of that driver path but not a usable touch device; and SDIO reaches the mapped
+command/poll path before timing out. The timeout does not establish working card,
+interrupt, timing or error semantics.
 
 Two things in the historical table are worth dwelling on, and both still hold.
 
@@ -393,14 +420,14 @@ function names to find. None of the kernel's 11,430 symbols fall inside
 
 That last line is the one M4 was for. The kernel walked its own storage stack,
 found the RAM disk we published in `/chosen/memory-map`, and mounted a real
-413 MB HFSX volume out of Apple's own IPSW as its root.
+413 MiB HFSX volume out of Apple's own IPSW as its root.
 
 Getting there needed two things that were not obvious. `bsd_init` calls
 `IOKitInitializeTime`, which does `waitForService(resourceMatching("IORTC"),
 &{tv_sec = 30})` — and `IORTC` is never published, because the PMU's real-time
 clock is not modelled. Thirty seconds of guest time is a very long silence.
-Patching that timeout to zero reaches `IOFindBSDRoot`. And the 512 MB `memSize`
-cap above is what stops early VM init from faulting once a 413 MB disk is
+Patching that timeout to zero reaches `IOFindBSDRoot`. And the 512 MiB `memSize`
+cap above is what stops early VM init from faulting once a 413 MiB disk is
 actually present.
 
 Where the instructions actually go, sampled every 1,024 instructions:
@@ -438,7 +465,7 @@ pleased about.
 
 ---
 
-## Stage 7 — pid 1, and where the boot stops today
+## Stage 7 — pid 1, and where the historical pre-VFP run stopped
 
 `bsdinit_task` runs, `load_init_program` opens `/sbin/launchd` off the volume we
 just mounted, and `execve` gets remarkably far.
@@ -459,24 +486,25 @@ just mounted, and `execve` gets remarkably far.
 | 234,731,379 | `_fleh_undef` (1) → `_sleh_undef` → `_vfp_trap` |
 | **234,731,493** | **the emulator stops: UNDEFINED INSTRUCTION, `0xecb10a20`, lr `_vfp_trap+0x38`** |
 
-**pid 1 executes user-mode code and makes system calls.** `_panic` is never
-reached. The run does not end on a guest failure at all — it ends because *we*
-stopped.
+**pid 1 executed user-mode code and made system calls.** `_panic` was never
+reached in this run. It did not end on a guest panic — the emulator stopped on
+an instruction it did not then implement.
 
 XNU does not leave VFP enabled: `_init_vfp` grants CP10/CP11 access once, and
 after that the gate is `FPEXC.EN` alone, cleared per thread. So the first VFP
 instruction any thread executes is *supposed* to take an Undefined exception,
 which `_fleh_undef` → `_sleh_undef` → `_vfp_trap` → `_vfp_switch` turns into
-"enable VFP and re-run it". That whole path now works. What stops us is the
-instruction `_vfp_switch` itself uses: `0xecb10a20` decodes as
+"enable VFP and re-run it". That whole path worked in this run. What stopped
+this run was the instruction `_vfp_switch` itself uses: `0xecb10a20` decodes as
 `VLDMIA r1!, {s0-s31}`, the load-multiple that restores a thread's VFP register
-file — and the interpreter does not implement it. Per M1's rule an unimplemented
-encoding returns `ARM_UNDEFINED` and halts the machine *at* the instruction
-rather than executing something plausible. The emulator named its own gap.
+file. The interpreter correctly returned `ARM_UNDEFINED` rather than guessing.
+That VFP family is implemented and covered by regression tests now, so this is
+no longer the current blocker.
 
-Keep the scale honest: five BSD system calls and twelve Mach traps is not a
-userland. Nothing has been logged by userspace, no daemon has started, and
-SpringBoard needs a display controller and a panel that do not exist yet.
+Keep the scale honest: in this trace, five BSD system calls and twelve Mach
+traps was not a userland. Nothing had been logged by userspace and no daemon had
+started. Later work added the CLCD/panel path; it did not turn this historical
+trace, or the app's synthetic demo, into SpringBoard.
 
 Three walls on this exact path are worth recording, because each looked like a
 completely different problem from its symptom:
@@ -500,11 +528,13 @@ completely different problem from its symptom:
   at 0x38000000 is not modelled, so six reads came back as whatever the stub
   returned and `SHA1Final` emitted that.
 
-  Two independent from-scratch verifications exonerated the image *before* anything
-  was changed — a UDIF verifier over all 7 `blkx` tables and every per-`blkx`
-  CRC32, and an HFSX reader that checked code-directory page hashes for all 155
-  signed Mach-Os and 6,731 code pages on the volume. Zero mismatches, launchd
-  46/46, dyld 56/56.
+  Two private, untracked historical verifications exonerated the image *before*
+  anything was changed — a UDIF verifier over all 7 `blkx` tables and every
+  per-`blkx` CRC32, and an HFSX reader that reported code-directory page hashes
+  for all 155 signed Mach-Os and 6,731 code pages on the volume. They reported
+  zero mismatches, launchd 46/46 and dyld 56/56. The verifier tools and outputs
+  are not present in the public tree, so this is recorded evidence rather than
+  a reproducible current check.
 
   **The clinching evidence was timing.** `SHA1Transform` costs ~2,262 Thumb
   instructions per 64-byte block, so hashing 4 KB in software must cost ~145,000
@@ -673,7 +703,7 @@ blocks + primary header) and block 105,779 (the alternate) — and no file
 owner would own the alternate header's bytes and be scribbled on at every
 flush. When the tail moves, that block becomes ordinary free space.
 
-The 16 KB allocation file is the ceiling: 16384 × 8 = 131,072 bits, a 512 MB
+The 16 KiB allocation file is the ceiling: 16384 × 8 = 131,072 bits, a 512 MiB
 volume at this block size. `--grow` clamps there and says so. (The headroom
 exists because `newfs_hfs` rounded 105,780 bits up to a whole 4-block clump;
 TN1150 allows a bitmap larger than the volume needs and requires only that the
@@ -682,7 +712,7 @@ surplus bits be zero, which they are.)
 Rebuilding the bitmap from scratch — a full catalog walk, which is what
 `fsck_hfs` phase 5 does — reproduces the on-disk bitmap exactly on all 113,971
 blocks of the grown volume, and `freeBlocks` matches the recount: 8191 blocks,
-32.00 MB.
+32.00 MiB.
 
 **What the guest says about it.** `fsck_hfs -p` accepts the grown volume and
 launchd goes on to remount `/` read-write, which is the kernel's own HFS mount
@@ -692,8 +722,8 @@ device — which is where `fsck_hfs` looks for the alternate header). But
 `fsck_hfs -p` **quick-exits on a volume carrying `kHFSVolumeUnmounted`**, so
 that is a weaker check than it sounds.
 
-Forcing the full one — clearing the clean bit so preen has to do the real scan
-— does not currently work, and the reason is ours, not the volume's:
+In the historical run, forcing the full one — clearing the clean bit so preen
+had to do the real scan — exposed a CPU gap rather than a volume defect:
 
 ```
 Running fsck on the boot volume...
@@ -702,11 +732,12 @@ Running fsck on the boot volume...
 ```
 
 `0x13130` is `fsck_hfs+0x12130` (its `__TEXT` is at `0x1000`), and the word
-there is `0xe1660385` — **`SMULBB r6, r3, r5`**. `arm_interp.c` traps the whole
-SMULxy/SMLAxy DSP-multiply space deliberately ("unimplemented — trap rather
-than corrupt Rd"), so `fsck_hfs`'s full-check path cannot run here at all yet.
-That is a core gap worth closing on its own merits: until it is, every `fsck`
-this boot performs is a quick-exit.
+there is `0xe1660385` — **`SMULBB r6, r3, r5`**. At that commit the interpreter
+trapped the DSP-multiply space deliberately. Current source implements and tests
+the complete related ARMv5TE set (`SMULxy`, `SMLAxy`, `SMLALxy`, `SMULWy`, and
+`SMLAWy`), so this exact instruction gap is closed. The forced-dirty full-check
+scenario has not yet been rerun end to end, so the honest current claim is
+"opcode implemented", not "full fsck completed".
 
 So the volume is checked where it actually lives instead. Snapshotting the
 machine at 2.9 G instructions and reading the volume header and allocation
@@ -733,8 +764,9 @@ to `md0` reach the volume, and the volume they reach is the grown one.
 point — though HFS+ updates the on-disk header lazily, so that is evidence of
 "no sync since a write" as much as "no write".
 
-**The free space did not, by itself, change the boot.** Run out to 3 billion
-instructions with and without `--grow`, the console is identical line for line.
+**The free space did not, by itself, change the historical comparison.** Run
+out to 3 billion instructions with and without `--grow`, the console was
+identical line for line.
 `_execve` stays at 11 either way — but that number was never measuring what it
 looked like it was measuring:
 
@@ -752,8 +784,8 @@ rather than 800 M to get there, and both then stall in the same place.
 ### Where the free space has to come from
 
 Growing the volume comes straight out of the guest's free page pool, because
-the RAM disk is static memory below `topOfKernelData`: 90.93 MB before,
-58.93 MB after, at the documented `-R 512`.
+the RAM disk is static memory below `topOfKernelData`: 90.93 MiB before,
+58.93 MiB after, at the documented `-R 512`.
 
 `topOfKernelData` is a single **line**, not a list — everything below it is
 static — so a RAM disk placed *below* the kernel image is exactly as protected
@@ -763,26 +795,85 @@ filesystem. `-Y` does that, and needs `-V` to open a gap under the kernel
 
 | flags | RAM disk | free page pool | volume free | reaches |
 |---|---|---|---|---|
-| `-R 512` (default) | 445 MB | 58.93 MB | 32 MB | launchd, daemons |
-| `-V 0xa4000000 -R 768 -Y` | 445 MB | 312.14 MB | 32 MB | `BSD root: md0`, then idle |
-| `-V 0xa0000000 -R 768 -Y --grow 100` | 512 MB | 248.14 MB | 98 MB | `BSD root: md0`, then idle |
+| `-R 512` (documented boot command) | 445 MiB | 58.93 MiB | 32 MiB | launchd, daemons |
+| `-V 0xa4000000 -R 768 -Y` (historical; now rejected) | 445 MiB | 312.14 MiB | 32 MiB | `BSD root: md0`, then idle |
+| `-V 0xa0000000 -R 768 -Y --grow 100` (historical; now rejected) | 512 MiB | 248.14 MiB | 98 MiB | `BSD root: md0`, then idle |
 
-768 MB is the most DRAM this machine can have: SDRAM base `0x08000000` plus
-768 MB is `0x38000000`, the first peripheral aperture, and the DRAM window
-silently shadows anything it covers. 512 MB is the largest volume the 16 KB
-allocation file can describe. So the last row is the ceiling in both directions
-at once — and it does not work.
+The two 768 MiB rows are retained as historical observations from older source,
+not valid current configurations. The current machine constructor rejects a RAM
+aperture that overlaps a decoded device. NOR begins at `0x28000000`, so SDRAM
+starting at `0x08000000` has a maximum non-overlapping size of 512 MiB. The
+allocation file also caps this volume layout at 512 MiB.
 
-**The last column is the point.** Both `-V` rows reach `BSD root: md0` and then
-go idle without ever reaching `_load_init_program`, where the default reaches it
-at ~225 M instructions and execs launchd. The cause is `-V`, not `-Y`: this is
-the failure `bootkernel`'s own `-V` note predicted — `VM_MIN_KERNEL_ADDRESS` is
-compiled into this kernel at `0xc0000000`, and a `gVirtBase` below it puts the
-whole static map in what the pmap believes is user space. Until that is
-understood, the headroom is arithmetic, not usable, which is why `-Y` is off by
-default and labelled an experiment. It is worth understanding, because the
-right-hand columns are the difference between a guest with 59 MB to run in and
-one with 312.
+**The last column was the historical point.** In those older runs both `-V` rows
+reached `BSD root: md0` and then went idle without reaching
+`_load_init_program`, while the documented 512 MiB run reached it at about 225 M
+instructions and execed launchd. A `gVirtBase` below the kernel's compiled-in
+`VM_MIN_KERNEL_ADDRESS` (`0xc0000000`) was already unusable; current source also
+rejects the overlapping 768 MiB physical map before boot. The old 59-versus-312
+MiB comparison illustrates the memory pressure that motivated `-Y`, not an
+available current configuration.
+
+---
+
+## Stage 9 — current snapshot-resume frontier
+
+Two interpreter changes make the current instruction counts different from the
+older narrative without making them less meaningful.
+
+First, XNU's exact ARM1176 wait-for-interrupt instruction no longer retires in a
+host loop while nothing happens. The CP15 WFI callback advances the timer and
+CLCD only to the earliest enabled VIC edge that can wake the processor, while
+the CPU's retired-instruction count remains unchanged. If no future event is
+known it falls back safely. Snapshot triggers therefore remain absolute retired
+instruction positions rather than a mixture of work and fabricated idle spins.
+
+Second, the next exact user-mode stop after VFP was decoded rather than patched
+as a one-off:
+
+```text
+pc       0x33dba604
+encoding 0xe1630381
+decode   SMULBB r3, r1, r3
+```
+
+That belongs to the ARMv5TE signed DSP multiply group. Current source implements
+the full related family — `SMULxy`, `SMLAxy`, `SMLALxy`, `SMULWy`, and `SMLAWy`
+— including top/bottom half selection, signed word-by-halfword truncation,
+sticky-Q overflow behavior, legal aliases and fail-closed invalid forms. This
+cleared `0xe1630381`; it was not replaced with a hard-coded result.
+
+**Measured current continuation:** the first three intervals below ended at
+their configured cap. The fourth stopped fail-closed on the named user-mode
+instruction rather than guessing its semantics; the fifth replayed through the
+fix to its cap. `_panic` and `Debugger` were not reached in any interval.
+
+| restore → cap | checkpoint written | new evidence | free-page report |
+|---|---|---|---|
+| 2.2 B → 2.45 B | 2.4 B | crossed `0xe1630381`; `launchd` and `mDNSResponder` alive | 2,004 pages / 7.83 MiB; low 1,999 |
+| 2.4 B → 2.8 B | 2.7 B | one new `_execve`, first at 2,605,595,575; `systemShutdown false` | 542 pages / 2.12 MiB; low 539 |
+| 2.7 B → 2.9 B | 2.85 B | no panic or undefined stop | 317 pages / 1.24 MiB; target 250; low 301 at 2,886,008,832 |
+| 2.85 B → 2,944,340,624 | none | stopped on `0xe6cf3073`, ARMv6 `UXTB16 r3, r3`, in user mode | 253 pages / 0.99 MiB; target 250; low 97 at 2,934,505,472 |
+| 2.85 B → 2.98 B, paired-extend fix | 2.97 B | cleared `0xe6cf3073`; status `OK`; 2 `_load_machfile`, 400 code validations, 4,266 SWIs, 3,373 Unix syscalls | 214 pages / 0.84 MiB; target 250; low 97 at 2,934,505,472 |
+
+The 58.93 MiB figure above is the earlier post-layout pool, not the amount left
+after this much userspace activity. Direct streaming removed a second host-side
+copy but the roughly 445 MiB RAM disk remains pinned guest memory below
+`topOfKernelData`. The latest run went 153 pages below the guest's free target,
+recovered to three pages above it before the former opcode stop, then ended 36
+pages below target at 2.98 B. That movement suggests XNU's reclamation path is
+active, but the available headroom is still unsafe for the app. The storage
+audit also proved that setting md physical mode and adding an external bus
+aperture is insufficient: this kernel's `_bcopy_phys` only applies the normal
+DRAM direct-map delta. The near-term design therefore needs a narrowly scoped,
+writable bulk-copy bridge for md strategy, plus snapshot backing identity and
+overlay state; full NAND remains the higher-fidelity, much larger route.
+
+This chain is stronger evidence for sustained userspace and snapshot
+repeatability. It is **not** evidence that SpringBoard rendered: the runs used
+the serial debugging configuration and captured no SpringBoard frame. The
+bounded continuations either reached their configured caps or, for the one
+diagnostic interval, stopped fail-closed on the named `UXTB16` encoding.
 
 ---
 
@@ -845,21 +936,20 @@ moved where the kernel builds its page tables and produced a prefetch abort at
 the top of DRAM, so we do too, and `topOfKernelData` again describes only the
 kernel's data.
 
-What is *not* there yet: `AppleH1CLCD`, the display controller at
-`/device-tree/arm-io/clcd` (physical 0x38900000, interrupt 13), and
-`AppleMerlotLCD`, which needs a non-zero `lcd-panel-id` at
-`/device-tree/arm-io/spi0/lcd0`. The kernel is drawing into a buffer, not
-driving a panel.
+What was *not active in this recorded run*: `AppleH1CLCD`, the display
+controller at `/device-tree/arm-io/clcd` (physical 0x38900000, interrupt 13),
+and `AppleMerlotLCD`, which needs a non-zero `lcd-panel-id` at
+`/device-tree/arm-io/spi0/lcd0`. The kernel drew into its boot framebuffer but
+did not drive the panel path.
 
-To be precise about *why*, since an earlier draft of this section got it
-wrong: the CLCD is modelled — `core/src/soc/clcd.c` is 384 lines with tests.
-`AppleH1CLCD` executes zero instructions, so it never reads those registers.
-It is also not a driver that programs the display: it reads `CLCD_CTRL`,
-adopts the first enabled window, and wraps that window's pitch, base and
-geometry in the IOSurface that becomes the screen. With `CLCD_CTRL == 0` the
-loads are predicated off and it builds the surface out of uninitialised
-callee-saved registers — so something must seed a window first. Wiring that buffer to the app's Metal view — and giving the
-LCD kexts something to bind to — is M5 work.
+To be precise about *why*, since an earlier draft of this section got it wrong:
+the CLCD was already modelled — `core/src/soc/clcd.c` has tests — but this trace
+left `CLCD_CTRL == 0`. `AppleH1CLCD` is not the component that programs a display
+window; it adopts the first enabled window and wraps its pitch, base and geometry
+in the IOSurface that becomes the screen. The current CLI can seed window 0,
+patch the Merlot panel ID and capture the controller's active window. The app's
+CoreGraphics view can display its synthetic guest's CLCD buffer, but it is not
+wired to a shared real-guest session. Touch remains separate M5 work.
 
 ---
 

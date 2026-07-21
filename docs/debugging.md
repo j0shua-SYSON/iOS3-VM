@@ -1,9 +1,9 @@
 # Diagnosing a wedge
 
-The same procedure has now been run six times, and each time it found the bug:
-ADMFMC, the MBX GPU driver, the IORTC wait, the TTBR abort storm, the post-SDIO
-silence, and launchd's failing page hash. It was rediscovered from scratch every
-time. This document is that procedure, written down.
+The same procedure has repeatedly found the bug: ADMFMC, the MBX GPU driver, the
+IORTC wait, the TTBR abort storm, the post-SDIO silence, launchd's failing page
+hash, the VFP restore, and the ARMv5TE DSP multiply stop. It was rediscovered
+from scratch too many times. This document is that procedure, written down.
 
 The shape of the problem is always the same. The boot stops making progress, and
 it does so **without panicking** — a panic would tell you where you are. What you
@@ -26,13 +26,24 @@ build/core/bootkernel firmware/kernel.macho \
 ```
 
 `-R 512` is not cosmetic: `arm_vm_init` hardcodes `virtual_avail = 0xe0000000`,
-so advertising more than 512 MB makes `zone_virtual_addr` index an empty
-`pv_head_table` and fault during `zone_bootstrap` (commit `5625f5c`). The
+so advertising more than 512 MiB at the documented virtual base makes
+`zone_virtual_addr` index an empty `pv_head_table` and fault during
+`zone_bootstrap` (commit `5625f5c`). The current machine also rejects a larger
+physical aperture because `[0x08000000, 0x28000000)` is exactly 512 MiB and NOR
+begins at `0x28000000`. Historical 768 MiB commands are rejected, not fallback
+recipes. The
 `nand-enable-adm=0` boot-arg is what stops `AppleS5L8900XADMFMC::start` from
 panicking on a NAND controller we do not model. Two more workarounds are applied
 automatically and printed in the header, so they are never invisible: the IORTC
 wait is patched from 30 seconds to 0, and the `mbx` node's `compatible` string is
 broken so the PowerVR driver does not match.
+
+Large-input memory is part of the preflight. Current `bootkernel` proves all
+static ranges are inside DRAM and pairwise disjoint, then streams the rootfs
+through a retained source handle directly into its final guest address. It does
+not hold a second roughly 445 MiB grown-image buffer. A source metadata change,
+short read, overflow, overlap, or out-of-range placement fails before guest
+execution.
 
 Everything the tool did to the machine before the first instruction — segments,
 patches, device-tree edits, ramdisk placement, `boot_args` — is echoed at the top
@@ -121,8 +132,8 @@ byte offset. A silently empty map is exactly what would waste the next cycle.
 
 ## 3. "Make the loop bearable" — snapshot and restore
 
-A cold boot to the frontier is minutes. Snapshot/restore (`95eaf8b`) makes the
-second and every subsequent iteration seconds:
+Snapshot/restore (`95eaf8b`) reduced one historical desktop replay. It does not
+establish the duration of the current frontier or every later iteration:
 
 ```sh
 # save the machine at a checkpoint (up to 8 per run)
@@ -134,8 +145,17 @@ build/core/bootkernel firmware/kernel.macho -d ... -r ... -R 512 \
     -n 400000000 --restore /tmp/at200M.snap
 ```
 
-Measured: cold to 900 M instructions is 140 s; restore-at-200 M and run to 900 M
-is 34 s.
+Historical development-host/commit measurement: cold to 900 M instructions was
+140 s; restoring at 200 M and running to 900 M was 34 s. Current source and
+current-frontier timing must be measured again. The stronger current functional
+result is a real-guest chain restored at 2.2, 2.4 and 2.7 B, with new checkpoints
+at 2.4, 2.7 and 2.85 B, followed by a normal 2.9 B cap stop. The 2.4 B → 2.8 B
+window observed a new `_execve` at 2,605,595,575 and `systemShutdown false`.
+A diagnostic continuation from 2.85 B then stopped at instruction
+2,944,340,624 on `0xe6cf3073`, ARMv6 `UXTB16 r3, r3`, in user mode.
+After the complete paired-extend implementation landed, replaying that same
+checkpoint cleared the stop, wrote a 2.97 B snapshot and reached a normal
+2.98 B cap.
 
 Three things about it will bite if you do not know them:
 
@@ -156,6 +176,27 @@ Three things about it will bite if you do not know them:
 repeating: comparing two snapshot *files* is not sufficient, because a field the
 format never stores is absent from both sides and cancels out. It therefore also
 prints a machine-derived report to diff.
+
+**Do not blindly extend the latest checkpoint yet.** Free pages fell from 2,004
+at 2.45 B to 542 at 2.8 B and 317 at 2.9 B. The diagnostic continuation reached
+a low of 97 pages at 2,934,505,472, recovered to 253 near the former opcode
+stop, and ended at 214 at 2.98 B against a target of 250. That movement is evidence of reclamation, not proof that
+the layout is safe. The RAM disk remains pinned guest memory even though its
+host-side duplicate is gone. The storage audit has ruled out a simple external
+aperture and selected a writable, range-gated md bulk-copy bridge with snapshot
+coupling; implement and test that bounded path before app integration or an
+unbounded continuation.
+
+### WFI changes elapsed device time, not the instruction coordinate
+
+XNU spends substantial time in the ARM1176 CP15 wait-for-interrupt form. The
+machine now recognizes that exact privileged instruction and advances timer and
+CLCD state to the earliest enabled VIC wake edge. It does **not** increment the
+CPU's retired-instruction counter for the skipped wait. This distinction matters
+when comparing an older snapshot or profile: the same amount of emulated time
+can contain fewer idle instructions, while `--snapshot-at` still names an exact
+retired-instruction coordinate. If no future wake is known, the callback makes
+no speculative leap.
 
 ---
 
@@ -179,6 +220,19 @@ The guest clock is the tie-breaker between "slow" and "wedged": if the timebase
 has frozen, the machine is in a loop that never takes an interrupt, and it is a
 spin rather than progress.
 
+For a user-mode undefined stop, do not read the numerical PC out of guest RAM as
+if it were physical. The abnormal-stop report now translates the current VA
+through the live MMU, prints the physical fetch mapping, and prints the fetched
+instruction word. That is how the post-VFP stop became the exact statement
+`0xe1630381` at VA `0x33dba604` = `SMULBB r3, r1, r3`, rather than "somewhere in
+userspace". The complete related ARMv5TE family was then implemented and the
+2.2 B checkpoint resumed through that address; chained restores reached the
+2.9 B cap. The same report then identified `0xe6cf3073` as the next user-mode
+blocker at instruction 2,944,340,624. Keep this translation in the report;
+userspace has no kernelcache symbol to save a bad fetch assumption later.
+The complete paired-extend implementation replayed through that exact address
+to a clean 2.98 B cap, which is the required semantic confirmation.
+
 ---
 
 ## 4a. "Which code path did it take?" — count the instructions
@@ -187,11 +241,12 @@ This one is new, and it is the cheapest oracle in the toolbox: **an instruction
 count between two milestones tells you which implementation ran.**
 
 The launchd signature bug is the worked example. `cs_validate_page` was reaching
-`bad_hash`, which by definition means our bytes were wrong — except two
-independent from-scratch verifications said the disk image was perfect (a UDIF
-verifier over every `blkx` CRC32, and an HFSX reader that checked code-directory
-page hashes for all 155 signed Mach-Os and 6,731 code pages on the volume; zero
-mismatches).
+`bad_hash`, which by definition means our bytes were wrong — except two private,
+untracked historical verifications reported that the disk image was perfect (a
+UDIF verifier over every `blkx` CRC32, and an HFSX reader that reported
+code-directory page hashes for all 155 signed Mach-Os and 6,731 code pages on
+the volume; zero mismatches). Those tools and outputs are not in the public tree,
+so this is not a reproducible current check.
 
 The resolution came from arithmetic, not disassembly. `SHA1Transform` is ~2,262
 Thumb instructions per 64-byte block, so hashing a 4096-byte page in software must
@@ -223,8 +278,9 @@ Most of this project's wall-clearing has been device whack-a-mole: model one mor
 peripheral, un-match one more driver, patch one more wait. Two fixes were not
 that shape at all. Honouring **TTBCR.N / TTBR1** (`e97934d`) and setting
 **DFSR.WnR** (`85c4653`) were each a single architectural gap in the CPU, and
-each one unblocked a dozen symptoms at once — the first started the entire IOKit
-driver tree, the second reached userspace. Both presented exactly as another
+each one unblocked a dozen symptoms at once — the first unblocked a broad set of
+IOKit drivers observed in that run, and the second reached userspace. Both
+presented exactly as another
 device problem would: a spin in an unsymbolized kext. The question worth asking
 early, before modelling the next peripheral, is *"could one thing the CPU itself
 gets wrong explain all of these?"*

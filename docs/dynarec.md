@@ -1,15 +1,18 @@
 # Dynamic recompilation: ARMv6 → arm64
 
-How iOS3-VM stops being 60x too slow.
+How iOS3-VM is intended to close a large historically measured interpreter gap.
+The target-device gap has not been measured.
 
 This document is a **design**. Part of J2 now exists; §0 records exactly how
 much, and the rest of the document is still ahead of the code.
 
 Every factual claim is labelled:
 
-- **CONFIRMED** — measured or read directly out of this repository at
-  `65c9240`, by the commands shown. Reproduce it before trusting it. Where a
-  CONFIRMED claim has since been *acted on* — the missing `-O` flags in §1.1/§1.5,
+- **CONFIRMED** — recorded as measured or read directly out of this repository
+  at `65c9240`, with the source identified. This label does not by itself mean a
+  public clone can reproduce it: measurements made with an untracked scratch
+  harness are marked historical/private below. Where a CONFIRMED claim has
+  since been *acted on* — the missing `-O` flags in §1.1/§1.5,
   the snapshot proposal in §11.2 — it is struck through or marked, rather than
   deleted, so the measurement that motivated the change is still readable.
 - **INFERRED** — follows from something confirmed plus how ARMv8 / iOS / this
@@ -20,24 +23,27 @@ Every factual claim is labelled:
 The headline conclusions, up front, because two of them are not what you would
 expect:
 
-> **1. There is a measured 5–6x sitting on the floor that is not a JIT.** ~~The
-> committed build compiles the core with *no optimiser at all*.~~ **Taken:** the
+> **1. A measured 3x build win landed; further non-JIT gains are projected.** ~~The
+> historical `65c9240` baseline compiled the core with *no optimiser at all*.~~ **Taken:** the
 > top-level `CMakeLists.txt` has defaulted to `Release` since `b3940fa`, worth a
-> measured **3.0x on a real kernel boot**. The software TLB — another **~2x**, and
-> the JIT's memory fast path anyway — is still on the floor.
+> measured **3.0x on a real kernel boot**. The software TLB and tick batching are
+> still design estimates; they must not be folded into current throughput.
 >
-> **2. The JIT should start after the first SpringBoard frame renders, not
-> before — but the thing that makes M5's iteration loop bearable is
-> snapshot/restore, not the JIT.** A boot to SpringBoard is billions of
+> **2. The tested translator foundation is not a reason to enable boot dispatch.
+> First establish the shared real-guest session; continue using the
+> now-reproducible CLI frontier and snapshot/restore to reduce replay distance.**
+> A boot to SpringBoard may be billions of
 > instructions; no realistic interpreter speed makes that a fast edit-run loop,
 > and no realistic *JIT* speed does either. Save the machine after the kernel is
-> up and resume from there. **Done, and it worked** — see §11.2.
+> up and resume from there. CLI snapshot/restore landed, reduced one historical
+> replay, and has now carried a real guest from 2.2 B through checkpoints at
+> 2.4, 2.7, 2.85 and 2.97 B to a clean 2.98 B cap. The chain isolated an ARMv6
+> `UXTB16` stop at 2,944,340,624 and then replayed through its fix (§11.2).
 >
-> **3. Do not promise realtime.** An honest, well-built block JIT on this host
-> lands at **0.15–0.45x** of the guest's nominal 412 MHz (§10.3). That is
-> "SpringBoard responds to your finger and animates at roughly quarter speed",
-> which is the difference between a screenshot and a demo. It is not
-> "indistinguishable from a real iPhone", and scheduling should not assume it.
+> **3. Do not promise realtime.** The model projects a mature block JIT at
+> **0.15–0.45x** of the guest's nominal 412 MHz (§10.3), but no A9 throughput has
+> been measured. If the quarter-speed region holds, it may separate a static
+> frame from an interactive demo; scheduling must treat that as a hypothesis.
 
 ---
 
@@ -48,30 +54,31 @@ default build and the boot path are untouched):
 
 | | State |
 |---|---|
-| `core/src/jit/a64_emit.c` — AArch64 emitter | **works**, 172 byte-exact assertions in `core/tests/test_a64_emit.c`, including an exhaustive check of the bitmask-immediate encoder against an independent `DecodeBitMasks` |
-| `core/src/jit/jit_translate.c` — block translator | **works** for a small ARM subset **and a measured-useful Thumb-1 subset**; 286 assertions in `core/tests/test_jit.c` on block shape and emitted words |
-| `core/src/jit/jit_mem.c` — code-buffer shim | plain RWX and `MAP_JIT` + `pthread_jit_write_protect_np`; dual mapping is not implemented (§8.2 explains why it would not help on iOS anyway) |
+| `core/src/jit/a64_emit.c` — AArch64 emitter | **works in structural and macOS arm64 execution tests**, including an exhaustive check of the bitmask-immediate encoder against an independent `DecodeBitMasks` |
+| `core/src/jit/jit_translate.c` — block translator | **works in tests** for a narrow ARM subset **and a measured-useful Thumb-1 subset**; unsupported forms are declined |
+| `core/src/jit/jit_mem.c` — code-buffer shim | supports plain RWX on arm64 iOS/Linux and `MAP_JIT` + `pthread_jit_write_protect_np` on macOS; CI executes the macOS policy and structurally tests the allocator elsewhere, while the iOS workflow only compile-checks this module. The app target does not link or dispatch it, and no target-phone execution result is recorded |
 | §3.4 dispatch, §3.5 chaining, §3.6 invalidation | **not built.** There is no code cache, so nothing calls the translator yet |
 | §6.1 software TLB (J1) | **not built.** Loads and stores go through a helper that calls `arm_mmu_translate` directly |
-| Thumb (J4) | **translation done**, 93.54% of retired Thumb instructions (see below) |
+| Thumb (J4) | **broad Thumb-1 subset translated**, covering 93.54% of retired Thumb instructions in the recorded sample (see below); excluded forms remain |
 
 ARM coverage is deliberately narrow: data-processing with a rotated immediate
 or an immediate-shifted register, `LDR`/`STR` word and byte with an immediate
 offset and no writeback, and `B`/`BL` — all with condition codes.
 
-Thumb coverage is broad, because §1.3 says it has to be. Everything in the
-16-bit space is translated except the block transfers (`PUSH`/`POP`/`LDMIA`/
-`STMIA`), the four shift-by-register ALU forms, the hi-register forms that
-write PC, and the mode-changing and undefined space.
+Thumb coverage is broad, because §1.3 says it has to be. The translator still
+declines block transfers (`PUSH`/`POP`/`LDMIA`/`STMIA`), the four
+shift-by-register ALU forms, hi-register forms that write PC, `REV`/`REV16`/
+`REVSH`, and the system, exception and undefined space.
 
 **Everything else, including every form listed as DECLINED or DEFERRED in
-`jit_translate.c`, ends the block and is executed by `arm_step()`**, which is
-§2's rule and is verified by a test that denies every class and checks the
-translator then declines everything.
+`jit_translate.c`, is rejected by the translator.** The future dispatcher must
+end/synchronise the block and execute that instruction with `arm_step()`, which
+is §2's rule. Current tests verify the decline decision, not a dispatcher that
+does not exist.
 
-**Measured coverage** (method as §1.1: first 20,000,000 retired instructions of
-the real `iPhone1,2_3.1.3_7E18` kernelcache; each retired instruction probed by
-translating a one-instruction block at its PC), **CONFIRMED**:
+**Historical private coverage measurement** (method as §1.1: first 20,000,000
+retired instructions of the real `iPhone1,2_3.1.3_7E18` kernelcache; each
+retired instruction probed by translating a one-instruction block at its PC):
 
 | | before J4 | after J4 |
 |---|---|---|
@@ -79,7 +86,7 @@ translating a one-instruction block at its PC), **CONFIRMED**:
 | …of the ARM 31.05% | 77.17% | 77.17% |
 | …of the Thumb 68.95% | 0.00% | **93.54%** |
 
-The 11.54% still handed to `arm_step()` is 7.09% ARM (LDM/STM, exclusives,
+The 11.54% still declined for future `arm_step()` fallback is 7.09% ARM (LDM/STM, exclusives,
 multiplies, MCR/MRC, PC-writing forms, the unconditional space) and 4.45%
 Thumb, itemised in the DECLINED table at the head of the Thumb section of
 `jit_translate.c`. The single largest remaining item in either instruction set
@@ -88,52 +95,55 @@ says must be a state helper wrapping the interpreter's own
 `exec_block_transfer`, and which therefore needs the full-sync helper ABI of
 §4.4 rather than more decoding.
 
-Not yet demonstrated: that emitted code executes correctly. The dev box is x86.
-`core/tests/test_jit_exec.c` runs the emitted code and lockstep-compares a
-translated block against the interpreter, but it only does so on an arm64 host
-and skips itself elsewhere; the `jit` job in `.github/workflows/core-tests.yml`
-is what puts it on Apple Silicon runners. A `SKIP` on a macOS runner would mean
-that coverage silently vanished, so read the log rather than the badge.
+Emitted code **has executed correctly in macOS arm64 CI**:
+`core/tests/test_jit_exec.c` runs emitted instructions and compares the final
+architectural state and touched RAM of short translated blocks against the
+interpreter. The test can skip on an unsupported local host, but hosted macOS CI
+explicitly rejects a skip or plain-RWX fallback and requires the `MAP_JIT` path.
+This proves the focused host test path; it does not prove per-instruction
+lockstep, boot integration or execution on the target iPhone.
 
-### 0.1 How much of a JIT this is: about 15%
+### 0.1 A tested translation foundation, not an active JIT
 
-Stated as a number because "foundation merged" is the kind of phrase that quietly
-becomes "we have a JIT".
+Keep translation eligibility, test execution and boot execution separate:
 
 | | |
 |---|---|
-| Emitted-code coverage of retired instructions | **~31% ceiling** — ARM only. Thumb is 68.95% (§1.3) and is declined outright |
-| Actual coverage today | far below that ceiling: only the narrow ARM subset listed above translates natively |
-| Speed of a translated block **today** | **worse than interpreting it.** Mean run is 8.1 instructions (§1.3) against a ~37-instruction prologue/epilogue, and with no chaining every block pays it |
-| Blocks executed in a boot | **zero.** There is no code cache and no dispatcher, so nothing calls the translator from the run loop |
+| Translation eligibility in the historical private 20 M-instruction sample | **88.46%** after Thumb support (§0); remaining forms would be handed to the interpreter once a dispatcher exists |
+| Emitted code executed by tests | **yes, on macOS arm64 CI**, including a small interpreter/JIT lockstep comparison |
+| Blocks executed by a machine boot | **zero.** There is no code cache or dispatcher, so the run loop never calls the translator |
+| On-device translator result | **unknown.** The app excludes `core/src/jit/**`; startup reports only non-executing policy hints |
 
-Everything that turns those rows around is §3 (cache, dispatch, chaining,
-invalidation), §6.1 (the software TLB), and J4 (Thumb) — which is to say, most of
-this document. The merge exists so the emitter and translator stop rotting
-against a core that is moving fast, and so their tests run in CI on every push.
-It is not a step towards shipping the JIT sooner than §11 says.
+Everything that turns boot execution around is §3 (cache, dispatch, chaining,
+invalidation), §6.1 (the software TLB), the state-sync/helper boundary and the
+remaining declined forms. The foundation exists so it stays tested against a
+moving core. It is not an active execution engine and should not be marketed as
+one.
 
-**What it does already prove** is worth keeping separate from what it does not:
-the AArch64 encodings are byte-exact against an independent decoder, the
-translator declines everything it does not handle (verified by a test that denies
-every class and checks it then declines the lot), and the "JIT is a layer over the
-interpreter" rule of §2 holds in code rather than only in prose.
+**What it does already establish** is worth keeping separate from what it does
+not: the tested AArch64 encodings agree with an independent decoder, and the
+translator declines forms it does not handle. The second half of §2's rule —
+synchronising state and falling back to `arm_step()` — is not implemented because
+the dispatcher does not exist.
 
 ---
 
 ## 1. The measurements this design is built on
 
-A dynarec designed from general principles will optimise the wrong things. Every
-structural decision below is anchored to a number measured on this repository.
+A dynarec designed from general principles will optimise the wrong things. The
+design below is anchored to recorded measurements, including the historical
+private dataset qualified here.
 
 **Method.** Host: the project's Windows dev box, x86-64, MinGW GCC 15.2. Guest
-workload: the real `iPhone1,2_3.1.3_7E18` kernelcache already in `firmware/`,
-run by `tools/bootkernel.c`, first 20,000,000 retired instructions
+workload: a user-supplied `iPhone1,2_3.1.3_7E18` kernelcache in the git-ignored
+`firmware/` directory, run by `tools/bootkernel.c`, first 20,000,000 retired instructions
 (`bootkernel firmware/kernel.macho -d firmware/devicetree.bin -n 20000000`). The
 instruction-mix figures come from a patched *copy* of that tool in a scratch
 directory, classifying each instruction at the point it is about to retire using
-the interpreter's own decode masks. Numbers are desktop numbers; the A9 will
-differ, and §10.3 says by how much and why that is a guess.
+the interpreter's own decode masks. That harness and its output are not tracked,
+so these are historical private measurements, not results reproducible from the
+public tree or guaranteed to describe current source. Numbers are desktop
+numbers; the A9 will differ, and §10.3 says by how much and why that is a guess.
 
 ### 1.1 How fast the interpreter really is
 
@@ -191,14 +201,14 @@ do per instruction:
    the honest one.
 2. **The device tick costs a fifth of the interpreter.** `s5l8900_tick` runs a
    64-bit divide *and* a 64-bit modulo per guest instruction to convert retired
-   instructions into timebase ticks at the 412 MHz : 6 MHz ratio
-   (`core/src/soc/machine.c:229`). One tick per instruction is also 68x finer
+   instructions into timebase ticks at the 412 MHz : 6 MHz ratio in
+   `s5l8900_tick()`. One tick per instruction is also 68x finer
    than the timebase can represent.
 
 ### 1.3 What the guest actually executes
 
-First 20M instructions of the real kernel, classified at retirement
-(**CONFIRMED**):
+First 20M instructions of the real kernel, classified at retirement by the
+historical private scratch harness described above:
 
 | | share of retired instructions |
 |---|---|
@@ -246,36 +256,37 @@ Five design consequences, each of which changes what gets built first:
 4. **MMIO is statistically nonexistent** — about one access per 110,000
    instructions. The MMIO slow path needs to be *correct*, not fast. All the
    engineering belongs in the RAM fast path.
-5. **Interrupts are rare** (3 in 20M). Sampling them at block boundaries instead
-   of per instruction costs nothing in responsiveness.
+5. **Interrupts were rare in this early-kernel sample** (3 in 20M). That supports
+   testing block-boundary sampling; it does not prove later device-heavy paths
+   can use the same budget without observable latency.
 
 ### 1.4 What "realtime" means here, precisely
 
 The machine model defines guest time as a function of *retired instructions*:
 `S5L8900_CPU_HZ` (412 MHz) retired instructions advance the timebase by
-`S5L8900_TB_HZ` (6 MHz) ticks, with the remainder carried
-(`core/include/soc.h:142`, `core/src/soc/machine.c:229`). One retired
+`S5L8900_TB_HZ` (6 MHz) ticks, with the remainder carried by the machine's
+timebase accumulator. One retired
 instruction is charged as one CPU cycle, which `soc.h` correctly calls
 optimistic for an ARM1176.
 
 So:
 
 - **1.0x "realtime" by the model = 412 M guest instructions/sec.** At the
-  committed build's 1.26 M/s that is **327x short**; at an optimised 6.5 M/s it
-  is **63x short**. This is where the project's "60x" comes from, and it is the
-  number to quote.
+  historical `65c9240` baseline's 1.26 M/s that was **327x short**; at a projected
+  optimised 6.5 M/s it would be **63x short**. This is the origin of the
+  project's "60x" shorthand, not a current target-device measurement.
 - **1.0x "as fast as the phone actually felt" is a smaller number.** A real
   ARM1176 at 412 MHz does not retire one instruction per cycle; ~0.6 IPC is a
   fair figure for compiled code with cache misses on that pipeline
   (**INFERRED**). Matching the *observed* speed of a 2G iPhone therefore needs
   roughly **250 M insn/s**, not 412 M.
-- **Because guest time is tied to guest work, running slow does not break the
-  guest.** The kernel's decrementer, `mach_absolute_time`, and every timeout
-  scale together. A 4x-slow emulator is not a stuttering iPhone with watchdog
-  panics; it is an iPhone whose animations play at quarter speed and whose
-  touches are handled a quarter as fast. That is the property that makes a
-  sub-realtime JIT genuinely usable, and it is worth stating out loud before
-  anyone proposes chasing 1.0x.
+- **Because guest time is tied to guest work, running slow does not by itself
+  break the guest.** The kernel's decrementer, `mach_absolute_time`, and internal
+  timeouts scale together. In this model, a 4x-slow emulator would advance
+  animations and input handling at roughly quarter speed rather than inject
+  intermittent nominal-speed stalls. This does not prove every watchdog or
+  external-time interaction is harmless; it only explains why sub-realtime
+  execution may still be usable.
 
 ### 1.5 Three cheap wins that are not a JIT
 
@@ -285,11 +296,10 @@ So:
 | Software TLB in front of `arm_mmu_translate` | **~1.7–2.0x** (from §1.2's 5.91 → ~12 M/s ceiling) | *real* — see §6.1 | **no**: it *is* the JIT's memory fast path |
 | Tick devices once per batch instead of per instruction | **~1.2x** (§1.2) | low | **no**: it is required for the JIT to be differentially testable (§9.3) |
 
-Compounded, that is roughly **5–6x on the interpreter alone**, taking the
-committed build from ~1.3 M insn/s to ~7–8 M insn/s of real kernel code on this
-desktop, with no new instruction semantics written and therefore essentially no
-new correctness risk (the TLB excepted — §6.1 explains exactly where its danger
-is).
+Compounded, the design projected roughly **5–6x on the interpreter alone** from
+the historical ~1.3 M insn/s baseline to ~7–8 M insn/s of real kernel code on
+that desktop. Only the Release-build portion has been measured in the current
+history; TLB and batching gains remain estimates with correctness risk (§6.1).
 
 It also moves the JIT's job from "make up 327x" to "make up 60x", and every one
 of the three is a prerequisite or a co-requisite of the JIT. **None of it is
@@ -299,22 +309,24 @@ throwaway.**
 
 ## 2. The structural decision everything else depends on
 
-> **The JIT is a layer over the interpreter, never a replacement for it. Any
-> instruction the translator does not handle is emitted as a call to
-> `arm_step()`.**
+> **The JIT is intended to remain a layer over the interpreter, never a
+> replacement. Today unsupported forms are declined. The future dispatcher must
+> synchronize state, execute the declined instruction with `arm_step()`, and
+> resume without changing architectural behavior.**
 
-This single rule buys:
+Once the dispatcher implements it, this rule buys:
 
-- **Incremental delivery.** The JIT is useful at 20% instruction coverage. There
-  is never a "big bang" where the JIT must be complete before anything boots.
-- **A guaranteed correctness floor.** An instruction the JIT does not implement
-  cannot be implemented *wrongly*, because it is executed by the same C function
-  the 142-test suite covers and the boot has been debugged against.
-- **A debugging escape hatch.** `IOS3VM_JIT_DENY=<encoding-class>` forces any
-  class back to the interpreter, so a divergence can be bisected by *feature*,
-  not just by instruction address.
-- **Coverage of the ~5% the interpreter itself still traps** (media/DSP,
-  LDRD/STRD, VFP arithmetic, SETEND BE). The JIT inherits `ARM_UNDEFINED`
+- **Incremental validation.** A partial translator can be tested before broad
+  coverage, although dispatcher/helper overhead may make it slower than the
+  interpreter until much later.
+- **A conservative correctness floor.** An instruction the JIT does not implement
+  executes through the same C path covered by the evolving CPU suite and used by
+  the interpreter boot. State synchronization still needs differential tests.
+- **A debugging escape hatch.** `jit_set_deny(mask)` already forces translator
+  decline in tests. Once dispatch exists, expose an equivalent runtime switch so
+  a divergence can be bisected by *feature*, not only by instruction address.
+- **Coverage of forms the interpreter itself still traps** (selected media/DSP,
+  LDRD/STRD and SETEND BE). The JIT inherits `ARM_UNDEFINED`
   handling for free and never has to reimplement it.
 
 The interpreter therefore stays the specification. `arm_interp.c` must not be
@@ -397,7 +409,7 @@ typedef struct {
   `va` field enforces.
 - **`flags.THUMB` must be in the key.** The same address decoded as ARM and as
   Thumb is two entirely different programs. The interpreter switches on
-  `ARM_CPSR_T` at `arm_interp.c:1273`; the JIT switches at translate time.
+  `ARM_CPSR_T` in `arm_step()`; the JIT switches at translate time.
 - **`flags.PRIVILEGED` must be in the key**, because the emitted memory fast
   path selects the privileged or unprivileged TLB array at translate time
   (§6.1). (An alternative is to select at runtime from a register, at the cost
@@ -408,11 +420,14 @@ typedef struct {
   direct-mapped table. It is *not* strictly required — `pa` already disambiguates
   — but it makes the fast dispatch path (§3.4) correct without a translation on
   every block entry, and it is what the ARMv7 port will need anyway (§12).
+  Because the proposed field is only 16 bits, tag exhaustion must flush every
+  virtual jump/indirect cache and TLB entry before generation restarts. Silent
+  wrap would let a stale block from an old address space alias a new one.
 
 Deliberately **not** in the key: DACR, AP bits, SCTLR.M. Permissions are checked
 by the TLB at *runtime*, not baked into emitted code, so a permission change
 needs a TLB flush (§6.1) but not a code flush. Endianness is not in the key
-because the interpreter refuses `SETEND BE` (`arm_interp.c:1420`); if that ever
+because the interpreter refuses `SETEND BE`; if that ever
 changes, it joins `flags`.
 
 ### 3.4 Dispatch
@@ -427,7 +442,7 @@ switch invalidates the whole cache *implicitly*, without touching memory.
 
 **Tier 2 — the physical hash table.** On a tier-1 miss: translate `va` through
 the instruction TLB (filling it via `arm_mmu_translate` on a miss, which may
-raise a prefetch abort exactly as `arm_step` does at `arm_interp.c:1261`), then
+raise a prefetch abort through the same path as `arm_step()`), then
 look up `(pa, va, flags)` in an open-addressed hash table of all live blocks. On
 a miss, translate a new block. Then install the result in tier 1.
 
@@ -442,6 +457,10 @@ calls the dispatcher, which — if the target block exists and is in the same
 the cache maintenance of §8.4 for that one instruction. Every subsequent
 execution is a single branch. For a conditional branch, both edges are patched
 independently.
+
+An A64 `B` reaches only ±128 MiB. Keeping all blocks and chain stubs inside one
+bounded 64 MiB arena satisfies that constraint; every patch operation must still
+range-check the signed `imm26` and fall back to the dispatcher on failure.
 
 **Indirect branches** (BX, `LDM {..,pc}`, POP{pc}, `MOV pc,lr` — a large share
 of the 12.34% taken transfers, since every function return is one) cannot be
@@ -474,7 +493,7 @@ later page executable code in. The mechanism:
   not just their first — which is why blocks may not span pages (§3.2 rule 5).
 
 **(b) The guest executes a cache-maintenance operation.** CP15 c7 is currently a
-documented no-op (`arm_interp.c:266`). Under a JIT it becomes a free safety net:
+documented no-op in the interpreter's CP15 handler. Under a JIT it becomes a free safety net:
 treat `ICIALLU` as "flush the code cache" and `ICIMVAU` as "invalidate this
 page". Mechanism (a) should already have caught everything; honouring c7 costs
 nothing and covers any path where it did not (a host-side loader writing guest
@@ -496,15 +515,15 @@ all its time retranslating. It is the single strongest argument for including
 Measured: 5,463 distinct block entries in the first 20M instructions of kernel
 init (§1.3). Extrapolating to a full boot with kexts, launchd, and SpringBoard:
 **50k–300k blocks (GUESS)**. At ~8 guest instructions and ~4 host instructions
-per guest instruction plus a header, ~200 bytes/block → **10–60 MB**.
+per guest instruction plus a header, ~200 bytes/block → **10–60 MiB**.
 
-Allocate a **64 MB** RWX arena, bump-allocate into it, and on exhaustion **flush
+Start by testing a **64 MiB** arena ceiling, bump-allocate into it, and on exhaustion **flush
 everything**: drop all blocks, clear all bitmaps, reset the arena. No LRU, no
-per-block freeing — with 530x mean reuse the retranslation cost after a flush is
-recovered in milliseconds, and the bookkeeping saved is substantial. The app
-already carries `com.apple.developer.kernel.increased-memory-limit`
-(CONFIRMED, `app/iOS3VM.entitlements` per `ARCHITECTURE.md`), which is what
-makes 64 MB on top of a 128 MB guest RAM acceptable on a 2 GB device.
+per-block freeing. The recorded 530x mean reuse suggests retranslation may be
+cheap, but only dispatcher measurements can validate the flush cost. The app
+requests `com.apple.developer.kernel.increased-memory-limit`, but that is not a
+guarantee. A 64 MiB arena must be treated as a tunable upper bound and validated
+against the live memory budget after the shared, streaming guest session exists.
 
 **Flush is also a test tool**: a "torture mode" that flushes every N blocks
 exercises translation and invalidation paths that would otherwise run once
@@ -556,26 +575,25 @@ This is a happy accident worth spelling out, because it is the reason not to
 "improve" the mapping later.
 
 ARM banks r13/r14 per privileged mode and additionally banks **r8–r12 for FIQ
-only** (`arm_set_mode`, `arm_interp.c:83`). With r8–r12 memory-resident, the FIQ
-bank swap is *entirely* a memory-to-memory operation inside `arm_set_mode`, and
-that function works under the JIT completely unmodified. Only r13 (pinned in
-`x27`) and r14 (memory) need any JIT-side handling on a mode change, and r14 is
-already in memory.
+only** (`arm_set_mode`). With r8–r12 memory-resident, the proposed FIQ bank swap
+remains a memory-to-memory operation inside `arm_set_mode`. Only r13 (pinned in
+`x27`) and r14 (memory) need JIT-side handling on a mode change; r14 is already
+in memory.
 
-So the mode-switch protocol is: **spill `x19`–`x27` and NZCV to the
+The proposed mode-switch protocol is: **spill `x19`–`x27` and NZCV to the
 `arm_cpu_t`, call the interpreter's own `arm_set_mode`, reload.** Nine stores,
-one call, nine loads — and provably identical banking behaviour, because it *is*
-the interpreter's banking code.
+one call and nine loads. Reusing the interpreter's banking code reduces duplicate
+semantics; lockstep testing must still validate spill/reload state.
 
 ### 4.3 Mode switches
 
-Every instruction that can change mode ends a block (§3.2 rule 2) and is
-executed by a helper that wraps the interpreter's own path. There is no
+Every instruction that can change mode will end a block (§3.2 rule 2) and be
+executed by a helper that wraps the interpreter's own path. There is no planned
 JIT-native implementation of MSR, CPS, SRS, RFE, SWI, `MOVS pc,lr`, or
 `LDM {..,pc}^`. Measured cost of that decision: MCR/MRC is 0.52% of instructions
-and mode changes are rarer still. Measured benefit: the exception-return
-alignment bug family (§7.4) cannot recur in the JIT, because the JIT does not
-contain a second copy of that logic.
+  and mode changes are rarer still. Reusing the exception-return helper avoids a
+  second copy of the alignment rules (§7.4), while differential tests still have
+  to validate the state boundary.
 
 ### 4.4 The helper-call ABI
 
@@ -589,15 +607,20 @@ compiler preserves them automatically. The emitted call must only:
 ```
     mrs   x9, nzcv          // guest flags live in host flags
     stp   x9,  x30, [sp, #-16]!
-    bl    helper
+    movz/movk x16, helper   // executable mmap may be outside BL's ±128 MiB range
+    blr   x16
     ldp   x9,  x30, [sp], #16
     msr   nzcv, x9
 ```
 
+The current translator follows this indirect-call shape with `x16`/IP0. A direct
+`BL helper` is not safe unless its displacement has been range-checked.
+
 **State helpers** (LDM/STM, anything mode-changing, the `arm_step` fallback)
 need to see and modify the whole register file. They are preceded by a **full
-sync**: store `x19`–`x27` into `cpu->r[0..7]` and `cpu->r[13]`, store NZCV into
-`cpu->cpsr`, store the guest PC of the current instruction into `cpu->r[15]`;
+sync**: store `x19`–`x27` into `cpu->r[0..7]` and `cpu->r[13]`, merge only
+NZCV bits 31:28 into `cpu->cpsr` (preserving Q, interrupt masks, T and mode),
+store the guest PC of the current instruction into `cpu->r[15]`;
 and followed by a **full reload**. That is 5 STP + 5 LDP + 2 flag moves ≈ 12
 instructions.
 
@@ -629,9 +652,11 @@ condition-failed instruction (5.30% of retired instructions) is emitted as a
 `B.<inverse>` over its body, or as a `CSEL` for a single-register result.
 
 Guest NZCV live in the host NZCV between instructions **and across chained
-blocks**. The rest of CPSR (I, F, T, mode) is memory-only. The Q (saturation)
-bit does not exist in this design because the interpreter implements no
-saturating instruction.
+blocks**. The rest of CPSR (including I, F, T, mode and the sticky Q saturation
+flag) remains memory-resident. The interpreter implements QADD/QSUB/QDADD/QDSUB;
+the current translator declines those forms. Any future native translation must
+update and preserve `ARM_CPSR_Q` explicitly rather than treating NZCV as the
+whole flag state.
 
 ### 5.2 What does NOT map, and is exactly the trap the brief warns about
 
@@ -641,7 +666,7 @@ is invisible in ordinary code and fatal in a lock or a `memcmp`.
 **(1) A64 logical operations destroy C and V.** `ANDS`/`BICS` in A64 set N and Z
 from the result and set **C = 0, V = 0**. A32's `ANDS`/`ORRS`/`EORS`/`BICS`/
 `MOVS`/`MVNS` set N and Z, set **C from the barrel-shifter carry-out**, and
-**preserve V** (`alu_logic_flags`, `arm_interp.c:427`). A direct mapping is
+**preserve V** (`alu_logic_flags`). A direct mapping is
 therefore wrong in two flags at once.
 
 Emit instead: compute the value and its shifter carry-out separately, then
@@ -663,7 +688,7 @@ flags (§5.3).
 **(2) A64 has no register-shifted operand, and its shifts are modulo 32.**
 A32's `LSL Rm, Rs` with `Rs = 32` yields 0 with carry-out `Rm[0]`; `Rs > 32`
 yields 0 with carry-out 0; `Rs = 0` leaves the value and the carry *both*
-untouched (`barrel_shift`, `arm_interp.c:345`). A64's `LSLV Wd, Wn, Wm` uses
+untouched (`barrel_shift`). A64's `LSLV Wd, Wn, Wm` uses
 `Wm mod 32`, so a shift by 32 is a shift by 0 — the exact opposite answer. Every
 register-specified shift must be emitted as an explicit sequence:
 
@@ -690,7 +715,7 @@ through the carry: result `(C << 31) | (val >> 1)`, new carry `val & 1`. Emit:
 
 **(4) A32's immediate rotate sets C.** An 8-bit immediate rotated by a non-zero
 amount sets C from bit 31 of the *rotated* value; rotate 0 leaves C alone
-(`dp_operand2`, `arm_interp.c:387`). This is a translate-time constant — fold it
+(`dp_operand2`). This is a translate-time constant — fold it
 into the emitted flag update. Getting it wrong is invisible until a `MOVS
 r0,#0x80000000` feeds a later `ADC`.
 
@@ -711,8 +736,8 @@ first**:
 2. any instruction that reads flags (a conditional instruction, ADC/SBC/RSC,
    RRX, `MRS`);
 3. **any instruction that can fault** — a load, a store, or an `arm_step`
-   fallback — because a data abort captures CPSR into SPSR_abt
-   (`take_exception`, `arm_interp.c:132`), which makes the flags observable at
+   fallback — because `take_exception` captures CPSR into SPSR_abt, which makes
+   the flags observable at
    that point;
 4. any helper call (helpers may read `cpu->cpsr`).
 
@@ -732,10 +757,9 @@ must be fixed in both at once, later, deliberately.
 
 | Behaviour | Interpreter | Real ARM1176 | Where |
 |---|---|---|---|
-| C flag after `MUL`/`MLA` | unchanged | unpredictable | `arm_interp.c:848` |
-| C, V after `UMULL`/`SMLAL` | unchanged | unpredictable | `arm_interp.c:896` |
-| Unaligned `LDR` | reads straddling bytes (memcpy) | rotates within the word | `machine.c:95` (§6.5) |
-| CP15 unmodelled registers | read 0, writes ignored | vary | `arm_interp.c:249` |
+| C flag after `MUL`/`MLA` | unchanged | unpredictable | multiply decode in `arm_interp.c` |
+| C, V after `UMULL`/`SMLAL` | unchanged | unpredictable | long-multiply decode in `arm_interp.c` |
+| CP15 unmodelled registers | read 0, writes ignored | vary | CP15 handler in `arm_interp.c` |
 
 This table is a **maintenance obligation**: whenever the interpreter's choice
 changes, the JIT's must change in the same commit, and the differential harness
@@ -773,14 +797,19 @@ take the slow path (§6.3).
 
 **The TLB is the riskiest item in this whole document, and here is exactly
 why.** Today, CP15 c8 TLB maintenance is a no-op and that is *correct*, because
-there is no TLB to be stale (`arm_interp.c:267`). The moment a TLB exists, those
+there is no software TLB to be stale. The moment a TLB exists, those
 no-ops become load-bearing. The invalidation rules:
 
-- **Any** c8 operation → flush all six arrays (a 24 KB `memset` of tags). Do not
-  attempt per-VA invalidation; the cost of being wrong dwarfs the cost of being
-  conservative, and c8 ops are rare.
-- Any write to TTBR0/TTBR1/TTBCR/DACR/CONTEXTIDR/FCSE/SCTLR → flush, and
-  allocate/lookup a new `ctx` tag (§3.3).
+- **Any** c8 operation → flush all six arrays (a 24 KB `memset` of tags). It must
+  also invalidate the virtual and indirect jump caches and unlink chains—or,
+  initially, flush the entire code arena. Otherwise a same-context VA remap can
+  keep jumping directly to a block compiled from the old physical page even
+  though the software TLB was cleared. Do not attempt per-VA optimization first;
+  c8 operations are rare and stale code is catastrophic.
+- Any write to TTBR0/TTBR1/TTBCR/DACR/CONTEXTIDR/FCSE/SCTLR → flush the software
+  TLB and conservatively invalidate dispatch/chaining state, then allocate or
+  look up the new `ctx` identity (§3.3). Permission-only refinements can be
+  optimized after differential tests exist.
 - A guest store into a page that is *itself* a page table would leave a stale
   entry. This is safe **only** because of an architectural rule worth writing
   down: ARMv6 does not cache faulting translations, so an invalid→valid
@@ -830,26 +859,32 @@ and retries; otherwise it performs the access through `m->bus` — the same
 `bus_read`/`bus_write` the interpreter uses, so UART, VIC, timer, power, NOR and
 stub windows all behave identically with zero JIT-side code.
 
-Measured MMIO frequency: **~180 accesses per 20,000,000 instructions** (§1.3).
-Even at 200 host instructions each, that is 0.002% of runtime. **Spend no effort
-optimising MMIO.** This will shift once the framebuffer and LCD exist, but the
-framebuffer lives in DRAM (per the M4 work), so it stays on the fast path.
+Measured MMIO frequency in the recorded early-kernel sample: **~180 accesses per
+20,000,000 instructions** (§1.3). Even at 200 host instructions each, that was
+0.002% of runtime. **Do not optimise MMIO from that sample alone.** CLCD and the
+framebuffer now exist, and future SpringBoard, touch, audio and networking paths
+may change the mix; framebuffer payload bytes remain in DRAM.
 
 ### 6.4 Stores to code pages
 
 Covered in §3.6(a): code pages get **no** write-TLB entry, so their stores fall
 into `Lslow`, which invalidates before storing. Non-code pages pay nothing.
 
-### 6.5 Alignment, and an existing divergence
+### 6.5 Alignment contract
 
-The bus reads via `memcpy` (`machine.c:95`), so an unaligned word load currently
-returns the straddling bytes. Real ARMv6 with `SCTLR.U == 0` *rotates* the
-addressed word instead. A64 `ldur`/`ldr` on Normal memory permits unaligned
-access and yields the straddling bytes — i.e. **the JIT's natural behaviour
-matches the interpreter's current behaviour**, and both differ from hardware in
-the same way. That is the correct outcome for lockstep testing, and it belongs
-in §5.4's table so that if the interpreter is ever fixed, the JIT is fixed with
-it.
+The interpreter now models the ARM1176 `SCTLR.U/A` matrix instead of inheriting
+the host bus's `memcpy` behaviour. With `A=1`, misaligned ordinary word and
+halfword accesses raise an alignment fault before touching the bus. With
+`U=0,A=0`, word loads read the aligned word and rotate it while word stores
+align down; the unpredictable odd-address legacy halfword forms are refused
+without a bus access. With `U=1,A=0`, ordinary unaligned accesses use the
+straddling bytes, and an access crossing a guest 4 KB boundary translates each
+page independently. Multiword, coprocessor, swap and exclusive forms retain
+their stricter architectural alignment rules.
+
+The translated load/store helpers implement the same decisions before calling
+the shared MMU/bus path. Any future inline A64 memory fast path must preserve
+this matrix rather than relying on AArch64's naturally unaligned `ldr`/`str`.
 
 ---
 
@@ -865,11 +900,11 @@ XNU spinlock and atomic goes through them.
 logic. The monitor is two fields (`excl_valid`, `excl_addr`) and the rules are
 subtle in ways the codebase has already been bitten by:
 
-- `take_exception` clears the monitor, and the comment at `arm_interp.c:141`
-  records that omitting this produced two owners of one spinlock once interrupts
+- `take_exception` clears the monitor, and the nearby regression comment records
+  that omitting this produced two owners of one spinlock once interrupts
   started firing.
 - `CLREX` must be decoded *before* `PLD` because its encoding satisfies the PLD
-  pattern (`arm_interp.c:1315`) — an ordering bug that made a STREX that must
+  pattern — an ordering bug that made a STREX that must
   fail succeed.
 
 At 1.21% frequency, a ~25-instruction helper costs ~0.3 host instructions per
@@ -878,23 +913,26 @@ spectacularly bad trade. If profiling ever demands it, inline only the *load*
 half (`LDREX` = load + two stores) and keep `STREX` in a helper.
 
 The monitor must also be cleared wherever the interpreter clears it and nowhere
-else — which is guaranteed by using the interpreter's code.
+else. Reusing the interpreter helper reduces duplication, and lockstep tests
+must verify the surrounding synchronization.
 
 ### 7.2 Taking an IRQ/FIQ at a block boundary
 
 The interpreter samples `fiq_line` then `irq_line` at the top of *every*
-`arm_step` (`arm_interp.c:1244`). A JIT that did that would spend more on
+`arm_step`. A JIT that did that would spend more on
 sampling than on executing.
 
 **Plan:**
 
-- Interrupt lines are only *changed* by `s5l8900_tick`, which the JIT calls at
-  **sync points** — block boundaries where the accumulated instruction budget
-  has expired. Between sync points, the lines physically cannot change.
-  Therefore sampling at sync points is not an approximation of the interpreter;
-  with the batched-tick interpreter of §1.5 it is **exactly equivalent**, which
-  is what makes lockstep testing possible (§9.3).
-- The budget is 64 instructions (matching the block cap). The timebase advances
+- Timer-driven lines change through `s5l8900_tick`, but they are not the only
+  source. Guest MMIO can raise, acknowledge or mask VIC/software/device
+  interrupts, and future UART/network/audio queues can make device status
+  interruptible. Any MMIO helper that may change IRQ/FIQ state must end the block
+  or return a signal that forces an immediate poll before the next guest
+  instruction. Host threads enqueue events only; the CPU thread promotes them
+  into device/VIC state at a sync point. §9.3's lockstep comparison is the
+  required proof.
+- For timer-only progress, the proposed budget is 64 instructions (matching the block cap). The timebase advances
   once per ~68 CPU cycles (412 MHz : 6 MHz), so a 64-instruction sync interval
   is **finer than the guest's own clock resolution** — the guest cannot observe
   the batching through `mach_absolute_time`.
@@ -912,20 +950,20 @@ Measured interrupt frequency in kernel init: **3 FIQs in 20M instructions**. A
 
 The interpreter is careful here and the JIT must not be less so:
 
-- `note_abort` latches the *first* fault only (`arm_interp.c:39`).
-- Single loads do not write the destination if an abort is pending
-  (`arm_interp.c:622`), and writeback is skipped.
+- `note_abort` latches the *first* fault only.
+- Single loads do not write the destination if an abort is pending, and
+  writeback is skipped.
 - LDM/STM buffer every loaded word in `loaded[16]` and commit only after **all**
-  accesses have succeeded (`arm_interp.c:724`), so Rn and the destination
+  accesses have succeeded, so Rn and the destination
   registers are untouched and the handler can map the page and re-execute.
 
 **Plan:**
 
-1. **LDM/STM/PUSH/POP are always state helpers** — the interpreter's
+1. **LDM/STM/PUSH/POP will use state helpers** — the interpreter's
    `exec_block_transfer` / Thumb PUSH-POP path, called after a full sync. That
    is 5.18% of instructions at ~12 instructions of sync overhead: ~0.6 host
-   instructions per guest instruction, in exchange for the base-restored abort
-   model being *provably* identical. Later (J5) an inlined fast path may
+   instructions per guest instruction, in exchange for reusing the base-restored
+   abort model. Differential tests must establish equivalence. Later (J5) an inlined fast path may
    pre-probe the first and last address through the TLB and, on a hit for both,
    run an unchecked inline sequence — but only after the differential harness is
    trusted.
@@ -936,7 +974,7 @@ The interpreter is careful here and the JIT must not be less so:
    **block exit stub** that syncs state and enters the interpreter's data-abort
    path.
 3. **`cpu->r[15]` must be correct at every faulting instruction**, because
-   LR_abt is `pc + 8` (`arm_interp.c:1588`) and DFAR/DFSR are read by the
+   data-abort entry derives LR_abt as `pc + 8` and DFAR/DFSR are read by the
    handler. The translator therefore materialises the current instruction's
    guest PC into `cpu->r[15]` before any instruction that can fault. That is one
    `movz`/`movk` + `str` — measurably cheap and non-negotiable. (An optimisation
@@ -948,8 +986,8 @@ The interpreter is careful here and the JIT must not be less so:
 
 There is documented bug history here and it cost a real debugging session: the
 resume address must be aligned for the state the **SPSR restores**, not the
-state you are currently in (`arm_interp.c:564`, and again for RFE at
-`arm_interp.c:1402`). Forcing word alignment when returning into Thumb rewinds
+state you are currently in. The interpreter applies this rule to data-processing
+exception returns and RFE. Forcing word alignment when returning into Thumb rewinds
 the guest by two bytes and re-executes an instruction — the failure mode was a
 zone free unlocking a mutex at address 1.
 
@@ -966,8 +1004,8 @@ mismatches under the JIT, and it is a free JIT regression test.
 
 ### 7.5 The PC as an operand
 
-`reg_read` returns `pc + 8` for r15 in ARM state (`arm_interp.c:333`), and Thumb
-reads `pc + 4`, word-aligned for PC-relative loads (`arm_interp.c:918`, `:1003`).
+`reg_read` returns `pc + 8` for r15 in ARM state, and the Thumb decode uses
+`pc + 4`, word-aligned for PC-relative loads.
 
 Under a JIT this is **free**: at translate time the PC of each instruction is a
 constant, so `pc+8` / `pc+4` becomes an immediate materialised with `movz`/`movk`
@@ -984,7 +1022,7 @@ in `pc+12`, with differential tests covering the distinction.
 ### 7.6 Instruction → timebase tick accounting
 
 Today: `s5l8900_run` calls `s5l8900_tick(m, 1)` per instruction, and each call
-performs a 64-bit divide and modulo (`machine.c:236`). Measured cost: **21% of
+performs a 64-bit divide and modulo. Measured cost: **21% of
 interpreter throughput** (§1.2).
 
 **Plan, in three parts:**
@@ -997,11 +1035,11 @@ interpreter throughput** (§1.2).
    already written for this.
 2. **Replace the divide** with a reciprocal multiply-shift for the fixed
    412 MHz : 6 MHz ratio, falling back to the divide when `cpu_hz`/`tb_hz` are
-   set to anything else (the on-device self-test sets both to 1 —
-   `EmulatorViewController.m:124`, CONFIRMED — so the fallback is not
+   set to anything else (the app's synthetic self-test configures both as 1, so
+   the fallback is not
    hypothetical).
 3. **`cpu->cycles` must match the interpreter exactly**, including the
-   increments on exception entry (`arm_interp.c:1246`, `:1253`, `:1264`), since
+   increments on exception entry, since
    the differential harness compares it.
 
 **Do the batching in the interpreter first (J1).** It is a 20% interpreter win
@@ -1024,41 +1062,44 @@ no longer holds code.
 
 ### 8.1 What is confirmed
 
-- The app **already probes both preconditions at launch** and prints them:
-  `csops(CS_OPS_STATUS)` for `CS_DEBUGGED`, and a plain
-  `mmap(PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANON)`
-  (`app/Sources/EmulatorViewController.m:56`, CONFIRMED). The self-test labels a
-  successful RWX map "dynarec-ready".
+- The app **already reports two policy hints at launch**:
+  `csops(CS_OPS_STATUS)` for `CS_DEBUGGED`, and whether a plain
+  `mmap(PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANON)` succeeds. It
+  deliberately does not execute that mapping during startup. These hints are
+  useful preflight information, not proof that unsigned code can execute and
+  not an execution of the emulator translator.
 - The A9 predates **APRR** (A11) and **PAC**/**PPL** (A12), so there is no
   per-thread hardware W^X to toggle and no pointer authentication to satisfy
   (`ARCHITECTURE.md`, CONFIRMED as the project's stated position; INFERRED as
   silicon fact, though it is well established).
-- The device is jailbroken, and the jailbreak is what sets `CS_DEBUGGED`.
+- The intended device is jailbroken. Whether this app process receives
+  `CS_DEBUGGED` under that jailbreak has not been recorded.
 
-So on the intended host, the memory story is genuinely as simple as
-`mmap(RWX)` → emit → cache-maintain → branch to it.
+The intended fast path is `mmap(RWX)` → emit → cache-maintain → branch, but no
+successful output from an explicit execution diagnostic on the intended phone
+is recorded in this repository. Treat the device policy as unvalidated until it
+is observed there.
 
 ### 8.2 If CS_DEBUGGED is *not* set
 
 Be precise about this, because it is the difference between "ship it" and "there
 is no JIT".
 
-**What happens (INFERRED, not tested on this device):** the `mmap` call with
-`PROT_EXEC` may well *succeed* — the app's own self-test would print
-"dynarec-ready" — and the process is then killed with a code-signing violation
-the first time execution reaches an emitted instruction, or `mprotect` adding
-`PROT_EXEC` to a written page fails with `EPERM`. **The current self-test is
-therefore not sufficient evidence that the JIT will work**, and step one of J2
-is to extend it: emit a three-instruction function (`mov w0,#42; ret`), call it,
-and print the result. That is the real readiness check, it is twenty lines, and
-it should be added *now*, long before any JIT, so the answer is known.
+**What can happen (INFERRED, not tested on this device):** an `mmap` with
+`PROT_EXEC` can appear to succeed while a later branch is rejected, or
+`mprotect` adding `PROT_EXEC` can fail with `EPERM`. Startup now reports
+`CS_DEBUGGED` and whether an RWX `mmap` succeeds, but never takes the dangerous
+branch: a policy mismatch there could make every launch crash. A separate,
+explicit and recoverable diagnostic must emit, call and check a tiny function;
+its target-device verdict still needs to be run and recorded. It does not
+validate the translator or cache.
 
 **What to do about it, in order:**
 
-1. **Ask for it.** Dopamine/palera1n expose a "JIT enable" path (`jbdswDebugMe`
-   / `libjailbreak`'s `jb_enable_jit`), which sets `CS_DEBUGGED` on the calling
-   process. This is the intended mechanism and the app should call it at launch
-   and re-probe.
+1. **Ask for it through a host adapter if needed.** A supported jailbreak service
+   may be able to set `CS_DEBUGGED`, after which the app must re-probe. The
+   current app only observes the flag; it does not call `libjailbreak` or depend
+   on a tweak API.
 2. **Dual mapping (RW + RX of one memory object).** Create a Mach memory entry
    with `mach_make_memory_entry_64` and map it twice with `mach_vm_map` /
    `mach_vm_remap`, writing through the RW view and executing the RX view. This
@@ -1072,14 +1113,30 @@ it should be added *now*, long before any JIT, so the answer is known.
    what a future A12+ host will need, §12.)
 3. **W^X flipping** (`mprotect` RW → RX around each emission batch) is the
    fallback *shape* on hardware that enforces W^X, and costs a syscall plus a TLB
-   shootdown per batch. It is unnecessary on the A9 and, again, does not defeat
-   code signing. Design the code-buffer allocator as a thin platform shim
-   (`jit_buf_alloc / jit_buf_begin_write / jit_buf_end_write / jit_buf_commit`)
-   so all three policies are swappable and the macOS CI runner (which needs
-   `MAP_JIT` + `pthread_jit_write_protect_np`) is just another implementation.
-4. **No JIT at all.** The interpreter after §1.5 is ~5–6x faster than today's
-   committed build. That is the floor, and it is why §1.5 is worth doing
-   regardless of how the JIT question resolves.
+   shootdown per batch. It may be unnecessary on the A9 if an explicit execution
+   diagnostic confirms that policy; either way, it does not defeat code signing.
+   Keep code-buffer policy in a small platform module. The current module
+   implements plain RWX on arm64 iOS/Linux and `MAP_JIT` plus
+   `pthread_jit_write_protect_np` on macOS; dual mapping and generic `mprotect`
+   flipping remain design options, not implemented policies. Its lifecycle
+   operations (`jit_buf_alloc`, `jit_buf_free`, `jit_buf_begin_write`,
+   `jit_buf_end_write`, `jit_buf_commit`, `jit_block_commit`, `jit_buf_take` and
+   `jit_enter`) report failure rather than assuming success.
+
+   `jit_block_commit` binds a translated block's arena, code pointer/range,
+   allocation generation, write epoch, `code_words` and `insn_count`. Opening a
+   later outermost write scope conservatively invalidates every block in that
+   arena until it is recommitted; `jit_enter` refuses an uncommitted,
+   metadata-mismatched, open-for-write or stale-generation/epoch block and
+   returns the interpreter-fallback exit instead of branching into it. It does
+   **not** hash emitted bytes or bind `key`, `native_count` or `end_reason`, and
+   a direct write that bypasses the API on a plain-RWX mapping cannot advance the
+   epoch. API discipline and the future cache lock therefore remain part of the
+   safety boundary. This is implemented safety plumbing, not evidence that the
+   dispatcher or iOS execution path exists.
+4. **No JIT at all.** The Release-build interpreter is the current portable
+   floor. The old unoptimised baseline and the remaining J1 projections explain
+   why §1.5 still matters, but do not turn an estimate into current throughput.
 
 ### 8.3 Cache maintenance after emitting
 
@@ -1127,20 +1184,21 @@ more than one host thread).
   JIT frames. The cost is one register that was already spoken for.
 - The 16 KB page size on arm64 iOS does not interact with the *guest's* 4 KB
   pages, but the code arena must be 16 KB-aligned.
-- The app is fake-signed with `ldid -S` (CONFIRMED, `ARCHITECTURE.md`); adding
-  entitlements later is a build-script change, not a redesign.
+- The app is fake-signed with `ldid -S` and already embeds JIT-related entitlement
+  requests. Entitlement presence is not proof that target policy grants emitted
+  code execution.
 
 ---
 
 ## 9. Validation
 
-"It seems to boot" is not evidence. The plan is that **every JIT-executed block
-is provably equivalent to the interpreter executing the same instructions**, and
-that this is checked automatically, off-device, in CI.
+"It seems to boot" is not evidence. The plan is for **every JIT-executed block to
+be differentially checked against the interpreter executing the same
+instructions**, automatically and off-device where the host can execute arm64.
 
-### 9.1 The existing suite, with the JIT backend
+### 9.1 The existing suite, with the future JIT backend
 
-`core/tests/test_arm.c` (the CPU suite, ~142 cases) runs unchanged against the
+The evolving `core/tests/test_arm.c` CPU suite should run unchanged against the
 JIT by switching the engine. Every case must pass with:
 
 - the JIT enabled,
@@ -1149,11 +1207,11 @@ JIT by switching the engine. Every case must pass with:
 - the JIT enabled with **all encodings denied** (proves the `arm_step` fallback
   path is transparent).
 
-This is the cheapest possible signal and it must be green before anything else
-is attempted. It runs on the macOS arm64 CI runner; on x86 CI hosts the JIT
-compiles out and the suite runs interpreted, preserving the project's
-"sub-second tests on the dev box" property (which the JIT otherwise costs us —
-see §13).
+This is the cheapest possible signal and it must be green before boot dispatch
+is enabled. It is **not wired today**: the CPU suite still uses the interpreter.
+The much smaller `test_jit_exec` lockstep sample runs on capable macOS arm64 CI
+hosts, while x86 hosts skip emitted-code execution. Expanding that into this
+suite is part of the dispatcher work, not an existing gate.
 
 ### 9.2 Lockstep differential execution
 
@@ -1218,15 +1276,16 @@ towards the encodings §5 says are dangerous:
 - accesses that straddle a page boundary, and accesses that fault.
 
 Each generated case that diverges is minimised and added to `test_arm.c` as a
-permanent regression, exactly as the four firmware-found bugs were.
+permanent regression, following the existing firmware-found regressions.
 
 ### 9.5 Validating the TLB *before* the JIT exists
 
 The software TLB (J1) is a pure cache, so it has a free oracle: build with
 `IOS3VM_NO_TLB` and run the same boot. The two runs must produce **identical**
-instruction traces, identical UART output, and identical final state. That test
-should run over the full available boot on every CI build, and it is what would
-catch the stale-mapping hazard of §6.1.
+instruction traces, UART output and final state. A full Apple-firmware comparison
+belongs in a private, firmware-enabled workflow; public CI cannot obtain those
+inputs. Public CI should use focused synthetic page tables and a sanitized trace
+fixture to catch the stale-mapping hazard of §6.1.
 
 ### 9.6 Torture modes
 
@@ -1240,19 +1299,21 @@ once. Three switches, all usable with §9.2:
 
 ### 9.7 Trace replay, for cheap CI regression
 
-Record from the interpreter, once, a compact trace of the first N million
-instructions: `(block start VA, flags, instructions retired, 64-bit state hash)`
-at every sync point. Store it as a fixture. CI then runs the JIT against the
-fixture and asserts an exact match. This gives whole-boot coverage in CI without
-shipping Apple firmware (the fixture contains hashes and addresses, not code)
-— which matters, since `firmware/` is user-supplied and cannot be committed.
+For private firmware-enabled validation, record `(block start VA, flags,
+instructions retired, 64-bit state hash)` at every sync point and compare the
+JIT run against it. Hashes and addresses alone cannot drive translation: replay
+also needs the guest instruction bytes, which must not be committed from Apple
+firmware. Public CI therefore uses equivalent project-owned synthetic instruction
+streams; it cannot honestly claim whole-boot Apple-code coverage.
 
 ### 9.8 On-device parity
 
-The app's self-test panel already runs the core on the phone. Add: the RWX
-execution probe (§8.2), the CPU suite, and a short lockstep run. A JIT bug that
-appears only on the A9 (cache maintenance, alignment, `x18`) will not be caught
-anywhere else.
+The app's self-test panel already runs the interpreter and reports the guarded
+RWX-allocation preflight (§8.2); it intentionally does not execute generated
+code. Add an explicit diagnostic, the CPU suite and a short translator lockstep
+run once the JIT is linked into a non-production diagnostic build. A JIT bug
+that appears only on the A9 (cache maintenance, alignment, `x18`) will not be
+caught anywhere else.
 
 ---
 
@@ -1266,15 +1327,15 @@ stage.
 |---|---|---|---|---|
 | **J0** | **Build flags.** `CMAKE_BUILD_TYPE=RelWithDebInfo` (or an explicit `-O2`) for the core and tools; keep a debug configuration for bisecting. | `bootkernel -n 20000000` drops from 15.9 s to 5.3 s on the dev box. | **3.0x** | **measured** |
 | **J1** | **Software TLB + batched device ticks + `arm_run(cpu, budget)`.** Interpreter only; no JIT, no new semantics. | Identical instruction trace and UART output to J0 (§9.5), at ~2x the speed. Real-kernel throughput on the dev box ~7–8 M insn/s. | **1.8–2.2x** | measured components (§1.2) |
-| **J2** | **JIT skeleton.** RWX allocator + on-device execution probe, code arena, block cache, dispatcher, and a translator that handles *only* ARM data-processing and direct branches; everything else calls `arm_step`. Lockstep harness (§9.2) built here. | The CPU suite passes with the JIT engine; the boot reaches the same instruction with a bit-identical trace; the first native block executes on the phone. | **0.9–1.2x** — probably no faster, possibly slower | INFERRED |
-| **J3** | **ARM completeness + memory fast path + block chaining.** All ARM encodings the interpreter implements, the §6.2 inline sequence, direct chaining, budget checks on back-edges only. | Boot to the current M4 stopping point, bit-identical, several times faster. | **3–5x** over J1 | GUESS, bounded by the mix in §1.3 |
-| **J4** | **Thumb.** The 16-bit encodings and interworking. *Translation landed early, ahead of J3; PUSH/POP did not — see §0.* | The same boot again, now with 88.46% of retired instructions natively translated (measured, §0). | **2–3x** over J3 | INFERRED from the measured 68.95% Thumb share |
+| **J2** | **JIT skeleton.** The emitter, allocator shim, ARM/Thumb translator, host execution tests and non-executing app preflight have landed early. The persistent block cache, dispatcher, boot lockstep and opt-in on-device execution proof have not. The future dispatcher sends unsupported instructions to `arm_step`. | The CPU suite passes with the JIT engine; the boot reaches the same instruction with a bit-identical trace; the first translated block executes on the phone. | **0.9–1.2x** — probably no faster, possibly slower | INFERRED |
+| **J3** | **ARM completeness + memory fast path + block chaining.** All ARM encodings the interpreter implements, the §6.2 inline sequence, direct chaining, budget checks on back-edges only. | Reach the same real-firmware frontier as the interpreter on the same commit, bit-identical, several times faster. | **3–5x** over J1 | GUESS, bounded by the mix in §1.3 |
+| **J4** | **Thumb.** The 16-bit encodings and interworking. *Translation landed early, ahead of J3; PUSH/POP did not — see §0.* | The same boot again, with the recorded sample's 88.46% translation eligibility converted into actual dispatched blocks. | **2–3x** over J3 | INFERRED from the measured 68.95% Thumb share |
 | **J5** | **Polish.** Dead-flag elimination (§5.3), indirect-branch target cache (§3.5), inline LDM fast path (§7.3), r8–r12 block-local caching, PC-store elision. | Profile-driven; each item gated behind a switch and validated by §9.2 with the switch on and off. | **1.3–1.7x** | GUESS |
 
 ### 10.1 What this compounds to
 
-On the dev box, relative to the **committed** build's measured 1.26 M insn/s of
-real kernel code:
+On the historical development host, relative to commit `65c9240`'s measured
+1.26 M insn/s of real kernel code:
 
 - after J0+J1: **~3.5–4 M insn/s** measured-plus-inferred (the harness overhead
   is included; bare, ~7–8 M);
@@ -1283,7 +1344,8 @@ real kernel code:
 
 ### 10.2 What gets us to interactive, and what does not
 
-- **J0 and J1 do not.** They turn a 327x deficit into a 60x deficit. They make
+- **J0 and J1 do not.** The projection would turn the historical 327x deficit into
+  roughly a 60x deficit. They make
   the *developer loop* better and they are prerequisites. They are not the
   answer to interactivity.
 - **J2 does not, alone.** A partial-coverage JIT can be a net loss; expect and
@@ -1306,11 +1368,10 @@ I-cache pressure from emitted code than desktop cores):
 - = **0.15–0.45x** of the model's nominal 412 MHz
 - = **0.25–0.7x** of how fast the real phone actually felt (§1.4)
 
-**Plan on 0.25x. Do not promise 1.0x.** What 0.25x means in practice: the home
-screen appears, icons respond to taps, and page-flip animations run at roughly
-quarter speed. That is a demo and it is genuinely usable. It is not
-indistinguishable from hardware, and any schedule or public claim that assumes
-otherwise is built on a number nobody has measured.
+**Use 0.25x only as a planning scenario; do not promise 1.0x.** If the estimate
+holds after a real SpringBoard path, touch path and A9 dispatcher exist, the UI
+may advance at roughly quarter speed. Whether that is usable cannot be asserted
+before those measurements.
 
 The single biggest lever on that number is not in this table: it is whether J5's
 inline LDM path and dead-flag elimination land, and whether the A9's small L1I
@@ -1320,26 +1381,28 @@ with data.
 
 ---
 
-## 11. Recommendation: start now, or after M5?
+## 11. Recommendation: when to enable JIT boot dispatch
 
-> **Do J0 today. Do J1 next, before or during M5. Build the lockstep harness
-> (§9.2) during M5, because the interpreter benefits from it too. Start the JIT
-> proper (J2–J5) when the first SpringBoard frame renders — and solve M5's
-> iteration-time problem with snapshot/restore, not with a JIT.**
+> **J0 is done. First establish the shared, memory-bounded real-guest session so
+> the app and CLI exercise one machine. J1 and the lockstep harness (§9.2) can
+> proceed in parallel because the interpreter benefits from both. Do not enable
+> JIT boot dispatch merely because the current real-firmware frontier is now
+> reproducible: the shared app session and semantic/device blockers still come
+> first.**
 
-### 11.1 Why the JIT waits
+### 11.1 Why boot dispatch waits
 
 **Risks that waiting retires, all of them real:**
 
-- **The interpreter is still growing.** Media/DSP, LDRD/STRD, VFP arithmetic and
-  parts of the Thumb space still trap by design. Every instruction implemented
-  while the JIT exists is implemented **twice** and tested twice. M5 will add
-  more (SpringBoard's userland is more instruction-diverse than the kernel).
-- **The device model is still moving.** LCD, multitouch, the FTL, and the
-  network device of `networking.md` all change the memory map, and §6's TLB and
-  §3.6's invalidation are coupled to what counts as RAM.
-- **The JIT destroys the debugging tooling that has found every bug so far.**
-  Four genuine emulator bugs were found by real firmware plus per-instruction
+- **The interpreter is still growing.** Remaining media/DSP and doubleword
+  forms, plus whatever the next real userland run exposes, still trap by design.
+  Every instruction implemented while the JIT exists is implemented **twice**
+  and tested twice. SpringBoard is more instruction-diverse than the kernel.
+- **The device model is still moving.** The real-session display handoff,
+  multitouch, audio, the FTL, and networking all affect host/device boundaries;
+  §6's TLB and §3.6's invalidation are coupled to what counts as RAM.
+- **The JIT removes the per-instruction visibility that has found many bugs.**
+  Multiple genuine emulator bugs were found by real firmware plus per-instruction
   tracing, symbol attribution, and first-abort reporting (`ROADMAP.md`,
   CONFIRMED). Under a JIT there is no per-instruction hook. Debugging M5 with a
   JIT in the loop means debugging two things at once, and the JIT is the one
@@ -1357,7 +1420,7 @@ interpreter's memory path twice, and (b) the interpreter API the JIT needs
 behaviour-preserving, both are worth doing on their own merits, and both are why
 the answer is "J1 now" rather than "nothing now".
 
-### 11.2 The trap in "wait for M5", and the actual fix
+### 11.2 The trap in "wait for M5", and what snapshots have proved
 
 There is a real counter-argument and it should be stated rather than dodged. A
 boot to SpringBoard is **GUESS 5–30 billion instructions** (a real device boots
@@ -1370,17 +1433,22 @@ insn/s) a full boot is still 30–200 seconds**, and at the pessimistic end it i
 minutes. The JIT does not fix the M5 iteration loop; it only makes it less
 awful.
 
-**Snapshot/restore does fix it. This is no longer a proposal — it shipped in
-`95eaf8b`**, and the prediction held.
+**Snapshot/restore shipped in `95eaf8b` and reduced one historical replay.** It
+has now also restored the real guest at 2.2, 2.4, 2.7 and 2.85 B, saved checkpoints at
+2.4, 2.7, 2.85 and 2.97 B, reached a normal 2.9 B cap, isolated the fail-closed
+user-mode stop at 2,944,340,624 (`UXTB16`, `0xe6cf3073`), and replayed its fix
+to a clean 2.98 B cap. It has not been integrated or measured in the app.
 
-`core/src/snapshot.c` serialises the whole machine: the CPU including all banked
-registers and SPSRs, the full CP15, the exclusive monitor, VFP, RAM, NOR, both
+`core/src/snapshot.c` serialises the whole currently modelled machine: the CPU,
+including all banked registers and SPSRs, the full CP15, the exclusive monitor,
+VFP, RAM, NOR, both
 VICs, the timer, power, CLCD, and every stub window. The format is
 `magic|version|len|flags → GEOM CPU MACH RAM NOR STUB END → FNV-1a-64`.
 
-**Measured:** cold to 900 M instructions is **140 s**; restore-at-200 M and run to
-900 M is **34 s**. Continue-to-400 M and restore-at-200 M-then-run-to-400 M produce
-snapshots identical across all 432,618,045 bytes.
+**Historical host/commit measurement:** cold to 900 M instructions was **140 s**;
+restore-at-200 M and run to 900 M was **34 s**. Continue-to-400 M and
+restore-at-200 M-then-run-to-400 M produced snapshots identical across all
+432,618,045 bytes.
 
 Three design notes, because the interesting problem was not serialisation but
 *making field-omission hard* — a snapshot that silently drops one register
@@ -1410,14 +1478,18 @@ ring, milestone hit counts, sampled profile, hot-page log — are **not** machin
 state and are not restored. They start fresh and cover only the window since the
 restore. Instruction indices are absolute either way.
 
-**That is the recommendation's load-bearing claim, and it survived contact: the
-thing that unblocks M5 is snapshotting, and the thing that unblocks
-*interactivity* is the JIT. They solve different problems and should not be
-confused for one another.**
+**The historical timing establishes that snapshotting can reduce cold replay
+cost, while the 2.2 B → 2.98 B chain establishes the current post-VFP frontier
+is resumable, can isolate a later user-mode opcode and can replay through its
+fix. Neither establishes app
+integration or device iteration time. A
+future JIT addresses throughput; snapshots address repeatability and replay
+distance. Neither alone completes M5.**
 
-### 11.3 The trigger to start early anyway
+### 11.3 The trigger to enable dispatch early anyway
 
-Start J2 before SpringBoard renders **only if** both of these become true:
+Enable JIT boot dispatch before SpringBoard renders **only if** both of these
+become true:
 
 1. snapshot/restore exists and the M5 loop is *still* dominated by emulation
    speed (i.e. the post-snapshot workload itself is billions of instructions —
@@ -1427,14 +1499,13 @@ Start J2 before SpringBoard renders **only if** both of these become true:
 
 Absent both, the sequencing above stands.
 
-**Where that stands now.** Condition 1's first half is satisfied — snapshot/restore
-exists — but its second half is not: the M5 loop is currently dominated by a
-34-second restore-and-continue, not by emulation throughput, and the frontier is
-a single mis-hashed page rather than billions of instructions of userland.
-Condition 2 is plainly false; the last session alone added the CPUID registers,
-`CPSR.A` on abort entry, and the User-mode `CPS` fix, and named four more
-interpreter gaps it deliberately did not close. So the trigger has **not** fired,
-and the J2 foundation being merged does not mean it has. J2 is parked on purpose.
+**Where that stands now.** Snapshot/restore has established a current post-VFP
+userland frontier through the `UXTB16` stop at 2.944 B and its clean 2.98 B
+replay, but it
+does not show that throughput is the dominant blocker. On the phone, the earlier prerequisite is a shared,
+memory-bounded real-guest session. The interpreter also continues to change as
+new paths are exposed. So the trigger has **not** fired, and the tested JIT
+foundation does not mean the boot engine should use it yet.
 
 ---
 
@@ -1460,10 +1531,10 @@ entire validation strategy (§9).
   interacts with block splitting (an `IT` block must not be split), with flag
   liveness (§5.3), and with exception entry mid-`IT`. Expect this to be the
   fiddliest correctness work in the port.
-- **VFP/NEON.** ARMv6 userland of the 3.x era got by without FP arithmetic
-  (the interpreter models only the VFP *system* registers today). iOS 6 userland
-  will not. That is a whole FP semantics module before the JIT question even
-  arises — and it belongs in the interpreter first, per §2.
+- **VFP/NEON.** The interpreter now has an ARM1176 VFPv2 module, including its
+  register file, load/store, transfers, arithmetic, comparison and conversions.
+  An ARMv7/iOS 6 port still needs evidence for the later VFP revision and NEON;
+  those semantics belong in the interpreter before the JIT, per §2.
 - **Memory-model instructions.** `DMB`/`DSB`/`ISB` decode to no-ops on a
   single-core model, but must decode.
 - **MMU details.** Still short-descriptor, but with TEX remap, the XN bit, and
@@ -1471,9 +1542,9 @@ entire validation strategy (§9).
   becomes ASID-scoped rather than global.
 - **A newer host, possibly.** If the port also moves to an A12+ device, §8's
   memory story changes completely: APRR/`pthread_jit_write_protect_np`, PAC on
-  return addresses, and PPL. This is why §8.2 insists the code-buffer allocator
-  is a four-function shim — that shim is the entire cost of a host change, and
-  it is cheap to build now and expensive to retrofit.
+  return addresses, and PPL. This is why §8.2 keeps executable-memory policy in
+  a small code-buffer module: it isolates much of the host-specific work and is
+  cheaper to extend now than to retrofit after dispatch is integrated.
 
 ---
 
@@ -1483,38 +1554,44 @@ entire validation strategy (§9).
    plan, because it makes today's *correct* CP15 c8 no-ops load-bearing (§6.1).
    Symptom: a guest reads through a mapping the kernel already changed — which
    looks exactly like an emulator bug anywhere else. *Mitigations:* flush
-   aggressively (whole TLB on any maintenance op), and §9.5's TLB-vs-no-TLB
-   differential run on every CI build. **This risk arrives at J1, before any
-   JIT.**
+   aggressively (whole TLB on any maintenance op), run synthetic TLB-vs-no-TLB
+   cases in public CI, and run the full-firmware differential only in a private
+   firmware-enabled workflow (§9.5). **This risk arrives at J1, before any JIT.**
 2. **Shifter carry-out and A64's differing logical-op flags (§5.2).** Exactly the
    nightmare the brief names. Silent, rare, and it corrupts a lock or a
    comparison thousands of instructions before anything visible happens.
    *Mitigations:* §9.4's targeted fuzzing of every shift form × amount ×
    S-bit combination, before J3 ships; and no `ANDS` fast path until that fuzzer
    is green.
-3. **`CS_DEBUGGED` turns out not to be set, or not to be obtainable.** Would end
-   the JIT entirely on this host (§8.2). *Mitigation:* it is cheap to find out —
-   add the emit-and-execute probe to the existing self-test panel **now**. The
-   current RWX-mmap probe is necessary but not sufficient and should not be
-   treated as an answer.
+3. **`CS_DEBUGGED` turns out not to be set, or not to be obtainable.** This could
+   block the intended JIT policy on this host (§8.2). *Mitigation:* keep the startup check
+   non-executing, add an explicit recoverable emit-and-execute diagnostic, run
+   it on the intended jailbreak, record the full verdict, and keep the
+   interpreter usable when it skips.
 4. **Cache maintenance missed on chain patches (§8.3).** Non-deterministic stale
    code, the hardest possible bug signature. *Mitigation:* one function performs
    every write to the code arena and no other path may; `sys_icache_invalidate`
    rather than hand-rolled sequences; a torture mode that patches and re-patches.
-5. **The JIT cannot be tested on the Windows dev box.** This directly attacks the
-   project's best property — sub-second local test loops (`ARCHITECTURE.md`).
-   The JIT is arm64-only; local `ctest` will exercise only the interpreter.
-   *Mitigations:* keep the JIT strictly optional at compile time so local
-   testing is unaffected; put the JIT suite on the macOS arm64 CI runner the
-   project already uses; and accept that JIT bugs have a slower loop, which is
-   itself an argument for the sequencing in §11.
+5. **Emitted arm64 code cannot execute on the x86 Windows development host.**
+   Structural emitter, decoder and translator tests can and should still run
+   there; only native execution/lockstep must move to an arm64 runner.
+   *Mitigations:* keep the JIT optional, run structural tests on every host, and
+   require the macOS arm64 execution job to report that it did not skip.
 6. **The end-state speed disappoints (§10.3).** 0.15x rather than 0.45x is a
    different demo. *Mitigation:* measure at J3, on the phone, and revise the
    estimate publicly rather than quietly.
-7. **Code-cache footprint on a 2 GB device.** 64 MB of RWX plus 128 MB of guest
-   RAM plus a Metal framebuffer, under jetsam. *Mitigation:* the increased-memory
-   entitlement is already carried; the flush-everything policy bounds growth;
-   measure block counts at J3 against §3.7's guess.
+7. **Memory footprint on a 2 GB device.** The CLI now avoids the former second
+   roughly 445 MiB rootfs allocation by streaming into checked final guest RAM,
+   but the RAM disk is still pinned inside the guest. A continuation beyond
+   2.9 B dipped to 97 free pages, recovered to 253 and ended at 214 at 2.98 B
+   against a 250-page target.
+   The app does not yet host that path; code cache and
+   frame/audio/network buffers can still lose to jetsam before performance
+   matters. *Mitigation:* implement the audited writable md bulk-copy bridge and
+   snapshot coupling, preserve bounded source access in the shared session,
+   query the live budget, bound every cache and queue, handle memory pressure,
+   and treat the increased-memory entitlement as a request rather than a
+   guarantee. Measure block counts at J3 against §3.7.
 8. **Divergence debugging is expensive even with the harness.** A mismatch 4
    billion instructions into a boot is a bad day regardless. *Mitigation:*
    §9.7's trace fixtures make the *first* divergence cheap to find, and
@@ -1529,22 +1606,22 @@ Stated plainly, so none of it is mistaken for fact:
 - **All throughput numbers are desktop x86 numbers.** No measurement in this
   document was taken on the A9. Every A9 figure is INFERRED or GUESS.
 - **The 6.5 M insn/s figure this project quotes was not reproduced directly.**
-  What was reproduced is that the committed build runs real kernel code at
+  What was reproduced is that historical commit `65c9240` ran real kernel code at
   1.26 M insn/s and the same code at `-O3` runs it at 3.77 M insn/s *including*
   `bootkernel`'s heavy per-instruction instrumentation, with synthetic loops at
   8–14 M/s. 6.5 M/s for real code in an optimised, uninstrumented build is
   consistent with all of that, but the provenance of the original number should
   be confirmed before it is used in any comparison against a JIT number.
 - **Whether unsigned executable memory actually executes on the target phone.**
-  The app probes `mmap` success and `CS_DEBUGGED`; neither proves execution
-  (§8.2). This is the cheapest high-value experiment available and it has not
-  been run.
+  The app currently reports `mmap` and `CS_DEBUGGED` but deliberately does not
+  call emitted code during startup. Add, run and record an explicit recoverable
+  diagnostic before enabling the JIT path (§8.2).
 - **A9 cache line sizes and L1 capacities** are assumed 64 B / typical; read
   `CTR_EL0` rather than trusting this.
 - **Instruction mix beyond 20M instructions.** The measured mix is early kernel
   init (`vm_page_init`, `zalloc`, `OSUnserializeXML` dominate the profile).
-  Userland and SpringBoard will be *more* Thumb-heavy and more FP-heavy, which
-  strengthens the J4-before-J5 argument but was not measured.
+  Userland and SpringBoard may be *more* Thumb-heavy and more FP-heavy, but that
+  is an inference and cannot strengthen scheduling claims until measured.
 - **How many instructions a boot to SpringBoard actually takes.** The 5–30
   billion figure is arithmetic on a 30–60 s real-device boot, not a measurement.
   It is load-bearing for §11.2 and should be replaced with a real number as soon

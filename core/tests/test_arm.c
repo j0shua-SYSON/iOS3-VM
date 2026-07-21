@@ -1520,6 +1520,199 @@ static void test_arm_media_extend_and_reverse(void) {
     CHECK(c.r[4] == 0x8344, "r4=%08x expect 8344 (UXTH)", c.r[4]);
 }
 
+static void test_arm_media_pair_extend(void) {
+    /* cccc 0110 1 op Rn Rd rot00 0111 Rm; op 8 is signed, C unsigned.
+     * Rn=PC names the plain form. These cases cover the exact real-userland
+     * blocker plus both lane signs, every rotation, lane-local wraparound,
+     * aliases, conditions, flag preservation and invalid PC operands. */
+#define PAIR_EXT(cond, op, rn, rd, rot, rm) \
+    (((cond) << 28) | 0x06000070u | ((op) << 20) | ((rn) << 16) | \
+     ((rd) << 12) | ((rot) << 10) | (rm))
+    arm_cpu_t c;
+    arm_status_t st;
+    const uint32_t blocker = 0xe6cf3073u;       /* UXTB16 r3,r3 */
+
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, blocker);
+    arm_reset(&c, &g_bus);
+    c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS
+           | ARM_CPSR_N | ARM_CPSR_C | ARM_CPSR_Q | 0x000f0000u;
+    c.r[3] = 0x00000100u;                  /* live register value at the stop */
+    uint32_t flags = c.cpsr;
+    st = arm_step(&c);
+    CHECK(st == ARM_OK && c.r[3] == 0u && c.r[15] == 4u,
+          "real UXTB16 blocker status=%d r3=%08x pc=%08x",
+          (int)st, c.r[3], c.r[15]);
+    CHECK(c.cpsr == flags, "UXTB16 changed CPSR %08x -> %08x", flags, c.cpsr);
+
+    struct pair_case { uint32_t insn, src, base, expect; const char *name; } cases[] = {
+        { PAIR_EXT(0xeu,0xcu,15u,0u,0u,1u), 0x80ff7f01u, 0u,
+          0x00ff0001u, "UXTB16 ror0" },
+        { PAIR_EXT(0xeu,0x8u,15u,0u,0u,1u), 0x80ff7f01u, 0u,
+          0xffff0001u, "SXTB16 ror0" },
+        { PAIR_EXT(0xeu,0x8u,15u,0u,1u,1u), 0x80ff7f01u, 0u,
+          0xff80007fu, "SXTB16 ror8" },
+        { PAIR_EXT(0xeu,0x8u,15u,0u,2u,1u), 0x80ff7f01u, 0u,
+          0x0001ffffu, "SXTB16 ror16" },
+        { PAIR_EXT(0xeu,0xcu,15u,0u,3u,1u), 0x80ff7f01u, 0u,
+          0x007f0080u, "UXTB16 ror24" },
+        { PAIR_EXT(0xeu,0xcu,2u,0u,0u,1u),  0x00ff0020u, 0xfffffff0u,
+          0x00fe0010u, "UXTAB16 lane-local wrap" },
+        { PAIR_EXT(0xeu,0x8u,2u,0u,0u,1u),  0x008000ffu, 0x00010001u,
+          0xff810000u, "SXTAB16 signed lanes" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        memset(g_ram, 0, sizeof g_ram);
+        m_w32(NULL, 0, cases[i].insn);
+        arm_reset(&c, &g_bus);
+        c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS
+               | ARM_CPSR_Z | ARM_CPSR_V | ARM_CPSR_Q | 0x000a0000u;
+        c.r[1] = cases[i].src;
+        c.r[2] = cases[i].base;
+        flags = c.cpsr;
+        st = arm_step(&c);
+        CHECK(st == ARM_OK && c.r[0] == cases[i].expect,
+              "%s status=%d got=%08x expect=%08x", cases[i].name,
+              (int)st, c.r[0], cases[i].expect);
+        CHECK(c.cpsr == flags, "%s changed CPSR %08x -> %08x",
+              cases[i].name, flags, c.cpsr);
+    }
+
+    /* The scalar accumulate forms share the tightened family mask. Exercise
+     * every op with a non-zero rotation so mask or dispatch changes cannot
+     * regress them while the paired cases stay green. */
+    struct scalar_case { uint32_t insn, src, base, expect; const char *name; } scalar[] = {
+        { PAIR_EXT(0xeu,0xau,2u,0u,1u,1u), 0x80ff7f01u, 0x00000100u,
+          0x0000017fu, "SXTAB ror8" },
+        { PAIR_EXT(0xeu,0xbu,2u,0u,2u,1u), 0x80ff7f01u, 0x00010000u,
+          0x000080ffu, "SXTAH ror16" },
+        { PAIR_EXT(0xeu,0xeu,2u,0u,3u,1u), 0x80ff7f01u, 0xfffffff0u,
+          0x00000070u, "UXTAB ror24" },
+        { PAIR_EXT(0xeu,0xfu,2u,0u,1u,1u), 0x80ff7f01u, 0x00010000u,
+          0x0001ff7fu, "UXTAH ror8" },
+    };
+    for (size_t i = 0; i < sizeof scalar / sizeof scalar[0]; i++) {
+        memset(g_ram, 0, sizeof g_ram); m_w32(NULL, 0, scalar[i].insn);
+        arm_reset(&c, &g_bus); c.r[1] = scalar[i].src; c.r[2] = scalar[i].base;
+        c.cpsr |= ARM_CPSR_N | ARM_CPSR_V | ARM_CPSR_Q | 0x00050000u;
+        flags = c.cpsr;
+        st = arm_step(&c);
+        CHECK(st == ARM_OK && c.r[0] == scalar[i].expect,
+              "%s status=%d got=%08x expect=%08x", scalar[i].name,
+              (int)st, c.r[0], scalar[i].expect);
+        CHECK(c.cpsr == flags, "%s changed CPSR %08x -> %08x",
+              scalar[i].name, flags, c.cpsr);
+    }
+
+    /* Rd aliases Rn: both source halves must be captured before the write. */
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, PAIR_EXT(0xeu,0xcu,2u,2u,0u,1u));
+    arm_reset(&c, &g_bus); c.r[1] = 0x00020003u; c.r[2] = 0xfffffff0u;
+    st = arm_step(&c);
+    CHECK(st == ARM_OK && c.r[2] == 0x0001fff3u,
+          "UXTAB16 Rd==Rn status=%d r2=%08x", (int)st, c.r[2]);
+
+    /* Rd aliases Rm: the complete rotated source must be captured first. */
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, PAIR_EXT(0xeu,0x8u,2u,1u,1u,1u));
+    arm_reset(&c, &g_bus); c.r[1] = 0x80ff7f01u; c.r[2] = 0x00010001u;
+    st = arm_step(&c);
+    CHECK(st == ARM_OK && c.r[1] == 0xff810080u,
+          "SXTAB16 Rd==Rm status=%d r1=%08x", (int)st, c.r[1]);
+
+    /* All operands may name one register; the old source and both base lanes
+     * must be captured before the destination write. */
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, PAIR_EXT(0xeu,0xcu,1u,1u,0u,1u));
+    arm_reset(&c, &g_bus); c.r[1] = 0x00020003u;
+    st = arm_step(&c);
+    CHECK(st == ARM_OK && c.r[1] == 0x00040006u,
+          "UXTAB16 Rn==Rd==Rm status=%d r1=%08x", (int)st, c.r[1]);
+
+    /* Failed condition leaves destination, flags and PC progression ordinary. */
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, PAIR_EXT(0x0u,0xcu,15u,0u,0u,1u)); /* UXTB16EQ */
+    arm_reset(&c, &g_bus); c.r[0] = 0xfeedfaceu; c.r[1] = 0xffffffffu;
+    c.cpsr &= ~ARM_CPSR_Z;
+    flags = c.cpsr;
+    st = arm_step(&c);
+    CHECK(st == ARM_OK && c.r[0] == 0xfeedfaceu && c.r[15] == 4u &&
+          c.cpsr == flags, "failed-condition UXTB16 mutated state");
+
+    /* PC is not a legal destination or byte source for any extend form. Check
+     * the paired encodings and the previously implemented scalar encodings. */
+    uint32_t bad[] = {
+        PAIR_EXT(0xeu,0x8u,15u,15u,0u,1u),
+        PAIR_EXT(0xeu,0xcu,15u,0u,0u,15u),
+        PAIR_EXT(0xeu,0xau,15u,15u,0u,1u),
+        PAIR_EXT(0xeu,0xeu,15u,0u,0u,15u),
+        0xe6cf2171u,                       /* reserved bits[9:8] != 00 */
+        PAIR_EXT(0xeu,0x9u,15u,0u,0u,1u), /* unallocated op */
+        PAIR_EXT(0xeu,0xdu,15u,0u,0u,1u), /* unallocated op */
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        st = run_status(&c, &bad[i], 1, 1);
+        CHECK(st == ARM_UNDEFINED, "bad extend encoding %08x status=%d",
+              bad[i], (int)st);
+    }
+#undef PAIR_EXT
+}
+
+static void test_arm_media_reverse_edges(void) {
+    struct reverse_case { uint32_t insn, expect; const char *name; } cases[] = {
+        { 0xe6bf0f31u, 0x44832211u, "REV" },
+        { 0xe6bf0fb1u, 0x22114483u, "REV16" },
+        { 0xe6ff0fb1u, 0x00004483u, "REVSH positive" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        arm_cpu_t c;
+        memset(g_ram, 0, sizeof g_ram);
+        m_w32(NULL, 0, cases[i].insn);
+        arm_reset(&c, &g_bus);
+        c.r[1] = 0x11228344u;
+        c.cpsr |= ARM_CPSR_N | ARM_CPSR_C | ARM_CPSR_Q | 0x000f0000u;
+        uint32_t flags = c.cpsr;
+        arm_status_t st = arm_step(&c);
+        CHECK(st == ARM_OK && c.r[0] == cases[i].expect,
+              "%s status=%d got=%08x expect=%08x", cases[i].name,
+              (int)st, c.r[0], cases[i].expect);
+        CHECK(c.cpsr == flags, "%s changed CPSR %08x -> %08x",
+              cases[i].name, flags, c.cpsr);
+
+        uint32_t bad_rd = cases[i].insn | 0x0000f000u;
+        uint32_t bad_rm = (cases[i].insn & ~0xfu) | 0xfu;
+        CHECK(run_status(&c, &bad_rd, 1, 1) == ARM_UNDEFINED,
+              "%s accepted Rd=PC encoding %08x", cases[i].name, bad_rd);
+        CHECK(run_status(&c, &bad_rm, 1, 1) == ARM_UNDEFINED,
+              "%s accepted Rm=PC encoding %08x", cases[i].name, bad_rm);
+    }
+
+    /* REVSH must sign-extend bit 15 of the byte-reversed halfword. */
+    uint32_t revsh = 0xe6ff0fb1u;
+    arm_cpu_t c;
+    memset(g_ram, 0, sizeof g_ram); m_w32(NULL, 0, revsh);
+    arm_reset(&c, &g_bus); c.r[1] = 0x11224483u;
+    CHECK(arm_step(&c) == ARM_OK && c.r[0] == 0xffff8344u,
+          "REVSH negative got=%08x expect ffff8344", c.r[0]);
+
+    /* Destination/source aliasing is legal, and a failed condition must be a
+     * pure no-op apart from ordinary sequential PC progression. */
+    uint32_t rev_alias = 0xe6bf1f31u;       /* REV r1,r1 */
+    memset(g_ram, 0, sizeof g_ram); m_w32(NULL, 0, rev_alias);
+    arm_reset(&c, &g_bus); c.r[1] = 0x11228344u;
+    CHECK(arm_step(&c) == ARM_OK && c.r[1] == 0x44832211u,
+          "REV Rd==Rm got=%08x", c.r[1]);
+
+    uint32_t rev_eq = 0x06bf0f31u;          /* REVEQ r0,r1 */
+    memset(g_ram, 0, sizeof g_ram); m_w32(NULL, 0, rev_eq);
+    arm_reset(&c, &g_bus); c.cpsr &= ~ARM_CPSR_Z;
+    c.r[0] = 0xfeedfaceu; c.r[1] = 0x11228344u;
+    uint32_t before = c.cpsr;
+    CHECK(arm_step(&c) == ARM_OK && c.r[0] == 0xfeedfaceu &&
+          c.r[15] == 4u && c.cpsr == before,
+          "failed-condition REV mutated state");
+}
+
 static void test_unimplemented_media_still_traps(void) {
     /* SEL is media-space but not implemented; it must still be named rather
      * than silently mis-executed as a load/store. */
@@ -4026,6 +4219,8 @@ int main(void) {
     test_clz_does_not_corrupt_cpsr();
     test_msr_still_works();
     test_arm_media_extend_and_reverse();
+    test_arm_media_pair_extend();
+    test_arm_media_reverse_edges();
     test_unimplemented_media_still_traps();
     test_apx_makes_mapping_read_only();
     test_xp0_ignores_extended_apx_bits();

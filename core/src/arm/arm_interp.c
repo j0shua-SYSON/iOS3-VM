@@ -746,6 +746,18 @@ static inline uint32_t ror32(uint32_t v, unsigned n) {
     return n ? ((v >> n) | (v << (32 - n))) : v;
 }
 
+/* Sign-extend without implementation-defined unsigned-to-signed casts. The
+ * subtraction is deliberately unsigned, so negative results wrap to their
+ * architectural 32-bit two's-complement bit pattern on every C11 host. */
+static inline uint32_t sign_extend8(uint32_t v) {
+    v &= 0xffu;
+    return (v ^ 0x80u) - 0x80u;
+}
+static inline uint32_t sign_extend16(uint32_t v) {
+    v &= 0xffffu;
+    return (v ^ 0x8000u) - 0x8000u;
+}
+
 /* Barrel shifter. Returns the shifted value and, via *carry, the shifter
  * carry-out (seeded with the current C flag for the "unaffected" cases). */
 static uint32_t barrel_shift(uint32_t val, unsigned type, unsigned amount,
@@ -1367,27 +1379,61 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
 }
 
 /*
- * ARMv6 media space: the extend and byte-reverse families. Real XNU uses these
- * in ordinary compiled code, so they are not optional.
+ * ARMv6 media space: the extend and byte-reverse families. Real XNU and its
+ * userland use these in ordinary compiled code, so they are not optional.
  *
  *   extend: cccc 0110 1 op nnnn dddd rr00 0111 mmmm
  *           Rn == 15 is the plain form; otherwise the result is added to Rn.
  *           rr rotates the source right by rr*8 before extracting.
  */
 static arm_status_t exec_media(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
-    if ((insn & 0x0f0000f0u) == 0x06000070u) {
+    if ((insn & 0x0f8003f0u) == 0x06800070u) {
         unsigned op  = (insn >> 20) & 0xfu;
         unsigned rn  = (insn >> 16) & 0xfu;
         unsigned rd  = (insn >> 12) & 0xfu;
+        unsigned rm  = insn & 0xfu;
         unsigned rot = (insn >> 10) & 3u;
-        uint32_t v   = ror32(reg_read(c, pc, insn & 0xfu), rot * 8u);
+        uint32_t v;
         uint32_t res;
+
+        /* ARM ARM DDI0100I A4-216..226 and A4-274..284: Rd and Rm == PC are
+         * UNPREDICTABLE. Refuse those encodings instead of turning an extend
+         * into an accidental branch or reading the pipelined PC. Rn == PC
+         * names the non-adding form and is therefore valid. */
+        if (rd == 15u || rm == 15u) return ARM_UNDEFINED;
+        v = ror32(reg_read(c, pc, rm), rot * 8u);
+
+        /* SXTB16/SXTAB16 and UXTB16/UXTAB16 operate as two independent
+         * 16-bit lanes. Each selected byte is extended to 16 bits, then (for
+         * Rn != PC) added to the corresponding Rn halfword modulo 2^16. A
+         * carry from the low lane must never leak into the high lane. */
+        if (op == 0x8u || op == 0xcu) {
+            uint16_t lo_ext, hi_ext;
+            uint16_t lo_base = 0u, hi_base = 0u;
+            if (op == 0x8u) {                                  /* SXT(A)B16 */
+                lo_ext = (uint16_t)sign_extend8(v);
+                hi_ext = (uint16_t)sign_extend8(v >> 16);
+            } else {                                           /* UXT(A)B16 */
+                lo_ext = (uint16_t)(uint8_t)v;
+                hi_ext = (uint16_t)(uint8_t)(v >> 16);
+            }
+            if (rn != 15u) {
+                uint32_t base = reg_read(c, pc, rn);
+                lo_base = (uint16_t)base;
+                hi_base = (uint16_t)(base >> 16);
+            }
+            res = (uint32_t)(uint16_t)(lo_base + lo_ext)
+                | ((uint32_t)(uint16_t)(hi_base + hi_ext) << 16);
+            c->r[rd] = res;
+            return ARM_OK;
+        }
+
         switch (op) {
-            case 0xa: res = (uint32_t)(int32_t)(int8_t)(uint8_t)v;    break; /* SXTB  */
-            case 0xb: res = (uint32_t)(int32_t)(int16_t)(uint16_t)v;  break; /* SXTH  */
+            case 0xa: res = sign_extend8(v);                           break; /* SXTB  */
+            case 0xb: res = sign_extend16(v);                          break; /* SXTH  */
             case 0xe: res = v & 0xffu;                                break; /* UXTB  */
             case 0xf: res = v & 0xffffu;                              break; /* UXTH  */
-            default:  return ARM_UNDEFINED;      /* the 16-bit pair variants */
+            default:  return ARM_UNDEFINED;
         }
         if (rn != 15) res += reg_read(c, pc, rn);          /* accumulate form */
         c->r[rd] = res;
@@ -1396,23 +1442,29 @@ static arm_status_t exec_media(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
 
     /* REV / REV16 / REVSH */
     if ((insn & 0x0fff0ff0u) == 0x06bf0f30u) {             /* REV */
-        uint32_t v = reg_read(c, pc, insn & 0xfu);
-        c->r[(insn >> 12) & 0xfu] =
+        unsigned rd = (insn >> 12) & 0xfu, rm = insn & 0xfu;
+        if (rd == 15u || rm == 15u) return ARM_UNDEFINED;
+        uint32_t v = reg_read(c, pc, rm);
+        c->r[rd] =
             ((v & 0xffu) << 24) | ((v & 0xff00u) << 8)
           | ((v >> 8) & 0xff00u) | ((v >> 24) & 0xffu);
         return ARM_OK;
     }
     if ((insn & 0x0fff0ff0u) == 0x06bf0fb0u) {             /* REV16 */
-        uint32_t v = reg_read(c, pc, insn & 0xfu);
-        c->r[(insn >> 12) & 0xfu] =
+        unsigned rd = (insn >> 12) & 0xfu, rm = insn & 0xfu;
+        if (rd == 15u || rm == 15u) return ARM_UNDEFINED;
+        uint32_t v = reg_read(c, pc, rm);
+        c->r[rd] =
             ((v & 0x00ffu) << 8) | ((v & 0xff00u) >> 8)
           | ((v & 0x00ff0000u) << 8) | ((v & 0xff000000u) >> 8);
         return ARM_OK;
     }
     if ((insn & 0x0fff0ff0u) == 0x06ff0fb0u) {             /* REVSH */
-        uint32_t v = reg_read(c, pc, insn & 0xfu);
+        unsigned rd = (insn >> 12) & 0xfu, rm = insn & 0xfu;
+        if (rd == 15u || rm == 15u) return ARM_UNDEFINED;
+        uint32_t v = reg_read(c, pc, rm);
         uint16_t h = (uint16_t)(((v & 0xffu) << 8) | ((v >> 8) & 0xffu));
-        c->r[(insn >> 12) & 0xfu] = (uint32_t)(int32_t)(int16_t)h;
+        c->r[rd] = sign_extend16(h);
         return ARM_OK;
     }
     return ARM_UNDEFINED;                  /* PKH, SEL, USAT, SMLAD, ... */

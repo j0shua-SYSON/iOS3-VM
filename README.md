@@ -2,9 +2,9 @@
 
 # iOS3-VM
 
-### Boot **real iPhone OS 3** — Apple's actual kernel, `launchd`, and SpringBoard — inside an app on a modern, jailbroken iPhone.
+### Project goal: boot **real iPhone OS 3** — Apple's actual kernel, `launchd`, and SpringBoard — inside an app on a modern, jailbroken iPhone.
 
-*A from-scratch, full-system emulator of the 2007 iPhone's silicon, running in 2025's pocket.*
+*A from-scratch, full-system emulator of the 2007 iPhone's silicon, running in a modern pocket.*
 
 [![core-tests](https://github.com/j0shua-SYSON/iOS3-VM/actions/workflows/core-tests.yml/badge.svg)](https://github.com/j0shua-SYSON/iOS3-VM/actions/workflows/core-tests.yml)
 [![ios-build](https://github.com/j0shua-SYSON/iOS3-VM/actions/workflows/ios-build.yml/badge.svg)](https://github.com/j0shua-SYSON/iOS3-VM/actions/workflows/ios-build.yml)
@@ -18,28 +18,46 @@
 
 ## What is this?
 
-iOS3-VM is a **low-level, full-system emulator**. It doesn't *reimplement* iPhone
-OS or fake its apps — it emulates the **hardware** of the original iPhone's chip
-(the Samsung **S5L8900** and its ARMv6 core) precisely enough that Apple's own
-**unmodified** boot ROM → iBoot → XNU kernel → `launchd` → **SpringBoard** run on
-top of it, believing they're on a real 2009 iPhone.
+> **Target versus current build:** the portable core and the `bootkernel` CLI
+> have run Apple's real kernel, root filesystem, `launchd`, and a live
+> `mDNSResponder`. The CLI now streams the root filesystem directly into its
+> checked final guest-RAM range instead of retaining a second image-sized host
+> buffer. The installable iOS app does **not** run that path yet: it runs a small
+> synthetic ARM guest to exercise the CPU, UART and framebuffer bridge. The app
+> currently uses CoreGraphics, with no touch, audio, guest networking or active
+> JIT. Moving the bounded CLI path into a shared real-guest session remains the
+> next app prerequisite.
 
-Then it puts that whole emulated phone **inside an app on your real iPhone.**
+iOS3-VM is a **low-level, full-system emulator project**. It doesn't
+*reimplement* iPhone OS or fake its apps — it emulates the **hardware** of the
+original iPhone's chip (the Samsung **S5L8900** and its ARMv6 core). The long-term
+target is for Apple's own boot ROM → iBoot → XNU kernel → `launchd` →
+**SpringBoard** chain to run on top of it, believing it is on a real 2009 iPhone.
+The current path does not execute SecureROM or iBoot: `bootkernel` synthesizes
+the subset of iBoot's handoff needed to enter XNU directly.
 
-> **The honest headline:** *no open-source emulator has ever booted iPhone OS 3.x
-> to a home screen.* The closest prior art boots iPhone OS 1.1 and 2.1.1 on an
-> emulated iPod touch. Booting **3.x**, targeting a real **iPhone's** SoC, is
-> unclaimed ground. That's the whole point.
+The product target puts that whole emulated phone **inside an app on your real
+iPhone.**
+
+> **The honest headline:** to the maintainers' knowledge, no publicly documented
+> open-source emulator has booted iPhone OS 3.x to a home screen. The closest
+> prior art found in the project's survey boots iPhone OS 1.1 and 2.1.1 on
+> emulated iPod touch hardware. Treat that as project positioning, not proof that
+> no private or unindexed implementation exists.
 
 ## Why it's different
 
-|  | Game/app emulators | UTM (QEMU-in-app) | **iOS3-VM** |
-|---|:---:|:---:|:---:|
-| Runs a **real Apple OS** | ✗ | ✗ (Linux/Windows guests) | ✓ **(iPhone OS 3)** |
-| **Full-system** (boots the actual kernel) | ✗ | ✓ | ✓ |
-| Targets a **real iPhone's** silicon | ✗ | ✗ | ✓ (S5L8900) |
-| **From scratch**, dependency-free core | — | ✗ (QEMU + glib + …) | ✓ (portable C11) |
-| Runs on a **jailbroken iPhone** | some | ✓ | ✓ |
+The distinctive target is specific rather than categorical: emulate the
+S5L8900 and boot the original Apple software stack, while keeping the machine
+core portable across hosts. Today the evidence is split deliberately:
+
+| Capability | CLI / portable core | Installable iOS app |
+|---|---|---|
+| ARM1176 and S5L8900 execution | Real-kernel path recorded | Synthetic demo guest |
+| Apple kernel and root filesystem | Historical private-firmware run | Not integrated |
+| Display | Kernel console and CLCD capture | CoreGraphics demo bridge |
+| Touch, audio, guest networking | Not implemented | Not implemented |
+| Dynamic recompiler | Translator tested off-device; inactive in boot | Excluded from target |
 
 ## Status
 
@@ -48,18 +66,23 @@ can see.** No months in the dark.
 
 | | Milestone | State |
 |---|---|---|
-| **M0** | Toolchain online: core builds + tests in CI, iOS `.ipa` builds on a macOS runner, on-device self-test runs ARM code | ✅ **done** |
-| **M1** | Complete ARMv6 (ARM1176) interpreter, unit-tested | ✅ **done** — ARM + Thumb, *229 CPU assertions* |
-| **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, CLCD, NOR/NAND · *125 SoC assertions* |
-| **M3** | IMG3 + NAND/NOR: Apple's real **iBoot** runs | ✅ **done** — decrypts real firmware; LLB runs, kernel extracted |
-| **M4** | The real **XNU kernel** boots and logs | ✅ **done** — the whole IOKit driver tree starts, the real 413 MB root filesystem **mounts**, `_panic` is never reached |
-| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** `launchd` executes user-mode code and issues its first system calls — then the boot stops on a VFP instruction our interpreter does not implement. Five syscalls is not a userland |
+| **M0** | Toolchain online: core builds + tests in CI, iOS `.ipa` builds on a macOS runner, and the app has historically run its ARM self-test on-device | ✅ **done** — current CI proves build/package, not device launch |
+| **M1** | ARMv6 (ARM1176) interpreter; unsupported encodings trap | ✅ **done for the reached boot path** — ARM, Thumb, VFPv2, ARM1176 WFI, and the reached ARMv5TE DSP multiply families, with explicit gaps |
+| **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, CLCD and NOR are integrated; standalone raw-NAND/storage primitives are host-tested, with no NAND controller/VFL/FTL |
+| **M3** | Firmware containers + LLB execution | ✅ **done** — parses/decrypts real IMG3 firmware, runs a real LLB payload and extracts the kernel; SecureROM and iBoot execution remain future full-chain work |
+| **M4** | The real **XNU kernel** boots and logs | ✅ **done** — a broad set of prelinked drivers matched or started in a recorded CLI run; the real 413 MiB root filesystem mounted, and that run did not reach `_panic` |
+| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** A current checkpoint chain reached the configured 2.98-billion retired-instruction cap without a guest panic or emulator undefined stop and wrote a 2.97 B checkpoint. The 2.4–2.8 B interval recorded `systemShutdown false`; the 2.85–2.98 B interval recorded two `_load_machfile` hits. No SpringBoard frame or touch path has been demonstrated; the iOS app remains a demo host. |
+
+At `9f873d4`, hosted [`ios-build` run 29832617767](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29832617767)
+and [`core-tests` run 29832617860](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29832617860)
+both completed successfully. Those runs verify build, package and public tests;
+they do not contain private firmware or prove a SpringBoard boot.
 
 ### What it actually does today
 
-Apple's real `xnu-1357.5.30`, decrypted from a stock 3.1.3 IPSW, running on
-hardware that exists only as C in this repo — mounting a real root filesystem
-and introducing itself over an emulated Samsung UART:
+In the `bootkernel` CLI harness, Apple's real `xnu-1357.5.30`, decrypted from a
+stock 3.1.3 IPSW, ran on hardware that exists only as C in this repo — mounting
+a real root filesystem and introducing itself over an emulated Samsung UART:
 
 ```
 iBoot version:
@@ -78,56 +101,62 @@ IOSDIOController::enumerateSlot(): Searching for SDIO device in slot: 0
 IOSDIOController::enumerateSlot(): CMD5 failed ... (no card is modelled)
 ```
 
-Those are **Apple's own kernel extensions**, unmodified, matching against our
-emulated device tree and programming our emulated peripherals. Nothing is
-stubbed out to make that log appear — the kernel found the hardware it expected,
-or it would have panicked instead.
+Those messages are produced by **Apple's own kernel extensions**, unmodified,
+after matching against the emulated device tree. They are evidence that the
+guest reached those drivers, not proof that every matched device is complete:
+the emulator models some peripherals, returns bounded placeholder behaviour for
+others, and deliberately prevents unsupported accelerators from matching.
 
-### And here is exactly where it stops
+### Latest real-guest boundary
 
-Being precise about this matters more than the log above. `bootkernel`'s
-milestone probes, from a boot with the real root filesystem:
+The current interpreter has gone substantially beyond the historical VFP stop.
+ARM1176 `WFI` now advances emulated devices to the next interrupt that can wake
+the CPU without inventing retired instructions, and the full related ARMv5TE
+signed-DSP multiply set is implemented: `SMULxy`, `SMLAxy`, `SMLALxy`, `SMULWy`,
+and `SMLAWy`.
 
-```
-_load_init_program        first @ 230,864,582
-_execve                   first @ 230,895,729
-_grade_binary             hits 3
-_load_machfile            first @ 231,011,045
-_ubc_cs_blob_add          hits 2
-_cs_validate_page         hits 15
-cs_validate:hashing       hits 15
-cs_validate:bad_hash      NEVER REACHED
-_cs_invalid_page          NEVER REACHED
-_fleh_swi                 hits 24    first @ 233,031,366
-_mach_msg_overwrite_trap  hits 12
-_unix_syscall             hits  5    first @ 234,013,919
-_panic                    NEVER REACHED
+The current checkpoint chain first restored the real guest at **2.2 billion**
+retired instructions, crossed the former user-mode stop at `0xe1630381`
+(`SMULBB r3, r1, r3`), wrote a **2.4-billion** checkpoint, and reached 2.45 B
+with `launchd` and `mDNSResponder` alive. A restore at 2.4 B then reached 2.8 B
+and wrote a 2.7 B checkpoint. That interval observed one new `_execve`, first at
+**2,605,595,575**, and reported `systemShutdown false`. Finally, restoring 2.7 B
+wrote a 2.85 B checkpoint and reached the configured **2.9-billion** cap. None of
+those continuations reached `_panic`, `Debugger`, or an emulator
+undefined-instruction stop. A smaller diagnostic continuation then reached
+**2,944,340,624** instructions and stopped fail-closed on `0xe6cf3073`, decoded
+as ARMv6 `UXTB16 r3, r3` in user mode. The complete paired signed/unsigned
+extend and accumulate family was implemented, with all rotations and illegal
+forms tested. Replaying the same 2.85 B checkpoint cleared that instruction,
+wrote a **2.97 B checkpoint**, and reached the configured **2.98 B cap** with
+status `OK`, no `_panic`, no `Debugger`, and no emulator undefined stop. The
+interval recorded two `_load_machfile` paths, 400 code-page validations, 4,266
+software-interrupt entries, and 3,373 Unix syscalls.
 
-stopped after 234,731,493 instructions: UNDEFINED INSTRUCTION
-  encoding at pc: 0xecb10a20 (ARM)
-  lr 0xc006ae0d (_vfp_trap+0x38)
-```
+The same diagnostic clarified the memory risk. Free pages fell from 542
+(2.12 MiB; low 539) at 2.8 B and 317 (1.24 MiB; low 301) at 2.9 B to a low of
+**97 pages (0.38 MiB) at 2,934,505,472**, recovered to 253 pages by the former
+opcode stop, and ended at **214 pages (0.84 MiB)** at 2.98 B, against a 250-page
+target. This suggests XNU's reclamation path is active, but it does not make the
+layout safe: the roughly 445 MiB pinned RAM disk consumes pages that a real
+device would keep on storage. The
+host-backed-storage audit ruled out merely relocating md0 or flipping its
+physical-mode flag: this kernel's `_bcopy_phys` only understands the normal
+DRAM direct map. The practical route is a narrow, writable, range-checked bulk
+copy bridge for md strategy I/O, with the backing identity and overlay included
+in snapshots. That remains a major device-memory prerequisite.
 
-**pid 1 is executing user-mode code and making system calls.** That is M5's first
-criterion. Then the run ends — not on a guest panic, but because *we* stopped.
-
-XNU does not leave VFP on: the first VFP instruction a thread executes is
-*supposed* to take an Undefined exception, and the kernel turns VFP on and re-runs
-it. That path now works — the trap is vectored to the guest, and `_sleh_undef`
-routes it to `_vfp_trap`. What halts us is what `_vfp_trap` does next: `0xecb10a20`
-decodes as `VLDMIA r1!, {s0-s31}`, the VFP load-multiple that restores the
-register file, and the interpreter does not implement it. So it stops *at* the
-instruction rather than computing something plausible — M1's rule working exactly
-as designed. VFP is the next thing to build.
-
-Keep the scale honest: **five system calls is not a userland.** SpringBoard needs
-daemons, a display controller (`AppleH1CLCD`), a panel ID, and a multitouch
-device, none of which exist yet.
+That is sustained real userspace, not a completed boot. There is still no
+captured SpringBoard frame, no proof that the current userland reached the home
+screen, and no touch, audio, or guest-network path in the app. The CLI evidence
+must not be read as an on-device result.
 
 Getting this far needed one more emulator-shaped bug worth naming, because it
 looked exactly like a corrupt disk. launchd's first text page was failing its
-code-signature hash. The bytes were fine — every one of the 155 signed Mach-Os
-and 6,731 code pages on the volume hashes correctly. `cs_validate_page` hashes
+code-signature hash. The bytes were fine: a private, untracked historical
+investigation reported that all 155 signed Mach-Os and 6,731 code pages on the
+volume hashed correctly. That verifier is not reproducible from the public
+tree. `cs_validate_page` hashes
 exactly 4096 bytes, and `SHA1UpdateUsePhysicalAddress` routes exactly-4096-byte
 buffers to a *hardware* SHA-1 engine whenever `IOCryptoAcceleratorFamily` has
 registered its hook — an engine at 0x38000000 that we do not model, so the digest
@@ -147,56 +176,65 @@ Full detail in [`docs/ROADMAP.md`](docs/ROADMAP.md), the boot narrative in
   ┌────────────────┐   git push  ┌──────────────────┐  .ipa    ┌──────────────┐
   │ portable C core│ ──────────► │ macOS runner:    │ ───────► │ jailbroken   │
   │ tested locally │             │ xcodebuild →     │          │ iOS 15 · A9  │
-  │ (MinGW, no SDK)│             │ ldid fake-sign   │          │ RWX JIT-ready│
+  │ (MinGW, no SDK)│             │ ldid fake-sign   │          │ RWX hint only │
   └────────────────┘             └──────────────────┘          └──────────────┘
 ```
 
-The **emulator core is plain C11 with zero dependencies**, so it unit-tests in
-under a second on any desktop — and drops unchanged into the iOS app. The only
-Apple-specific code is the UIKit/Metal shell. See
+The interpreter, MMU and device core are plain C11 without third-party runtime
+dependencies, so they test quickly on ordinary desktop hosts and drop into the
+iOS app. Executable-memory allocation is a small platform shim. The current
+Apple-specific shell uses UIKit, CoreGraphics and QuartzCore; other hosts should
+implement the same host-facing seams without importing Apple APIs into the core. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-**Why an old phone is the *ideal* host:** the A9 is `arm64` but predates Apple's
-APRR JIT hardening (A11) and PAC/PPL (A12), so once the jailbreak relaxes
-code-signing we get plain **RWX** pages from a bare `mmap` — the cleanest
-possible home for a dynamic recompiler. The guests ran on a 412 MHz single core with 128 MB of RAM;
-the host is a dual ~1.85 GHz `arm64` with 2 GB.
+**Why an old phone is a promising host:** the A9 is `arm64` but predates Apple's
+APRR JIT hardening (A11) and PAC/PPL (A12), so the dynarec is designed around a
+plain **RWX** mapping after jailbreak policy permits it. At startup the app only
+reports `CS_DEBUGGED` and whether an RWX mapping can be created; it deliberately
+does not branch into unsigned generated code, because a policy mismatch could
+create a permanent launch crash. An explicit, recoverable device diagnostic is
+still needed to prove execution. The guests ran on a 412 MHz single core with
+128 MB of RAM; the host is a dual ~1.85 GHz `arm64` with 2 GB.
 
-**Realtime is not promised.** The design work in
-[`docs/dynarec.md`](docs/dynarec.md) §10.3 puts an honest, well-built block JIT
-on this host at **0.15–0.45x** of the guest's nominal 412 MHz — "SpringBoard
-responds to your finger and animates at roughly quarter speed", which is the
-difference between a screenshot and a demo, and is not the same as
-indistinguishable from a real iPhone.
+**Realtime is not promised.** The unmeasured projection in
+[`docs/dynarec.md`](docs/dynarec.md) §10.3 places a mature block JIT at roughly
+**0.15–0.45x** of the guest model's nominal rate. No A9 throughput result exists
+yet, so that range is a planning hypothesis, not a claim about SpringBoard
+responsiveness on the phone.
 
-**The dynarec's honest state:** an AArch64 emitter and an ARM block translator
-exist behind `-DIOS3VM_JIT=ON`, with 297 assertions, and that is roughly **15% of
-a JIT that could carry a boot**. There is no code cache, no dispatcher, no
-chaining and no invalidation — so nothing calls the translator yet, and a
-translated block currently costs *more* than interpreting it (mean run 8.1
-instructions against a ~37-instruction prologue/epilogue). Thumb is declined
-entirely, which matters because Thumb is 68.95% of retired instructions in kernel
-init. It is merged so it stops rotting against a fast-moving core, not because it
-is nearly done. [`docs/dynarec.md`](docs/dynarec.md) §0 keeps the score.
+**The dynarec's honest state:** an AArch64 emitter and ARM/Thumb block translator
+exist behind `-DIOS3VM_JIT=ON`, and emitted blocks execute in the macOS arm64 CI
+tests. There is still no code cache, dispatcher, chaining or invalidation, so the
+machine run loop never calls the translator and the iOS app excludes it. It is a
+tested foundation, not an active boot engine. [`docs/dynarec.md`](docs/dynarec.md)
+§0 keeps the score.
 
 ## Build & run
 
-You need **nothing Apple** on your own machine — CI does the Apple build.
+The hosted app build needs no local Apple SDK or toolchain — CI performs the
+Apple-specific build. Booting Apple software still requires firmware supplied by
+the user.
 
 **Test the core locally** (any OS with a C compiler + CMake):
 ```sh
-cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-That is 10 suites and **974 assertions** with no firmware present; drop a real
-kernelcache in `firmware/` and the symbol/kext resolver runs 258 more against it,
-for 1,232. The build defaults to `Release` — the interpreter is the hot loop of
-everything here, and `-O3` is a measured ~3x.
+The public suite runs without Apple firmware; additional symbol/kext checks are
+enabled only when the user supplies a kernelcache. Suite and assertion counts
+change as coverage grows, so use the current test output and CI logs rather than
+a number copied into this README. The build defaults to `Release` — the
+interpreter is the hot loop of everything here, and optimization has measured a
+substantial speedup in historical boot runs.
 
-**Optionally build the dynarec** (off by default, and it must stay that way —
-see the status note below):
+**Optionally build the dynarec** (off by default; see the status above and
+[`docs/dynarec.md`](docs/dynarec.md)):
 ```sh
-cmake -S . -B build-jit -DIOS3VM_JIT=ON && ctest --test-dir build-jit
+cmake -S . -B build-jit -DCMAKE_BUILD_TYPE=Release -DIOS3VM_JIT=ON
+cmake --build build-jit --config Release
+ctest --test-dir build-jit -C Release --output-on-failure
 ```
 
 **Boot the kernel** once you have supplied firmware (see below):
@@ -209,11 +247,20 @@ build/core/bootkernel firmware/kernel.macho \
 ```
 
 `-R 512` is load-bearing rather than a preference: `arm_vm_init` hardcodes
-`virtual_avail = 0xe0000000`, so advertising more than 512 MB of guest RAM makes
-the kernel's zone bootstrap fault. `nand-enable-adm=0` keeps
+`virtual_avail = 0xe0000000`, so advertising more than 512 MiB of guest RAM makes
+the kernel's zone bootstrap fault at the documented virtual base. The current
+machine also rejects a larger aperture because SDRAM is exactly
+`[0x08000000, 0x28000000)` and NOR starts at `0x28000000`. Historical 768 MiB
+experiments are therefore not valid current recipes. `nand-enable-adm=0` keeps
 `AppleS5L8900XADMFMC` from panicking on a NAND controller we do not model. Two
 further workarounds (the IORTC wait, un-matching the MBX GPU driver) are applied
 automatically and printed in the run header, so they are never invisible.
+
+The large input path is host-memory bounded: `bootkernel` sizes and validates
+the complete guest layout first, allocates guest DRAM once, and streams the
+rootfs into its final range through the same retained source handle. It verifies
+the source metadata around the read and never mirrors the roughly 445 MiB grown
+RAM disk in a second host allocation.
 
 Two more are applied to the **loaded copy** of the RAM disk — `firmware/rootfs.img`
 itself is never written — and are likewise printed on every run. The guest's
@@ -224,8 +271,10 @@ watch launchd halt instead). And the volume is **grown** by `--grow` MB, default
 because on hardware everything writable lives on `disk0s2`, which this machine
 does not have, so without this launchd and the daemons cannot create a single
 file. It comes out of the guest's free page pool 1:1; `-Y` (RAM disk below the
-kernel) buys that back several times over. `docs/BOOTLOG.md` has the numbers and
-the TN1150 detail.
+kernel) recovered that space only in historical 768 MiB experiments that current
+source rejects for overlapping NOR. At the valid 512 MiB physical ceiling it is
+not a usable headroom recipe. `docs/BOOTLOG.md` has the numbers and the TN1150
+detail.
 
 ### The tools
 
@@ -233,39 +282,45 @@ the TN1150 detail.
 |---|---|
 | `bootkernel` | boots the kernelcache and reports where it stopped: milestone probes, a sampled profile, every non-RAM page touched with the PC that touched it, abort sites, and the guest's console output |
 | `bootkernel -L` | print the prelinked kext load map and exit without booting |
-| `bootkernel --snapshot-at <insn> <file>` / `--restore <file>` | save and resume the whole machine. Cold boot to 900 M instructions is 140 s; restore-at-200 M and continue is 34 s |
+| `bootkernel --snapshot-at <insn> <file>` / `--restore <file>` | save and resume the currently modelled machine. The current chain restored at 2.2, 2.4, 2.7 and 2.85 B, wrote checkpoints at 2.4, 2.7, 2.85 and 2.97 B, and reached a clean 2.98 B cap after clearing the `UXTB16` stop; older timing numbers are host/commit-specific |
 | `snapboot` | the snapshot acceptance harness — also prints a machine-derived report, because comparing two snapshot files alone lets a field the format never stores cancel out on both sides |
 | `machoinfo <kernel> -k` / `-r <addr>` | dump the kext load map, or resolve one address to a kernel symbol or `<bundle-id>+0xNNNN` |
 | `img3dump`, `unlzss`, `runfw` | firmware container, compression, and bare-payload tools |
 
 `docs/debugging.md` is the procedure these add up to.
 
-**Get the app:** push to GitHub → the `ios-build` workflow produces an unsigned,
-fake-signed `iOS3VM.ipa` artifact. Install it on your jailbroken device running
-**AppSync Unified** (which lets `installd` accept the `ldid` ad-hoc-signed IPA)
-via Filza or any package installer — or, on a supported device, with
-**TrollStore** (which permanently re-signs it through the CoreTrust bug, no
-AppSync needed). Either way, no Apple Developer account is required.
+**Get the app:** on a matching-path push or a manual dispatch, the `ios-build`
+workflow produces an `ldid` ad-hoc/fake-signed `iOS3VM.ipa` and uploads it as a
+temporary GitHub Actions artifact, subject to the repository's artifact-retention
+policy. CI builds, signs and packages the candidate; it does not install or
+launch it. Installation still requires a method compatible with the device's
+jailbreak, such as an appropriate AppSync or TrollStore setup. No Apple
+Developer account is used by the workflow.
 
-**Boot an OS** (from M3 on): drop your **own** iPhone OS 3.1.3 IPSW and its
-(publicly documented) decryption keys into the app's firmware folder — see
-[`docs/BOOT_CHAIN.md`](docs/BOOT_CHAIN.md). Reaching the root mount additionally
-needs the IPSW's root DMG decrypted with the published RootFS key; the result is
-an HFSX volume the emulator loads as a RAM disk (`-r`). Nothing in `firmware/` is
-ever committed — the whole directory is git-ignored.
+**Boot an OS in the CLI harness** (from M3 on): place your **own** iPhone OS
+3.1.3 IPSW-derived files and documented decryption keys in the repository's
+git-ignored `firmware/` directory — see [`docs/BOOT_CHAIN.md`](docs/BOOT_CHAIN.md).
+Reaching the root mount additionally needs the IPSW's root DMG decrypted with
+the published RootFS key; `bootkernel` loads that HFSX volume as a RAM disk
+(`-r`). The IPA has no firmware importer or real-guest session yet, so these
+instructions do not currently make the app boot the OS. No Apple firmware is
+committed or bundled.
 
 ## Requirements
 
-- **Host:** a **jailbroken** iPhone 6s / 6s Plus (Apple A9) on iOS 15. Dopamine
-  2.x (A9 support) or palera1n both work; the jailbreak's "Allow JIT in apps"
-  is what unlocks the dynarec.
-- **Firmware:** your own iPhone OS 3.1.3 image + keys. **None is bundled** — this
-  repo contains no Apple code, exactly like a console emulator ships no ROMs.
+- **First validation host:** a **jailbroken iPhone 6s Plus** (Apple A9) on iOS
+  15. Installation needs a compatible signing/jailbreak environment. The JIT is
+  not active; a separate opt-in diagnostic must confirm emitted-code execution
+  on the actual device before that path is enabled. Startup's `CS_DEBUGGED` and
+  RWX-mapping report is only a preflight hint.
+- **Firmware:** your own iPhone OS 3.1.3 image + keys. **No Apple firmware image
+  or decryption key is bundled.**
 
 ## Legal
 
-iOS3-VM is an original, clean-room emulator under the MIT license. It ships **no
-Apple firmware, keys, or code.** You supply firmware you are entitled to use.
+iOS3-VM is an independently written emulator under the MIT license. It ships
+**no Apple firmware images or decryption keys.** You supply firmware you are
+entitled to use.
 "iPhone", "iOS", and "iPhone OS" are trademarks of Apple Inc.; this project is
 not affiliated with or endorsed by Apple.
 
