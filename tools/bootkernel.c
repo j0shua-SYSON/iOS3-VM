@@ -36,6 +36,113 @@ static uint8_t *slurp(const char *path, size_t *len_out) {
 }
 
 /* ---------------------------------------------------------------------------
+ * The guest's /private/etc/fstab describes storage this machine does not have.
+ *
+ * Stock iPhone OS 3.1.3 ships:
+ *
+ *     /dev/disk0s1 / hfs ro 0 1
+ *     /dev/disk0s2 /private/var hfs rw,nosuid,nodev 0 2
+ *
+ * disk0 on real hardware is published by AppleNANDFTL (raw NAND -> a linear
+ * logical space) with IOFlashPartitionScheme on top of it cutting that space
+ * into disk0s1/disk0s2. BOTH of those read undocumented Apple on-media
+ * structures — IOFlashPartitionScheme logs "magic on partition table ...
+ * doesn't match expected value" and "major version on partition table ...
+ * does not match driver", i.e. it validates a format nobody outside Apple has
+ * a specification for. Per the project rule we do not invent that layout, so
+ * this VM has no disk0 at all: the system volume is the RAM disk md0
+ * (bsd/dev/memdev.c), attached from the /chosen/memory-map RAMDisk property.
+ *
+ * (Worth recording for whoever revisits this: the undocumented part is the
+ * NAND side, NOT partitioning in general. IOStorageFamily in this kernelcache
+ * carries built-in IOGUIDPartitionScheme and IOFDiskPartitionScheme
+ * personalities — both provider IOMedia, IOPropertyMatch Whole — so a block
+ * device that ever does get published can be cut up with an ordinary,
+ * documented GPT or MBR. What is missing is anything that would publish that
+ * IOMedia *at boot*: there is no IOUSBMassStorageClass and no SCSI stack here,
+ * and the kernel-side DiskImages entry point di_root_image() is called solely
+ * by imageboot/netboot, neither of which is compiled into this kernelcache.
+ * The DiskImages stack is not dead — /usr/libexec/mobile_image_mounter and
+ * /usr/libexec/debug_image_mount both drive IOHDIXController directly — but
+ * they are lockdownd services that attach a .dimage on host request, onto
+ * /Developer, long after fstab has been consulted. Nothing attaches anything
+ * during the launchd bootstrap, which is where /private/var is needed.)
+ *
+ * That matters because launchd's bootstrap (launchctl.c, launchd-321) treats
+ * the boot-volume fsck as FATAL and everything after it as advisory:
+ *
+ *     statfs("/", &sfs);
+ *     if (sfs.f_flags & MNT_RDONLY) {            // xnu always mounts / ro
+ *         fwexec(fsck -p) || fwexec(fsck -fy)
+ *             || (fputs("fsck failed!"), reboot(RB_HALT));   // <-- fatal
+ *         path_check("/etc/fstab") ? fwexec(mount -vat nonfs)
+ *                                  : fwexec(mount -uw /);    // <-- advisory
+ *     }
+ *
+ * /sbin/fsck is the BSD wrapper: it reads /etc/fstab and fscks every entry
+ * with a nonzero pass number. Pointed at a /dev/disk0s1 that cannot exist it
+ * exits nonzero, twice, and launchd halts the machine. That is the whole
+ * reason the boot ended in _halt_all_cpus.
+ *
+ * So the VM rewrites the record to name the device it actually provides. This
+ * is a guest CONFIGURATION change — the same edit you would make porting an
+ * OS image to different storage — not a guess at an Apple binary format.
+ *
+ * It is done as a byte-for-byte in-place overwrite of the exact stock string,
+ * which must appear EXACTLY ONCE in the image, so no HFS+ catalog surgery is
+ * needed and the file's logicalSize is unchanged; the replacement is padded to
+ * the same length with an fstab comment line. If the stock bytes are missing
+ * or ambiguous we refuse and say so rather than patch something else.
+ * ------------------------------------------------------------------------- */
+static const char FSTAB_STOCK[] =
+    "/dev/disk0s1 / hfs ro 0 1\n"
+    "/dev/disk0s2 /private/var hfs rw,nosuid,nodev 0 2\n";
+
+/* Returns the image offset patched, or (size_t)-1 on refusal. */
+static size_t rd_rewrite_fstab(uint8_t *rd, size_t rd_n, const char *line) {
+    const size_t stock_n = sizeof FSTAB_STOCK - 1;   /* 76 */
+    size_t hit = (size_t)-1, hits = 0;
+
+    for (size_t i = 0; i + stock_n <= rd_n; i++) {
+        if (rd[i] == '/' && !memcmp(rd + i, FSTAB_STOCK, stock_n)) {
+            if (!hits) hit = i;
+            hits++;
+        }
+    }
+    if (hits != 1) {
+        fprintf(stderr,
+                "fstab: stock record found %u times in the RAM disk, expected "
+                "exactly 1 — refusing to patch.\n"
+                "       Pass --keep-fstab if this image is deliberately not the "
+                "stock 3.1.3 rootfs\n"
+                "       (a restore ramdisk, say); silently booting on unchecked "
+                "assumptions is\n"
+                "       how you lose an afternoon to launchd halting the "
+                "machine.\n", (unsigned)hits);
+        return (size_t)-1;
+    }
+
+    size_t line_n = strlen(line);
+    if (line_n + 1 > stock_n) {
+        fprintf(stderr, "fstab: replacement is %u bytes, only %u fit in the "
+                        "record\n", (unsigned)line_n + 1, (unsigned)stock_n);
+        return (size_t)-1;
+    }
+
+    /* line "\n", then a comment line of exactly the remaining width. getfsent
+     * ignores '#' lines, so the padding is inert but still valid fstab. */
+    uint8_t *p = rd + hit;
+    memcpy(p, line, line_n);
+    p[line_n] = '\n';
+    size_t pad = stock_n - line_n - 1;
+    if (pad) {
+        memset(p + line_n + 1, '#', pad - 1);
+        p[stock_n - 1] = '\n';
+    }
+    return hit;
+}
+
+/* ---------------------------------------------------------------------------
  * Address naming.
  *
  * Both sources — the kernel's own LC_SYMTAB and the prelinked kext load map in
@@ -1279,6 +1386,14 @@ int main(int argc, char **argv) {
             "      (empty path == root), e.g. -D cpus/cpu0:timebase-frequency=6000000\n"
             "  -r  load a raw disk image into DRAM, publish it as the RAMDisk\n"
             "      entry of /chosen/memory-map, and append rd=md0 to the cmdline\n"
+            "  --fstab <line>  what to write over the guest's /private/etc/fstab\n"
+            "      record in the loaded RAM disk (default\n"
+            "      \"/dev/md0 / hfs rw,update 0 1\"). The stock record names\n"
+            "      /dev/disk0s1 and /dev/disk0s2, which only exist behind\n"
+            "      AppleNANDFTL + IOFlashPartitionScheme; this VM has no NAND-\n"
+            "      backed disk0, so launchd's fsck fails and it halts the\n"
+            "      machine. The image on disk is never modified.\n"
+            "  --keep-fstab    leave the stock record alone (reproduces the halt)\n"
             "  -L  print the prelinked kext load map (bundle id, load address,\n"
             "      size) read out of __PRELINK_INFO, then exit without booting\n"
             "  -R  guest DRAM size in MB (default 128, the iPhone1,2 fitment)\n"
@@ -1349,6 +1464,30 @@ int main(int argc, char **argv) {
     enum { RD_ADDR_VIRT, RD_ADDR_PHYS, RD_ADDR_LITERAL } rd_form = RD_ADDR_VIRT;
     uint32_t rd_literal = 0;
 
+    /*
+     * --fstab / --keep-fstab: see rd_rewrite_fstab() above for why this exists.
+     *
+     * Default ON, because with the stock record launchd's bootstrap ALWAYS ends
+     * in reboot(RB_HALT) on this machine — a default of "off" would mean the
+     * documented boot command never gets past launchd. The rewrite is printed
+     * on every run so it is never silent, and --keep-fstab restores the stock
+     * record for anyone re-deriving the failure.
+     *
+     * The default line is chosen from what launchctl and /sbin/fsck actually
+     * do with it:
+     *   - pass 1 makes /sbin/fsck -p check the volume that really exists, so
+     *     the boot still exercises Apple's own fsck_hfs against md0 rather
+     *     than skipping the check the hardware would have done;
+     *   - rw,update is what turns launchctl's "mount -vat nonfs" into a
+     *     remount of / read-write. xnu mounts every root MNT_RDONLY
+     *     (vfs_rootmountalloc), and md0 is a writable memory device, so the
+     *     update is the only thing standing between us and a writable
+     *     /private/var — which SpringBoard needs and which, on hardware, would
+     *     have come from disk0s2.
+     */
+    const char *fstab_line  = "/dev/md0 / hfs rw,update 0 1";
+    bool        fstab_fixup = true;
+
     /* -W <lo>[:<hi>] profile window, -Z <n> heartbeat. Defaults are "the whole
      * run" and "silent", so neither changes an existing invocation. */
     unsigned win_lo = 0, win_hi = 0xffffffffu, heartbeat = 0;
@@ -1391,6 +1530,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-K")) { no_kpatch = true; continue; }  /* no kernel patches */
         if (!strcmp(argv[i], "-M")) { patch_memnode = false; continue; }
         if (!strcmp(argv[i], "-L")) { want_kextmap = true; continue; }
+        if (!strcmp(argv[i], "--keep-fstab")) { fstab_fixup = false; continue; }
         /* Three-argument flag: must be recognised before the two-argument
          * guard below, which would otherwise stop the walk on the last pair. */
         if (!strcmp(argv[i], "--snapshot-at") && i + 2 < argc) {
@@ -1437,6 +1577,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-b")) ba_rev    = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-w")) ba_ver    = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-r")) rdpath    = argv[++i];
+        else if (!strcmp(argv[i], "--fstab")) fstab_line = argv[++i];
         else if (!strcmp(argv[i], "-R")) ram_size  = (uint32_t)strtoul(argv[++i], NULL, 0) << 20;
         else if (!strcmp(argv[i], "-X")) {
             const char *v = argv[++i];
@@ -1629,6 +1770,19 @@ int main(int argc, char **argv) {
     size_t rd_n = 0;
     uint8_t *rd = rdpath ? slurp(rdpath, &rd_n) : NULL;
     if (rdpath && !rd) { fprintf(stderr, "ramdisk: cannot read %s\n", rdpath); return 1; }
+
+    /* Retarget /private/etc/fstab at the device this machine actually has.
+     * Only the in-memory copy is touched; firmware/rootfs.img stays pristine. */
+    if (rd && fstab_fixup) {
+        size_t at = rd_rewrite_fstab(rd, rd_n, fstab_line);
+        if (at == (size_t)-1) return 1;
+        printf("fstab      : /private/etc/fstab @ image+0x%08x -> \"%s\"\n"
+               "             (stock names /dev/disk0s1 + /dev/disk0s2; this VM "
+               "has no NAND-backed disk0.\n"
+               "              --keep-fstab to leave it alone — launchd then "
+               "fails fsck and halts.)\n",
+               (unsigned)at, fstab_line);
+    }
 
     /*
      * Reserve a linear framebuffer and advertise it in Boot_Video. With

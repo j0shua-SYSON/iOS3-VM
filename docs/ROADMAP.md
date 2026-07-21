@@ -513,7 +513,26 @@ display controller and a panel that do not exist yet.
 - **Multitouch**, mapped from the host touchscreen to the guest's controller.
   `AppleMultitouchZ2SPI` already starts and reports "using DMA for bootloading",
   so the driver side is live and waiting for a device.
+- **Free space on the root volume.** `/` is now remounted read-write (see
+  BOOTLOG "Stage 8"), but the volume Apple ships has `freeBlocks == 0` and all
+  105,780 allocation bits set — it is sized exactly to its contents, because on
+  a real restore `asr` writes it to `disk0s1` and *then* the volume is grown.
+  Nothing can be allocated until we do the same. The grow itself is small and
+  fully documented (TN1150): the allocation bitmap is already 16 KB = 131,072
+  bits, so any size up to 512 MB needs only `totalBlocks`/`freeBlocks` updated,
+  one bit set for the block holding the new alternate volume header, and that
+  header written at `totalBlocks * 4096 - 1024`. The real constraint is DRAM:
+  the RAM disk lives in guest memory and the kernel's static map ceiling is
+  512 MB, of which the 413 MB volume already takes most.
 - **NAND VFL/FTL**, if we ever mount a real NAND image rather than a RAM disk.
+  This is the only route to a genuine `disk0`, and it is a large one. Both
+  layers read undocumented Apple on-media formats: `AppleNANDFTL`'s FTL/VFL
+  metadata, and the partition table that **`IOFlashPartitionScheme`** validates
+  by magic and major version. (There is no `AppleAPM`/`AppleGPT`/`AppleFDisk`
+  kext in this kernelcache — `IOFlashPartitionScheme` is what makes `disk0s1`
+  and `disk0s2`, and it fails its probe outright unless its provider carries a
+  `boot-from-nand` property.) Per the project rule we do not invent either
+  format, so this stays parked rather than half-built.
 
 ### The two things that could have killed M5
 

@@ -512,6 +512,139 @@ completely different problem from its symptom:
   too few. Software SHA-1 provably never ran, which located the bug without
   disassembling anything further.
 
+### Stage 8 — the fstab wall, and why launchd was halting the machine
+
+Once launchd ran, the boot ended in a *clean guest reboot*: `_halt_all_cpus`,
+with `_panic` never reached. That is not a kernel fault, it is launchd giving
+up. The console said:
+
+```
+Running fsck on the boot volume...
+/dev/disk0s1: No such file or directory
+/dev/disk0s1: CAN'T CHECK FILE SYSTEM.
+/dev/disk0s1 (hfs) EXITED WITH SIGNAL 8
+fsck failed!
+```
+
+The guest's `/private/etc/fstab` is 76 bytes and reads:
+
+```
+/dev/disk0s1 / hfs ro 0 1
+/dev/disk0s2 /private/var hfs rw,nosuid,nodev 0 2
+```
+
+**Neither device can exist on this machine.** `disk0` on an iPhone1,2 is
+published by `AppleNANDFTL` (raw NAND → a linear logical space) and cut into
+`disk0s1`/`disk0s2` by **`IOFlashPartitionScheme`**, which fails its probe
+unless the provider carries a `boot-from-nand` property and then validates a
+*magic* and a *major version* on an on-media partition table:
+
+```
+IOFlashPartitionScheme::%s: ERROR: magic on partition table, 0x%08X, doesn't match expected value, 0x%08X
+IOFlashPartitionScheme::%s: ERROR: major version on partition table, 0x%08X, does not match driver, 0x%08X
+```
+
+Both that table and the FTL's own on-media format are undocumented, so per the
+project rule we do not synthesise them. We boot the system volume as the RAM
+disk `md0` instead, and there is no `disk0` of any kind.
+
+Be precise about *which* piece is undocumented, because it is easy to conclude
+too much here. Partitioning in general is fine: `IOStorageFamily` in this
+kernelcache carries built-in **`IOGUIDPartitionScheme`** and
+**`IOFDiskPartitionScheme`** personalities (provider `IOMedia`,
+`IOPropertyMatch { Whole = true }`, and an FDisk content table that maps type
+`0xAF` to `Apple_HFS`), so any block device that does get published can be cut
+up with an ordinary GPT or MBR. What is missing is anything that would publish
+that `IOMedia` **during the launchd bootstrap** — there is no
+`IOUSBMassStorageClass` and no SCSI stack in this kernelcache, and the
+kernel-side DiskImages entry point `di_root_image()` is called solely by
+`imageboot`/`netboot`, neither of which is compiled in. The DiskImages stack
+itself is alive and does have userland clients on the system volume —
+`/usr/libexec/mobile_image_mounter` and `/usr/libexec/debug_image_mount` both
+name `IOHDIXController` and `hdik-unique-identifier` — but they are lockdownd
+services that attach a `.dimage` on host request, onto `/Developer`, long
+after fstab has been read. The kernel also has exactly one memory device:
+`IOFindBSDRoot` reads a single `RAMDisk` property under a static `didRam`
+guard, so there is no `md1` to be had either.
+
+Disassembling `launchctl`'s `_bootstrap_cmd` (launchd-321) settles exactly what
+launchd wants, and the distinction turns out to be the whole answer — **fsck is
+fatal, mount is not**:
+
+```c
+statfs("/", &sfs);
+if (sfs.f_flags & MNT_RDONLY) {          /* xnu mounts EVERY root MNT_RDONLY */
+    if (!is_safeboot()) fputs("Running fsck on the boot volume...\n", stdout);
+    if (fwexec(fsck -p) == -1 && fwexec(fsck -fy) == -1) {
+        fputs("fsck failed!\n", stdout);
+        reboot(RB_HALT);                 /* <-- the halt. unconditional. */
+    }
+    path_check("/etc/fstab") ? fwexec(mount -vat nonfs)
+                             : fwexec(mount -uw /);
+    /* ... every failure from here on is only _log_launchctl_bug() ... */
+}
+```
+
+Three facts fall out of that, each checked against the binaries on our own
+rootfs rather than assumed:
+
+- `fwexec()` returns −1 unless the child exits with status 0, so `/sbin/fsck`
+  really must succeed. `/sbin/fsck` is the BSD wrapper: it reads `/etc/fstab`
+  and checks every entry with a nonzero pass number, so it inherits whatever
+  the file says. Deleting the file does not help — it has
+  `"Can't open checklist file: %s"` and exits non-zero.
+- The `MNT_RDONLY` test is on `struct statfs.f_flags` at **offset 0x40**, which
+  identifies it as the 64-bit-inode `struct statfs`. If `/` is already
+  read-write, launchd skips this entire block.
+- `mount(8)`'s `ismounted()` compares **both** `f_mntfromname` and
+  `f_mntonname`, and xnu's root mount has `f_mntfromname == "root_device"` (set
+  in `vfs_rootmountalloc_internal`, which is also where the unconditional
+  `MNT_RDONLY` comes from). So an fstab entry for `/` is *not* skipped as
+  already-mounted, and with `update` in its options it becomes a genuine
+  `MNT_UPDATE` remount.
+
+So the VM rewrites the record in the **loaded copy** of the RAM disk to name
+the device it actually provides (`tools/bootkernel.c`, `rd_rewrite_fstab`; the
+image on disk is never touched, and the patch refuses unless the stock 76 bytes
+appear exactly once):
+
+```
+/dev/md0 / hfs rw,update 0 1
+```
+
+`pass 1` keeps Apple's own `fsck_hfs` in the loop rather than skipping the
+check the hardware would have done — and it costs nothing, because the volume
+carries `kHFSVolumeUnmounted` and `fsck_hfs -p` quick-exits on a clean volume.
+The result:
+
+```
+Running fsck on the boot volume...
+/dev/md0 on / (hfs, local, noatime)
+launchctl: Couldn't stat("/etc/mach_init.d"): No such file or directory
+```
+
+`mount -v` prints `read-only` when it means it; its absence is the proof that
+`/` is now mounted **read-write** — which on hardware is what `disk0s2` would
+have supplied for `/private/var`. launchd clears the whole crucial-path table
+(`/tmp`, `/var/tmp`, `/var/folders`, `/var/db/launchd.db` all already exist on
+the volume) and goes on to load LaunchDaemons.
+
+Two residual complaints on that path are cosmetic and worth naming so nobody
+chases them:
+
+- `Bug: launchctl.c:3793 ... sysctl(nbmib, 2, ...) == 0` — `nbmib` is
+  `{CTL_KERN, 40}` = `KERN_NETBOOT`, a node this kernelcache does not register
+  because its NFS client is compiled out. The failure path branches to the
+  *same* instruction as the `netbooting == 0` success path, so it changes
+  nothing.
+- `Bug: launchctl.c:3094 ... value != NULL` — the `boot-args` property lookup
+  on `IODeviceTree:/options`, used only to decide whether the boot is verbose.
+
+**The volume has zero free blocks.** `freeBlocks == 0` in the volume header and
+every one of the 105,780 bits in the allocation bitmap is set: Apple ships the
+system dmg sized exactly to its contents. `/` is writable now, but nothing can
+be *allocated* on it until the volume is grown, which is the next wall.
+
 ---
 
 ## The screen *(historical — a different boot configuration)*
