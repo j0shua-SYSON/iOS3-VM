@@ -24,6 +24,15 @@ add_library(emucore STATIC
 )
 target_include_directories(emucore PUBLIC include)
 
+# vfp.c uses sqrt/sqrtf/trunc and <fenv.h>'s feclearexcept/fetestexcept to sample
+# the IEEE sticky flags. MinGW and macOS fold libm into libc, so this only shows
+# up as an undefined-reference wall of text when linking on Linux — which is why
+# it passed on the dev box and broke CI. PUBLIC so every consumer of emucore
+# inherits it.
+if(NOT WIN32 AND NOT APPLE)
+    target_link_libraries(emucore PUBLIC m)
+endif()
+
 if(NOT MSVC)
     target_compile_options(emucore PRIVATE -Wall -Wextra)
     # VFPv2 has no fused multiply-add: VMLA rounds the product and then rounds
