@@ -1498,6 +1498,224 @@ static void test_cps_is_a_nop_in_user_mode(void) {
           d.cpsr & ARM_CPSR_MODE_MASK);
 }
 
+/* ------------------------------------------------- lazy VFP / undefined ---
+ *
+ * XNU clears FPEXC.EN and enables VFP one thread at a time: the first VFP
+ * instruction a thread runs is SUPPOSED to be undefined, and _sleh_undef turns
+ * VFP on and re-runs it. So a VFP encoding with VFP off must vector the guest
+ * — but the same encoding with VFP already ON must still stop the machine,
+ * because at that point the kernel's own handler would call it an illegal
+ * instruction and we would have converted "not implemented" into a SIGILL.
+ */
+
+/* Run one instruction with the CPU privileged, VFP granted by CPACR, and
+ * FPEXC.EN as asked. Returns the step status. */
+static arm_status_t run_vfp(arm_cpu_t *c, uint32_t insn, bool en) {
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, insn);
+    arm_reset(c, &g_bus);
+    c->cpsr = (c->cpsr & ~0x1fu) | ARM_MODE_SYS;
+    c->cp15.cpacr  = 0xfu << ARM_CPACR_CP10_SHIFT;   /* full access to both */
+    c->vfp_fpexc   = en ? ARM_FPEXC_EN : 0u;
+    c->r[15] = 0;
+    return arm_step(c);
+}
+
+static void test_vfp_disabled_vectors_the_guest(void) {
+    /* Every encoding _sleh_undef (0xc006c368) matches, one per mask. */
+    struct { uint32_t insn; const char *what; } v[] = {
+        { 0xf2000d40u, "VADD.F32 (Advanced SIMD data processing)" },
+        { 0xee300a00u, "VADD.F32 s0,s0,s0 (VFP data processing)"  },
+        { 0xed901a00u, "VLDR s2,[r0] (VFP load/store)"            },
+        { 0xecb10a20u, "VLDMIA r1!,{s0-s31} (VFP load/store)"     },
+        { 0xf4200a0fu, "VLD1.8 (SIMD element/structure ld/st)"    },
+        { 0xee100a10u, "VMOV r0,s0 (VFP 32-bit transfer)"         },
+        { 0xec510b10u, "VMOV r0,r1,d0 (VFP 64-bit transfer)"      },
+    };
+    for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) {
+        arm_cpu_t c;
+        arm_status_t st = run_vfp(&c, v[i].insn, false);
+        CHECK(st == ARM_OK && c.r[15] == ARM_VEC_UNDEFINED,
+              "%s with FPEXC.EN=0: status=%d pc=%08x, expect a guest vector to 0x04",
+              v[i].what, (int)st, c.r[15]);
+    }
+}
+
+static void test_vfp_enabled_still_halts(void) {
+    /* The other half of the rule, and the half that keeps us honest: once the
+     * kernel has enabled VFP, an encoding we cannot execute has to stop the
+     * machine and name itself. _sleh_undef would deliver EXC_BAD_INSTRUCTION
+     * here, so vectoring would destroy the diagnostic AND kill the process. */
+    struct { uint32_t insn; const char *what; } v[] = {
+        { 0xee300a00u, "VADD.F32 s0,s0,s0" },
+        { 0xecb10a20u, "VLDMIA r1!,{s0-s31}" },
+        { 0xf2000d40u, "VADD.F32 (SIMD)" },
+    };
+    for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) {
+        arm_cpu_t c;
+        arm_status_t st = run_vfp(&c, v[i].insn, true);
+        CHECK(st == ARM_UNDEFINED,
+              "%s with FPEXC.EN=1: status=%d, expect ARM_UNDEFINED — we would "
+              "have to compute a real floating-point result", v[i].what, (int)st);
+    }
+}
+
+static void test_non_vfp_undefined_still_halts(void) {
+    /* Encodings outside the six masks must be untouched by all of this, or the
+     * lazy-VFP path becomes a silent swallow-everything. 0xE7FFDEFE is the
+     * ARM breakpoint: _sleh_undef recognises it too, but it means the guest
+     * trapped deliberately and we want to see where. */
+    struct { uint32_t insn; const char *what; } v[] = {
+        { 0xe7ffdefeu, "BKPT (0xE7FFDEFE)"           },
+        { 0xe6800010u, "PKHBT (unimplemented media)" },
+        { 0xf1010200u, "SETEND BE"                   },
+        { 0xee000d10u, "MCR p13 (a coprocessor we do not model)" },
+    };
+    for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) {
+        arm_cpu_t c;
+        arm_status_t st = run_vfp(&c, v[i].insn, false);
+        CHECK(st == ARM_UNDEFINED,
+              "%s: status=%d, expect ARM_UNDEFINED even with VFP disabled",
+              v[i].what, (int)st);
+    }
+}
+
+static void test_vfp_undef_entry_state(void) {
+    /* The exception the guest actually receives. _fleh_undef does
+     * "MRS sp,spsr; TST sp,#0x20; SUBEQ lr,lr,#4" — so LR must be the faulting
+     * PC + 4 in ARM state, or the kernel resumes at the wrong instruction. */
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0x100u, 0xee300a00u);            /* VADD.F32 s0,s0,s0 */
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_set_mode(&c, ARM_MODE_USR);
+    c.cpsr &= ~(ARM_CPSR_I | ARM_CPSR_A);
+    c.cp15.cpacr = 0xfu << ARM_CPACR_CP10_SHIFT;
+    c.vfp_fpexc  = 0;
+    c.r[15] = 0x100u;
+    uint32_t before = c.cpsr;
+    arm_status_t st = arm_step(&c);
+
+    CHECK(st == ARM_OK, "status=%d expect ARM_OK (the guest handles this)", (int)st);
+    CHECK(c.r[15] == ARM_VEC_UNDEFINED, "pc=%08x expect the 0x04 vector", c.r[15]);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_UND,
+          "mode=%02x expect Undefined (0x1b)", c.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK(c.r[14] == 0x104u,
+          "lr=%08x expect 0x104 — _fleh_undef subtracts 4 to find the faulting PC",
+          c.r[14]);
+    CHECK(c.spsr[ARM_BANK_UND] == before,
+          "spsr=%08x expect the CPSR at fault time %08x", c.spsr[ARM_BANK_UND], before);
+    CHECK((c.cpsr & ARM_CPSR_I) != 0, "cpsr=%08x: entry must mask IRQ", c.cpsr);
+    CHECK((c.cpsr & ARM_CPSR_A) == 0,
+          "cpsr=%08x: Undefined must NOT set CPSR.A (only aborts and interrupts do)",
+          c.cpsr);
+    CHECK((c.cpsr & ARM_CPSR_T) == 0, "cpsr=%08x: entry is always ARM state", c.cpsr);
+
+    /* SCTLR.V moves the whole table, this vector included. */
+    arm_cpu_t d; arm_reset(&d, &g_bus);
+    d.cpsr = (d.cpsr & ~0x1fu) | ARM_MODE_SYS;
+    d.cp15.sctlr |= ARM_SCTLR_V;
+    d.cp15.cpacr  = 0xfu << ARM_CPACR_CP10_SHIFT;
+    d.vfp_fpexc   = 0;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, 0xee300a00u);
+    d.r[15] = 0;
+    arm_step(&d);
+    CHECK(d.r[15] == 0xffff0004u,
+          "pc=%08x expect 0xffff0004 with high vectors", d.r[15]);
+}
+
+static void test_vfp_sysreg_access_follows_fpexc(void) {
+    /* FPEXC and FPSID stay readable with VFP off — that is what makes lazy
+     * enabling possible, and _get_vfp_enabled (0xc006994c) does exactly this
+     * VMRS with EN clear. FPSCR does not: accessing it with EN==0 is
+     * UNDEFINED, and _vfp_switch is careful to set FPEXC.EN first. */
+    arm_cpu_t c;
+    arm_status_t st = run_vfp(&c, 0xeef80a10u, false);   /* VMRS r0, FPEXC */
+    CHECK(st == ARM_OK && c.r[0] == 0,
+          "VMRS FPEXC with EN=0: status=%d r0=%08x, must read back, not trap",
+          (int)st, c.r[0]);
+
+    st = run_vfp(&c, 0xeef00a10u, false);                /* VMRS r0, FPSID */
+    CHECK(st == ARM_OK && c.r[0] == ARM1176_FPSID,
+          "VMRS FPSID with EN=0: status=%d r0=%08x expect %08x",
+          (int)st, c.r[0], ARM1176_FPSID);
+
+    st = run_vfp(&c, 0xeef10a10u, false);                /* VMRS r0, FPSCR */
+    CHECK(st == ARM_OK && c.r[15] == ARM_VEC_UNDEFINED,
+          "VMRS FPSCR with EN=0: status=%d pc=%08x, must take the guest's "
+          "Undefined exception", (int)st, c.r[15]);
+
+    st = run_vfp(&c, 0xeef10a10u, true);                 /* VMRS r0, FPSCR */
+    CHECK(st == ARM_OK && c.r[15] == 4u,
+          "VMRS FPSCR with EN=1: status=%d pc=%08x, must simply execute",
+          (int)st, c.r[15]);
+
+    /* Setting FPEXC.EN is the whole point of the handler; it must stick. */
+    st = run_vfp(&c, 0xeee80a10u, false);                /* VMSR FPEXC, r0 */
+    CHECK(st == ARM_OK, "VMSR FPEXC with EN=0: status=%d, must be permitted", (int)st);
+}
+
+static void test_vfp_cpacr_denial_vectors(void) {
+    /* CPACR gates CP10/CP11 ahead of FPEXC. XNU's _init_vfp writes 0xf<<20 to
+     * grant both; before that runs, or if a field is set to "privileged only",
+     * the access is UNDEFINED and the guest must see it. */
+    arm_cpu_t c;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, 0xee300a00u);                  /* VADD.F32 */
+    arm_reset(&c, &g_bus);
+    c.cpsr = (c.cpsr & ~0x1fu) | ARM_MODE_SYS;
+    c.cp15.cpacr = 0;                             /* access denied */
+    c.vfp_fpexc  = ARM_FPEXC_EN;                  /* enabled, but unreachable */
+    c.r[15] = 0;
+    arm_status_t st = arm_step(&c);
+    CHECK(st == ARM_OK && c.r[15] == ARM_VEC_UNDEFINED,
+          "CPACR=0 with FPEXC.EN=1: status=%d pc=%08x, CPACR must win",
+          (int)st, c.r[15]);
+
+    /* "Privileged only" (0b01 in both fields) denies User mode and permits SYS. */
+    arm_cpu_t d; arm_reset(&d, &g_bus);
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, 0xeef10a10u);                  /* VMRS r0, FPSCR */
+    arm_set_mode(&d, ARM_MODE_USR);
+    d.cp15.cpacr = (1u << ARM_CPACR_CP10_SHIFT) | (1u << ARM_CPACR_CP11_SHIFT);
+    d.vfp_fpexc  = ARM_FPEXC_EN;
+    d.r[15] = 0;
+    st = arm_step(&d);
+    CHECK(st == ARM_OK && d.r[15] == ARM_VEC_UNDEFINED,
+          "CPACR=privileged-only from User mode: status=%d pc=%08x, expect the "
+          "guest vector", (int)st, d.r[15]);
+
+    arm_cpu_t e; arm_reset(&e, &g_bus);
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, 0xeef10a10u);
+    e.cpsr = (e.cpsr & ~0x1fu) | ARM_MODE_SYS;
+    e.cp15.cpacr = (1u << ARM_CPACR_CP10_SHIFT) | (1u << ARM_CPACR_CP11_SHIFT);
+    e.vfp_fpexc  = ARM_FPEXC_EN;
+    e.r[15] = 0;
+    st = arm_step(&e);
+    CHECK(st == ARM_OK && e.r[15] == 4u,
+          "CPACR=privileged-only from SYS: status=%d pc=%08x, expect it to run",
+          (int)st, e.r[15]);
+}
+
+static void test_vfp_lazy_trap_cannot_loop(void) {
+    /* The property that makes vectoring safe: the trap is one-shot. Enable VFP
+     * the way _vfp_switch does and the SAME instruction now halts loudly
+     * instead of vectoring again, so a kernel that enables VFP and retries
+     * gets a diagnostic rather than an infinite exception loop. */
+    arm_cpu_t c;
+    arm_status_t st = run_vfp(&c, 0xee300a00u, false);
+    CHECK(st == ARM_OK && c.r[15] == ARM_VEC_UNDEFINED, "first pass must vector");
+
+    c.vfp_fpexc |= ARM_FPEXC_EN;                  /* what _vfp_switch does */
+    arm_set_mode(&c, ARM_MODE_SYS);
+    c.r[15] = 0;
+    st = arm_step(&c);
+    CHECK(st == ARM_UNDEFINED,
+          "status=%d after the guest enabled VFP: the retry must halt, not "
+          "vector a second time", (int)st);
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -1586,6 +1804,13 @@ int main(void) {
     test_prefetch_abort_never_sets_wnr();
     test_dfar_is_the_faulting_word_of_a_block_transfer();
     test_cps_is_a_nop_in_user_mode();
+    test_vfp_disabled_vectors_the_guest();
+    test_vfp_enabled_still_halts();
+    test_non_vfp_undefined_still_halts();
+    test_vfp_undef_entry_state();
+    test_vfp_sysreg_access_follows_fpexc();
+    test_vfp_cpacr_denial_vectors();
+    test_vfp_lazy_trap_cannot_loop();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

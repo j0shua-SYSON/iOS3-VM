@@ -50,6 +50,29 @@
 #define ARM1176_FPSID      0x410120b4u
 
 /*
+ * FPEXC, the VFP exception register. Only EN matters here: it is the switch
+ * XNU flips to enable VFP for a thread, and with it clear every VFP
+ * instruction except an access to FPEXC or FPSID is UNDEFINED. That is not a
+ * quirk to work around — it is the mechanism the kernel relies on to enable
+ * VFP lazily, one thread at a time. See vfp_lazy_enable_trap in arm_interp.c.
+ */
+#define ARM_FPEXC_EX (1u << 31)  /* exceptional state                        */
+#define ARM_FPEXC_EN (1u << 30)  /* VFP enabled for the current thread       */
+
+/*
+ * CPACR, the coprocessor access control register, fields for CP10 and CP11 —
+ * the two halves of the VFP/Advanced SIMD unit. Two bits each:
+ *   00 access denied (any access is UNDEFINED)
+ *   01 privileged access only (User-mode access is UNDEFINED)
+ *   10 reserved
+ *   11 full access
+ * XNU's _init_vfp (0xc0069938) does "CPACR |= 0xf << 20", granting full
+ * access to both, and then gates per thread with FPEXC.EN alone.
+ */
+#define ARM_CPACR_CP10_SHIFT 20
+#define ARM_CPACR_CP11_SHIFT 22
+
+/*
  * The ARMv6 CPUID feature identification block: CP15 c0 with CRm == 1
  * (processor / memory-model features) and CRm == 2 (instruction set
  * attributes). These are read-only and, on the ARM1176JZF-S, constant —

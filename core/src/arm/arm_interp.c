@@ -161,6 +161,136 @@ static void take_exception(arm_cpu_t *c, uint32_t vector, uint32_t mode,
     *next = ((c->cp15.sctlr & ARM_SCTLR_V) ? 0xffff0000u : 0u) + vector;
 }
 
+/* ============================ the Undefined-instruction discrimination =====
+ *
+ * Everything this core cannot execute returns ARM_UNDEFINED, which stops the
+ * machine and prints the encoding and PC. That loudness is the point: it names
+ * the next instruction to implement instead of letting the guest run on
+ * fabricated results.
+ *
+ * There is exactly one family of encodings where stopping is WRONG, because
+ * the guest is architecturally supposed to see the Undefined exception and
+ * handle it. XNU does not leave VFP on. It clears FPEXC.EN and enables VFP
+ * lazily, per thread: the first VFP instruction a thread executes is MEANT to
+ * be undefined, and the kernel's handler turns VFP on and re-runs it.
+ *
+ *   _fleh_undef  0xc0067ff8  MRS sp,spsr; TST sp,#0x20; SUBEQ lr,lr,#4;
+ *                            SUBNE lr,lr,#2  -> BL _sleh_undef
+ *   _sleh_undef  0xc006c184  reads SPSR.T from the saved state, then matches
+ *                            the faulting word against six masks (below). On a
+ *                            match it calls _get_vfp_enabled (0xc006994c,
+ *                            "VMRS r0,FPEXC; AND r1,r0,#0x40000000"):
+ *                              FPEXC.EN == 0 -> _vfp_trap -> _vfp_switch,
+ *                                 which sets FPEXC.EN and returns WITHOUT
+ *                                 advancing PC, so the instruction re-runs;
+ *                              FPEXC.EN != 0 -> falls through to
+ *                                 EXC_BAD_INSTRUCTION (SIGILL / panic).
+ *
+ * That second branch is what makes this safe. The kernel itself refuses to
+ * treat a VFP encoding as a lazy-enable fault once VFP is already on. So the
+ * rule below is not a guess and not a blanket "vector everything":
+ *
+ *   VFP/SIMD encoding AND VFP currently unavailable -> vector the guest.
+ *       Positively identified: this is the lazy-enable path, and the only
+ *       thing the guest can do with it is turn VFP on and retry.
+ *   VFP/SIMD encoding AND VFP already enabled       -> ARM_UNDEFINED, halt.
+ *       We would have to actually compute a floating-point result. Vectoring
+ *       here would hand the guest an encoding its own handler classifies as
+ *       an illegal instruction, i.e. we would convert "not implemented" into
+ *       a SIGILL in launchd and lose the diagnostic entirely.
+ *   Anything else                                   -> ARM_UNDEFINED, halt.
+ *
+ * Because the trap is one-shot per thread, this cannot loop: after the guest
+ * enables VFP the retry lands in the second case and stops loudly, naming the
+ * exact instruction. Deliberately NOT vectored, though _sleh_undef also
+ * recognises them: the ARM/Thumb breakpoints 0xE7FFDEFE / 0xDEFE, which mean
+ * the guest has trapped on purpose and we want to see where.
+ */
+
+/*
+ * The six masks are copied bit for bit out of _sleh_undef's ARM-state branch at
+ * 0xc006c368 (its literal pool at 0xc006c50c). Using the kernel's own test
+ * rather than one derived from the ARM ARM is deliberate: the set we vector is
+ * then, by construction, exactly the set the shipped handler claims it can
+ * handle. Anything outside it reaches the guest's "illegal instruction" path,
+ * so it must reach ours instead.
+ *
+ *   0xfe000000/0xf2000000  Advanced SIMD data processing
+ *   0x0f000e10/0x0e000a00  VFP data processing            (CDP  cp10/cp11)
+ *   0x0e000e00/0x0c000a00  VFP load/store                 (LDC/STC cp10/cp11)
+ *   0xff100000/0xf4000000  Advanced SIMD element/structure load/store
+ *   0x0f000e10/0x0e000a10  VFP 32-bit register transfer   (MCR/MRC cp10/cp11)
+ *   0x0fe00e00/0x0c400a00  VFP 64-bit register transfer   (MCRR/MRRC cp10/11)
+ *
+ * There is no Thumb counterpart here. _sleh_undef has one (0xc006c420, masks
+ * 0xef000e10/0xee000a00 and friends) because the same source builds for
+ * ARMv7, but the ARM1176JZF-S is ARMv6 and has no Thumb-2: Thumb state on this
+ * part cannot encode a coprocessor instruction at all, so no Thumb encoding
+ * can ever be a lazy-VFP fault.
+ */
+static bool insn_is_vfp_space(uint32_t insn) {
+    return (insn & 0xfe000000u) == 0xf2000000u
+        || (insn & 0x0f000e10u) == 0x0e000a00u
+        || (insn & 0x0e000e00u) == 0x0c000a00u
+        || (insn & 0xff100000u) == 0xf4000000u
+        || (insn & 0x0f000e10u) == 0x0e000a10u
+        || (insn & 0x0fe00e00u) == 0x0c400a00u;
+}
+
+/*
+ * CPACR gates CP10/CP11 before FPEXC does. The ARM1176 requires the two fields
+ * to be programmed identically (ARM DDI 0301H 3.2.7) and XNU's _init_vfp does
+ * exactly that — "CPACR |= 0xf << 20" from _arm_init+0x2cc, the only CPACR
+ * write anywhere in the kernel — so in practice they always agree. Where they
+ * do not, take the more restrictive: a VFP instruction needs both halves, and
+ * over-permitting would silently execute something the hardware would refuse.
+ */
+static bool vfp_cpacr_permits(const arm_cpu_t *c) {
+    unsigned cp10 = (c->cp15.cpacr >> ARM_CPACR_CP10_SHIFT) & 3u;
+    unsigned cp11 = (c->cp15.cpacr >> ARM_CPACR_CP11_SHIFT) & 3u;
+    unsigned acc  = cp10 < cp11 ? cp10 : cp11;
+    if (acc == 3u) return true;                  /* full access             */
+    if (acc == 1u) return cpu_is_priv(c);        /* privileged only         */
+    return false;                                /* 0 denied, 2 reserved    */
+}
+
+static bool vfp_enabled(const arm_cpu_t *c) {
+    return (c->vfp_fpexc & ARM_FPEXC_EN) != 0;
+}
+
+/* True only for the lazy-enable case described above. */
+static bool vfp_lazy_enable_trap(const arm_cpu_t *c, uint32_t insn) {
+    if (!insn_is_vfp_space(insn)) return false;
+    return !vfp_cpacr_permits(c) || !vfp_enabled(c);
+}
+
+/*
+ * Final disposition of an ARM-state encoding this core did not execute. Either
+ * the guest gets its Undefined exception, or we stop.
+ *
+ * ARM ARM (ARMv6, DDI0100I) A2.6.7: R14_und is the address of the instruction
+ * following the undefined one — PC+4 in ARM state, PC+2 in Thumb — the mode
+ * becomes Undefined (0b11011), SPSR_und takes the old CPSR, CPSR.I is set and
+ * CPSR.T cleared. CPSR.A is NOT set, unlike the abort and interrupt vectors;
+ * take_exception already draws that distinction. The kernel confirms the
+ * +4/+2 split from the other side: _fleh_undef recovers the faulting PC with
+ * "SUBEQ lr,lr,#4 / SUBNE lr,lr,#2" keyed on SPSR.T alone.
+ *
+ * Only the ARM-state form exists here, and that is not an omission. The Thumb
+ * return address would be PC+2, but no Thumb encoding can qualify: ARMv6 Thumb
+ * has no coprocessor instructions, so a Thumb undefined instruction is never a
+ * lazy-VFP fault and always stops the machine. Writing the +2 case would be
+ * unreachable code standing in for a case this part cannot produce.
+ */
+static arm_status_t undefined_instruction(arm_cpu_t *c, uint32_t pc,
+                                          uint32_t insn) {
+    uint32_t vec;
+    if (!vfp_lazy_enable_trap(c, insn)) return ARM_UNDEFINED;
+    take_exception(c, ARM_VEC_UNDEFINED, ARM_MODE_UND, pc + 4u, false, &vec);
+    c->r[15] = vec;
+    return ARM_OK;
+}
+
 /*
  * CP15 access via MCR (write) / MRC (read).
  *
@@ -195,6 +325,10 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
      * guest executes a real VFP data-processing instruction it will still trap,
      * which is the honest outcome — it names what is missing rather than
      * silently computing nonsense.
+     *
+     * Note that ARM_UNDEFINED is not necessarily fatal on this path: arm_step
+     * routes it through undefined_instruction(), which vectors the guest when
+     * — and only when — the access is one VFP itself is currently refusing.
      */
     if (cp == 10 || cp == 11) {
         unsigned opc1 = (insn >> 21) & 7u;
@@ -202,6 +336,19 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
         if (opc1 != 7) return ARM_UNDEFINED;      /* FP data-processing */
 
         unsigned reg = (insn >> 16) & 0xfu;       /* CRn selects the sysreg */
+
+        /*
+         * The availability rules, which are the lazy-enable mechanism itself:
+         * CPACR can withhold CP10/CP11 outright, and with FPEXC.EN clear the
+         * only VFP system registers that remain accessible are FPEXC (8) and
+         * FPSID (0). Everything else is UNDEFINED. XNU depends on exactly this
+         * asymmetry — _get_vfp_enabled reads FPEXC precisely when VFP is off —
+         * and never touches FPSCR before setting EN (see _vfp_switch, which
+         * writes FPEXC first and only then VMRS/VMSR FPSCR).
+         */
+        if (!vfp_cpacr_permits(c)) return ARM_UNDEFINED;
+        if (reg != 0 && reg != 8 && !vfp_enabled(c)) return ARM_UNDEFINED;
+
         if ((insn >> 20) & 1u) {                  /* VMRS: read */
             uint32_t v;
             switch (reg) {
@@ -1528,7 +1675,10 @@ arm_status_t arm_step(arm_cpu_t *c) {
             c->r[15] = next;
             return ARM_OK;
         }
-        return ARM_UNDEFINED;
+        /* The Advanced SIMD spaces (0xF2/0xF3 data processing, 0xF4 element
+         * and structure load/store) live here, in the unconditional space, so
+         * the lazy-VFP discrimination has to be applied on this arm too. */
+        return undefined_instruction(c, pc, insn);
     }
 
     if (!arm_cond_passed(c, cond)) { c->r[15] = next; return ARM_OK; }
@@ -1696,6 +1846,12 @@ arm_status_t arm_step(arm_cpu_t *c) {
         c->r[15] = vec;
         return ARM_OK;
     }
+
+    /* Every ARM-state encoding we declined funnels through here, wherever in
+     * the decode tree it was rejected — the CDP, LDC/STC and MCRR/MRRC forms
+     * of VFP all fall out of the bottom of the tree, and MCR/MRC comes back
+     * from exec_coprocessor. One choke point, one rule. */
+    if (st == ARM_UNDEFINED) return undefined_instruction(c, pc, insn);
 
     if (st == ARM_OK) c->r[15] = next;
     return st;
