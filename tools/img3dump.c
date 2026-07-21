@@ -12,7 +12,7 @@
  *
  * Usage:
  *   img3dump <file.img3>                     describe the container
- *   img3dump <file.img3> -k <hex> [-o out]   decrypt DATA with a key
+ *   img3dump <file.img3> -k <hex> -iv <hex> [-o out]
  *   img3dump -s <blob>                       scan a blob (e.g. a NOR dump)
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
@@ -152,22 +152,24 @@ static int describe(const char *path, const char *keyhex, const char *ivhex, con
             free(buf);
             return 1;
         }
-        /* Prefer an explicitly supplied IV: the KBAG's is wrapped. */
+        /* The KBAG's IV is wrapped on real firmware. Never silently use it as
+         * an AES-CBC IV: that produces plausible-sized garbage. */
         uint8_t iv[16];
-        bool have_iv = false;
-        if (ivhex) {
-            if (parse_hex_key(ivhex, iv, sizeof iv) != 128) {
-                fprintf(stderr, "iv must be 32 hex characters\n");
-                free(buf);
-                return 1;
-            }
-            have_iv = true;
+        if (!ivhex) {
+            fprintf(stderr, "encrypted IMG3 decryption requires -iv with the "
+                            "32-character unwrapped IV\n");
+            free(buf);
+            return 1;
+        }
+        if (parse_hex_key(ivhex, iv, sizeof iv) != 128) {
+            fprintf(stderr, "iv must be 32 hex characters\n");
+            free(buf);
+            return 1;
         }
         uint8_t *plain = malloc(img.data_len);
         uint32_t n = 0;
-        bool ok = plain && (have_iv
-                    ? img3_decrypt_data_iv(&img, key, bits, iv, plain, &n)
-                    : img3_decrypt_data(&img, key, bits, plain, &n));
+        bool ok = plain && img3_decrypt_data_iv(&img, key, bits, iv, plain,
+                                                 img.data_len, &n);
         if (ok) {
             printf("decrypted   : %u bytes with a %u-bit key\n", n, bits);
             printf("first 32 bytes of plaintext:\n");
@@ -220,7 +222,7 @@ static int scan(const char *path) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-            "usage: %s <file.img3> [-k <hexkey>] [-o <out.bin>]\n"
+            "usage: %s <file.img3> [-k <hexkey> -iv <hexiv>] [-o <out.bin>]\n"
             "       %s -s <blob>       scan a blob (e.g. a NOR dump)\n",
             argv[0], argv[0]);
         return 1;

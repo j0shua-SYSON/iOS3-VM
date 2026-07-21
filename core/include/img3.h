@@ -47,7 +47,8 @@ typedef enum {
     IMG3_ERR_TOO_SMALL,     /* buffer smaller than a header                */
     IMG3_ERR_BAD_MAGIC,     /* not an IMG3 container                       */
     IMG3_ERR_BAD_SIZE,      /* declared size inconsistent with the buffer  */
-    IMG3_ERR_BAD_TAG        /* a tag runs past the end of the container    */
+    IMG3_ERR_BAD_TAG,       /* a tag runs past the end of the container    */
+    IMG3_ERR_INVALID_ARGUMENT
 } img3_status_t;
 
 /* A KBAG describes how DATA is encrypted. cryptState 1 = production keys,
@@ -81,28 +82,22 @@ typedef struct {
 img3_status_t img3_parse(const uint8_t *buf, size_t len, img3_t *out);
 
 /*
- * Decrypt the DATA payload with a user-supplied AES key, using the IV from the
- * image's KBAG. Apple encrypts 3.x firmware with AES-CBC; the keys are
- * published by the community and supplied by the user (we ship none).
- *
- * `out` must have room for img.data_len bytes. Only whole 16-byte blocks are
- * decrypted; any trailing partial block is copied through verbatim, which is
- * what real images need since their payloads are not always block-aligned.
- * Returns false if the image has no DATA, no usable KBAG IV, or the key size
- * is invalid. `out_len` receives the number of bytes written.
- */
-bool img3_decrypt_data(const img3_t *img, const uint8_t *key, unsigned key_bits,
-                       uint8_t *out, uint32_t *out_len);
-
-/*
- * As above, but with an explicit IV. This is the form real firmware needs: the
+ * Decrypt DATA with an explicit, user-supplied IV. This is the only safe form
+ * for real firmware: the
  * IV stored in the KBAG is RSA/GID-wrapped, whereas the IV published alongside
  * the key by the reverse-engineering community is the unwrapped one. They are
  * different values, so decrypting with the KBAG's IV would silently produce
- * garbage in the first block.
+ * garbage in the first block. There is deliberately no API that implicitly
+ * uses img.kbag.iv.
+ *
+ * `key_bits` must match the parsed KBAG and `out_cap` must cover img.data_len
+ * bytes. Only whole 16-byte blocks are decrypted; an unaligned tail is copied
+ * through verbatim, matching Apple's container convention. `out_len` receives
+ * the number of bytes written.
  */
 bool img3_decrypt_data_iv(const img3_t *img, const uint8_t *key, unsigned key_bits,
-                          const uint8_t iv[16], uint8_t *out, uint32_t *out_len);
+                          const uint8_t iv[16], uint8_t *out, size_t out_cap,
+                          uint32_t *out_len);
 
 /* Human-readable status, for logs and the app UI. */
 const char *img3_strerror(img3_status_t st);

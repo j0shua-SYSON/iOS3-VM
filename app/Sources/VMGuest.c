@@ -181,7 +181,16 @@ uint32_t vm_guest_fb_pa(uint32_t ram_base, uint32_t ram_size) {
     /* Leave room for the payload itself at the bottom of DRAM, and for a
      * comfortable gap, before claiming the top for the framebuffer. */
     if (ram_size < VM_FB_BYTES + VM_GUEST_BLOB_BYTES + 0x10000u) return 0;
-    return (uint32_t)((ram_base + ram_size - VM_FB_BYTES) & ~0xfffu);
+    /* The machine API accepts an arbitrary 32-bit RAM base. Do the end
+     * calculation wide: wrapping a bank near 4 GiB would otherwise turn the
+     * framebuffer into a small physical address and the host-pointer helpers
+     * below into an out-of-bounds read. An end exactly at 2^32 is valid as long
+     * as the framebuffer itself still begins in the 32-bit address space. */
+    uint64_t end = (uint64_t)ram_base + ram_size;
+    if (end > 0x100000000ull) return 0;
+    uint64_t fb = (end - VM_FB_BYTES) & ~(uint64_t)0xfffu;
+    if (fb > UINT32_MAX || fb < ram_base) return 0;
+    return (uint32_t)fb;
 }
 
 const uint8_t *vm_guest_framebuffer(const s5l8900_t *m) {
@@ -322,9 +331,10 @@ bool vm_guest_install(s5l8900_t *m) {
      * leaves for IOMobileFramebuffer to adopt. The interrupt mask is untouched,
      * so no frame IRQ can reach this vector-less payload.
      */
-    s5l_clcd_seed_window0(&m->clcd, fb_pa, VM_FB_WIDTH, VM_FB_HEIGHT,
-                          VM_FB_WIDTH * VM_FB_BPP, CLCD_FMT_32BPP,
-                          CLCD_ORDER_BGRA);
+    if (!s5l_clcd_seed_window0(&m->clcd, fb_pa, VM_FB_WIDTH, VM_FB_HEIGHT,
+                               VM_FB_WIDTH * VM_FB_BPP, CLCD_FMT_32BPP,
+                               CLCD_ORDER_BGRA))
+        return false;
 #endif
 
     /* Start in a privileged mode with interrupts masked: this payload has no

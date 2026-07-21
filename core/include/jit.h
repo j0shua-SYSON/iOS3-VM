@@ -132,6 +132,15 @@ uint32_t jit_get_deny(void);
 bool jit_translate(arm_cpu_t *cpu, uint32_t va, uint32_t *code,
                    size_t cap_words, jit_block_t *out);
 
+/* Memory-helper ABI used by emitted blocks. These are visible so the fault and
+ * page-crossing contract can be tested on hosts that cannot execute AArch64:
+ * loads return bit 32 on fault, stores return non-zero, and a fault is reported
+ * before any bus access so interpreter replay cannot duplicate MMIO effects. */
+uint64_t jit_mem_load32(arm_cpu_t *cpu, uint32_t va);
+uint64_t jit_mem_load16(arm_cpu_t *cpu, uint32_t va);
+uint32_t jit_mem_store32(arm_cpu_t *cpu, uint32_t va, uint32_t value);
+uint32_t jit_mem_store16(arm_cpu_t *cpu, uint32_t va, uint32_t value);
+
 /* --------------------------------------------------------- code buffers --
  * A four-function shim so the memory policy is swappable without touching the
  * translator (docs/dynarec.md §8.2): plain RWX on a jailbroken A9, MAP_JIT +

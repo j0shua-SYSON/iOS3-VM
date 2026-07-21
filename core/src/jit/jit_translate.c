@@ -98,21 +98,39 @@ uint32_t jit_get_deny(void)          { return g_deny; }
 static bool jit_priv(const arm_cpu_t *c) {
     return (c->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
 }
-static uint64_t jit_helper_load32(arm_cpu_t *c, uint32_t va) {
+
+#define JIT_PAGE_MASK 0xfffu
+
+/* Resolve every page touched by a crossing access before performing any bus
+ * transaction. The JIT replays a faulting instruction in the interpreter, so
+ * an early MMIO read or write here would otherwise happen twice. */
+static bool jit_pretranslate_crossing(arm_cpu_t *c, uint32_t va, unsigned n,
+                                      arm_access_t access, uint32_t *pas) {
+    uint32_t page_pa = 0;
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t a = va + i;
+        if (i == 0u || (a & JIT_PAGE_MASK) == 0u) {
+            uint32_t pa;
+            if (arm_mmu_translate(c, a, access, jit_priv(c), &pa)) return false;
+            page_pa = pa & ~JIT_PAGE_MASK;
+        }
+        pas[i] = page_pa | (a & JIT_PAGE_MASK);
+    }
+    return true;
+}
+
+uint64_t jit_mem_load32(arm_cpu_t *c, uint32_t va) {
     uint32_t pa;
     /* Same page-crossing split as the interpreter's mem_r32: a word straddling
-     * a 4 KB boundary lives in two pages that need translating separately. */
-    if (((va & 0xfffu) + 4u) > 0x1000u) {
-        uint32_t val = 0, page_pa = 0;
+     * a 4 KB boundary lives in two pages that need translating separately.
+     * Preflight both translations so a second-page fault cannot double an
+     * MMIO read when the interpreter replays the instruction. */
+    if (((va & JIT_PAGE_MASK) + 4u) > JIT_PAGE_MASK + 1u) {
+        uint32_t val = 0, pas[4];
+        if (!jit_pretranslate_crossing(c, va, 4u, ARM_ACCESS_READ, pas))
+            return (uint64_t)1 << 32;
         for (unsigned i = 0; i < 4u; i++) {
-            uint32_t a = va + i;
-            if (i == 0u || (a & 0xfffu) == 0u) {
-                if (arm_mmu_translate(c, a, ARM_ACCESS_READ, jit_priv(c), &pa))
-                    return (uint64_t)1 << 32;
-                page_pa = pa & ~0xfffu;
-            }
-            val |= (uint32_t)c->bus->read8(c->bus->ctx, page_pa | (a & 0xfffu))
-                   << (8u * i);
+            val |= (uint32_t)c->bus->read8(c->bus->ctx, pas[i]) << (8u * i);
         }
         return val;
     }
@@ -120,9 +138,18 @@ static uint64_t jit_helper_load32(arm_cpu_t *c, uint32_t va) {
         return (uint64_t)1 << 32;
     return c->bus->read32(c->bus->ctx, pa);
 }
-static uint64_t jit_helper_load16(arm_cpu_t *c, uint32_t va) {
+uint64_t jit_mem_load16(arm_cpu_t *c, uint32_t va) {
     uint32_t pa;
-    if (arm_mmu_translate(c, va, false, jit_priv(c), &pa)) return (uint64_t)1 << 32;
+    if (((va & JIT_PAGE_MASK) + 2u) > JIT_PAGE_MASK + 1u) {
+        uint32_t pas[2], val = 0;
+        if (!jit_pretranslate_crossing(c, va, 2u, ARM_ACCESS_READ, pas))
+            return (uint64_t)1 << 32;
+        for (unsigned i = 0; i < 2u; i++)
+            val |= (uint32_t)c->bus->read8(c->bus->ctx, pas[i]) << (8u * i);
+        return val;
+    }
+    if (arm_mmu_translate(c, va, ARM_ACCESS_READ, jit_priv(c), &pa))
+        return (uint64_t)1 << 32;
     return c->bus->read16(c->bus->ctx, pa);
 }
 static uint64_t jit_helper_load8(arm_cpu_t *c, uint32_t va) {
@@ -131,29 +158,31 @@ static uint64_t jit_helper_load8(arm_cpu_t *c, uint32_t va) {
         return (uint64_t)1 << 32;
     return c->bus->read8(c->bus->ctx, pa);
 }
-static uint32_t jit_helper_store32(arm_cpu_t *c, uint32_t va, uint32_t val) {
+uint32_t jit_mem_store32(arm_cpu_t *c, uint32_t va, uint32_t val) {
     uint32_t pa;
-    if (((va & 0xfffu) + 4u) > 0x1000u) {
-        uint32_t page_pa = 0;
-        for (unsigned i = 0; i < 4u; i++) {
-            uint32_t a = va + i;
-            if (i == 0u || (a & 0xfffu) == 0u) {
-                if (arm_mmu_translate(c, a, ARM_ACCESS_WRITE, jit_priv(c), &pa))
-                    return 1u;
-                page_pa = pa & ~0xfffu;
-            }
-            c->bus->write8(c->bus->ctx, page_pa | (a & 0xfffu),
-                           (uint8_t)(val >> (8u * i)));
-        }
+    if (((va & JIT_PAGE_MASK) + 4u) > JIT_PAGE_MASK + 1u) {
+        uint32_t pas[4];
+        if (!jit_pretranslate_crossing(c, va, 4u, ARM_ACCESS_WRITE, pas))
+            return 1u;
+        for (unsigned i = 0; i < 4u; i++)
+            c->bus->write8(c->bus->ctx, pas[i], (uint8_t)(val >> (8u * i)));
         return 0u;
     }
     if (arm_mmu_translate(c, va, ARM_ACCESS_WRITE, jit_priv(c), &pa)) return 1u;
     c->bus->write32(c->bus->ctx, pa, val);
     return 0u;
 }
-static uint32_t jit_helper_store16(arm_cpu_t *c, uint32_t va, uint32_t val) {
+uint32_t jit_mem_store16(arm_cpu_t *c, uint32_t va, uint32_t val) {
     uint32_t pa;
-    if (arm_mmu_translate(c, va, true, jit_priv(c), &pa)) return 1u;
+    if (((va & JIT_PAGE_MASK) + 2u) > JIT_PAGE_MASK + 1u) {
+        uint32_t pas[2];
+        if (!jit_pretranslate_crossing(c, va, 2u, ARM_ACCESS_WRITE, pas))
+            return 1u;
+        for (unsigned i = 0; i < 2u; i++)
+            c->bus->write8(c->bus->ctx, pas[i], (uint8_t)(val >> (8u * i)));
+        return 0u;
+    }
+    if (arm_mmu_translate(c, va, ARM_ACCESS_WRITE, jit_priv(c), &pa)) return 1u;
     c->bus->write16(c->bus->ctx, pa, (uint16_t)val);
     return 0u;
 }
@@ -595,9 +624,9 @@ static void emit_mem_call(jit_t *t, bool load, jmem_t sz, jext_t ext, unsigned r
                 uint32_t (*st)(arm_cpu_t *, uint32_t, uint32_t);
                 uintptr_t v; } u;
         if (load) u.ld = (sz == JM_B) ? jit_helper_load8
-                       : (sz == JM_H) ? jit_helper_load16 : jit_helper_load32;
+                       : (sz == JM_H) ? jit_mem_load16 : jit_mem_load32;
         else      u.st = (sz == JM_B) ? jit_helper_store8
-                       : (sz == JM_H) ? jit_helper_store16 : jit_helper_store32;
+                       : (sz == JM_H) ? jit_mem_store16 : jit_mem_store32;
         helper = u.v;
     }
     /* A BL cannot reach an arbitrary host address from the code arena, so the

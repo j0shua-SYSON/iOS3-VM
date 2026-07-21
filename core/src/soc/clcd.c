@@ -344,17 +344,21 @@ bool s5l_clcd_tick(s5l_clcd_t *c, uint32_t ticks) {
          * Accumulate rather than test-and-reset against a running counter, so a
          * long tick cannot swallow a frame boundary and a short one cannot
          * double-count it. Frames that fall inside a single large tick are
-         * coalesced into one VBL: the status bit is a level, not a count, and
-         * the driver only ever completes one swap per interrupt anyway.
+         * coalesced into one asserted line: the status bit is a level, not a
+         * count, and the driver only completes one swap per interrupt. The
+         * visibility counter still records every elapsed frame boundary.
          */
-        c->frame_accum += ticks;
-        if (c->frame_accum >= c->frame_ticks) {
-            c->frame_accum %= c->frame_ticks;
+        uint64_t total = (uint64_t)c->frame_accum + ticks;
+        if (total >= c->frame_ticks) {
+            uint64_t elapsed = total / c->frame_ticks;
+            c->frame_accum = (uint32_t)(total % c->frame_ticks);
             /* Bit 0 only. Never CLCD_INT_UNDERRUN — there is no FIFO here to
              * underrun, and asserting it only makes a correct driver log
              * errors. */
             c->intstatus |= CLCD_INT_FRAME;
-            c->frames++;
+            c->frames += elapsed;
+        } else {
+            c->frame_accum = (uint32_t)total;
         }
     }
     /* Gate on the hardware mask, not on the status alone. See the header
@@ -364,19 +368,30 @@ bool s5l_clcd_tick(s5l_clcd_t *c, uint32_t ticks) {
     return (c->intstatus & c->intmask) != 0u;
 }
 
-void s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
+bool s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
                            uint32_t width, uint32_t height,
                            uint32_t stride, uint32_t format, uint32_t order) {
+    if (!c || width == 0 || width > 0x7ffu ||
+        height == 0 || height > 0x3ffu ||
+        format > CLCD_FMT_MASK || order > CLCD_ORDER_MASK ||
+        (stride & 3u) != 0u) {
+        return false;
+    }
+
+    uint32_t bytes_per_pixel = CLCD_FMT_IS_32BPP(format) ? 4u : 2u;
+    uint64_t row_bytes = (uint64_t)width * bytes_per_pixel;
+    uint64_t span = (uint64_t)(height - 1u) * stride + row_bytes;
+    if ((uint64_t)stride < row_bytes ||
+        (uint64_t)fb_phys + span > UINT64_C(0x100000000)) {
+        return false;
+    }
+
     s5l_clcd_window_t *w = &c->win[0];
     w->stride    = stride;
     w->control   = ((format & CLCD_FMT_MASK)   << CLCD_FMT_SHIFT) |
                    ((order  & CLCD_ORDER_MASK) << CLCD_ORDER_SHIFT);
     w->fbaddr    = fb_phys;
-    /* Width is 11 bits at [26:16], height 10 bits at [9:0]. Mask rather than
-     * trust the caller: a 2048-wide request must not spill into the format
-     * field and produce a window that reads plausible but is not what was
-     * asked for. */
-    w->geometry  = ((width & 0x7ffu) << 16) | (height & 0x3ffu);
+    w->geometry  = (width << 16) | height;
     w->linewords = stride / 4u;
     w->position  = 0;
 
@@ -394,6 +409,8 @@ void s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
      */
     c->enable   = 1;
     c->scanning = true;
+    c->frame_accum = 0;
+    return true;
 }
 
 /* The driver's own enable-bit order: window 0 first, then 1, 2, 3. */

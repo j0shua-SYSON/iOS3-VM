@@ -268,6 +268,57 @@ static void test_stub_window_stores_and_counts(void) {
     s5l8900_free(&m);
 }
 
+static void test_mmio_width_alignment_and_window_edges(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+    CHECK(s5l8900_add_stub(&m, 0x3b100000u, 8u, "lanes"),
+          "small stub declaration failed");
+
+    /* Stub storage is byte-addressable and little-endian, including an
+     * unaligned halfword that spans two backing uint32_t values. */
+    m.bus.write32(m.bus.ctx, 0x3b100000u, 0x11223344u);
+    m.bus.write8(m.bus.ctx, 0x3b100001u, 0xaau);
+    CHECK(m.bus.read32(m.bus.ctx, 0x3b100000u) == 0x1122aa44u,
+          "byte write updated the wrong register lane");
+    m.bus.write16(m.bus.ctx, 0x3b100003u, 0xbeefu);
+    CHECK(m.bus.read16(m.bus.ctx, 0x3b100003u) == 0xbeefu,
+          "unaligned cross-register halfword did not round-trip");
+
+    /* An access must fit wholly inside its window. Starting in the last byte
+     * is not permission to spill into the next physical region. */
+    uint64_t before = m.unmapped_reads;
+    (void)m.bus.read16(m.bus.ctx, 0x3b100007u);
+    CHECK(m.unmapped_reads == before + 1u,
+          "cross-boundary stub read was treated as mapped");
+    before = m.unmapped_reads;
+    (void)m.bus.read16(m.bus.ctx, S5L8900_NOR_BASE + S5L8900_NOR_SIZE - 1u);
+    CHECK(m.unmapped_reads == before + 1u,
+          "cross-boundary NOR read was treated as mapped");
+
+    /* Register devices are 32-bit MMIO. A byte store must not accidentally
+     * become a full-register write, while UART TX deliberately accepts STRB. */
+    uint64_t writes = m.unmapped_writes;
+    m.bus.write8(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE, 1u);
+    CHECK(m.unmapped_writes == writes + 1u && m.vic[0].enable == 0,
+          "narrow VIC write clobbered a word register");
+    m.bus.write8(m.bus.ctx, S5L8900_UART0_BASE + UART_UTXH, 'X');
+    CHECK(m.uart0.tx_len == 1 && m.uart0.tx[0] == 'X',
+          "aligned UART byte transmit should remain supported");
+    s5l8900_free(&m);
+}
+
+static void test_address_space_wrap_is_refused(void) {
+    s5l8900_t m;
+    CHECK(!s5l8900_init(&m, 0, 0), "zero-sized RAM was accepted");
+    CHECK(!s5l8900_init(&m, 0xffffff00u, 0x200u),
+          "RAM aperture wrapping past 4 GiB was accepted");
+
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+    CHECK(!s5l8900_add_stub(&m, 0xf0000000u, 0x20000000u, "wrap"),
+          "stub window wrapping past 4 GiB was accepted");
+    s5l8900_free(&m);
+}
+
 /*
  * The power controller is the block that stood between a booting kernel and a
  * booting OS. AppleS5L8900XPowerController::start writes the domains it wants
@@ -664,6 +715,27 @@ static void test_clcd_raises_the_frame_interrupt(void) {
     CHECK(n == 10, "raised %u frames in 10 frames' worth of ticks", n);
 }
 
+/* A host scheduler can hand the machine a very large time slice. The phase
+ * arithmetic must not wrap at 32 bits and silently postpone VBL forever. */
+static void test_clcd_large_tick_preserves_phase(void) {
+    s5l_clcd_t c; s5l_clcd_reset(&c);
+    c.frame_ticks = 100u;
+    c.scanning = true;
+    c.frame_accum = 99u;
+    c.intmask = CLCD_INT_FRAME;
+
+    const uint64_t total = UINT64_C(99) + UINT32_MAX;
+    CHECK(s5l_clcd_tick(&c, UINT32_MAX),
+          "a huge tick crossing a frame must raise the frame line");
+    CHECK(c.frame_accum == (uint32_t)(total % c.frame_ticks),
+          "phase=%u expect %u after a UINT32_MAX tick",
+          c.frame_accum, (uint32_t)(total % c.frame_ticks));
+    CHECK(c.frames == total / c.frame_ticks,
+          "frames=%llu expect %llu after a UINT32_MAX tick",
+          (unsigned long long)c.frames,
+          (unsigned long long)(total / c.frame_ticks));
+}
+
 /*
  * The interrupt LINE must be gated by the hardware mask at 0x014, not by the
  * status alone. The handler at 0xc0705d7c computes `status & shadowMask` and
@@ -755,8 +827,9 @@ static void test_clcd_seed_is_visible_to_the_guest(void) {
     CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
 
     const uint32_t FB = 0x0ff00000u, W = 320, H = 480, STRIDE = 320 * 4;
-    s5l_clcd_seed_window0(&m.clcd, FB, W, H, STRIDE,
-                          CLCD_FMT_32BPP, CLCD_ORDER_BGRA);
+    CHECK(s5l_clcd_seed_window0(&m.clcd, FB, W, H, STRIDE,
+                                CLCD_FMT_32BPP, CLCD_ORDER_BGRA),
+          "the iPhone 3G's 320x480 framebuffer must be representable");
 
     uint32_t b = S5L8900_CLCD_BASE + CLCD_WIN_FIRST;
     CHECK(m.bus.read32(m.bus.ctx, b + CLCD_WIN_FBADDR) == FB,
@@ -791,6 +864,57 @@ static void test_clcd_seed_is_visible_to_the_guest(void) {
     CHECK(m.clcd.frames > 0, "scanout should have been running all the same");
 
     s5l8900_free(&m);
+}
+
+/* The host-side iBoot shim is a trust boundary: malformed or overflowed seed
+ * data must be rejected atomically, never masked into plausible registers. */
+static void test_clcd_seed_rejects_invalid_layouts_atomically(void) {
+    s5l_clcd_t c; s5l_clcd_reset(&c);
+    CHECK(s5l_clcd_seed_window0(&c, 0x0ff00000u, 320u, 480u, 1280u,
+                                CLCD_FMT_32BPP, CLCD_ORDER_BGRA),
+          "baseline seed failed");
+    s5l_clcd_t before = c;
+
+    struct {
+        uint32_t fb, width, height, stride, format, order;
+        const char *why;
+    } bad[] = {
+        { 0x0ff00000u, 0u,      480u, 1280u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+          "zero width" },
+        { 0x0ff00000u, 0x800u,  480u, 8192u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+          "width field overflow" },
+        { 0x0ff00000u, 320u,      0u, 1280u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+          "zero height" },
+        { 0x0ff00000u, 320u,    0x400u, 1280u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+          "height field overflow" },
+        { 0x0ff00000u, 320u,    480u, 1276u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+          "stride shorter than a row" },
+        { 0x0ff00000u, 320u,    480u, 1282u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+          "stride not word aligned" },
+        { 0x0ff00000u, 320u,    480u, 1280u, CLCD_FMT_MASK + 1u, CLCD_ORDER_BGRA,
+          "format field overflow" },
+        { 0x0ff00000u, 320u,    480u, 1280u, CLCD_FMT_32BPP, CLCD_ORDER_MASK + 1u,
+          "order field overflow" },
+        { 0xfffffff1u, 4u,        1u,   16u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+          "physical address wrap" },
+    };
+
+    CHECK(!s5l_clcd_seed_window0(NULL, 0, 1, 1, 4,
+                                 CLCD_FMT_32BPP, CLCD_ORDER_BGRA),
+          "a null controller must be rejected");
+    for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        CHECK(!s5l_clcd_seed_window0(&c, bad[i].fb, bad[i].width,
+                                     bad[i].height, bad[i].stride,
+                                     bad[i].format, bad[i].order),
+              "accepted %s", bad[i].why);
+        CHECK(memcmp(&c, &before, sizeof c) == 0,
+              "%s changed controller state on rejection", bad[i].why);
+    }
+
+    s5l_clcd_t edge; s5l_clcd_reset(&edge);
+    CHECK(s5l_clcd_seed_window0(&edge, 0xfffffff0u, 4u, 1u, 16u,
+                                CLCD_FMT_32BPP, CLCD_ORDER_BGRA),
+          "a framebuffer ending exactly at 4 GiB was rejected");
 }
 
 /*
@@ -872,8 +996,9 @@ static void test_clcd_scanout_reads_guest_memory(void) {
           "a window running one byte past DRAM must be an error, not a picture");
 
     /* A stride too small to hold a row is a programming fault, not a squeeze. */
-    s5l_clcd_seed_window0(&m.clcd, FB, W, H, W * 4u - 1u,
-                          CLCD_FMT_32BPP, CLCD_ORDER_BGRA);
+    /* Guest MMIO can still produce malformed state even though the host seed
+     * API rejects it, so exercise that path through the real register write. */
+    s5l_clcd_write(&m.clcd, CLCD_WIN_FIRST + CLCD_WIN_PITCH, W * 4u - 1u);
     CHECK(!s5l_clcd_scanout(&m.clcd, 0, m.ram, m.ram_base, m.ram_size,
                             rgb, sizeof rgb, NULL, NULL),
           "a stride shorter than one row must be an error");
@@ -1100,6 +1225,8 @@ int main(void) {
     test_bounds_check_cannot_overflow();
     test_bare_metal_uart_hello();
     test_stub_window_stores_and_counts();
+    test_mmio_width_alignment_and_window_edges();
+    test_address_space_wrap_is_refused();
     test_machine_declares_its_known_windows();
     test_nor_reads_are_nor_at_the_boot_ram_size();
     test_no_window_the_machine_decodes_is_shadowed_by_ram();
@@ -1111,10 +1238,12 @@ int main(void) {
     test_vic_masks_and_routes();
     test_vic1_is_mapped_and_drives_the_cpu();
     test_clcd_raises_the_frame_interrupt();
+    test_clcd_large_tick_preserves_phase();
     test_clcd_line_is_gated_by_the_mask();
     test_clcd_status_never_defers_the_swap();
     test_clcd_saved_registers_read_back();
     test_clcd_seed_is_visible_to_the_guest();
+    test_clcd_seed_rejects_invalid_layouts_atomically();
     test_clcd_active_window_follows_the_drivers_order();
     test_clcd_scanout_reads_guest_memory();
     test_clcd_scanout_565_reaches_full_white();

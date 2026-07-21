@@ -246,7 +246,12 @@ static const NSUInteger kConsoleScrollback = 12000;
     [self append:[NSString stringWithFormat:@"RWX mmap    : %@",
                   rwx ? @"YES" : @"no"]];
 #if defined(__arm64__)
-    if (rwx) {
+    /* Do not deliberately branch into unsigned memory unless the process is
+     * actually marked CS_DEBUGGED. A permissive-looking mmap is not proof of
+     * executable permission; on a misconfigured jailbreak the old automatic
+     * probe killed the app at launch, before the user could read the diagnosis.
+     * The real dynarec will apply the same preflight before it is enabled. */
+    if (rwx && debugged) {
         uint32_t *code = (uint32_t *)page;
         code[0] = 0x52824680u;   /* movz w0, #0x1234 */
         code[1] = 0xd65f03c0u;   /* ret              */
@@ -259,8 +264,10 @@ static const NSUInteger kConsoleScrollback = 12000;
         [self append:@"JIT execute : calling emitted code…"];
         uint32_t got = ((uint32_t (*)(void))page)();
         [self append:[NSString stringWithFormat:@"JIT execute : %@ (got 0x%04x)",
-                      got == 0x1234u ? @"YES  — dynarec viable"
-                                     : @"ran, but WRONG RESULT", got]];
+                       got == 0x1234u ? @"YES  — dynarec viable"
+                                      : @"ran, but WRONG RESULT", got]];
+    } else if (rwx) {
+        [self append:@"JIT execute : skipped (CS_DEBUGGED is not set)"];
     }
 #else
     if (rwx) [self append:@"JIT execute : skipped (host is not arm64)"];

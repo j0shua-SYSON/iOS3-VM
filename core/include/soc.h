@@ -511,7 +511,7 @@ typedef struct {
     bool     scanning;        /* CLCD_ENABLE has been written 1, no stop since */
     uint32_t frame_ticks;     /* timebase ticks per frame; 0 disables the VBL  */
     uint32_t frame_accum;
-    uint64_t frames;          /* how many VBLs we have raised (visibility)     */
+    uint64_t frames;          /* elapsed VBL boundaries (host visibility)      */
 } s5l_clcd_t;
 
 void     s5l_clcd_reset(s5l_clcd_t *c);
@@ -528,9 +528,10 @@ bool     s5l_clcd_tick(s5l_clcd_t *c, uint32_t ticks);
  *
  * `format` is a CLCD_FMT_* value and `order` a CLCD_ORDER_* value; `stride` is
  * in bytes. This is a host-side call, not a guest-visible register: a boot stub
- * standing in for iBoot calls it before the guest runs.
+ * standing in for iBoot calls it before the guest runs. Returns false without
+ * changing the controller if the geometry cannot be represented safely.
  */
-void     s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
+bool     s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
                                uint32_t width, uint32_t height,
                                uint32_t stride, uint32_t format, uint32_t order);
 

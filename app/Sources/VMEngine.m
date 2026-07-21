@@ -228,8 +228,14 @@ static double vm_now(void) {
     uint32_t fbStride = 0, fbW = 0, fbH = 0;
     vm_pixel_order_t order = VM_ORDER_BGRA;
     const uint8_t *fb = vm_guest_display(&_machine, &fbW, &fbH, &fbStride, &order);
-    size_t fbBytes = (size_t)fbStride * fbH;
-    if (fbBytes == 0 || fbBytes > VM_FB_BYTES) fb = NULL;
+    size_t fbBytes = 0;
+    if (!fb || fbW == 0 || fbH == 0 || fbW > SIZE_MAX / VM_FB_BPP ||
+        fbStride < (size_t)fbW * VM_FB_BPP || fbStride > SIZE_MAX / fbH) {
+        fb = NULL;
+    } else {
+        fbBytes = (size_t)fbStride * fbH;
+        if (fbBytes == 0 || fbBytes > VM_FB_BYTES) fb = NULL;
+    }
 
     // Drain the UART before taking the lock's contents out of the machine:
     // core's tx buffer is a fixed 8 KB that stops accepting bytes when full, so
@@ -252,6 +258,11 @@ static double vm_now(void) {
 
     pthread_mutex_lock(&_lock);
     if (fb && _snapshot) {
+        /* A future guest mode may use less than the fixed publication buffer.
+         * Clear the unused tail so a geometry change cannot expose pixels from
+         * the previous frame. */
+        if (fbBytes < VM_FB_BYTES)
+            memset(_snapshot + fbBytes, 0, VM_FB_BYTES - fbBytes);
         memcpy(_snapshot, fb, fbBytes);
         _snapshotARGB = (order == VM_ORDER_ARGB);
         _snapshotFresh = YES;

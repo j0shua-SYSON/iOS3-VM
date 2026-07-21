@@ -6,6 +6,10 @@ on:
   push:
     paths:
       - 'core/**'
+      - 'tools/**'
+      - 'app/Sources/VMGuest.c'
+      - 'app/Sources/VMGuest.h'
+      - 'app/Tests/**'
       - 'CMakeLists.txt'
       - '.github/workflows/core-tests.yml'
   pull_request:
@@ -109,3 +113,24 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           ASAN_OPTIONS: detect_leaks=1
         run: ctest --test-dir build-san --output-on-failure
+
+  strict:
+    # Every C target, including host tools and the app's portable bridge, must
+    # remain warning-free.  Keep this hosted: the user's development machine is
+    # intentionally reserved for tiny checks and may not have the same compiler.
+    name: warnings as errors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (strict warnings)
+        run: |
+          cmake -S . -B build-strict \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-Wall -Wextra -Werror"
+
+      - name: Build
+        run: cmake --build build-strict
+
+      - name: Test
+        run: ctest --test-dir build-strict --output-on-failure

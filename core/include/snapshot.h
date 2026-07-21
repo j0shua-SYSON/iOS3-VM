@@ -68,9 +68,9 @@ typedef enum {
 const char *snapshot_strerror(snapshot_status_t st);
 
 /*
- * Write the entire machine to `path`. The machine is not modified.
- * The file is written in one pass; on failure it may exist and be incomplete,
- * which the length + checksum in the file make detectable on load.
+ * Write the entire machine to `path`. The machine is not modified. The bytes
+ * are first completed in the same directory and then atomically replace the
+ * destination, so a failed save leaves an earlier checkpoint intact.
  */
 snapshot_status_t snapshot_save(const s5l8900_t *m, const char *path);
 
@@ -86,9 +86,11 @@ snapshot_status_t snapshot_save(const s5l8900_t *m, const char *path);
  * overwritten. That is what lets a tool interpose on the bus (as bootkernel
  * does) and still restore underneath it.
  *
- * On any error other than SNAP_ERR_IO from the second pass, the machine is
- * left untouched. See the note in snapshot.c about the one case that cannot
- * be, and why it cannot arise.
+ * Malformed data, checksum failures and geometry mismatches are rejected
+ * before the applying pass and leave the machine untouched. A genuine file
+ * read failure (or external in-place modification) during that final pass can
+ * leave contents partially applied; in-memory loads are transactional for all
+ * malformed inputs.
  */
 snapshot_status_t snapshot_load(s5l8900_t *m, const char *path);
 

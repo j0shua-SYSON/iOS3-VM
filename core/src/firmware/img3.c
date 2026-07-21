@@ -34,6 +34,7 @@ void img3_ident_str(uint32_t ident, char *out) {
 const char *img3_strerror(img3_status_t st) {
     switch (st) {
         case IMG3_OK:            return "ok";
+        case IMG3_ERR_INVALID_ARGUMENT: return "invalid IMG3 parser argument";
         case IMG3_ERR_TOO_SMALL: return "buffer too small for an IMG3 header";
         case IMG3_ERR_BAD_MAGIC: return "not an IMG3 container";
         case IMG3_ERR_BAD_SIZE:  return "declared size does not fit the buffer";
@@ -42,15 +43,12 @@ const char *img3_strerror(img3_status_t st) {
     }
 }
 
-bool img3_decrypt_data(const img3_t *img, const uint8_t *key, unsigned key_bits,
-                       uint8_t *out, uint32_t *out_len) {
-    if (!img || !img->kbag.present) return false;  /* no IV to work with */
-    return img3_decrypt_data_iv(img, key, key_bits, img->kbag.iv, out, out_len);
-}
-
 bool img3_decrypt_data_iv(const img3_t *img, const uint8_t *key, unsigned key_bits,
-                          const uint8_t iv[16], uint8_t *out, uint32_t *out_len) {
-    if (!img || !img->data || !key || !out || !iv) return false;
+                          const uint8_t iv[16], uint8_t *out, size_t out_cap,
+                          uint32_t *out_len) {
+    if (!img || !img->data || !img->kbag.present || img->kbag.malformed ||
+        !key || !out || !iv || key_bits != img->kbag.key_bits ||
+        out_cap < img->data_len) return false;
 
     aes_ctx_t ctx;
     if (!aes_init(&ctx, key, key_bits)) return false;
@@ -81,8 +79,9 @@ static void parse_kbag(const uint8_t *d, uint32_t len, img3_kbag_t *k) {
     k->key_bits    = rd32(d + 4);
     memcpy(k->iv, d + 8, 16);
 
+    if (k->key_bits != 128u && k->key_bits != 192u && k->key_bits != 256u)
+        return;
     uint32_t key_len = k->key_bits / 8u;
-    if (key_len > sizeof k->key) return;          /* implausible key size */
     if ((uint64_t)24 + key_len > (uint64_t)len) return;
     memcpy(k->key, d + 24, key_len);
     k->present   = true;
@@ -90,6 +89,7 @@ static void parse_kbag(const uint8_t *d, uint32_t len, img3_kbag_t *k) {
 }
 
 img3_status_t img3_parse(const uint8_t *buf, size_t len, img3_t *out) {
+    if (!out) return IMG3_ERR_INVALID_ARGUMENT;
     memset(out, 0, sizeof *out);
     if (!buf || len < IMG3_HEADER_SIZE) return IMG3_ERR_TOO_SMALL;
 
@@ -163,5 +163,9 @@ img3_status_t img3_parse(const uint8_t *buf, size_t len, img3_t *out) {
         off += total_len;
     }
 
+    /* A declared container must be exactly a sequence of complete tags.
+     * Accepting an unexplained 1..11-byte suffix makes a malformed fullSize
+     * look valid and weakens every caller's framing assumptions. */
+    if (off != end) return IMG3_ERR_BAD_TAG;
     return IMG3_OK;
 }

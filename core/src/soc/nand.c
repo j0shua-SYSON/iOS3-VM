@@ -12,11 +12,13 @@
 #include <string.h>
 
 uint32_t nand_total_pages(const nand_t *n) {
+    if (!n) return 0;
     return n->pages_per_block * n->block_count;
 }
 
 bool nand_init(nand_t *n, uint32_t page_size, uint32_t spare_size,
                uint32_t pages_per_block, uint32_t block_count) {
+    if (!n) return false;
     memset(n, 0, sizeof *n);
     if (!page_size || !pages_per_block || !block_count) return false;
 
@@ -47,6 +49,7 @@ bool nand_init(nand_t *n, uint32_t page_size, uint32_t spare_size,
 }
 
 void nand_free(nand_t *n) {
+    if (!n) return;
     free(n->data);  n->data = NULL;
     free(n->spare); n->spare = NULL;
     free(n->bad);   n->bad = NULL;
@@ -55,7 +58,7 @@ void nand_free(nand_t *n) {
 
 nand_status_t nand_read_page(const nand_t *n, uint32_t page,
                              uint8_t *data, uint8_t *spare) {
-    if (!n->data || page >= nand_total_pages(n)) return NAND_ERR_RANGE;
+    if (!n || !n->data || page >= nand_total_pages(n)) return NAND_ERR_RANGE;
     if (data)
         memcpy(data, &n->data[(size_t)page * n->page_size], n->page_size);
     if (spare && n->spare)
@@ -65,7 +68,8 @@ nand_status_t nand_read_page(const nand_t *n, uint32_t page,
 
 nand_status_t nand_program_page(nand_t *n, uint32_t page,
                                 const uint8_t *data, const uint8_t *spare) {
-    if (!n->data || page >= nand_total_pages(n)) return NAND_ERR_RANGE;
+    if (!n || !n->data || !n->bad || page >= nand_total_pages(n))
+        return NAND_ERR_RANGE;
     uint32_t block = page / n->pages_per_block;
     if (n->bad[block]) return NAND_ERR_BAD_BLOCK;
 
@@ -94,7 +98,8 @@ nand_status_t nand_program_page(nand_t *n, uint32_t page,
 }
 
 nand_status_t nand_erase_block(nand_t *n, uint32_t block) {
-    if (!n->data || block >= n->block_count) return NAND_ERR_RANGE;
+    if (!n || !n->data || !n->bad || block >= n->block_count)
+        return NAND_ERR_RANGE;
     if (n->bad[block]) return NAND_ERR_BAD_BLOCK;
 
     size_t first = (size_t)block * n->pages_per_block;
@@ -107,9 +112,9 @@ nand_status_t nand_erase_block(nand_t *n, uint32_t block) {
 }
 
 void nand_mark_bad(nand_t *n, uint32_t block) {
-    if (n->bad && block < n->block_count) n->bad[block] = 1;
+    if (n && n->bad && block < n->block_count) n->bad[block] = 1;
 }
 
 bool nand_is_bad(const nand_t *n, uint32_t block) {
-    return n->bad && block < n->block_count && n->bad[block] != 0;
+    return n && n->bad && block < n->block_count && n->bad[block] != 0;
 }

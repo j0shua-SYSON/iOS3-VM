@@ -163,6 +163,16 @@ static void test_reject_zero_length_tag(void) {
           "zero-length tag accepted (infinite-loop hazard)");
 }
 
+static void test_reject_partial_trailing_tag(void) {
+    img_begin(0x69626f74u);
+    img_tag(IMG3_TAG_DATA, "abcd", 4);
+    g_buf[g_len++] = 0xAA;                       /* less than a tag header */
+    img_finish();
+    img3_t img;
+    CHECK(img3_parse(g_buf, g_len, &img) == IMG3_ERR_BAD_TAG,
+          "partial trailing tag accepted");
+}
+
 static void test_truncated_kbag_ignored(void) {
     /* A KBAG too short to hold its own fields must simply not be marked
      * present, rather than reading past the tag. */
@@ -211,7 +221,8 @@ static void test_decrypt_data_roundtrip(void) {
 
     uint8_t out[sizeof plain];
     uint32_t out_len = 0;
-    CHECK(img3_decrypt_data(&img, key, 128, out, &out_len), "decrypt failed");
+    CHECK(img3_decrypt_data_iv(&img, key, 128, iv, out, sizeof out, &out_len),
+          "decrypt failed");
     CHECK(out_len == sizeof plain, "out_len=%u expect %u", out_len, (unsigned)sizeof plain);
     CHECK(memcmp(out, plain, sizeof plain) == 0, "decrypted payload mismatch");
 }
@@ -224,8 +235,37 @@ static void test_decrypt_requires_kbag(void) {
     img3_t img;
     CHECK(img3_parse(g_buf, g_len, &img) == IMG3_OK, "parse failed");
     uint8_t out[16];
-    CHECK(!img3_decrypt_data(&img, key, 128, out, NULL),
+    uint8_t iv[16] = {0};
+    CHECK(!img3_decrypt_data_iv(&img, key, 128, iv, out, sizeof out, NULL),
           "decrypt without a KBAG should fail");
+}
+
+static void test_decrypt_checks_output_capacity(void) {
+    static const uint8_t key[16] = {0};
+    uint8_t iv[16] = {0}, kbag[40] = {0}, out[16];
+    kbag[0] = 1; kbag[4] = 128;
+    img_begin(0x69626f74u);
+    img_tag(IMG3_TAG_KBAG, kbag, sizeof kbag);
+    img_tag(IMG3_TAG_DATA, "0123456789abcdef", 16);
+    img_finish();
+
+    img3_t img;
+    CHECK(img3_parse(g_buf, g_len, &img) == IMG3_OK, "parse failed");
+    memset(out, 0xEE, sizeof out);
+    CHECK(!img3_decrypt_data_iv(&img, key, 128, iv, out, sizeof out - 1u, NULL),
+          "undersized output buffer accepted");
+    bool untouched = true;
+    for (unsigned i = 0; i < sizeof out; i++)
+        if (out[i] != 0xEE) untouched = false;
+    CHECK(untouched, "capacity failure modified the output buffer");
+
+    CHECK(!img3_decrypt_data_iv(&img, key, 256, iv, out, sizeof out, NULL),
+          "key size inconsistent with KBAG was accepted");
+}
+
+static void test_null_output_struct_is_refused(void) {
+    CHECK(img3_parse(g_buf, g_len, NULL) == IMG3_ERR_INVALID_ARGUMENT,
+          "NULL output struct was dereferenced or accepted");
 }
 
 /* --- regressions from the adversarial audit ----------------------------- */
@@ -287,6 +327,9 @@ static void test_kbag_192_and_256_accepted(void) {
 static void test_kbag_absurd_keybits_rejected(void) {
     /* The only thing protecting the fixed 32-byte key field is one bounds
      * check on an attacker-controlled length. Pin it. */
+    kbag_case(0,     0,   false);
+    kbag_case(127,  16,   false);
+    kbag_case(129,  17,   false);
     kbag_case(264,  33,  false);         /* one byte past the field */
     kbag_case(512,  64,  false);
     kbag_case(4096, 512, false);
@@ -343,9 +386,12 @@ int main(void) {
     test_reject_tag_past_end();
     test_reject_tag_data_exceeds_tag();
     test_reject_zero_length_tag();
+    test_reject_partial_trailing_tag();
     test_truncated_kbag_ignored();
     test_decrypt_data_roundtrip();
     test_decrypt_requires_kbag();
+    test_decrypt_checks_output_capacity();
+    test_null_output_struct_is_refused();
     test_magic_is_literal_3gmI();
     test_kbag_192_and_256_accepted();
     test_kbag_absurd_keybits_rejected();

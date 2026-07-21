@@ -52,6 +52,52 @@ static bool roundtrip(const s5l8900_t *a, s5l8900_t *b) {
     return true;
 }
 
+static uint32_t rd32le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t rd64le(const uint8_t *p) {
+    return (uint64_t)rd32le(p) | ((uint64_t)rd32le(p + 4) << 32);
+}
+
+static void wr32le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+static void wr64le(uint8_t *p, uint64_t v) {
+    wr32le(p, (uint32_t)v); wr32le(p + 4, (uint32_t)(v >> 32));
+}
+
+static uint64_t snapshot_hash(const uint8_t *p, size_t n) {
+    /* Preserve the format's existing (nonstandard) historical FNV offset. */
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static void refresh_snapshot_hash(uint8_t *buf, size_t len) {
+    if (!buf || len < 48u) return;
+    uint64_t plen = rd64le(buf + 24);
+    if (plen <= len - 48u)
+        wr64le(buf + 40u + (size_t)plen, snapshot_hash(buf + 40, (size_t)plen));
+}
+
+static size_t find_section(const uint8_t *buf, size_t len, uint32_t tag) {
+    if (len < 48u) return 0;
+    uint64_t plen = rd64le(buf + 24), used = 0;
+    size_t off = 40;
+    while (used + 16u <= plen && off + 16u <= len) {
+        uint64_t slen = rd64le(buf + off + 8);
+        if (rd32le(buf + off) == tag) return off;
+        if (slen > plen - used - 16u || slen > SIZE_MAX - off - 16u) return 0;
+        off += 16u + (size_t)slen;
+        used += 16u + slen;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------- CPU state --- */
 
 /*
@@ -372,6 +418,10 @@ static void test_file_round_trip(void) {
     const char *path = "test_snapshot.tmp";
     snapshot_status_t st = snapshot_save(a, path);
     CHECK(st == SNAP_OK, "file save: %s", snapshot_strerror(st));
+    /* The second save exercises atomic replacement of an existing checkpoint
+     * (plain rename cannot replace an existing file on Windows). */
+    st = snapshot_save(a, path);
+    CHECK(st == SNAP_OK, "file replace: %s", snapshot_strerror(st));
     st = snapshot_load(b, path);
     CHECK(st == SNAP_OK, "file load: %s", snapshot_strerror(st));
     SAME(cpu.r[7]); SAME(timer.ticks);
@@ -406,6 +456,101 @@ static bool machine_is_pristine(s5l8900_t *m) {
     return true;
 }
 
+static void test_checksum_valid_malformed_snapshots_are_transactional(void) {
+    const uint32_t TAG_CPU_TEST = 0x20555043u; /* "CPU " */
+    const uint32_t TAG_NOR_TEST = 0x20524f4eu; /* "NOR " */
+    s5l8900_t src;
+    CHECK(s5l8900_init(&src, 0, RAMSZ), "init source");
+    src.cpu.r[0] = 0xdeadbeefu;
+    src.nor.data[0] = 0;
+    src.nor.image_count = 1;
+    src.nor.images[0].ident = 0x69626f74u;
+    src.nor.images[0].offset = 0;
+    src.nor.images[0].size = 20;
+
+    uint8_t *good = NULL; size_t glen = 0;
+    CHECK(snapshot_save_mem(&src, &good, &glen) == SNAP_OK, "save source");
+    if (!good) { s5l8900_free(&src); return; }
+    size_t cpu = find_section(good, glen, TAG_CPU_TEST);
+    size_t nor = find_section(good, glen, TAG_NOR_TEST);
+    CHECK(cpu != 0 && nor != 0, "required sections not found");
+
+    /* A wrong section length used to be noticed only after the CPU visitor
+     * had overwritten the live target. Keep the hash valid to reach grammar
+     * validation rather than the checksum fast path. */
+    {
+        uint8_t *bad = malloc(glen);
+        memcpy(bad, good, glen);
+        wr64le(bad + cpu + 8, rd64le(bad + cpu + 8) + 1u);
+        refresh_snapshot_hash(bad, glen);
+        s5l8900_t dst; s5l8900_init(&dst, 0, RAMSZ);
+        CHECK(snapshot_load_mem(&dst, bad, glen) == SNAP_ERR_CORRUPT,
+              "checksum-valid wrong section length was accepted");
+        CHECK(machine_is_pristine(&dst) && dst.nor.image_count == 0,
+              "rejected section length partially restored the machine");
+        s5l8900_free(&dst); free(bad);
+    }
+
+    /* One byte after END but inside payload_len was silently ignored. */
+    {
+        uint64_t plen = rd64le(good + 24);
+        size_t trailer = 40u + (size_t)plen;
+        uint8_t *bad = malloc(glen + 1u);
+        memcpy(bad, good, trailer);
+        bad[trailer] = 0xa5;
+        memcpy(bad + trailer + 1u, good + trailer, 8u);
+        wr64le(bad + 24, plen + 1u);
+        refresh_snapshot_hash(bad, glen + 1u);
+        s5l8900_t dst; s5l8900_init(&dst, 0, RAMSZ);
+        CHECK(snapshot_load_mem(&dst, bad, glen + 1u) == SNAP_ERR_CORRUPT,
+              "payload bytes after END were accepted");
+        CHECK(machine_is_pristine(&dst), "extra payload byte changed target state");
+        s5l8900_free(&dst); free(bad);
+    }
+
+    /* Header flags are reserved and outside the payload checksum. */
+    {
+        uint8_t *bad = malloc(glen);
+        memcpy(bad, good, glen); bad[32] = 1;
+        s5l8900_t dst; s5l8900_init(&dst, 0, RAMSZ);
+        CHECK(snapshot_load_mem(&dst, bad, glen) == SNAP_ERR_CORRUPT,
+              "nonzero snapshot header flags were accepted");
+        CHECK(machine_is_pristine(&dst), "header-flag rejection changed target state");
+        s5l8900_free(&dst); free(bad);
+    }
+
+    /* abort_pending is the first serialized CPU boolean, at byte 252 of the
+     * CPU body. Booleans have one canonical byte each: 0 or 1. */
+    {
+        uint8_t *bad = malloc(glen);
+        memcpy(bad, good, glen); bad[cpu + 16u + 252u] = 2;
+        refresh_snapshot_hash(bad, glen);
+        s5l8900_t dst; s5l8900_init(&dst, 0, RAMSZ);
+        CHECK(snapshot_load_mem(&dst, bad, glen) == SNAP_ERR_CORRUPT,
+              "noncanonical snapshot boolean was accepted");
+        CHECK(machine_is_pristine(&dst), "boolean rejection changed target state");
+        s5l8900_free(&dst); free(bad);
+    }
+
+    /* NOR payload is followed by entries {ident,offset,size}. Keep count=1
+     * but push entry 0 past the flash boundary. */
+    {
+        uint8_t *bad = malloc(glen);
+        memcpy(bad, good, glen);
+        wr32le(bad + nor + 16u + src.nor.size + 4u, src.nor.size - 10u);
+        refresh_snapshot_hash(bad, glen);
+        s5l8900_t dst; s5l8900_init(&dst, 0, RAMSZ);
+        CHECK(snapshot_load_mem(&dst, bad, glen) == SNAP_ERR_CORRUPT,
+              "out-of-range snapshot NOR entry was accepted");
+        CHECK(machine_is_pristine(&dst) && dst.nor.image_count == 0 &&
+              dst.nor.data[0] == 0xff,
+              "NOR-entry rejection partially restored machine state");
+        s5l8900_free(&dst); free(bad);
+    }
+
+    free(good); s5l8900_free(&src);
+}
+
 static void test_bad_snapshots_are_refused(void) {
     s5l8900_t ma;
     s5l8900_t *a = &ma;
@@ -416,6 +561,22 @@ static void test_bad_snapshots_are_refused(void) {
     uint8_t *good = NULL; size_t glen = 0;
     CHECK(snapshot_save_mem(a, &good, &glen) == SNAP_OK, "save");
     if (!good) { s5l8900_free(a); return; }
+
+    CHECK(snapshot_load_mem(a, NULL, glen) == SNAP_ERR_IO,
+          "NULL snapshot bytes were accepted");
+    {
+        s5l8900_t corrupt_target = *a;
+        corrupt_target.stub_count = S5L_STUB_MAX + 1u;
+        CHECK(snapshot_load_mem(&corrupt_target, good, glen) == SNAP_ERR_GEOMETRY,
+              "corrupt target stub_count reached snapshot traversal");
+    }
+    {
+        uint8_t *out = (uint8_t *)(uintptr_t)1u;
+        size_t out_len = 1u;
+        CHECK(snapshot_save_mem(NULL, &out, &out_len) == SNAP_ERR_IO &&
+              out == NULL && out_len == 0,
+              "failed save_mem did not clear its outputs");
+    }
 
     struct { const char *what; snapshot_status_t want; } cases[] = {
         { "bad magic",      SNAP_ERR_MAGIC     },
@@ -614,6 +775,7 @@ int main(void) {
     test_nor_round_trips();
     test_file_round_trip();
     test_bad_snapshots_are_refused();
+    test_checksum_valid_malformed_snapshots_are_transactional();
     test_restore_does_not_diverge();
     test_restore_is_idempotent();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

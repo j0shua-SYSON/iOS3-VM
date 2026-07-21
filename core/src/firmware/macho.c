@@ -18,6 +18,7 @@ static uint32_t rd32(const uint8_t *p) {
 const char *macho_strerror(macho_status_t st) {
     switch (st) {
         case MACHO_OK:            return "ok";
+        case MACHO_ERR_INVALID_ARGUMENT: return "invalid Mach-O parser argument";
         case MACHO_ERR_TOO_SMALL: return "buffer too small for a Mach-O header";
         case MACHO_ERR_BAD_MAGIC: return "not a 32-bit little-endian Mach-O";
         case MACHO_ERR_NOT_ARM:   return "not an ARM executable";
@@ -28,6 +29,7 @@ const char *macho_strerror(macho_status_t st) {
 }
 
 macho_status_t macho_parse(const uint8_t *buf, size_t len, macho_t *out) {
+    if (!out) return MACHO_ERR_INVALID_ARGUMENT;
     memset(out, 0, sizeof *out);
     if (!buf || len < 28) return MACHO_ERR_TOO_SMALL;
     if (rd32(buf) != MH_MAGIC_32) return MACHO_ERR_BAD_MAGIC;
@@ -39,20 +41,24 @@ macho_status_t macho_parse(const uint8_t *buf, size_t len, macho_t *out) {
     uint32_t cmdsz  = rd32(buf + 20);
 
     if (out->cputype != MH_CPU_TYPE_ARM) return MACHO_ERR_NOT_ARM;
-    if ((uint64_t)28 + cmdsz > (uint64_t)len) return MACHO_ERR_MALFORMED;
+    uint64_t cmds_end = (uint64_t)28 + cmdsz;
+    if (cmds_end > (uint64_t)len) return MACHO_ERR_MALFORMED;
 
     out->vm_low = 0xffffffffu;
     uint64_t off = 28;
 
     for (uint32_t i = 0; i < ncmds; i++) {
-        if (off + 8 > (uint64_t)len) return MACHO_ERR_MALFORMED;
+        if (off + 8 > cmds_end) return MACHO_ERR_MALFORMED;
         uint32_t cmd     = rd32(buf + off);
         uint32_t cmdsize = rd32(buf + off + 4);
         /* A zero or tiny cmdsize would loop forever. */
-        if (cmdsize < 8 || off + cmdsize > (uint64_t)len) return MACHO_ERR_MALFORMED;
+        if (cmdsize < 8 || off + cmdsize > cmds_end) return MACHO_ERR_MALFORMED;
 
         if (cmd == LC_SEGMENT) {
             if (cmdsize < 56) return MACHO_ERR_MALFORMED;
+            uint32_t nsects = rd32(buf + off + 48);
+            if ((uint64_t)56 + (uint64_t)nsects * 68u != cmdsize)
+                return MACHO_ERR_MALFORMED;
             if (out->segment_count >= MACHO_MAX_SEGMENTS) return MACHO_ERR_TOO_MANY;
 
             macho_segment_t *s = &out->segments[out->segment_count];
@@ -66,10 +72,12 @@ macho_status_t macho_parse(const uint8_t *buf, size_t len, macho_t *out) {
             /* The segment's file extent must actually be inside the image. */
             if ((uint64_t)s->fileoff + s->filesize > (uint64_t)len)
                 return MACHO_ERR_MALFORMED;
+            if (s->filesize > s->vmsize) return MACHO_ERR_MALFORMED;
 
             if (s->vmsize) {
                 if (s->vmaddr < out->vm_low) out->vm_low = s->vmaddr;
                 uint64_t end = (uint64_t)s->vmaddr + s->vmsize;
+                if (end > 0xffffffffu) return MACHO_ERR_MALFORMED;
                 if (end > out->vm_high) out->vm_high = (uint32_t)end;
             }
             out->segment_count++;
@@ -103,11 +111,14 @@ macho_status_t macho_parse(const uint8_t *buf, size_t len, macho_t *out) {
         off += cmdsize;
     }
 
+    if (off != cmds_end) return MACHO_ERR_MALFORMED;
+
     if (out->vm_low == 0xffffffffu) out->vm_low = 0;
     return MACHO_OK;
 }
 
 const macho_segment_t *macho_segment(const macho_t *m, const char *name) {
+    if (!m || !name) return NULL;
     for (unsigned i = 0; i < m->segment_count; i++)
         if (!strcmp(m->segments[i].name, name)) return &m->segments[i];
     return NULL;

@@ -27,18 +27,20 @@ static uint32_t rd32(const uint8_t *p) {
 }
 
 bool s5l_nor_init(s5l_nor_t *n, uint32_t size) {
+    if (!n || !size) return false;
     memset(n, 0, sizeof *n);
-    n->data = malloc(size ? size : 1u);
+    n->data = malloc(size);
     if (!n->data) return false;
     n->size = size;
     /* Erased flash reads as all ones. Starting from zero would make the device
      * behave like RAM-that-cannot-be-written: programming only clears bits, so
      * with every bit already 0 no write could ever have an effect. */
-    memset(n->data, 0xff, size ? size : 1u);
+    memset(n->data, 0xff, size);
     return true;
 }
 
 void s5l_nor_free(s5l_nor_t *n) {
+    if (!n) return;
     free(n->data);
     n->data = NULL;
     n->size = 0;
@@ -48,7 +50,7 @@ void s5l_nor_free(s5l_nor_t *n) {
 uint32_t s5l_nor_read(const s5l_nor_t *n, uint32_t off, unsigned bytes) {
     /* The result is a uint32_t, so a wider access cannot be represented — bound
      * it here rather than trusting every present and future caller. */
-    if (bytes > sizeof(uint32_t)) return 0;
+    if (!n || (bytes != 1u && bytes != 2u && bytes != 4u)) return 0;
     /* 64-bit comparison so an offset near the top of the space cannot wrap. */
     if (!n->data || (uint64_t)off + bytes > (uint64_t)n->size) return 0;
     uint32_t v = 0;
@@ -57,12 +59,13 @@ uint32_t s5l_nor_read(const s5l_nor_t *n, uint32_t off, unsigned bytes) {
 }
 
 void s5l_nor_program(s5l_nor_t *n, uint32_t off, const void *src, size_t len) {
-    if (!n->data || len > n->size) return;
+    if (!n || !n->data || !src || !len || len > n->size) return;
     if ((uint64_t)off + len > (uint64_t)n->size) return;
     memcpy(&n->data[off], src, len);
 }
 
 unsigned s5l_nor_scan(s5l_nor_t *n) {
+    if (!n) return 0;
     n->image_count = 0;
     if (!n->data || n->size < IMG3_HEADER) return 0;
 
@@ -96,13 +99,21 @@ unsigned s5l_nor_scan(s5l_nor_t *n) {
 }
 
 const s5l_nor_entry_t *s5l_nor_find(const s5l_nor_t *n, uint32_t ident) {
-    for (unsigned i = 0; i < n->image_count; i++)
-        if (n->images[i].ident == ident) return &n->images[i];
+    if (!n || !n->data) return NULL;
+    unsigned count = n->image_count < S5L_NOR_MAX_IMAGES
+                   ? n->image_count : S5L_NOR_MAX_IMAGES;
+    for (unsigned i = 0; i < count; i++) {
+        const s5l_nor_entry_t *e = &n->images[i];
+        if (e->ident == ident && e->size >= 20u &&
+            (uint64_t)e->offset + e->size <= n->size)
+            return e;
+    }
     return NULL;
 }
 
 bool s5l_nor_write(s5l_nor_t *n, uint32_t off, uint32_t val, unsigned bytes) {
-    if (!n->data || bytes > sizeof(uint32_t)) return false;
+    if (!n || !n->data ||
+        (bytes != 1u && bytes != 2u && bytes != 4u)) return false;
     if ((uint64_t)off + bytes > (uint64_t)n->size) return false;
 
     /* Flash programming can only clear bits. Refuse a write that would need to
@@ -118,7 +129,7 @@ bool s5l_nor_write(s5l_nor_t *n, uint32_t off, uint32_t val, unsigned bytes) {
 }
 
 bool s5l_nor_erase_sector(s5l_nor_t *n, uint32_t off) {
-    if (!n->data) return false;
+    if (!n || !n->data) return false;
     uint32_t base = off & ~(S5L8900_NOR_SECTOR - 1u);
     if ((uint64_t)base + S5L8900_NOR_SECTOR > (uint64_t)n->size) return false;
     memset(&n->data[base], 0xff, S5L8900_NOR_SECTOR);

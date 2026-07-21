@@ -125,6 +125,19 @@ add_executable(test_nand tests/test_nand.c)
 target_link_libraries(test_nand PRIVATE emucore)
 add_test(NAME nand_device COMMAND test_nand)
 
+# VMGuest is the portable-C seam between the iOS shell and emucore.  Building
+# it only with Xcode left its physical-address and scanout bounds checks outside
+# the sanitizer suite, even though a mistake there becomes an out-of-bounds
+# framebuffer read on the phone.  Keep this target host-only and tiny: it does
+# not compile UIKit or allocate the real 128/512 MB guest configuration.
+add_executable(test_vmguest
+    ../app/Tests/test_vmguest.c
+    ../app/Sources/VMGuest.c
+)
+target_include_directories(test_vmguest PRIVATE ../app/Sources)
+target_link_libraries(test_vmguest PRIVATE emucore)
+add_test(NAME app_vmguest_bridge COMMAND test_vmguest)
+
 # --- host tools -------------------------------------------------------------
 # img3dump points the real parser at real firmware, so inspecting an IPSW also
 # validates our format handling.

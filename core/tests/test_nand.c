@@ -22,6 +22,67 @@ static int g_pass = 0, g_fail = 0;
 /* A small device: 64-byte pages, 8 bytes spare, 4 pages/block, 4 blocks. */
 static bool small(nand_t *n) { return nand_init(n, 64, 8, 4, 4); }
 
+static bool copy_prefix(const char *src, const char *dst, size_t keep) {
+    FILE *in = fopen(src, "rb"), *out = fopen(dst, "wb");
+    if (!in || !out) { if (in) fclose(in); if (out) fclose(out); return false; }
+    bool ok = true;
+    while (keep) {
+        uint8_t buf[128];
+        size_t want = keep < sizeof buf ? keep : sizeof buf;
+        size_t got = fread(buf, 1, want, in);
+        if (got != want || fwrite(buf, 1, got, out) != got) { ok = false; break; }
+        keep -= got;
+    }
+    if (fclose(in) != 0) ok = false;
+    if (fclose(out) != 0) ok = false;
+    return ok;
+}
+
+static bool flip_file_byte(const char *path, long off) {
+    FILE *f = fopen(path, "r+b");
+    if (!f || fseek(f, off, SEEK_SET) != 0) { if (f) fclose(f); return false; }
+    int c = fgetc(f);
+    if (c == EOF || fseek(f, off, SEEK_SET) != 0) { fclose(f); return false; }
+    bool ok = fputc(c ^ 0x80, f) != EOF;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
+static bool append_file_byte(const char *path, uint8_t byte) {
+    FILE *f = fopen(path, "ab");
+    if (!f) return false;
+    bool ok = fputc(byte, f) != EOF;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
+static uint64_t storage_hash(const uint8_t *p, size_t n) {
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+/* Rewrite a checksum-bearing small test image after an intentional semantic
+ * corruption, so the loader must reach field validation rather than failing
+ * at the checksum first. */
+static bool refresh_storage_hash(const char *path, size_t payload_off) {
+    uint8_t buf[2048];
+    FILE *f = fopen(path, "r+b");
+    if (!f || fseek(f, 0, SEEK_END) != 0) { if (f) fclose(f); return false; }
+    long end = ftell(f);
+    if (end < 0 || (size_t)end > sizeof buf ||
+        (size_t)end < payload_off + 8u || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f); return false;
+    }
+    size_t len = (size_t)end;
+    if (fread(buf, 1, len, f) != len) { fclose(f); return false; }
+    uint64_t h = storage_hash(buf + payload_off, len - payload_off - 8u);
+    for (unsigned i = 0; i < 8; i++) buf[len - 8u + i] = (uint8_t)(h >> (8u * i));
+    bool ok = fseek(f, 0, SEEK_SET) == 0 && fwrite(buf, 1, len, f) == len;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
 static void test_erased_reads_all_ones(void) {
     nand_t n; CHECK(small(&n), "init failed");
     uint8_t buf[64], spare[8];
@@ -179,6 +240,110 @@ static void test_bad_image_refused(void) {
     remove(path);
 }
 
+static void test_truncated_nand_load_is_transactional(void) {
+    const char *good = "ios3vm_nand_tx_good.img";
+    const char *shortp = "ios3vm_nand_tx_short.img";
+    nand_t src, dst;
+    CHECK(small(&src) && small(&dst), "init failed");
+    memset(src.data, 0x11, (size_t)nand_total_pages(&src) * src.page_size);
+    CHECK(storage_save_nand(&src, good) == STORAGE_OK, "save failed");
+    CHECK(copy_prefix(good, shortp, 33u), "could not make truncated fixture");
+
+    size_t db = (size_t)nand_total_pages(&dst) * dst.page_size;
+    size_t sb = (size_t)nand_total_pages(&dst) * dst.spare_size;
+    memset(dst.data, 0x5a, db); memset(dst.spare, 0x6b, sb); memset(dst.bad, 1, dst.block_count);
+    uint8_t data_before[64 * 16], spare_before[8 * 16], bad_before[4];
+    memcpy(data_before, dst.data, db); memcpy(spare_before, dst.spare, sb);
+    memcpy(bad_before, dst.bad, dst.block_count);
+
+    CHECK(storage_load_nand(&dst, shortp) == STORAGE_ERR_TRUNCATED,
+          "truncated NAND image was not rejected");
+    CHECK(memcmp(dst.data, data_before, db) == 0 &&
+          memcmp(dst.spare, spare_before, sb) == 0 &&
+          memcmp(dst.bad, bad_before, dst.block_count) == 0,
+          "failed NAND load partially mutated the live device");
+    nand_free(&src); nand_free(&dst); remove(good); remove(shortp);
+}
+
+static void test_nand_integrity_and_exact_length(void) {
+    const char *path = "ios3vm_nand_integrity.img";
+    nand_t src, dst;
+    CHECK(small(&src) && small(&dst), "init failed");
+    memset(src.data, 0x3c, (size_t)nand_total_pages(&src) * src.page_size);
+    CHECK(storage_save_nand(&src, path) == STORAGE_OK, "save failed");
+    CHECK(flip_file_byte(path, 32), "could not corrupt payload");
+    CHECK(storage_load_nand(&dst, path) == STORAGE_ERR_CHECKSUM,
+          "same-length payload corruption was accepted");
+
+    CHECK(storage_save_nand(&src, path) == STORAGE_OK, "resave failed");
+    CHECK(append_file_byte(path, 0xa5), "could not append junk");
+    CHECK(storage_load_nand(&dst, path) == STORAGE_ERR_TRAILING,
+          "trailing NAND bytes were accepted");
+
+    CHECK(storage_save_nand(&src, path) == STORAGE_OK, "resave failed");
+    CHECK(flip_file_byte(path, 24), "could not set an unknown header flag");
+    CHECK(storage_load_nand(&dst, path) == STORAGE_ERR_TRAILING,
+          "unknown NAND header flags were accepted");
+
+    CHECK(storage_save_nand(&src, path) == STORAGE_OK, "resave failed");
+    size_t bad_off = 32u + (size_t)nand_total_pages(&src) * src.page_size +
+                     (size_t)nand_total_pages(&src) * src.spare_size;
+    FILE *f = fopen(path, "r+b");
+    bool wrote_bad = f && fseek(f, (long)bad_off, SEEK_SET) == 0 &&
+                     fputc(2, f) != EOF;
+    if (f && fclose(f) != 0) wrote_bad = false;
+    CHECK(wrote_bad && refresh_storage_hash(path, 32u),
+          "could not make checksum-valid noncanonical bad map");
+    CHECK(storage_load_nand(&dst, path) == STORAGE_ERR_FORMAT,
+          "noncanonical NAND bad-map byte was accepted");
+
+    src.bad[0] = 2;
+    CHECK(storage_save_nand(&src, path) == STORAGE_ERR_FORMAT,
+          "noncanonical in-memory bad-map byte was persisted");
+    src.bad[0] = 0;
+    nand_free(&src); nand_free(&dst); remove(path);
+}
+
+static void test_truncated_nor_load_is_transactional(void) {
+    const char *good = "ios3vm_nor_tx_good.img";
+    const char *shortp = "ios3vm_nor_tx_short.img";
+    s5l_nor_t src, dst;
+    CHECK(s5l_nor_init(&src, 4096) && s5l_nor_init(&dst, 4096), "NOR init failed");
+    memset(src.data, 0x22, src.size);
+    CHECK(storage_save_nor(&src, good) == STORAGE_OK, "NOR save failed");
+    CHECK(copy_prefix(good, shortp, 17u), "could not make truncated NOR fixture");
+
+    memset(dst.data, 0x7c, dst.size);
+    dst.image_count = 1;
+    dst.images[0].ident = 0x69626f74u;
+    dst.images[0].offset = 0x100;
+    dst.images[0].size = 0x80;
+    CHECK(storage_load_nor(&dst, shortp) == STORAGE_ERR_TRUNCATED,
+          "truncated NOR image was not rejected");
+    bool unchanged = dst.image_count == 1 && dst.images[0].offset == 0x100;
+    for (uint32_t i = 0; i < dst.size; i++) if (dst.data[i] != 0x7c) unchanged = false;
+    CHECK(unchanged, "failed NOR load changed data or its scanned directory");
+
+    s5l_nor_free(&src); s5l_nor_free(&dst); remove(good); remove(shortp);
+}
+
+static void test_nor_integrity_and_exact_length(void) {
+    const char *path = "ios3vm_nor_integrity.img";
+    s5l_nor_t src, dst;
+    CHECK(s5l_nor_init(&src, 4096) && s5l_nor_init(&dst, 4096), "NOR init failed");
+    memset(src.data, 0x3c, src.size);
+    CHECK(storage_save_nor(&src, path) == STORAGE_OK, "NOR save failed");
+    CHECK(flip_file_byte(path, 16), "could not corrupt NOR payload");
+    CHECK(storage_load_nor(&dst, path) == STORAGE_ERR_CHECKSUM,
+          "same-length NOR corruption was accepted");
+
+    CHECK(storage_save_nor(&src, path) == STORAGE_OK, "NOR replace failed");
+    CHECK(append_file_byte(path, 0xa5), "could not append NOR junk");
+    CHECK(storage_load_nor(&dst, path) == STORAGE_ERR_TRAILING,
+          "trailing NOR bytes were accepted");
+    s5l_nor_free(&src); s5l_nor_free(&dst); remove(path);
+}
+
 int main(void) {
     printf("iOS3-VM NAND device tests\n");
     test_erased_reads_all_ones();
@@ -190,6 +355,10 @@ int main(void) {
     test_persistence_round_trip();
     test_geometry_mismatch_refused();
     test_bad_image_refused();
+    test_truncated_nand_load_is_transactional();
+    test_nand_integrity_and_exact_length();
+    test_truncated_nor_load_is_transactional();
+    test_nor_integrity_and_exact_length();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

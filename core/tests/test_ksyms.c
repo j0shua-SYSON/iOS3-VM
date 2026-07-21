@@ -41,6 +41,11 @@ static void put32(size_t off, uint32_t v) {
     g_img[off+2] = (uint8_t)(v >> 16); g_img[off+3] = (uint8_t)(v >> 24);
 }
 
+static uint32_t get32(size_t off) {
+    return (uint32_t)g_img[off] | ((uint32_t)g_img[off + 1] << 8) |
+           ((uint32_t)g_img[off + 2] << 16) | ((uint32_t)g_img[off + 3] << 24);
+}
+
 /* Two symbols, so "nearest symbol below" has something to choose between. */
 static const struct { const char *name; uint32_t value; } SYMS[] = {
     { "_alpha", 0xc0008000u },
@@ -156,6 +161,51 @@ static const char *GOOD_PLIST =
 static const char *name_of(ksyms_t *ks, uint32_t a) {
     static char buf[192];
     return ksyms_resolve(ks, a, buf, sizeof buf);
+}
+
+static void test_macho_command_boundaries(void) {
+    macho_t m;
+    build_image(GOOD_PLIST, true);
+    uint32_t full_cmdsz = get32(20);
+
+    /* ncmds may not walk past the header's declared sizeofcmds area even when
+     * the surrounding file contains plausible command-shaped bytes. */
+    put32(20, 56u);
+    CHECK(macho_parse(g_img, g_len, &m) == MACHO_ERR_MALFORMED,
+          "load commands escaped sizeofcmds");
+    put32(20, full_cmdsz);
+
+    /* A loader cannot safely copy more initialized bytes than the segment's
+     * virtual allocation, nor represent a 32-bit extent that wraps. */
+    put32(28 + 28, 1u); put32(28 + 36, 2u);
+    CHECK(macho_parse(g_img, g_len, &m) == MACHO_ERR_MALFORMED,
+          "segment filesize larger than vmsize was accepted");
+    put32(28 + 28, 0x20u); put32(28 + 36, 0u); put32(28 + 24, 0xfffffff0u);
+    CHECK(macho_parse(g_img, g_len, &m) == MACHO_ERR_MALFORMED,
+          "wrapping segment VM extent was accepted");
+
+    build_image(GOOD_PLIST, true);
+    put32(28 + 48, 1u); /* one section declared, no section_32 bytes present */
+    CHECK(macho_parse(g_img, g_len, &m) == MACHO_ERR_MALFORMED,
+          "LC_SEGMENT section count escaped cmdsize");
+    CHECK(macho_parse(g_img, g_len, NULL) == MACHO_ERR_INVALID_ARGUMENT,
+          "NULL Mach-O result pointer was accepted");
+    CHECK(macho_segment(NULL, "__TEXT") == NULL &&
+          macho_segment(&m, NULL) == NULL,
+          "macho_segment accepted a NULL argument");
+}
+
+static void test_unterminated_symbol_name_is_skipped(void) {
+    build_image(NULL, true);
+    g_img[g_len - 1u] = 'X'; /* remove _beta's terminator inside LC_SYMTAB */
+    ksyms_t ks;
+    (void)ksyms_load(&ks, g_img, g_len);
+    CHECK(ks.sym_status == KSYMS_OK && ks.nsym == 1,
+          "unterminated symbol was retained (status=%s nsym=%u)",
+          ksyms_strerror(ks.sym_status), ks.nsym);
+    CHECK(ksyms_value(&ks, "_beta") == 0,
+          "unterminated symbol name was exposed to string consumers");
+    ksyms_free(&ks);
 }
 
 /* ----------------------------------------------------------- happy path --- */
@@ -429,6 +479,8 @@ int main(void) {
     test_stripped_kernel();
     test_malformed_plists();
     test_overlap_warns();
+    test_macho_command_boundaries();
+    test_unterminated_symbol_name_is_skipped();
     test_real_kernelcache();
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -42,7 +42,7 @@
  *      32  uint64   flags            0
  *   payload (payload_len bytes)      a sequence of sections
  *   trailer (8 bytes)
- *       0  uint64   FNV-1a-64 over the payload bytes
+ *       0  uint64   legacy FNV-1a-style hash over the payload bytes
  *
  *   section:  uint32 tag, uint32 zero, uint64 len, then len bytes
  *   sections, in order: GEOM CPU  MACH RAM  NOR  STUB END
@@ -84,6 +84,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 /* ===========================================================================
  * STRUCT SIZE GUARDS — see "HOW TO ADD A FIELD" above.
@@ -131,7 +134,7 @@ SNAP_SIZE_GUARD(s5l8900_t,         15768, "snap_mach");
 #define SNAP_HEADER_LEN 40u
 #define SNAP_PAGE       4096u
 
-typedef enum { SN_COUNT = 0, SN_SAVE, SN_LOAD } sn_mode_t;
+typedef enum { SN_COUNT = 0, SN_SAVE, SN_LOAD, SN_VALIDATE } sn_mode_t;
 
 typedef struct {
     sn_mode_t mode;
@@ -143,12 +146,18 @@ typedef struct {
     const uint8_t *in;
     size_t         in_len;
     uint64_t  pos;          /* bytes produced/consumed so far (all modes)   */
-    uint64_t  hash;         /* FNV-1a-64 over everything that passed through */
+    uint64_t  hash;         /* legacy payload hash over bytes passed through */
     snapshot_status_t err;
 } sn_io_t;
 
-/* FNV-1a, 64-bit. Chosen for being four lines long and having no state to get
- * wrong; this is a corruption check, not a security primitive. */
+static bool sn_reading(const sn_io_t *io) {
+    return io->mode == SN_LOAD || io->mode == SN_VALIDATE;
+}
+
+/* Historical v1/v2 FNV-1a-style hash. The offset below is not the standard
+ * FNV-1a-64 basis; changing it would invalidate existing snapshots, so it is
+ * deliberately retained and documented as format state. This is a corruption
+ * check, not a security primitive. */
 #define FNV64_OFFSET 1469598103934665603ull
 #define FNV64_PRIME  1099511628211ull
 
@@ -167,22 +176,38 @@ static void sn_raw(sn_io_t *io, void *p, size_t n) {
             if (io->f) {
                 if (fwrite(p, 1, n, io->f) != n) { io->err = SNAP_ERR_IO; return; }
             } else {
-                if (io->pos + n > io->cap) { io->err = SNAP_ERR_NOMEM; return; }
+                if (io->pos > io->cap || n > io->cap - (size_t)io->pos) {
+                    io->err = SNAP_ERR_NOMEM; return;
+                }
                 memcpy(io->buf + io->pos, p, n);
             }
             sn_hash(io, p, n);
             break;
         case SN_LOAD:
+        case SN_VALIDATE:
             if (io->f) {
                 if (fread(p, 1, n, io->f) != n) { io->err = SNAP_ERR_TRUNCATED; return; }
             } else {
-                if (io->pos + n > io->in_len) { io->err = SNAP_ERR_TRUNCATED; return; }
+                if (io->pos > io->in_len || n > io->in_len - (size_t)io->pos) {
+                    io->err = SNAP_ERR_TRUNCATED; return;
+                }
                 memcpy(p, io->in + io->pos, n);
             }
             sn_hash(io, p, n);
             break;
     }
     io->pos += n;
+}
+
+/* Consume bytes without assigning them anywhere. Validation uses this for the
+ * large host-owned RAM/NOR/stub buffers so a dry run cannot touch live state. */
+static void sn_discard(sn_io_t *io, size_t n) {
+    uint8_t scratch[4096];
+    while (n && io->err == SNAP_OK) {
+        size_t chunk = n < sizeof scratch ? n : sizeof scratch;
+        sn_raw(io, scratch, chunk);
+        n -= chunk;
+    }
 }
 
 /* --- little-endian primitives. Every field goes through one of these, so the
@@ -197,7 +222,7 @@ static void sn_u32(sn_io_t *io, uint32_t *v) {
         b[2] = (uint8_t)(*v >> 16); b[3] = (uint8_t)(*v >> 24);
     }
     sn_raw(io, b, 4);
-    if (io->mode == SN_LOAD && io->err == SNAP_OK)
+    if (sn_reading(io) && io->err == SNAP_OK)
         *v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
              ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
 }
@@ -207,7 +232,7 @@ static void sn_u64(sn_io_t *io, uint64_t *v) {
     if (io->mode == SN_SAVE)
         for (unsigned i = 0; i < 8; i++) b[i] = (uint8_t)(*v >> (8 * i));
     sn_raw(io, b, 8);
-    if (io->mode == SN_LOAD && io->err == SNAP_OK) {
+    if (sn_reading(io) && io->err == SNAP_OK) {
         uint64_t x = 0;
         for (unsigned i = 0; i < 8; i++) x |= (uint64_t)b[i] << (8 * i);
         *v = x;
@@ -217,7 +242,10 @@ static void sn_u64(sn_io_t *io, uint64_t *v) {
 static void sn_bool(sn_io_t *io, bool *v) {
     uint8_t b = (io->mode == SN_SAVE) ? (*v ? 1u : 0u) : 0u;
     sn_u8(io, &b);
-    if (io->mode == SN_LOAD && io->err == SNAP_OK) *v = b != 0;
+    if (sn_reading(io) && io->err == SNAP_OK) {
+        if (b > 1u) io->err = SNAP_ERR_CORRUPT;
+        else *v = b != 0;
+    }
 }
 
 static void sn_u32a(sn_io_t *io, uint32_t *a, size_t n) {
@@ -227,7 +255,10 @@ static void sn_u32a(sn_io_t *io, uint32_t *a, size_t n) {
 static void sn_size(sn_io_t *io, size_t *v) {   /* size_t as a fixed u64 */
     uint64_t x = (io->mode == SN_SAVE) ? (uint64_t)*v : 0;
     sn_u64(io, &x);
-    if (io->mode == SN_LOAD && io->err == SNAP_OK) *v = (size_t)x;
+    if (sn_reading(io) && io->err == SNAP_OK) {
+        if (x > (uint64_t)SIZE_MAX) io->err = SNAP_ERR_CORRUPT;
+        else *v = (size_t)x;
+    }
 }
 
 /* The field macros the visitors use. `io` is captured by name deliberately:
@@ -295,7 +326,7 @@ static void snap_uart(sn_io_t *io, s5l_uart_t *u) {
     F32(u->ulcon); F32(u->ucon); F32(u->ufcon); F32(u->umcon); F32(u->ubrdiv);
     FBYTES(u->tx, UART_TX_BUFFER);
     FSZ(u->tx_len);
-    if (io->mode == SN_LOAD && io->err == SNAP_OK &&
+    if (sn_reading(io) && io->err == SNAP_OK &&
         u->tx_len >= (size_t)UART_TX_BUFFER)
         io->err = SNAP_ERR_CORRUPT;     /* the writer keeps a NUL slot free */
 }
@@ -349,16 +380,26 @@ static void snap_clcd(sn_io_t *io, s5l_clcd_t *c) {
  * touched, and the bytes are then written through the existing pointer.
  */
 static void snap_nor(sn_io_t *io, s5l_nor_t *n) {
-    FBYTES(n->data, n->size);
+    if (io->mode == SN_VALIDATE) sn_discard(io, n->size);
+    else                         FBYTES(n->data, n->size);
     for (unsigned i = 0; i < S5L_NOR_MAX_IMAGES; i++) {
         F32(n->images[i].ident);
         F32(n->images[i].offset);
         F32(n->images[i].size);
     }
     F32(n->image_count);
-    if (io->mode == SN_LOAD && io->err == SNAP_OK &&
+    if (sn_reading(io) && io->err == SNAP_OK &&
         n->image_count > (unsigned)S5L_NOR_MAX_IMAGES)
         io->err = SNAP_ERR_CORRUPT;
+    if (sn_reading(io) && io->err == SNAP_OK) {
+        for (unsigned i = 0; i < n->image_count; i++) {
+            if (n->images[i].size < 20u ||
+                (uint64_t)n->images[i].offset + n->images[i].size > n->size) {
+                io->err = SNAP_ERR_CORRUPT;
+                break;
+            }
+        }
+    }
 }
 
 /*
@@ -394,7 +435,7 @@ static void snap_mach(sn_io_t *io, s5l8900_t *m) {
 
     F32(m->stub_declare_failures);
 
-    if (io->mode == SN_LOAD && io->err == SNAP_OK &&
+    if (sn_reading(io) && io->err == SNAP_OK &&
         (m->unmapped_addr_count > (unsigned)S5L_UNMAPPED_LOG ||
          m->dev_count           > (unsigned)S5L_DEVLOG))
         io->err = SNAP_ERR_CORRUPT;
@@ -413,7 +454,7 @@ static void snap_geom(sn_io_t *io, s5l8900_t *m) {
     uint32_t page = SNAP_PAGE;
     F32(ram_base); F32(ram_size); F32(nor_size); F32(stub_count); F32(page);
 
-    if (io->mode == SN_LOAD) {
+    if (sn_reading(io)) {
         if (io->err != SNAP_OK) return;
         if (ram_base != m->ram_base || ram_size != m->ram_size ||
             nor_size != m->nor.size || stub_count != m->stub_count ||
@@ -437,7 +478,7 @@ static void snap_geom(sn_io_t *io, s5l8900_t *m) {
         F32(base); F32(size); F32(nregs); F32(nlen);
         if (io->err == SNAP_OK && nlen >= sizeof nm) { io->err = SNAP_ERR_CORRUPT; return; }
         FBYTES(nm, nlen);
-        if (io->mode == SN_LOAD && io->err == SNAP_OK) {
+        if (sn_reading(io) && io->err == SNAP_OK) {
             nm[nlen] = '\0';
             if (base != m->stubs[i].base || size != m->stubs[i].size ||
                 nregs != m->stubs[i].nregs || strcmp(nm, live) != 0) {
@@ -464,7 +505,7 @@ static void snap_ram(sn_io_t *io, s5l8900_t *m) {
     uint64_t n = npages;
     F64(n);
     if (io->err != SNAP_OK) return;
-    if (io->mode == SN_LOAD && n != npages) { io->err = SNAP_ERR_CORRUPT; return; }
+    if (sn_reading(io) && n != npages) { io->err = SNAP_ERR_CORRUPT; return; }
 
     if (io->mode == SN_LOAD) memset(m->ram, 0, m->ram_size);
 
@@ -474,7 +515,7 @@ static void snap_ram(sn_io_t *io, s5l8900_t *m) {
                                 ? m->ram_size - off : SNAP_PAGE);
         uint8_t *page = m->ram + off;
         uint8_t  cls = 0;
-        if (io->mode != SN_LOAD) {
+        if (!sn_reading(io)) {
             uint8_t first = page[0];
             cls = 1;
             for (size_t i = 1; i < len; i++)
@@ -489,7 +530,8 @@ static void snap_ram(sn_io_t *io, s5l8900_t *m) {
             sn_u8(io, &v);
             if (io->mode == SN_LOAD && io->err == SNAP_OK) memset(page, v, len);
         } else if (cls == 2) {
-            sn_raw(io, page, len);
+            if (io->mode == SN_VALIDATE) sn_discard(io, len);
+            else                         sn_raw(io, page, len);
         } else {
             io->err = SNAP_ERR_CORRUPT;
             return;
@@ -502,7 +544,14 @@ static void snap_ram(sn_io_t *io, s5l8900_t *m) {
 static void snap_stubs(sn_io_t *io, s5l8900_t *m) {
     for (unsigned i = 0; i < m->stub_count; i++) {
         s5l_stub_t *s = &m->stubs[i];
-        FA32(s->regs, s->nregs);
+        if (io->mode == SN_VALIDATE) {
+            for (uint32_t k = 0; k < s->nregs; k++) {
+                uint32_t discard = 0;
+                sn_u32(io, &discard);
+            }
+        } else {
+            FA32(s->regs, s->nregs);
+        }
         F64(s->reads); F64(s->writes); F64(s->oob);
     }
 }
@@ -521,13 +570,13 @@ static uint64_t snap_measure(snap_fn_t fn, s5l8900_t *m) {
 static void snap_section(sn_io_t *io, uint32_t tag, snap_fn_t fn, s5l8900_t *m) {
     if (io->err != SNAP_OK) return;
     uint32_t t = tag, zero = 0;
-    uint64_t len = (io->mode == SN_LOAD) ? 0 : snap_measure(fn, m);
+    uint64_t len = sn_reading(io) ? 0 : snap_measure(fn, m);
 
     if (io->mode == SN_COUNT) { io->pos += 16 + len; return; }
 
     sn_u32(io, &t); sn_u32(io, &zero); sn_u64(io, &len);
     if (io->err != SNAP_OK) return;
-    if (io->mode == SN_LOAD) {
+    if (sn_reading(io)) {
         if (t != tag || zero != 0) { io->err = SNAP_ERR_CORRUPT; return; }
     }
     uint64_t start = io->pos;
@@ -566,12 +615,14 @@ static void snap_header(sn_io_t *io, uint64_t *payload_len) {
     sn_u64(io, &flags);
     io->hash = saved_hash;
 
-    if (io->mode == SN_LOAD && io->err == SNAP_OK) {
+    if (sn_reading(io) && io->err == SNAP_OK) {
         if (memcmp(magic, SNAPSHOT_MAGIC, SNAPSHOT_MAGIC_LEN) != 0)
             io->err = SNAP_ERR_MAGIC;
         else if (version != SNAPSHOT_VERSION)
             io->err = SNAP_ERR_VERSION;
         else if (hlen != SNAP_HEADER_LEN)
+            io->err = SNAP_ERR_CORRUPT;
+        else if (flags != 0)
             io->err = SNAP_ERR_CORRUPT;
     }
 }
@@ -606,18 +657,66 @@ static snapshot_status_t snap_write(const s5l8900_t *cm, FILE *f,
     return io.err;
 }
 
+static bool snap_machine_valid(const s5l8900_t *m) {
+    if (!m || !m->ram || !m->ram_size || !m->nor.data || !m->nor.size ||
+        m->stub_count > S5L_STUB_MAX ||
+        m->uart0.tx_len >= UART_TX_BUFFER ||
+        m->nor.image_count > S5L_NOR_MAX_IMAGES ||
+        m->unmapped_addr_count > S5L_UNMAPPED_LOG || m->dev_count > S5L_DEVLOG)
+        return false;
+    for (unsigned i = 0; i < m->nor.image_count; i++)
+        if (m->nor.images[i].size < 20u ||
+            (uint64_t)m->nor.images[i].offset + m->nor.images[i].size > m->nor.size)
+            return false;
+    for (unsigned i = 0; i < m->stub_count; i++) {
+        const s5l_stub_t *s = &m->stubs[i];
+        uint64_t want = ((uint64_t)s->size + 3u) / 4u;
+        const char *name = s->name ? s->name : "";
+        if (!s->size || !s->regs || s->nregs != want || strlen(name) >= 64u)
+            return false;
+    }
+    return true;
+}
+
+static char *snapshot_temp_path(const char *path, const void *tag) {
+    size_t n = strlen(path);
+    if (n > SIZE_MAX - 40u) return NULL;
+    char *tmp = malloc(n + 40u);
+    if (!tmp) return NULL;
+    snprintf(tmp, n + 40u, "%s.tmp.%p", path, tag);
+    return tmp;
+}
+
+static bool snapshot_replace_file(const char *tmp, const char *path) {
+#ifdef _WIN32
+    return MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING |
+                                  MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return rename(tmp, path) == 0;
+#endif
+}
+
 snapshot_status_t snapshot_save(const s5l8900_t *m, const char *path) {
     if (!m || !path) return SNAP_ERR_IO;
-    FILE *f = fopen(path, "wb");
-    if (!f) return SNAP_ERR_IO;
+    if (!snap_machine_valid(m)) return SNAP_ERR_CORRUPT;
+    char *tmp = snapshot_temp_path(path, m);
+    if (!tmp) return SNAP_ERR_NOMEM;
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { free(tmp); return SNAP_ERR_IO; }
     snapshot_status_t st = snap_write(m, f, NULL, 0, NULL);
     if (fclose(f) != 0 && st == SNAP_OK) st = SNAP_ERR_IO;
+    if (st == SNAP_OK && !snapshot_replace_file(tmp, path)) st = SNAP_ERR_IO;
+    if (st != SNAP_OK) remove(tmp);
+    free(tmp);
     return st;
 }
 
 snapshot_status_t snapshot_save_mem(const s5l8900_t *m,
                                     uint8_t **out, size_t *out_len) {
-    if (!m || !out || !out_len) return SNAP_ERR_IO;
+    if (!out || !out_len) return SNAP_ERR_IO;
+    *out = NULL; *out_len = 0;
+    if (!m) return SNAP_ERR_IO;
+    if (!snap_machine_valid(m)) return SNAP_ERR_CORRUPT;
     s5l8900_t *mm = (s5l8900_t *)(uintptr_t)m;
     uint64_t payload_len = snap_measure(snap_payload, mm);
     uint64_t total = SNAP_HEADER_LEN + payload_len + 8u;
@@ -637,20 +736,17 @@ snapshot_status_t snapshot_save_mem(const s5l8900_t *m,
 /* ------------------------------------------------------------ load side --- */
 
 /*
- * Pass 1: verify the file is intact WITHOUT touching the machine.
+ * Loading has three stages. The first verifies framing and the legacy payload
+ * hash without touching the machine. The second parses the complete stream
+ * into a shallow probe in SN_VALIDATE mode: it checks section lengths,
+ * geometry, scalar encodings, NOR metadata and the exact END position while
+ * discarding all bulk contents. Only a stream that passes both stages reaches
+ * the final applying pass.
  *
- * This is the whole reason a load is two passes. "Never restore partial state"
- * is not achievable if the first thing a truncated file does is overwrite r0.
- * Pass 1 checks the magic, the version, the declared payload length against
- * the bytes actually present, and the FNV-1a of the payload against the
- * trailer. Only if all of that holds does pass 2 apply anything.
- *
- * Pass 2 can therefore only fail on a genuine I/O error or on a GEOMETRY
- * mismatch, and geometry is the FIRST section, checked before any mutation.
- * A structural error in pass 2 would mean a file that checksums correctly and
- * is still malformed — i.e. a bug in this writer at the same version number —
- * and it is reported as SNAP_ERR_CORRUPT with the machine in an indeterminate
- * state, which the caller must treat as fatal.
+ * In-memory loads are therefore transactional for malformed input. A file
+ * load can still be interrupted by a genuine read error (or external in-place
+ * modification) during the final applying pass; callers must treat that
+ * SNAP_ERR_IO/SNAP_ERR_TRUNCATED result as potentially partially applied.
  */
 static snapshot_status_t snap_verify_stream(FILE *f, const uint8_t *in,
                                             size_t in_len, uint64_t *payload_len) {
@@ -662,8 +758,11 @@ static snapshot_status_t snap_verify_stream(FILE *f, const uint8_t *in,
     snap_header(&io, &plen);
     if (io.err != SNAP_OK) return io.err;
 
+    if (plen > UINT64_MAX - SNAP_HEADER_LEN - 8u) return SNAP_ERR_CORRUPT;
+    uint64_t total = SNAP_HEADER_LEN + plen + 8u;
+
     /* A declared length that cannot fit is a truncated file, not a huge one. */
-    if (!f && (uint64_t)in_len < SNAP_HEADER_LEN + plen + 8u)
+    if (!f && (uint64_t)in_len < total)
         return SNAP_ERR_TRUNCATED;
 
     uint8_t chunk[65536];
@@ -682,13 +781,36 @@ static snapshot_status_t snap_verify_stream(FILE *f, const uint8_t *in,
     if (recorded != computed) return SNAP_ERR_CHECKSUM;
 
     /* Trailing junk is a sign the file is not what it claims to be. */
-    if (!f && (uint64_t)in_len != SNAP_HEADER_LEN + plen + 8u)
+    if (!f && (uint64_t)in_len != total)
         return SNAP_ERR_CORRUPT;
     if (f) {
         uint8_t extra;
         if (fread(&extra, 1, 1, f) == 1) return SNAP_ERR_CORRUPT;
+        if (ferror(f)) return SNAP_ERR_IO;
     }
     *payload_len = plen;
+    return SNAP_OK;
+}
+
+/* Parse every section and validate every constrained field into a shallow
+ * machine copy. Large host-owned buffers are consumed with sn_discard(), so
+ * this pass cannot modify the live machine. A checksummed but structurally
+ * hostile stream is therefore rejected before the applying pass starts. */
+static snapshot_status_t snap_validate_structure(const s5l8900_t *m, FILE *f,
+                                                  const uint8_t *in,
+                                                  size_t in_len) {
+    s5l8900_t probe = *m;
+    sn_io_t io = {0};
+    io.mode = SN_VALIDATE; io.f = f; io.in = in; io.in_len = in_len;
+    io.hash = FNV64_OFFSET;
+
+    uint64_t plen = 0;
+    snap_header(&io, &plen);
+    if (io.err != SNAP_OK) return io.err;
+    uint64_t body_start = io.pos;
+    snap_payload(&io, &probe);
+    if (io.err != SNAP_OK) return io.err;
+    if (io.pos - body_start != plen) return SNAP_ERR_CORRUPT;
     return SNAP_OK;
 }
 
@@ -701,8 +823,10 @@ static snapshot_status_t snap_apply(s5l8900_t *m, FILE *f,
     uint64_t plen = 0;
     snap_header(&io, &plen);
     if (io.err != SNAP_OK) return io.err;
+    uint64_t body_start = io.pos;
     snap_payload(&io, m);
     if (io.err != SNAP_OK) return io.err;
+    if (io.pos - body_start != plen) return SNAP_ERR_CORRUPT;
 
     /* Host-owned wiring the visitors deliberately never touched. Re-pointing
      * the CPU at the live machine's bus is what makes restoring underneath an
@@ -714,6 +838,7 @@ static snapshot_status_t snap_apply(s5l8900_t *m, FILE *f,
 
 snapshot_status_t snapshot_load(s5l8900_t *m, const char *path) {
     if (!m || !path) return SNAP_ERR_IO;
+    if (!snap_machine_valid(m)) return SNAP_ERR_GEOMETRY;
     FILE *f = fopen(path, "rb");
     if (!f) return SNAP_ERR_IO;
 
@@ -722,6 +847,9 @@ snapshot_status_t snapshot_load(s5l8900_t *m, const char *path) {
     if (st != SNAP_OK) { fclose(f); return st; }
 
     if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return SNAP_ERR_IO; }
+    st = snap_validate_structure(m, f, NULL, 0);
+    if (st != SNAP_OK) { fclose(f); return st; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return SNAP_ERR_IO; }
     st = snap_apply(m, f, NULL, 0);
     fclose(f);
     return st;
@@ -729,8 +857,11 @@ snapshot_status_t snapshot_load(s5l8900_t *m, const char *path) {
 
 snapshot_status_t snapshot_load_mem(s5l8900_t *m, const uint8_t *buf, size_t len) {
     if (!m || !buf) return SNAP_ERR_IO;
+    if (!snap_machine_valid(m)) return SNAP_ERR_GEOMETRY;
     uint64_t plen = 0;
     snapshot_status_t st = snap_verify_stream(NULL, buf, len, &plen);
+    if (st != SNAP_OK) return st;
+    st = snap_validate_structure(m, NULL, buf, len);
     if (st != SNAP_OK) return st;
     return snap_apply(m, NULL, buf, len);
 }

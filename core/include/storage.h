@@ -14,8 +14,11 @@
  * state survives. Apple's real VFL/FTL remains future work for authentic
  * jailbreak-tool research (see nand.h).
  *
- * The container carries the geometry it was written with, so restoring into a
- * differently-shaped device is refused rather than silently misinterpreted.
+ * The container carries the geometry it was written with and new saves append
+ * an integrity checksum. Loads are transactional: geometry, exact file length,
+ * payload checksum, and all bytes are validated in scratch storage before the
+ * live device is changed. Saves replace a completed same-directory temporary
+ * file so a failed write cannot destroy the previous good image.
  *
  * Only stdio is used, so the core stays portable; the caller supplies the path
  * and therefore owns all platform policy (on iOS, the app's Documents dir).
@@ -36,7 +39,10 @@ typedef enum {
     STORAGE_ERR_FORMAT,       /* not one of our images                     */
     STORAGE_ERR_VERSION,      /* written by an incompatible version        */
     STORAGE_ERR_GEOMETRY,     /* geometry does not match the target device */
-    STORAGE_ERR_TRUNCATED     /* file shorter than its header promises     */
+    STORAGE_ERR_TRUNCATED,    /* file shorter than its header promises     */
+    STORAGE_ERR_CHECKSUM,     /* persisted bytes failed their integrity hash */
+    STORAGE_ERR_TRAILING,     /* bytes follow the one complete image       */
+    STORAGE_ERR_NOMEM
 } storage_status_t;
 
 /* Write the NAND's contents (data, spare and bad-block map) to `path`. */

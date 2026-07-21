@@ -69,7 +69,8 @@ typedef enum {
     MACHO_ERR_BAD_MAGIC,     /* not a 32-bit little-endian Mach-O          */
     MACHO_ERR_NOT_ARM,       /* wrong CPU type for this machine            */
     MACHO_ERR_MALFORMED,     /* a load command or segment runs past the end */
-    MACHO_ERR_TOO_MANY       /* more segments than we track                 */
+    MACHO_ERR_TOO_MANY,      /* more segments than we track                 */
+    MACHO_ERR_INVALID_ARGUMENT
 } macho_status_t;
 
 macho_status_t macho_parse(const uint8_t *buf, size_t len, macho_t *out);

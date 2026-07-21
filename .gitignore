@@ -3,6 +3,9 @@
 **/build/
 **/dist/
 **/DerivedData/
+/.tmp/
+/.cache/
+/.m5-lab/
 
 # XcodeGen output (generated from app/project.yml — never committed)
 *.xcodeproj

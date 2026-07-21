@@ -732,8 +732,6 @@ must be fixed in both at once, later, deliberately.
 
 | Behaviour | Interpreter | Real ARM1176 | Where |
 |---|---|---|---|
-| `STR r15, [..]` stores | `pc + 8` | `pc + 12` | `arm_interp.c:629` (comment acknowledges it) |
-| `Rm == 15` with a register-specified shift reads | `pc + 8` | `pc + 12` | `arm_interp.c:400` |
 | C flag after `MUL`/`MLA` | unchanged | unpredictable | `arm_interp.c:848` |
 | C, V after `UMULL`/`SMLAL` | unchanged | unpredictable | `arm_interp.c:896` |
 | Unaligned `LDR` | reads straddling bytes (memcpy) | rotates within the word | `machine.c:95` (§6.5) |
@@ -977,10 +975,11 @@ constant, so `pc+8` / `pc+4` becomes an immediate materialised with `movz`/`movk
 for r15 at all; `cpu->r[15]` is written only at faultable instructions (§7.3)
 and at block exits.
 
-Two subtleties, both already in §5.4's table: the interpreter reads `pc+8` (not
-the architectural `pc+12`) for `Rm == 15` under a register-specified shift and
-for a stored r15. **The JIT must emit `pc+8` in both cases** to stay in lockstep,
-with a comment pointing at this document.
+Two contexts use `pc+12` rather than the ordinary visible `pc+8`: `Rm == 15`
+under a register-specified shift, and r15 stored by `STR`/`STM`. The interpreter
+implements those architectural values. The current JIT declines both PC
+operands and register-specified shifts; when those forms are added it must bake
+in `pc+12`, with differential tests covering the distinction.
 
 ### 7.6 Instruction → timebase tick accounting
 

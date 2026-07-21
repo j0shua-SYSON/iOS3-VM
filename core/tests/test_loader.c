@@ -121,7 +121,17 @@ static void test_encrypted_image_boots(void) {
     s5l8900_init(&m, 0, 1u << 20);
 
     fw_image_t info;
-    fw_status_t st = fw_boot_img3(&m, g_img, g_len, key, 128, 0x1000, &info);
+    memset(&m.ram[0x1000], 0xA5, sizeof PAYLOAD);
+    fw_status_t st = fw_load_img3(&m, g_img, g_len, key, 128, 0x1000, &info);
+    CHECK(st == FW_ERR_IV_REQUIRED,
+          "implicit wrapped-KBAG IV should be refused, got: %s", fw_strerror(st));
+    bool untouched = true;
+    for (unsigned i = 0; i < sizeof PAYLOAD; i++)
+        if (m.ram[0x1000 + i] != 0xA5) untouched = false;
+    CHECK(untouched, "IV-required failure modified guest RAM");
+
+    st = fw_boot_img3_iv(&m, g_img, g_len, key, 128, iv,
+                         0x1000, &info);
     CHECK(st == FW_OK, "boot failed: %s", fw_strerror(st));
     CHECK(info.was_encrypted, "encrypted image not reported as encrypted");
     CHECK(info.was_signed, "SHSH present but not reported");
@@ -173,6 +183,18 @@ static void test_garbage_refused(void) {
     s5l8900_init(&m, 0, 1u << 16);
     fw_status_t st = fw_load_img3(&m, junk, sizeof junk, NULL, 0, 0x100, NULL);
     CHECK(st == FW_ERR_PARSE, "expected FW_ERR_PARSE, got %s", fw_strerror(st));
+    s5l8900_free(&m);
+}
+
+static void test_invalid_loader_arguments(void) {
+    CHECK(fw_load_img3(NULL, g_img, g_len, NULL, 0, 0, NULL) ==
+              FW_ERR_INVALID_ARGUMENT,
+          "NULL machine was not refused");
+    s5l8900_t m;
+    s5l8900_init(&m, 0, 1u << 16);
+    CHECK(fw_load_img3(&m, NULL, 0, NULL, 0, 0, NULL) ==
+              FW_ERR_INVALID_ARGUMENT,
+          "NULL input was not refused");
     s5l8900_free(&m);
 }
 
@@ -240,6 +262,20 @@ static void test_nor_scan_rejects_corrupt_header(void) {
     s5l_nor_program(&m.nor, 0, g_img, g_len);
     CHECK(s5l_nor_scan(&m.nor) == 0, "corrupt container was accepted");
     s5l8900_free(&m);
+}
+
+static void test_nor_find_rejects_corrupt_directory(void) {
+    s5l_nor_t n;
+    CHECK(s5l_nor_init(&n, 4096), "NOR init failed");
+    n.image_count = 1;
+    n.images[0].ident = 0x69626f74u;
+    n.images[0].offset = n.size - 4u;
+    n.images[0].size = 20u;
+    CHECK(s5l_nor_find(&n, n.images[0].ident) == NULL,
+          "out-of-range in-memory NOR directory entry was returned");
+    CHECK(s5l_nor_find(NULL, n.images[0].ident) == NULL,
+          "NULL NOR directory was dereferenced");
+    s5l_nor_free(&n);
 }
 
 /* The M3 boot-chain shape in miniature: locate iBoot in NOR by ident, load it
@@ -428,9 +464,11 @@ int main(void) {
     test_encrypted_without_key_is_refused();
     test_oversized_payload_refused();
     test_garbage_refused();
+    test_invalid_loader_arguments();
     test_nor_scan_and_find();
     test_nor_is_memory_mapped();
     test_nor_scan_rejects_corrupt_header();
+    test_nor_find_rejects_corrupt_directory();
     test_boot_from_nor();
     test_nor_directory_cap();
     test_load_with_non_zero_ram_base();

@@ -844,6 +844,17 @@ static bool dt_memmap_add(uint8_t *b, size_t len, const char *key,
 #define S5L8900_FIX_HZ   24000000u
 #define S5L8900_TB_HZ     6000000u
 
+/* iBoot reads the three Syrah panel-identification bytes as a big-endian
+ * 24-bit value (openiBoot, plat-s5l8900/lcd.c:syrah_init). Its N82/iPhone 3G
+ * hardware log records a5:c2:2b. In this repo's shipped AppleMerlotLCD binary,
+ * 0xc0651f60 rejects ID zero and 0x8000 and 0xc0651770 branches on the ID's low
+ * three bits. The zero in the IPSW tree is therefore only a placeholder. */
+#define N82_LCD_PANEL_ID 0x00a5c22bu
+#define N82_FB_WIDTH     320u
+#define N82_FB_HEIGHT    480u
+#define N82_FB_BPP       4u
+#define N82_FB_BYTES     (N82_FB_WIDTH * N82_FB_HEIGHT * N82_FB_BPP)
+
 /* Applied in order; later entries win, and -D on the command line wins over
  * all of them. Nothing here changes firmware/devicetree.bin on disk — this
  * runs on the copy that is about to be loaded into guest RAM. */
@@ -1695,7 +1706,7 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
             "usage: %s <kernel.macho> [-p <physbase>] [-V <virtbase>] [-n <steps>]\n"
-            "          [-d <devicetree.bin>] [-c <cmdline>] [-a] [-M]\n"
+            "          [-d <devicetree.bin>] [-c <cmdline>] [-a] [-M] [-F] [-g]\n"
             "          [-r <ramdisk.img>] [-R <ram-MB>] [-X phys|virt|<addr>]\n"
             "          [-D <node/path>:<prop>=<value>] ...\n"
             "          [--snapshot-at <insn> <file>] ... [--restore <file>]\n"
@@ -1765,6 +1776,12 @@ int main(int argc, char **argv) {
             "      the default), or a literal address to use as a sentinel\n"
             "  -b  boot_args Revision field (default 1)\n"
             "  -M  do not synthesise /memory reg from the RAM layout\n"
+            "  -F  reserve a 320x480x32 Boot_Video buffer, seed CLCD window 0\n"
+            "      exactly as iBoot leaves it, and patch the N82 Merlot panel\n"
+            "      ID when -d is present. v_display stays 0 so the kernel can\n"
+            "      draw boot text; remove serial=1 from -c to route it there.\n"
+            "  -g  graphics experiment: implies -F, sets v_display=1, and\n"
+            "      leaves the unmodelled MBX driver matched (it may stall).\n"
             "  -W  <lo>[:<hi>] restrict the sampled profile / hot-PC table /\n"
             "      per-kext attribution to instructions in [lo,hi). A whole-run\n"
             "      profile of a boot that STALLS describes the boot, not the\n"
@@ -1948,7 +1965,7 @@ int main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-a")) { stop_on_abort = true; continue; }
         if (!strcmp(argv[i], "-F")) { want_fb = true; continue; }
-        if (!strcmp(argv[i], "-g")) { v_display = 1; want_mbx = true; continue; }  /* defer to IOMFB, keep MBX */
+        if (!strcmp(argv[i], "-g")) { want_fb = true; v_display = 1; want_mbx = true; continue; }  /* defer to IOMFB, keep MBX */
         if (!strcmp(argv[i], "-S")) { want_sha1hw = true; continue; }  /* keep the SHA-1 nub matched */
         if (!strcmp(argv[i], "-K")) { no_kpatch = true; continue; }  /* no kernel patches */
         if (!strcmp(argv[i], "-M")) { patch_memnode = false; continue; }
@@ -2189,6 +2206,10 @@ int main(int argc, char **argv) {
      * else landed — and the tree's own length is part of that arithmetic. */
     size_t dt_n = 0;
     uint8_t *dt = dtpath ? slurp(dtpath, &dt_n) : NULL;
+    if (dtpath && !dt) {
+        fprintf(stderr, "devicetree: cannot read %s\n", dtpath);
+        return 1;
+    }
     if (dt) dt_len = (uint32_t)dt_n;
 
     /* Likewise the RAM disk: its size decides where topOfKernelData ends up. */
@@ -2230,8 +2251,9 @@ int main(int argc, char **argv) {
      * is why no boot text ever appeared. A real buffer lets the kernel render
      * its console into memory we can look at.
      */
-    const uint32_t FB_W = 320, FB_H = 480, FB_BPP = 4;
-    const uint32_t fb_bytes = want_fb ? FB_W * FB_H * FB_BPP : 0u;
+    const uint32_t FB_W = N82_FB_WIDTH, FB_H = N82_FB_HEIGHT;
+    const uint32_t FB_BPP = N82_FB_BPP;
+    const uint32_t fb_bytes = want_fb ? N82_FB_BYTES : 0u;
 
     uint32_t ba_pa = (dt_pa + dt_len + 0xfffu) & ~0xfffu;
 
@@ -2303,14 +2325,41 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    uint32_t fb_pa = want_fb
-        ? ((phys_base + ram_size - fb_bytes) & ~0xfffu)   /* top of DRAM */
-        : top_of_kernel_data;
+    const uint64_t dram_end64 = (uint64_t)phys_base + ram_size;
+    uint32_t fb_pa = top_of_kernel_data;
 
-    if (rd && (uint64_t)top_of_kernel_data + fb_bytes > (uint64_t)phys_base + ram_size) {
-        fprintf(stderr, "ramdisk: %u MB image does not fit in %u MB of DRAM "
-                        "— raise -R\n", rd_len >> 20, ram_size >> 20);
+    /* Do all placement arithmetic in 64 bits. A wrapped subtraction here used
+     * to turn a too-small RAM aperture into a plausible high physical address,
+     * and the final framebuffer scan then indexed outside mach.ram. */
+    if ((uint64_t)top_of_kernel_data < phys_base ||
+        (uint64_t)top_of_kernel_data > dram_end64) {
+        fprintf(stderr,
+                "layout: topOfKernelData 0x%08x is outside DRAM "
+                "[0x%08x,0x%llx) — reduce the RAM disk or raise -R\n",
+                top_of_kernel_data, phys_base,
+                (unsigned long long)dram_end64);
         return 1;
+    }
+    if (want_fb) {
+        if ((uint64_t)ram_size < fb_bytes) {
+            fprintf(stderr,
+                    "framebuffer: %u bytes do not fit in %u bytes of DRAM\n",
+                    fb_bytes, ram_size);
+            return 1;
+        }
+        uint64_t start = (dram_end64 - fb_bytes) & ~UINT64_C(0xfff);
+        uint64_t end = start + fb_bytes;
+        if (start < phys_base || start > UINT32_MAX || end > dram_end64 ||
+            (uint64_t)top_of_kernel_data > start) {
+            fprintf(stderr,
+                    "framebuffer: 0x%llx..0x%llx overlaps the static boot "
+                    "layout ending at 0x%08x or lies outside DRAM — "
+                    "reduce the RAM disk or raise -R\n",
+                    (unsigned long long)start, (unsigned long long)end,
+                    top_of_kernel_data);
+            return 1;
+        }
+        fb_pa = (uint32_t)start;
     }
 
     /*
@@ -2354,6 +2403,17 @@ int main(int argc, char **argv) {
         printf("  --- device-tree patches (iBoot would have done these) ---\n");
         for (unsigned i = 0; i < NDTPATCH; i++)
             dt_set_u32(dt, dt_n, DT_PATCH[i].path, DT_PATCH[i].prop, DT_PATCH[i].val);
+        /* The IPSW tree carries zero here because iBoot replaces it with the
+         * three-byte ID read from the Syrah panel. Merlot rejects zero before
+         * it reaches the target-specific calibration path. */
+        if (want_fb &&
+            !dt_set_u32(dt, dt_n, "arm-io/spi0/lcd0", "lcd-panel-id",
+                        N82_LCD_PANEL_ID)) {
+            fprintf(stderr,
+                    "framebuffer: cannot patch the N82 lcd-panel-id; "
+                    "refusing a half-configured display\n");
+            return 1;
+        }
         /* /memory reg: the real iBoot fills in the DRAM bank. Ours is
          * zero, which would advertise a zero-sized bank. */
         if (patch_memnode)
@@ -2396,6 +2456,10 @@ int main(int argc, char **argv) {
         printf("  ---------------------------------------------------------\n");
         s5l8900_load(&mach, dt_pa, dt, dt_n);
         free(dt);
+    } else if (want_fb) {
+        fprintf(stderr,
+                "framebuffer: no device tree was supplied; Boot_Video and "
+                "CLCD will work, but AppleMerlotLCD cannot be configured\n");
     }
 
     if (rd) {
@@ -2467,7 +2531,19 @@ int main(int argc, char **argv) {
 #undef PUT16
 #undef PUT32
     s5l8900_load(&mach, ba_pa, ba, sizeof ba);
-    printf("framebuffer: pa 0x%08x  %ux%u %u-bit\n", fb_pa, FB_W, FB_H, FB_BPP*8);
+    if (want_fb) {
+        if (!s5l_clcd_seed_window0(&mach.clcd, fb_pa, FB_W, FB_H,
+                                   FB_W * FB_BPP,
+                                   CLCD_FMT_32BPP, CLCD_ORDER_BGRA)) {
+            fprintf(stderr,
+                    "framebuffer: validated layout was rejected by CLCD seed\n");
+            return 1;
+        }
+        printf("framebuffer: pa 0x%08x  %ux%u %u-bit; CLCD window 0 seeded\n",
+               fb_pa, FB_W, FB_H, FB_BPP * 8u);
+    } else {
+        printf("framebuffer: disabled (-F enables Boot_Video + CLCD window 0)\n");
+    }
     printf("boot_args  : pa 0x%08x  topOfKernelData vm 0x%08x  cmdline \"%s\"\n\n",
            ba_pa, top_of_kernel_data - phys_base + virt_base, cmdline);
 
@@ -2568,6 +2644,12 @@ int main(int argc, char **argv) {
         }
         printf("restored   : %s at %llu retired instructions  (pc 0x%08x)\n\n",
                restore_path, (unsigned long long)mach.cpu.cycles, mach.cpu.r[15]);
+        if (want_fb && s5l_clcd_active_window(&mach.clcd) == CLCD_WIN_NONE) {
+            fprintf(stderr,
+                    "restore: -F was requested but the snapshot has no active "
+                    "CLCD window; recreate it from a boot started with -F\n");
+            return 3;
+        }
     }
 
     /*
@@ -3313,28 +3395,51 @@ int main(int argc, char **argv) {
     else
         printf("\n(no UART output yet)\n");
 
-    /* Did the kernel actually draw? Count non-zero framebuffer bytes and, if
-     * so, write a PPM so the console output can be looked at directly. */
-    {
-        uint32_t nonzero = 0;
-        for (uint32_t i = 0; i < fb_bytes; i++)
-            if (mach.ram[fb_pa - phys_base + i]) nonzero++;
-        printf("\nframebuffer: %u of %u bytes non-zero\n", nonzero, fb_bytes);
-        if (nonzero) {
-            FILE *o = fopen("firmware/screen.ppm", "wb");
-            if (o) {
-                fprintf(o, "P6\n%u %u\n255\n", FB_W, FB_H);
-                for (uint32_t y = 0; y < FB_H; y++)
-                    for (uint32_t x = 0; x < FB_W; x++) {
-                        const uint8_t *px =
-                            &mach.ram[fb_pa - phys_base + (y * FB_W + x) * 4];
-                        /* Stored BGRA; emit RGB. */
-                        fputc(px[2], o); fputc(px[1], o); fputc(px[0], o);
-                    }
-                fclose(o);
-                printf("wrote firmware/screen.ppm - THE KERNEL DREW SOMETHING\n");
+    /* Did the kernel actually draw? Read the controller's CURRENT active
+     * window, not merely the original Boot_Video address: IOMFB is allowed to
+     * swap FBADDR after adopting iBoot's surface. The core scanout helper owns
+     * all source-range and destination-size checks. */
+    if (want_fb) {
+        const size_t rgb_n = (size_t)FB_W * FB_H * 3u;
+        uint8_t *rgb = calloc(rgb_n, 1);
+        unsigned active = s5l_clcd_active_window(&mach.clcd);
+        uint32_t out_w = 0, out_h = 0;
+        if (!rgb) {
+            fprintf(stderr, "framebuffer: cannot allocate %zu-byte RGB capture\n",
+                    rgb_n);
+        } else if (active == CLCD_WIN_NONE) {
+            fprintf(stderr, "framebuffer: CLCD has no active RGB window\n");
+        } else if (!s5l_clcd_scanout(&mach.clcd, active,
+                                     mach.ram, mach.ram_base, mach.ram_size,
+                                     rgb, rgb_n, &out_w, &out_h)) {
+            fprintf(stderr,
+                    "framebuffer: active CLCD window %u is malformed, outside "
+                    "DRAM, or larger than the N82 capture buffer\n", active);
+        } else {
+            size_t out_n = (size_t)out_w * out_h * 3u;
+            size_t nonzero = 0;
+            for (size_t i = 0; i < out_n; i++)
+                if (rgb[i]) nonzero++;
+            printf("\nframebuffer: CLCD window %u, %ux%u, "
+                   "%zu of %zu RGB bytes non-zero\n",
+                   active, out_w, out_h, nonzero, out_n);
+            if (nonzero) {
+                FILE *o = fopen("firmware/screen.ppm", "wb");
+                if (o) {
+                    bool wrote = fprintf(o, "P6\n%u %u\n255\n", out_w, out_h) > 0 &&
+                                 fwrite(rgb, 1, out_n, o) == out_n;
+                    if (fclose(o) != 0) wrote = false;
+                    if (wrote)
+                        printf("wrote firmware/screen.ppm - THE KERNEL DREW SOMETHING\n");
+                    else
+                        fprintf(stderr,
+                                "framebuffer: firmware/screen.ppm write failed\n");
+                } else {
+                    perror("framebuffer: open firmware/screen.ppm");
+                }
             }
         }
+        free(rgb);
     }
 
     s5l8900_free(&mach);

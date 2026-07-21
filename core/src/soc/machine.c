@@ -94,25 +94,35 @@ static inline bool in_ram(const s5l8900_t *m, uint32_t a, uint32_t len) {
     if (a < m->ram_base) return false;
     return (uint64_t)(a - m->ram_base) + (uint64_t)len <= (uint64_t)m->ram_size;
 }
-static inline bool in_dev(uint32_t a, uint32_t base) {
-    return a >= base && (uint64_t)a < (uint64_t)base + S5L8900_DEV_SIZE;
+static inline bool in_window(uint32_t a, unsigned bytes,
+                             uint32_t base, uint32_t size) {
+    if (!bytes || a < base) return false;
+    return (uint64_t)(a - base) + bytes <= (uint64_t)size;
+}
+static inline bool in_dev(uint32_t a, unsigned bytes, uint32_t base) {
+    return in_window(a, bytes, base, S5L8900_DEV_SIZE);
+}
+static inline bool mmio_word(uint32_t a, unsigned bytes,
+                             uint32_t base, uint32_t size) {
+    return bytes == 4u && (a & 3u) == 0u && in_window(a, bytes, base, size);
 }
 /* The timer is the one peripheral that does not fit the uniform 4 KB window:
  * its interrupt-status alias sits at offset 0x10000. */
-static inline bool in_power(uint32_t a) {
-    return a >= S5L8900_POWER_BASE &&
-           (uint64_t)a < (uint64_t)S5L8900_POWER_BASE + S5L8900_POWER_SIZE;
+static inline bool in_power(uint32_t a, unsigned bytes) {
+    return mmio_word(a, bytes, S5L8900_POWER_BASE, S5L8900_POWER_SIZE);
 }
-static inline bool in_timer(uint32_t a) {
-    return a >= S5L8900_TIMER_BASE &&
-           (uint64_t)a < (uint64_t)S5L8900_TIMER_BASE + S5L8900_TIMER_SIZE;
+static inline bool in_timer(uint32_t a, unsigned bytes) {
+    return mmio_word(a, bytes, S5L8900_TIMER_BASE, S5L8900_TIMER_SIZE);
 }
 
 /* ------------------------------------------------------- stub windows --- */
 
 bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
                       const char *name) {
-    if (m->stub_count >= S5L_STUB_MAX || !size) return false;
+    if (!m || m->stub_count >= S5L_STUB_MAX || !size) return false;
+    /* A window that extends beyond the 32-bit physical address space is only
+     * partially reachable and used to make the rounded register count wrap. */
+    if ((uint64_t)base + size > 0x100000000ull) return false;
     /*
      * Refuse to shadow, or be shadowed by, anything already on the bus: a
      * modelled device, another stub, or RAM. A stub that quietly overlays a
@@ -128,8 +138,11 @@ bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
         if (s5l8900_overlaps(base, size, m->stubs[i].base, m->stubs[i].size))
             return false;
     if (s5l8900_overlaps(base, size, m->ram_base, m->ram_size)) return false;
-    uint32_t nregs = (size + 3u) / 4u;
-    uint32_t *regs = calloc(nregs, sizeof *regs);
+    uint64_t nregs64 = ((uint64_t)size + 3u) / 4u;
+    if (nregs64 > 0xffffffffu ||
+        nregs64 > (uint64_t)SIZE_MAX / sizeof(uint32_t)) return false;
+    uint32_t nregs = (uint32_t)nregs64;
+    uint32_t *regs = calloc((size_t)nregs, sizeof *regs);
     if (!regs) return false;
 
     s5l_stub_t *s = &m->stubs[m->stub_count++];
@@ -139,12 +152,37 @@ bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
     return true;
 }
 
-static s5l_stub_t *find_stub(s5l8900_t *m, uint32_t a) {
+static s5l_stub_t *find_stub(s5l8900_t *m, uint32_t a, unsigned bytes) {
     for (unsigned i = 0; i < m->stub_count; i++)
-        if (a >= m->stubs[i].base &&
-            (uint64_t)a < (uint64_t)m->stubs[i].base + m->stubs[i].size)
+        if (in_window(a, bytes, m->stubs[i].base, m->stubs[i].size))
             return &m->stubs[i];
     return NULL;
+}
+
+/* Stub windows are honest byte-addressable storage. Assemble accesses a byte
+ * at a time so 8/16-bit and unaligned transactions update the correct lanes
+ * without ever indexing beyond the rounded backing-register array. */
+static uint32_t stub_read(const s5l_stub_t *s, uint32_t addr, unsigned bytes) {
+    uint32_t v = 0;
+    uint32_t rel = addr - s->base;
+    for (unsigned i = 0; i < bytes; i++) {
+        uint32_t at = rel + i;
+        uint32_t byte = (s->regs[at >> 2] >> ((at & 3u) * 8u)) & 0xffu;
+        v |= byte << (i * 8u);
+    }
+    return v;
+}
+
+static void stub_write(s5l_stub_t *s, uint32_t addr,
+                       uint32_t val, unsigned bytes) {
+    uint32_t rel = addr - s->base;
+    for (unsigned i = 0; i < bytes; i++) {
+        uint32_t at = rel + i;
+        uint32_t shift = (at & 3u) * 8u;
+        uint32_t *reg = &s->regs[at >> 2];
+        *reg = (*reg & ~(0xffu << shift)) |
+               (((val >> (i * 8u)) & 0xffu) << shift);
+    }
 }
 
 /* ------------------------------------------------------------- reads --- */
@@ -187,9 +225,10 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         return v;
     }
     uint32_t v;
-    if (in_dev(addr, S5L8900_UART0_BASE)) {
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) && (addr & 3u) == 0u &&
+        in_dev(addr, bytes, S5L8900_UART0_BASE)) {
         v = s5l_uart_read(&m->uart0, addr - S5L8900_UART0_BASE);
-    } else if (in_dev(addr, S5L8900_VIC0_BASE)) {
+    } else if (mmio_word(addr, bytes, S5L8900_VIC0_BASE, S5L8900_DEV_SIZE)) {
         uint32_t off = addr - S5L8900_VIC0_BASE;
         /* VIC0's VICADDRESS surfaces its own sources first, then daisy-chains
          * to VIC1 (global sources 32-63) — the standard PL192 cascade, and how
@@ -200,31 +239,29 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         } else {
             v = s5l_vic_read(&m->vic[0], off);
         }
-    } else if (in_dev(addr, S5L8900_VIC1_BASE)) {
+    } else if (mmio_word(addr, bytes, S5L8900_VIC1_BASE, S5L8900_DEV_SIZE)) {
         uint32_t off = addr - S5L8900_VIC1_BASE;
         if (off == VIC_VECTADDR) v = s5l_vic_vectaddr(&m->vic[1], 32);
         else                     v = s5l_vic_read(&m->vic[1], off);
-    } else if (in_dev(addr, S5L8900_CLCD_BASE)) {
+    } else if (mmio_word(addr, bytes, S5L8900_CLCD_BASE, S5L8900_DEV_SIZE)) {
         v = s5l_clcd_read(&m->clcd, addr - S5L8900_CLCD_BASE);
-    } else if (in_timer(addr)) {
+    } else if (in_timer(addr, bytes)) {
         v = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
-    } else if (in_power(addr)) {
+    } else if (in_power(addr, bytes)) {
         v = s5l_power_read(&m->power, addr - S5L8900_POWER_BASE);
-    } else if (addr >= S5L8900_NOR_BASE &&
-               (uint64_t)addr < (uint64_t)S5L8900_NOR_BASE + m->nor.size) {
+    } else if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+               in_window(addr, bytes, S5L8900_NOR_BASE, m->nor.size)) {
         v = s5l_nor_read(&m->nor, addr - S5L8900_NOR_BASE, bytes);
     } else {
-        s5l_stub_t *s = find_stub(m, addr);
+        s5l_stub_t *s = find_stub(m, addr, bytes);
         if (!s) {
             m->unmapped_reads++;
             note_unmapped(m, addr);
             note_device(m, addr, 0, false);
             return 0;
         }
-        uint32_t off = (addr - s->base) >> 2;
         s->reads++;
-        if (off < s->nregs) v = s->regs[off];
-        else { s->oob++; v = 0; }
+        v = stub_read(s, addr, bytes);
     }
     note_device(m, addr, v, false);
     return v;
@@ -237,35 +274,36 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         memcpy(&m->ram[addr - m->ram_base], &val, bytes);
         return;
     }
-    if (in_dev(addr, S5L8900_UART0_BASE)) {
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) && (addr & 3u) == 0u &&
+        in_dev(addr, bytes, S5L8900_UART0_BASE)) {
         note_device(m, addr, val, true);
         s5l_uart_write(&m->uart0, addr - S5L8900_UART0_BASE, val);
         return;
     }
-    if (in_dev(addr, S5L8900_VIC0_BASE)) {
+    if (mmio_word(addr, bytes, S5L8900_VIC0_BASE, S5L8900_DEV_SIZE)) {
         s5l_vic_write(&m->vic[0], addr - S5L8900_VIC0_BASE, val);
         return;
     }
-    if (in_dev(addr, S5L8900_VIC1_BASE)) {
+    if (mmio_word(addr, bytes, S5L8900_VIC1_BASE, S5L8900_DEV_SIZE)) {
         s5l_vic_write(&m->vic[1], addr - S5L8900_VIC1_BASE, val);
         return;
     }
-    if (in_dev(addr, S5L8900_CLCD_BASE)) {
+    if (mmio_word(addr, bytes, S5L8900_CLCD_BASE, S5L8900_DEV_SIZE)) {
         note_device(m, addr, val, true);
         s5l_clcd_write(&m->clcd, addr - S5L8900_CLCD_BASE, val);
         return;
     }
-    if (in_timer(addr)) {
+    if (in_timer(addr, bytes)) {
         s5l_timer_write(&m->timer, addr - S5L8900_TIMER_BASE, val);
         return;
     }
-    if (in_power(addr)) {
+    if (in_power(addr, bytes)) {
         note_device(m, addr, val, true);
         s5l_power_write(&m->power, addr - S5L8900_POWER_BASE, val);
         return;
     }
-    if (addr >= S5L8900_NOR_BASE &&
-        (uint64_t)addr < (uint64_t)S5L8900_NOR_BASE + m->nor.size) {
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+        in_window(addr, bytes, S5L8900_NOR_BASE, m->nor.size)) {
         /* Guest writes program the flash (bits can only be cleared). Note this
          * is a simplification: on real hardware the NOR is SPI-attached and is
          * programmed through controller commands rather than by storing to a
@@ -276,13 +314,11 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         return;
     }
     {
-        s5l_stub_t *s = find_stub(m, addr);
+        s5l_stub_t *s = find_stub(m, addr, bytes);
         if (s) {
-            uint32_t off = (addr - s->base) >> 2;
             s->writes++;
             note_device(m, addr, val, true);
-            if (off < s->nregs) s->regs[off] = val;
-            else s->oob++;
+            stub_write(s, addr, val, bytes);
             return;
         }
     }
@@ -301,6 +337,7 @@ static void w8 (void *c, uint32_t a, uint8_t  v) { bus_write(c, a, v, 1); }
 /* ----------------------------------------------------------- lifecycle --- */
 
 bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
+    if (!m) return false;
     memset(m, 0, sizeof *m);
 
     /*
@@ -313,7 +350,8 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
      * Neither is worth having, and both are invisible at run time, so the
      * machine simply does not exist.
      */
-    if (s5l8900_ram_conflict(ram_base, ram_size)) return false;
+    if (!ram_size || (uint64_t)ram_base + ram_size > 0x100000000ull ||
+        s5l8900_ram_conflict(ram_base, ram_size)) return false;
 
     m->ram = calloc(ram_size, 1);
     if (!m->ram) return false;
@@ -373,6 +411,7 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
 }
 
 void s5l8900_free(s5l8900_t *m) {
+    if (!m) return;
     for (unsigned i = 0; i < m->stub_count; i++) {
         free(m->stubs[i].regs);
         m->stubs[i].regs = NULL;
@@ -384,6 +423,7 @@ void s5l8900_free(s5l8900_t *m) {
 }
 
 void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
+    if (!m || !data || !len) return;
     /* Check before narrowing: a >4 GiB length must not truncate into range. */
     if (len > 0xffffffffu) return;
     if (!in_ram(m, addr, (uint32_t)len)) return;

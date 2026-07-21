@@ -61,8 +61,10 @@ static ksyms_status_t symtab_load(ksyms_t *ks, const macho_t *m) {
         uint32_t val  = rd32(e + 8);
         if ((type & 0x0e) != 0x0e || !val) continue;      /* N_SECT only */
         if (strx >= m->strsize) continue;
+        const char *name = (const char *)(ks->img + m->stroff + strx);
+        if (!memchr(name, '\0', m->strsize - strx)) continue;
         ks->sym[ks->nsym].value = val;
-        ks->sym[ks->nsym].name  = (const char *)(ks->img + m->stroff + strx);
+        ks->sym[ks->nsym].name  = name;
         ks->nsym++;
     }
     qsort(ks->sym, ks->nsym, sizeof *ks->sym, ksym_cmp);

@@ -25,6 +25,7 @@
 //
 #import "VMFramebufferView.h"
 #import <QuartzCore/QuartzCore.h>
+#include <stdint.h>
 #import <stdlib.h>
 #import <string.h>
 
@@ -67,7 +68,8 @@ static void vm_fb_release_data(void *info, const void *data, size_t size) {
                height:(size_t)h
                stride:(size_t)stride
                  argb:(BOOL)argb {
-    if (!pixels || w == 0 || h == 0 || stride < w * 4 || !_colorSpace) return;
+    if (!pixels || w == 0 || h == 0 || !_colorSpace ||
+        w > SIZE_MAX / 4 || stride < w * 4 || h > SIZE_MAX / stride) return;
 
     const size_t bytes = stride * h;
 

@@ -31,12 +31,13 @@ static int g_pass = 0, g_fail = 0;
 /* ------------------------------------------------------------ flat memory */
 #define RAM_SIZE (1u << 20)
 static uint8_t g_ram[RAM_SIZE];
+static unsigned g_read8_calls, g_write8_calls;
 static uint32_t m_r32(void *c, uint32_t a){ (void)c; uint32_t v; memcpy(&v,&g_ram[a&(RAM_SIZE-1)],4); return v; }
 static uint16_t m_r16(void *c, uint32_t a){ (void)c; uint16_t v; memcpy(&v,&g_ram[a&(RAM_SIZE-1)],2); return v; }
-static uint8_t  m_r8 (void *c, uint32_t a){ (void)c; return g_ram[a&(RAM_SIZE-1)]; }
+static uint8_t  m_r8 (void *c, uint32_t a){ (void)c; g_read8_calls++; return g_ram[a&(RAM_SIZE-1)]; }
 static void m_w32(void *c, uint32_t a, uint32_t v){ (void)c; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,4); }
 static void m_w16(void *c, uint32_t a, uint16_t v){ (void)c; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,2); }
-static void m_w8 (void *c, uint32_t a, uint8_t  v){ (void)c; g_ram[a&(RAM_SIZE-1)]=v; }
+static void m_w8 (void *c, uint32_t a, uint8_t  v){ (void)c; g_write8_calls++; g_ram[a&(RAM_SIZE-1)]=v; }
 static const arm_bus_t g_bus = { NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8 };
 
 #define CODE_WORDS 4096
@@ -56,6 +57,119 @@ static bool xlate(arm_cpu_t *c, uint32_t at, const uint32_t *prog, size_t n,
     load(c, at, prog, n);
     memset(g_code, 0, sizeof g_code);
     return jit_translate(c, at, g_code, cap, blk);
+}
+
+/* Two non-contiguous physical frames behind adjacent virtual small pages. The
+ * second descriptor can be omitted to exercise the JIT's replay-on-abort rule.
+ * VA 0 is identity-mapped as a section so an interpreter replay can fetch its
+ * faulting instruction. */
+#define SPLIT_VA  0x80000000u
+#define SPLIT_PA0 0x00030000u
+#define SPLIT_PA1 0x00060000u
+static void jit_split_setup(arm_cpu_t *c, bool map_second) {
+    const uint32_t l1 = 0x4000u, l2 = 0x5000u;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, l1 + (0x000u << 2), (3u << 10) | 2u);       /* VA 0 identity */
+    m_w32(NULL, l1 + (0x800u << 2), l2 | 1u);               /* coarse table  */
+    m_w32(NULL, l2 + (0u << 2), SPLIT_PA0 | (3u << 4) | 2u);
+    if (map_second)
+        m_w32(NULL, l2 + (1u << 2), SPLIT_PA1 | (3u << 4) | 2u);
+    arm_reset(c, &g_bus);
+    c->cpsr = (c->cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS;
+    c->cp15.ttbr0 = l1;
+    c->cp15.dacr = 1u;
+    c->cp15.sctlr |= ARM_SCTLR_M | ARM_SCTLR_XP;
+    c->r[15] = 0;
+    g_read8_calls = g_write8_calls = 0;
+}
+
+static void test_memory_helpers_cross_pages_without_replay_side_effects(void) {
+    arm_cpu_t c;
+    uint64_t loaded;
+
+    /* Halfword success: the two bytes come from non-contiguous frames. */
+    jit_split_setup(&c, true);
+    g_ram[SPLIT_PA0 + 0xfffu] = 0x34u;
+    g_ram[SPLIT_PA1] = 0x12u;
+    g_ram[SPLIT_PA0 + 0x1000u] = 0xeeu;            /* decoy after first frame */
+    loaded = jit_mem_load16(&c, SPLIT_VA + 0xfffu);
+    CHECK((loaded >> 32) == 0u && (uint32_t)loaded == 0x1234u,
+          "cross-page load16=%llx expect 1234", (unsigned long long)loaded);
+    CHECK(g_read8_calls == 2u, "cross-page load16 issued %u byte reads expect 2",
+          g_read8_calls);
+
+    /* The storing mirror must split to the same two frames. */
+    jit_split_setup(&c, true);
+    CHECK(jit_mem_store16(&c, SPLIT_VA + 0xfffu, 0x1234u) == 0u,
+          "cross-page store16 should succeed");
+    CHECK(g_ram[SPLIT_PA0 + 0xfffu] == 0x34u && g_ram[SPLIT_PA1] == 0x12u,
+          "store16 landed at %02x/%02x expect 34/12",
+          g_ram[SPLIT_PA0 + 0xfffu], g_ram[SPLIT_PA1]);
+    CHECK(g_ram[SPLIT_PA0 + 0x1000u] == 0u,
+          "store16 incorrectly treated physical frames as contiguous");
+
+    /* A missing second page is detected before any device-like bus access. */
+    jit_split_setup(&c, false);
+    loaded = jit_mem_load16(&c, SPLIT_VA + 0xfffu);
+    CHECK((loaded >> 32) == 1u, "faulting load16 did not report its fault bit");
+    CHECK(g_read8_calls == 0u,
+          "faulting load16 issued %u reads before interpreter replay", g_read8_calls);
+    CHECK(jit_mem_store16(&c, SPLIT_VA + 0xfffu, 0x1234u) != 0u,
+          "faulting store16 did not report failure");
+    CHECK(g_write8_calls == 0u,
+          "faulting store16 issued %u writes before interpreter replay", g_write8_calls);
+
+    /* A successful crossing word is still committed bytewise to both frames,
+     * but only after both translations have passed. */
+    jit_split_setup(&c, true);
+    CHECK(jit_mem_store32(&c, SPLIT_VA + 0xffeu, 0x11223344u) == 0u,
+          "cross-page store32 should succeed");
+    CHECK(g_write8_calls == 4u, "cross-page store32 issued %u writes expect 4",
+          g_write8_calls);
+    CHECK(g_ram[SPLIT_PA0 + 0xffeu] == 0x44u &&
+          g_ram[SPLIT_PA0 + 0xfffu] == 0x33u &&
+          g_ram[SPLIT_PA1] == 0x22u && g_ram[SPLIT_PA1 + 1u] == 0x11u,
+          "cross-page store32 bytes landed in the wrong frames");
+
+    /* On a second-page write fault the helper must write nothing. The fallback
+     * interpreter then performs the architecture's one partial transaction;
+     * counting byte writes models an MMIO side effect and proves it is not
+     * duplicated by JIT + replay. */
+    jit_split_setup(&c, false);
+    m_w32(NULL, 0, 0xe5801000u);                  /* STR r1,[r0] */
+    c.r[0] = SPLIT_VA + 0xffeu;
+    c.r[1] = 0x11223344u;
+    g_write8_calls = 0;
+    CHECK(jit_mem_store32(&c, c.r[0], c.r[1]) != 0u,
+          "faulting store32 did not report failure");
+    CHECK(g_write8_calls == 0u,
+          "faulting JIT store32 caused %u premature MMIO-like writes", g_write8_calls);
+    CHECK(arm_step(&c) == ARM_OK && c.r[15] == ARM_VEC_DATA_ABORT,
+          "interpreter replay of store32 must take the data abort");
+    CHECK(g_write8_calls == 2u,
+          "JIT + replay caused %u first-page writes expect exactly 2", g_write8_calls);
+    CHECK(g_ram[SPLIT_PA0 + 0xffeu] == 0x44u &&
+          g_ram[SPLIT_PA0 + 0xfffu] == 0x33u,
+          "interpreter replay did not leave the architectural partial store");
+
+    /* Reads can be side-effecting too. Preflight prevents the same duplicate
+     * transaction before replay of a crossing LDR whose second page faults. */
+    jit_split_setup(&c, false);
+    m_w32(NULL, 0, 0xe5901000u);                  /* LDR r1,[r0] */
+    g_ram[SPLIT_PA0 + 0xffeu] = 0xaau;
+    g_ram[SPLIT_PA0 + 0xfffu] = 0xbbu;
+    c.r[0] = SPLIT_VA + 0xffeu;
+    c.r[1] = 0xdeadbeefu;
+    g_read8_calls = 0;
+    loaded = jit_mem_load32(&c, c.r[0]);
+    CHECK((loaded >> 32) == 1u, "faulting load32 did not report its fault bit");
+    CHECK(g_read8_calls == 0u,
+          "faulting JIT load32 caused %u premature MMIO-like reads", g_read8_calls);
+    CHECK(arm_step(&c) == ARM_OK && c.r[15] == ARM_VEC_DATA_ABORT,
+          "interpreter replay of load32 must take the data abort");
+    CHECK(g_read8_calls == 2u,
+          "JIT + replay caused %u first-page reads expect exactly 2", g_read8_calls);
+    CHECK(c.r[1] == 0xdeadbeefu, "faulting replay changed destination to %08x", c.r[1]);
 }
 
 /* How many times `w` appears in the emitted code. */
@@ -955,6 +1069,7 @@ int main(void) {
     test_bl_writes_lr();
     test_load_sequence();
     test_store_sequence();
+    test_memory_helpers_cross_pages_without_replay_side_effects();
     test_code_buffer();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
