@@ -2,7 +2,9 @@
 
 How iOS3-VM stops being 60x too slow.
 
-This document is a **design**, not a report on working code. No dynarec exists.
+This document is a **design**. Part of J2 now exists; §0 records exactly how
+much, and the rest of the document is still ahead of the code.
+
 Every factual claim is labelled:
 
 - **CONFIRMED** — measured or read directly out of this repository at
@@ -34,6 +36,36 @@ expect:
 > "SpringBoard responds to your finger and animates at roughly quarter speed",
 > which is the difference between a screenshot and a demo. It is not
 > "indistinguishable from a real iPhone", and scheduling should not assume it.
+
+---
+
+## 0. Implementation status
+
+Built so far, behind the CMake option `IOS3VM_JIT` (**OFF by default**, and the
+default build and the boot path are untouched):
+
+| | State |
+|---|---|
+| `core/src/jit/a64_emit.c` — AArch64 emitter | **works**, 172 byte-exact assertions in `core/tests/test_a64_emit.c`, including an exhaustive check of the bitmask-immediate encoder against an independent `DecodeBitMasks` |
+| `core/src/jit/jit_translate.c` — block translator | **works** for a small ARM subset; 125 assertions in `core/tests/test_jit.c` on block shape and emitted words |
+| `core/src/jit/jit_mem.c` — code-buffer shim | plain RWX and `MAP_JIT` + `pthread_jit_write_protect_np`; dual mapping is not implemented (§8.2 explains why it would not help on iOS anyway) |
+| §3.4 dispatch, §3.5 chaining, §3.6 invalidation | **not built.** There is no code cache, so nothing calls the translator yet |
+| §6.1 software TLB (J1) | **not built.** Loads and stores go through a helper that calls `arm_mmu_translate` directly |
+| Thumb (J4) | **not started**; every Thumb block is declined |
+
+Native instruction coverage is deliberately narrow: ARM data-processing with a
+rotated immediate or an immediate-shifted register, `LDR`/`STR` word and byte
+with an immediate offset and no writeback, and `B`/`BL` — all with condition
+codes. **Everything else, including every form listed as DEFERRED in
+`jit_translate.c`, ends the block and is executed by `arm_step()`**, which is
+§2's rule and is verified by a test that denies every class and checks the
+translator then declines everything.
+
+Not yet demonstrated: that emitted code executes correctly. The dev box is x86.
+`core/tests/test_jit_exec.c` runs the emitted code and lockstep-compares a
+translated block against the interpreter, but it only does so on an arm64 host
+and skips itself elsewhere; the `jit` job in `.github/workflows/core-tests.yml`
+is what puts it on Apple Silicon runners.
 
 ---
 
