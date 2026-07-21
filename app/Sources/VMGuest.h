@@ -61,21 +61,24 @@ bool vm_guest_install(s5l8900_t *m);
  */
 const uint8_t *vm_guest_framebuffer(const s5l8900_t *m);
 
-/* 32-bit component order in memory: BGRA is byte0=B..byte3=A (what this SoC's
- * framebuffer uses and what XNU's console writes); ARGB is the reverse. */
+/* 32-bit component order in memory: BGRA is byte0=B..byte3=A (what the
+ * evidence-backed CLCD scanout and XNU console use); ARGB is the reverse. */
 typedef enum { VM_ORDER_BGRA = 0, VM_ORDER_ARGB = 1 } vm_pixel_order_t;
 
 /*
  * Locate the framebuffer the emulated display controller is scanning out, and
  * report its geometry and byte order. This is the honest path: when the core
- * provides a CLCD model, it reads back window 0 exactly as the guest (or the
- * iBoot stand-in in vm_guest_install) programmed it — address, size and pixel
- * order all come from the hardware model, not from a constant here. When the
- * core has no CLCD, it falls back to the fixed framebuffer this demo paints.
+ * provides a CLCD model, it follows AppleH1CLCD's window-priority order and
+ * reads back the first enabled window exactly as the guest (or the iBoot
+ * stand-in in vm_guest_install) programmed it. Address, size and depth come
+ * from the hardware model. The unverified order bits are deliberately ignored,
+ * matching s5l_clcd_scanout(), rather than inventing a swizzle. An enabled but
+ * invalid window is rejected rather than hidden behind a stale demo frame.
  *
  * Returns a host pointer valid until s5l8900_free(), or NULL. Any of the out
- * parameters may be NULL. The returned buffer is guaranteed to lie within DRAM
- * and to be no larger than VM_FB_BYTES.
+ * parameters may be NULL; on failure numeric outputs are zeroed and order is
+ * reset to BGRA. The returned buffer is guaranteed to lie within DRAM and to
+ * be no larger than VM_FB_BYTES.
  */
 const uint8_t *vm_guest_display(const s5l8900_t *m,
                                 uint32_t *width, uint32_t *height,

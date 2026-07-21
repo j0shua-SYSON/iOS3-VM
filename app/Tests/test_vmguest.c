@@ -56,6 +56,8 @@ static void test_null_and_uninitialised_inputs(void) {
           "framebuffer accepted a null machine");
     CHECK(vm_guest_display(NULL, &w, &h, &stride, &order) == NULL,
           "display accepted a null machine");
+    CHECK(w == 0 && h == 0 && stride == 0 && order == VM_ORDER_BGRA,
+          "failed display lookup left stale output metadata");
 
     s5l8900_t blank;
     memset(&blank, 0, sizeof blank);
@@ -120,11 +122,11 @@ static void test_host_refuses_malicious_clcd_windows(void) {
     const uint32_t b = CLCD_WIN_FIRST;
 
     /* Keep the window enabled and apparently well-formed, but place its last
-     * line outside RAM.  The app must fall back instead of handing UIKit an
-     * out-of-bounds host pointer. */
+     * line outside RAM. The app must reject it instead of handing UIKit an
+     * out-of-bounds host pointer or hiding the failure behind a stale frame. */
     s5l_clcd_write(&m.clcd, b + CLCD_WIN_FBADDR,
                    m.ram_base + m.ram_size - 4u);
-    CHECK(vm_guest_display(&m, NULL, NULL, NULL, NULL) == fixed,
+    CHECK(vm_guest_display(&m, NULL, NULL, NULL, NULL) == NULL,
           "out-of-RAM CLCD window escaped validation");
 
     CHECK(s5l_clcd_seed_window0(&m.clcd, fixed_pa,
@@ -135,18 +137,73 @@ static void test_host_refuses_malicious_clcd_windows(void) {
     /* The seed API rejects this layout, but guest MMIO is allowed to program
      * arbitrary register bits. Exercise the latter trust boundary directly. */
     s5l_clcd_write(&m.clcd, b + CLCD_WIN_PITCH, UINT32_MAX);
-    CHECK(vm_guest_display(&m, NULL, NULL, NULL, NULL) == fixed,
+    CHECK(vm_guest_display(&m, NULL, NULL, NULL, NULL) == NULL,
           "overflowing CLCD stride escaped validation");
 
-    CHECK(s5l_clcd_seed_window0(&m.clcd, fixed_pa,
+    for (uint32_t rawOrder = 0; rawOrder <= CLCD_ORDER_MASK; rawOrder++) {
+        CHECK(s5l_clcd_seed_window0(&m.clcd, fixed_pa,
+                                    VM_FB_WIDTH, VM_FB_HEIGHT,
+                                    VM_FB_WIDTH * VM_FB_BPP,
+                                    CLCD_FMT_32BPP, rawOrder),
+              "could not seed valid order value %u", rawOrder);
+        vm_pixel_order_t order = VM_ORDER_ARGB;
+        CHECK(vm_guest_display(&m, NULL, NULL, NULL, &order) == fixed,
+              "valid order value %u was rejected", rawOrder);
+        CHECK(order == VM_ORDER_BGRA,
+              "unverified order value %u invented a swizzle", rawOrder);
+    }
+
+    s5l8900_free(&m);
+}
+
+static void test_host_follows_active_clcd_window(void) {
+    s5l8900_t m;
+    bool initialised = s5l8900_init(&m, 0x08000000u, 2u << 20);
+    CHECK(initialised, "2 MB machine init failed");
+    if (!initialised) return;
+
+    const uint32_t fb0 = m.ram_base + 0x100000u;
+    const uint32_t fb1 = m.ram_base + 0x160000u;
+    CHECK(s5l_clcd_seed_window0(&m.clcd, fb0,
                                 VM_FB_WIDTH, VM_FB_HEIGHT,
                                 VM_FB_WIDTH * VM_FB_BPP,
-                                CLCD_FMT_32BPP, CLCD_ORDER_ARGB),
-          "could not seed a valid ARGB window");
-    vm_pixel_order_t order = VM_ORDER_BGRA;
-    CHECK(vm_guest_display(&m, NULL, NULL, NULL, &order) == fixed,
-          "valid ARGB window was rejected");
-    CHECK(order == VM_ORDER_ARGB, "ARGB order was not propagated");
+                                CLCD_FMT_32BPP, CLCD_ORDER_BGRA),
+          "could not seed window 0");
+
+    const uint32_t b1 = CLCD_WIN_FIRST + CLCD_WIN_STRIDE;
+    s5l_clcd_write(&m.clcd, b1 + CLCD_WIN_PITCH, VM_FB_WIDTH * VM_FB_BPP);
+    s5l_clcd_write(&m.clcd, b1 + CLCD_WIN_CONTROL,
+                   (6u << CLCD_FMT_SHIFT) /* driver also defines format 6 as 32 bpp */
+                   | (2u << CLCD_ORDER_SHIFT));
+    s5l_clcd_write(&m.clcd, b1 + CLCD_WIN_FBADDR, fb1);
+    s5l_clcd_write(&m.clcd, b1 + CLCD_WIN_GEOMETRY,
+                   (VM_FB_WIDTH << 16) | VM_FB_HEIGHT);
+
+    /* Window 0 has priority while both are enabled. */
+    s5l_clcd_write(&m.clcd, CLCD_CTRL,
+                   CLCD_CTRL_ENABLE | CLCD_CTRL_WIN0 | CLCD_CTRL_WIN1);
+    CHECK(vm_guest_display(&m, NULL, NULL, NULL, NULL) ==
+          m.ram + (fb0 - m.ram_base),
+          "window priority did not select window 0");
+
+    /* Once the guest disables window 0, the host must follow window 1. */
+    s5l_clcd_write(&m.clcd, CLCD_CTRL,
+                   CLCD_CTRL_ENABLE | CLCD_CTRL_WIN1);
+    vm_pixel_order_t order = VM_ORDER_ARGB;
+    CHECK(vm_guest_display(&m, NULL, NULL, NULL, &order) ==
+          m.ram + (fb1 - m.ram_base),
+          "active window 1 did not become scanout");
+    CHECK(order == VM_ORDER_BGRA, "unknown order bits invented a swizzle");
+
+    s5l_clcd_write(&m.clcd, CLCD_DISABLE, 1u);
+    CHECK(vm_guest_display(&m, NULL, NULL, NULL, NULL) == NULL,
+          "stopped scanout still exposed a framebuffer");
+    s5l_clcd_write(&m.clcd, CLCD_ENABLE, 1u);
+
+    /* No enabled window is an explicit no-scanout state, not the demo buffer. */
+    s5l_clcd_write(&m.clcd, CLCD_CTRL, CLCD_CTRL_ENABLE);
+    CHECK(vm_guest_display(&m, NULL, NULL, NULL, NULL) == NULL,
+          "disabled windows produced a stale fallback frame");
 
     s5l8900_free(&m);
 }
@@ -156,6 +213,7 @@ int main(void) {
     test_null_and_uninitialised_inputs();
     test_install_scanout_and_execution();
     test_host_refuses_malicious_clcd_windows();
+    test_host_follows_active_clcd_window();
 
     printf("vmguest: %u checks, %u failed\n", tests, failed);
     return failed ? 1 : 0;

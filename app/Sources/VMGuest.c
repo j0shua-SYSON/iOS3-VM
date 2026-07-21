@@ -203,20 +203,32 @@ const uint8_t *vm_guest_framebuffer(const s5l8900_t *m) {
 const uint8_t *vm_guest_display(const s5l8900_t *m,
                                 uint32_t *width, uint32_t *height,
                                 uint32_t *stride, vm_pixel_order_t *order) {
+    /* Never leave geometry from an earlier frame looking valid after an
+     * error. Callers can treat a NULL return as a complete no-scanout state. */
+    if (width)  *width = 0;
+    if (height) *height = 0;
+    if (stride) *stride = 0;
+    if (order)  *order = VM_ORDER_BGRA;
     if (!m || !m->ram) return NULL;
 
 #ifdef S5L8900_CLCD_BASE
     /*
-     * Ask the display controller. s5l_clcd_window() returns what the guest
-     * programmed into window 0 — the same registers real iBoot leaves set and
-     * IOMobileFramebuffer adopts. Everything is validated before it is trusted:
-     * a framebuffer the model reports outside DRAM, or larger than the buffer
-     * the app allocated, is refused rather than turned into an out-of-bounds
-     * read on the phone.
+     * Ask the display controller which window Apple's driver would adopt.
+     * IOMobileFramebuffer tests windows 0, 1, 2, then 3 and uses the first
+     * enabled one; hard-coding window 0 can display stale memory once the guest
+     * switches scanout. Everything is validated before it is trusted. An
+     * enabled but malformed window is an error, never a reason to silently
+     * resurrect the demo framebuffer and hide the controller bug.
      */
-    uint32_t fb_phys = 0, w = 0, h = 0, st = 0, fmt = 0, ord = 0;
-    if (s5l_clcd_window(&m->clcd, 0, &fb_phys, &w, &h, &st, &fmt, &ord)
-        && fmt == CLCD_FMT_32BPP
+    uint32_t fb_phys = 0, w = 0, h = 0, st = 0, fmt = 0;
+    uint32_t active = s5l_clcd_active_window(&m->clcd);
+    bool running = m->clcd.scanning
+                && (m->clcd.ctrl & CLCD_CTRL_ENABLE) != 0u
+                && (m->clcd.gate & 1u) != 0u;
+    if (running && active != CLCD_WIN_NONE
+        && s5l_clcd_window(&m->clcd, active,
+                           &fb_phys, &w, &h, &st, &fmt, NULL)
+        && CLCD_FMT_IS_32BPP(fmt)
         && w == VM_FB_WIDTH && h == VM_FB_HEIGHT
         && st >= w * VM_FB_BPP
         && fb_phys >= m->ram_base
@@ -225,14 +237,21 @@ const uint8_t *vm_guest_display(const s5l8900_t *m,
         if (width)  *width  = w;
         if (height) *height = h;
         if (stride) *stride = st;
-        if (order)  *order  = (ord == CLCD_ORDER_ARGB) ? VM_ORDER_ARGB
-                                                       : VM_ORDER_BGRA;
+        /* AppleH1CLCD publishes the same 'ARGB' IOSurface for every value of
+         * control bits[17:16], and the core deliberately has no evidence for a
+         * hardware swizzle. Match s5l_clcd_scanout(): report the observed
+         * little-endian AARRGGBB memory layout as BGRA. */
+        if (order)  *order  = VM_ORDER_BGRA;
         return m->ram + (fb_phys - m->ram_base);
     }
+
+    /* The core always has a CLCD model. No enabled, usable window means there
+     * is no trustworthy scanout to publish; returning the fixed demo address
+     * here would turn a guest display failure into a convincing stale frame. */
+    return NULL;
 #endif
 
-    /* No CLCD, or window 0 not usable: the fixed framebuffer this demo paints,
-     * which is 32bpp BGRA by construction (see the emitter's pixel packing). */
+    /* Build-time fallback for a core configuration without the CLCD model. */
     uint32_t pa = vm_guest_fb_pa(m->ram_base, m->ram_size);
     if (!pa) return NULL;
     if (width)  *width  = VM_FB_WIDTH;

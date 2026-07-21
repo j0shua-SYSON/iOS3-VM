@@ -19,7 +19,6 @@
 #import "VMGuest.h"
 
 #import <QuartzCore/QuartzCore.h>
-#import <libkern/OSCacheControl.h>
 #import <math.h>
 #import <stdlib.h>
 #import <string.h>
@@ -37,6 +36,15 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 // forever, so this cannot be unbounded.
 static const NSUInteger kConsoleScrollback = 12000;
 
+@class EmulatorViewController;
+
+/* CADisplayLink retains its target. Keeping only a weak edge back to the view
+ * controller lets normal controller teardown reach -dealloc and stop the VM. */
+@interface VMDisplayLinkProxy : NSObject
+- (instancetype)initWithTarget:(EmulatorViewController *)target;
+- (void)tick:(CADisplayLink *)sender;
+@end
+
 // Declared up front so every call below is checked against a prototype.
 @interface EmulatorViewController ()
 - (void)startEmulator;
@@ -47,8 +55,26 @@ static const NSUInteger kConsoleScrollback = 12000;
 - (void)runUartDemo;
 - (void)runInterruptDemo;
 - (void)runMmuDemo;
-- (void)appDidEnterBackground;
-- (void)appWillEnterForeground;
+- (void)appWillResignActive:(NSNotification *)notification;
+- (void)appDidBecomeActive:(NSNotification *)notification;
+@end
+
+@implementation VMDisplayLinkProxy {
+    __weak EmulatorViewController *_target;
+}
+
+- (instancetype)initWithTarget:(EmulatorViewController *)target {
+    self = [super init];
+    if (self) _target = target;
+    return self;
+}
+
+- (void)tick:(CADisplayLink *)sender {
+    EmulatorViewController *target = _target;
+    if (target) [target tick:sender];
+    else [sender invalidate];
+}
+
 @end
 
 @implementation EmulatorViewController {
@@ -113,28 +139,34 @@ static const NSUInteger kConsoleScrollback = 12000;
     if (![_engine start]) {
         [self append:@"[vm] emulator failed to start"];
         [self appendConsole:[_engine takePendingConsoleText]];
+        _engine = nil;
+        free(_frame);
+        _frame = NULL;
         return;
     }
 
     // 30 Hz is plenty: the guest cannot repaint 320x480 anywhere near that
     // fast, so a higher rate would only re-upload identical pixels.
     //
-    // The display link retains this controller, so -dealloc below will never
-    // actually run. That is deliberate rather than overlooked: this is the
-    // root view controller and it is meant to live for the life of the
-    // process. The cleanup is written out anyway so that the day this screen
-    // becomes one of several, the right thing already happens.
-    _link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+    VMDisplayLinkProxy *proxy = [[VMDisplayLinkProxy alloc] initWithTarget:self];
+    _link = [CADisplayLink displayLinkWithTarget:proxy selector:@selector(tick:)];
     _link.preferredFramesPerSecond = 30;
     [_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 
     // Interpreting flat out in the background is a good way to be terminated,
     // and nobody is looking at the screen anyway.
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-    [nc addObserver:self selector:@selector(appDidEnterBackground)
-               name:UIApplicationDidEnterBackgroundNotification object:nil];
-    [nc addObserver:self selector:@selector(appWillEnterForeground)
-               name:UIApplicationWillEnterForegroundNotification object:nil];
+    [nc addObserver:self selector:@selector(appWillResignActive:)
+               name:UIApplicationWillResignActiveNotification object:nil];
+    [nc addObserver:self selector:@selector(appDidBecomeActive:)
+               name:UIApplicationDidBecomeActiveNotification object:nil];
+
+    /* A foreground transition can race the relatively expensive VM startup
+     * before the observers above exist. Reconcile with current state so a
+     * missed resign-active notification cannot leave the interpreter burning
+     * CPU in the background on a memory-constrained phone. */
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive)
+        [self appWillResignActive:nil];
 }
 
 - (void)dealloc {
@@ -144,8 +176,17 @@ static const NSUInteger kConsoleScrollback = 12000;
     free(_frame);
 }
 
-- (void)appDidEnterBackground { [_engine setPaused:YES]; _link.paused = YES; }
-- (void)appWillEnterForeground { _link.paused = NO; [_engine setPaused:NO]; }
+- (void)appWillResignActive:(NSNotification *)notification {
+    (void)notification;
+    [_engine setPaused:YES];
+    _link.paused = YES;
+}
+
+- (void)appDidBecomeActive:(NSNotification *)notification {
+    (void)notification;
+    _link.paused = NO;
+    [_engine setPaused:NO];
+}
 
 #pragma mark - Layout
 
@@ -235,43 +276,20 @@ static const NSUInteger kConsoleScrollback = 12000;
                     && (flags & CS_DEBUGGED);
     [self append:[NSString stringWithFormat:@"CS_DEBUGGED : %@", debugged ? @"YES" : @"no"]];
 
-    // On A9 (no APRR/PAC/PPL) a plain RWX mapping is all the future dynarec
-    // needs — but a successful mmap does NOT prove that. The kernel can hand
-    // back a page that is writable and looks executable, and still fault the
-    // instant it is branched to. The only conclusive test is to emit real
-    // arm64 and call it, so that is what we do.
+    /* Requesting an RWX page is a useful capability hint on A9, but it is not
+     * proof that branching to unsigned memory is safe. Never execute probe
+     * code automatically during viewDidLoad: a jailbreak policy mismatch
+     * would turn every app launch into the same crash loop. The eventual JIT
+     * diagnostics screen can run an explicit, recoverable execution test. */
     void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
                       MAP_PRIVATE | MAP_ANON, -1, 0);
     BOOL rwx = (page != MAP_FAILED);
     [self append:[NSString stringWithFormat:@"RWX mmap    : %@",
                   rwx ? @"YES" : @"no"]];
-#if defined(__arm64__)
-    /* Do not deliberately branch into unsigned memory unless the process is
-     * actually marked CS_DEBUGGED. A permissive-looking mmap is not proof of
-     * executable permission; on a misconfigured jailbreak the old automatic
-     * probe killed the app at launch, before the user could read the diagnosis.
-     * The real dynarec will apply the same preflight before it is enabled. */
-    if (rwx && debugged) {
-        uint32_t *code = (uint32_t *)page;
-        code[0] = 0x52824680u;   /* movz w0, #0x1234 */
-        code[1] = 0xd65f03c0u;   /* ret              */
-        // Writes land in D-cache; the fetch side will not see them without this.
-        sys_icache_invalidate(page, 2 * sizeof(uint32_t));
-
-        // Printed BEFORE the call on purpose: if the branch faults, the process
-        // dies here and this is the last line on screen, which is itself the
-        // answer. A missing verdict line means "no".
-        [self append:@"JIT execute : calling emitted code…"];
-        uint32_t got = ((uint32_t (*)(void))page)();
-        [self append:[NSString stringWithFormat:@"JIT execute : %@ (got 0x%04x)",
-                       got == 0x1234u ? @"YES  — dynarec viable"
-                                      : @"ran, but WRONG RESULT", got]];
-    } else if (rwx) {
-        [self append:@"JIT execute : skipped (CS_DEBUGGED is not set)"];
-    }
-#else
-    if (rwx) [self append:@"JIT execute : skipped (host is not arm64)"];
-#endif
+    [self append:[NSString stringWithFormat:
+        @"JIT execute : not run at startup (%@)",
+        (rwx && debugged) ? @"manual diagnostic required"
+                          : @"capability preflight failed"]];
     if (rwx) munmap(page, 4096);
 
     [self append:[NSString stringWithFormat:@"footprint   : %.1f MB at launch",

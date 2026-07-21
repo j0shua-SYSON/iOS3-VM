@@ -14,10 +14,10 @@
 /*
  * Present one frame. `pixels` is `stride`-bytes-per-row, 32 bits per pixel.
  * When `argb` is NO the bytes are B,G,R,A (the S5L8900 framebuffer's native
- * order, see tools/bootkernel.c); when YES they are A,R,G,B. Which one is not
- * assumed here — it comes from what the guest programmed into the display
- * controller. The bytes are copied before returning, so the caller may reuse
- * the buffer immediately.
+ * order, see tools/bootkernel.c); when YES they are A,R,G,B. VMGuest reports
+ * the validated host interpretation; the current CLCD model exposes only its
+ * evidence-backed BGRA memory layout. The bytes are copied before returning,
+ * so the caller may reuse the buffer immediately.
  */
 - (void)presentPixels:(const void *)pixels
                 width:(size_t)w

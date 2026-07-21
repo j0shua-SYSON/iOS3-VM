@@ -53,6 +53,13 @@ static const double kVMPublishInterval = 1.0 / 30.0;
 // stops draining (backgrounded, say) while the guest keeps printing.
 static const NSUInteger kVMConsoleLimit = 16000;
 
+typedef NS_ENUM(uint8_t, VMEngineState) {
+    VMEngineStateIdle = 0,
+    VMEngineStateStarting,
+    VMEngineStateRunning,
+    VMEngineStateStopping,
+};
+
 static double vm_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -61,7 +68,7 @@ static double vm_now(void) {
 
 // Declared up front so every call below is checked against a prototype.
 @interface VMEngine ()
-- (void)threadMain;
+- (void)threadMain:(id)unused;
 - (void)publishRetired:(uint64_t)retired
                   rate:(double)instantRate
                 status:(arm_status_t)status;
@@ -74,15 +81,18 @@ static double vm_now(void) {
 
     NSThread        *_thread;
     pthread_mutex_t  _lock;
+    BOOL             _lockReady;
 
     // Everything below is guarded by _lock.
     uint8_t         *_snapshot;      // VM_FB_BYTES, last published frame
     BOOL             _snapshotFresh;
     BOOL             _snapshotARGB;  // byte order of the snapshot's pixels
+    BOOL             _snapshotBlank;
     NSMutableString *_pending;
     uint64_t         _retired;
     double           _rate;          // instructions per second, smoothed
     NSString        *_status;
+    VMEngineState    _state;
     BOOL             _stopRequested;
     BOOL             _paused;
 }
@@ -99,8 +109,10 @@ static double vm_now(void) {
 - (instancetype)init {
     self = [super init];
     if (!self) return nil;
-    pthread_mutex_init(&_lock, NULL);
+    if (pthread_mutex_init(&_lock, NULL) != 0) return nil;
+    _lockReady = YES;
     _pending = [NSMutableString string];
+    if (!_pending) return nil;
     _status  = @"idle";
     return self;
 }
@@ -110,35 +122,94 @@ static double vm_now(void) {
     // target for as long as the thread is alive, so -dealloc cannot possibly
     // run while -threadMain is still using the snapshot buffer or the lock.
     free(_snapshot);
-    pthread_mutex_destroy(&_lock);
+    if (_lockReady) pthread_mutex_destroy(&_lock);
 }
 
 #pragma mark - Lifecycle
 
 - (BOOL)start {
-    if (_thread) return YES;
+    /* start/stop are normally called by the main thread, but keeping the state
+     * transition under the same lock as the worker flags prevents a retry from
+     * racing the final free after a guest halt. */
+    pthread_mutex_lock(&_lock);
+    if (_state == VMEngineStateRunning) {
+        pthread_mutex_unlock(&_lock);
+        return YES;
+    }
+    if (_state != VMEngineStateIdle) {
+        pthread_mutex_unlock(&_lock);
+        return NO;
+    }
+    _state = VMEngineStateStarting;
+    _stopRequested = NO;
+    _paused = NO;
+    _snapshotFresh = NO;
+    _snapshotBlank = NO;
+    _retired = 0;
+    _rate = 0.0;
+    _status = @"starting";
+    BOOL needSnapshot = (_snapshot == NULL);
+    if (_snapshot) {
+        memset(_snapshot, 0, VM_FB_BYTES);
+        _snapshotARGB = NO;
+        _snapshotFresh = YES;
+        _snapshotBlank = YES;
+    }
+    pthread_mutex_unlock(&_lock);
 
-    _snapshot = calloc(1, VM_FB_BYTES);
-    if (!_snapshot) return NO;
+    if (needSnapshot) {
+        uint8_t *snapshot = calloc(1, VM_FB_BYTES);
+        pthread_mutex_lock(&_lock);
+        _snapshot = snapshot;
+        if (snapshot) {
+            _snapshotARGB = NO;
+            _snapshotFresh = YES;
+            _snapshotBlank = YES;
+        }
+        if (!snapshot) {
+            _state = VMEngineStateIdle;
+            _stopRequested = NO;
+            _paused = NO;
+            _status = @"out of memory";
+        }
+        pthread_mutex_unlock(&_lock);
+        if (!snapshot) return NO;
+    }
+
+    pthread_mutex_lock(&_lock);
+    BOOL cancelledEarly = (_state == VMEngineStateStopping || _stopRequested);
+    if (cancelledEarly) {
+        _state = VMEngineStateIdle;
+        _stopRequested = NO;
+        _paused = NO;
+        _status = @"stopped";
+    }
+    pthread_mutex_unlock(&_lock);
+    if (cancelledEarly) return NO;
 
     // Measured either side of the allocation so the guest DRAM's real cost is
     // a number on the screen rather than an assertion in a comment.
     uint64_t before = [VMEngine physFootprintBytes];
 
     if (!s5l8900_init(&_machine, VM_GUEST_RAM_BASE, VM_GUEST_RAM_SIZE)) {
-        free(_snapshot);
-        _snapshot = NULL;
+        pthread_mutex_lock(&_lock);
+        _state = VMEngineStateIdle;
+        _stopRequested = NO;
+        _status = @"allocation failed";
+        pthread_mutex_unlock(&_lock);
         [self appendConsole:@"[vm] could not allocate 128 MB of guest DRAM\n"];
         return NO;
     }
     if (!vm_guest_install(&_machine)) {
         s5l8900_free(&_machine);
-        free(_snapshot);
-        _snapshot = NULL;
+        pthread_mutex_lock(&_lock);
+        _state = VMEngineStateIdle;
+        _stopRequested = NO;
+        _status = @"guest setup failed";
+        pthread_mutex_unlock(&_lock);
         [self appendConsole:@"[vm] could not install the guest payload\n"];
         return NO;
     }
-    _machineReady = YES;
 
     uint64_t after = [VMEngine physFootprintBytes];
     [self appendConsole:[NSString stringWithFormat:
@@ -148,20 +219,54 @@ static double vm_now(void) {
         vm_guest_fb_pa(VM_GUEST_RAM_BASE, VM_GUEST_RAM_SIZE),
         before / 1048576.0, after / 1048576.0]];
 
-    _thread = [[NSThread alloc] initWithTarget:self
-                                      selector:@selector(threadMain)
-                                        object:nil];
-    _thread.name = @"iOS3-VM emulator";
-    _thread.qualityOfService = NSQualityOfServiceUserInitiated;
-    _thread.stackSize = 512 * 1024;
-    [_thread start];
+    NSThread *thread = [[NSThread alloc] initWithTarget:self
+                                               selector:@selector(threadMain:)
+                                                 object:nil];
+    if (!thread) {
+        s5l8900_free(&_machine);
+        pthread_mutex_lock(&_lock);
+        _state = VMEngineStateIdle;
+        _stopRequested = NO;
+        _status = @"thread allocation failed";
+        pthread_mutex_unlock(&_lock);
+        [self appendConsole:@"[vm] could not allocate the emulator thread\n"];
+        return NO;
+    }
+    thread.name = @"iOS3-VM emulator";
+    thread.qualityOfService = NSQualityOfServiceUserInitiated;
+    thread.stackSize = 512 * 1024;
+
+    pthread_mutex_lock(&_lock);
+    BOOL cancelled = (_state == VMEngineStateStopping || _stopRequested);
+    if (!cancelled) {
+        _machineReady = YES;
+        _thread = thread;
+        _state = VMEngineStateRunning;
+    }
+    pthread_mutex_unlock(&_lock);
+
+    if (cancelled) {
+        s5l8900_free(&_machine);
+        pthread_mutex_lock(&_lock);
+        _state = VMEngineStateIdle;
+        _stopRequested = NO;
+        _paused = NO;
+        _status = @"stopped";
+        pthread_mutex_unlock(&_lock);
+        return NO;
+    }
+
+    [thread start];
     return YES;
 }
 
 - (void)stop {
     pthread_mutex_lock(&_lock);
-    _stopRequested = YES;
-    _paused = NO;
+    if (_state == VMEngineStateStarting || _state == VMEngineStateRunning) {
+        _stopRequested = YES;
+        _paused = NO;
+        _state = VMEngineStateStopping;
+    }
     pthread_mutex_unlock(&_lock);
 }
 
@@ -173,10 +278,12 @@ static double vm_now(void) {
 
 #pragma mark - Emulator thread
 
-- (void)threadMain {
+- (void)threadMain:(id)unused {
+    (void)unused;
     double lastPublish = vm_now();
     uint64_t retired = 0, retiredAtLastPublish = 0;
     arm_status_t status = ARM_OK;
+    BOOL stoppedByRequest = NO;
 
     while (YES) {
         @autoreleasepool {
@@ -185,7 +292,10 @@ static double vm_now(void) {
             BOOL paused = _paused;
             pthread_mutex_unlock(&_lock);
 
-            if (stop) break;
+            if (stop) {
+                stoppedByRequest = YES;
+                break;
+            }
             if (paused) {
                 usleep(50 * 1000);
                 lastPublish = vm_now();
@@ -194,6 +304,19 @@ static double vm_now(void) {
             }
 
             retired += s5l8900_run(&_machine, kVMChunkInstructions, &status);
+
+            /* A stop can arrive while the bounded chunk is executing. Let the
+             * explicit lifecycle request win before publishing a simultaneous
+             * guest halt as though the controller were still active. */
+            pthread_mutex_lock(&_lock);
+            stop = _stopRequested;
+            if (status != ARM_OK && !stop && _state == VMEngineStateRunning)
+                _state = VMEngineStateStopping;
+            pthread_mutex_unlock(&_lock);
+            if (stop) {
+                stoppedByRequest = YES;
+                break;
+            }
 
             double now = vm_now();
             double elapsed = now - lastPublish;
@@ -208,14 +331,42 @@ static double vm_now(void) {
             // A non-OK status means the guest hit an encoding this core does
             // not implement, or halted. Stopping is right: spinning on the same
             // faulting instruction would burn the battery and tell us nothing.
-            if (status != ARM_OK) break;
+            if (status != ARM_OK) {
+                break;
+            }
         }
     }
 
+    /* An explicit stop can arrive between regular publications. Drain the
+     * remaining UART bytes and publish the final counters before destroying
+     * the sole copy of the machine. */
+    if (stoppedByRequest)
+        [self publishRetired:retired rate:0.0 status:ARM_OK];
+
     if (_machineReady) {
         s5l8900_free(&_machine);
-        _machineReady = NO;
     }
+
+    /* Publish the terminal state only after the machine is gone. In
+     * particular, clear _thread here so a later start really creates a fresh
+     * machine instead of returning a false success for a dead worker. */
+    pthread_mutex_lock(&_lock);
+    _machineReady = NO;
+    _thread = nil;
+    if (stoppedByRequest) {
+        if (_snapshot) {
+            memset(_snapshot, 0, VM_FB_BYTES);
+            _snapshotARGB = NO;
+            _snapshotFresh = YES;
+            _snapshotBlank = YES;
+        }
+        _status = @"stopped";
+        _rate = 0.0;
+    }
+    _state = VMEngineStateIdle;
+    _stopRequested = NO;
+    _paused = NO;
+    pthread_mutex_unlock(&_lock);
 }
 
 // Called on the emulator thread only.
@@ -266,6 +417,16 @@ static double vm_now(void) {
         memcpy(_snapshot, fb, fbBytes);
         _snapshotARGB = (order == VM_ORDER_ARGB);
         _snapshotFresh = YES;
+        _snapshotBlank = NO;
+    } else if (_snapshot && !_snapshotBlank) {
+        /* A stopped or invalid controller is a black panel, not permission to
+         * leave the last good frame on screen forever. Publish that transition
+         * once; do not allocate a new black CGImage at 30 Hz while it remains
+         * stopped. */
+        memset(_snapshot, 0, VM_FB_BYTES);
+        _snapshotARGB = NO;
+        _snapshotFresh = YES;
+        _snapshotBlank = YES;
     }
     if (fresh.length) [_pending appendString:fresh];
     if (_pending.length > kVMConsoleLimit) {

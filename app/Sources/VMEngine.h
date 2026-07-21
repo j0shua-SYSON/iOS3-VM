@@ -13,7 +13,8 @@
 @interface VMEngine : NSObject
 
 /* Allocate the machine, install the demo guest, and start interpreting on a
- * background thread. Returns NO if guest DRAM could not be allocated. */
+ * background thread. Returns YES when already running, and NO if startup fails
+ * or a start/stop transition is already in progress. */
 - (BOOL)start;
 
 /* Ask the emulator thread to finish and release the machine. */
