@@ -497,6 +497,22 @@ static const milestone_t MILESTONES[] = {
     { "_machine_startup",           0xc0209a40u },
     { "_kernel_bootstrap",          0xc020862cu },
     { "_bsd_init",                  0xc020ae14u },
+    /* The M5 frontier: pid 1 exec'ing /sbin/launchd, and what it hits on the
+     * way. grade_binary is the gate that used to answer 0 — CPU_SUBTYPE_ARM_ALL
+     * against an ARMv6 Mach-O — and turn the exec into EBADARCH. The rest say
+     * whether we then get past code signing (cs_validate_page / ubc_cs_blob_add)
+     * and the MAC policy (mac_vnode_check_exec), and whether the new image ever
+     * reaches user mode (thread_bootstrap_return) and issues a system call. */
+    { "_load_init_program",         0xc011d9acu },
+    { "_execve",                    0xc011d98cu },
+    { "_load_machfile",             0xc014c508u },
+    { "_grade_binary",              0xc0153f90u },
+    { "_mac_vnode_check_exec",      0xc01acb38u },
+    { "_ubc_cs_blob_add",           0xc013b2a4u },
+    { "_cs_validate_page",          0xc013af54u },
+    { "_thread_bootstrap_return",   0xc006871cu },
+    { "_unix_syscall",              0xc01541a8u },
+    { "_bsdinit_task",              0xc0110868u },
     { "_panic",                     0xc001c13cu },
     { "_Debugger",                  0xc006abbcu },
 };

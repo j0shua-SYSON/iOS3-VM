@@ -49,6 +49,45 @@
 /* VFP11 identity register as reported by the ARM1176JZF-S. */
 #define ARM1176_FPSID      0x410120b4u
 
+/*
+ * The ARMv6 CPUID feature identification block: CP15 c0 with CRm == 1
+ * (processor / memory-model features) and CRm == 2 (instruction set
+ * attributes). These are read-only and, on the ARM1176JZF-S, constant —
+ * the values below are the part's, from ARM DDI 0301H section 3.2.
+ *
+ * They are not optional decoration. MIDR[19:16] on this core reads 0xF,
+ * which by the ARM ARM means "architecture version is described by the
+ * CPUID scheme, not by this field" — so any reader that wants the actual
+ * architecture MUST come here. XNU does exactly that: do_cpuid() sees the
+ * 0xF, reads ID_ISAR1, checks the Jazelle field, and only then rewrites
+ * its cached MIDR to say ARMv6. Without ID_ISAR1 the kernel concludes the
+ * CPU has no known architecture and reports CPU_SUBTYPE_ARM_ALL, which
+ * makes grade_binary() reject every ARMv6 executable on the disk.
+ */
+#define ARM1176_ID_PFR0    0x00000111u  /* ARM + Thumb + Jazelle state     */
+#define ARM1176_ID_PFR1    0x00000011u  /* programmers' model: v6, no TrustZone */
+/*
+ * ID_DFR0 is the one deliberate zero. The real part answers 0x00000033 —
+ * "coprocessor-accessed debug, ARMv6.1" — but we do not implement the CP14
+ * debug unit; DBGDIDR reads as zero here. XNU's do_debugid() takes a
+ * non-zero ID_DFR0 as licence to publish a breakpoint/watchpoint count
+ * derived from DBGDIDR, so claiming 0x33 would advertise debug hardware
+ * that does not exist. Zero is the truthful answer for this machine, and
+ * the architecture defines it to mean "no debug support".
+ */
+#define ARM1176_ID_DFR0    0x00000000u
+#define ARM1176_ID_AFR0    0x00000000u  /* no implementation-defined features */
+#define ARM1176_ID_MMFR0   0x01130003u
+#define ARM1176_ID_MMFR1   0x10030302u
+#define ARM1176_ID_MMFR2   0x01222100u
+#define ARM1176_ID_MMFR3   0x00000000u
+#define ARM1176_ID_ISAR0   0x00140011u
+#define ARM1176_ID_ISAR1   0x12002111u  /* [15:12] = 2: Jazelle BXJ + J bit */
+#define ARM1176_ID_ISAR2   0x11231121u
+#define ARM1176_ID_ISAR3   0x01102131u
+#define ARM1176_ID_ISAR4   0x00000141u
+#define ARM1176_ID_ISAR5   0x00000000u
+
 /* ARMv6 fault status codes (FSR[3:0]); FSR[7:4] carries the domain. */
 #define ARM_FSR_SECTION_TRANSLATION 0x5u
 #define ARM_FSR_PAGE_TRANSLATION    0x7u

@@ -233,10 +233,29 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     if (load) {
         uint32_t v = 0;
         switch (crn) {
-            case 0:
-                if (crm == 0 && opc2 == 0) v = ARM1176_MIDR;
-                else if (crm == 0 && opc2 == 1) v = ARM1176_CACHE_TYPE;
+            case 0: {
+                /* CRm selects which identity bank; opc2 the register in it. */
+                static const uint32_t id_crm1[8] = {   /* feature registers  */
+                    ARM1176_ID_PFR0,  ARM1176_ID_PFR1,
+                    ARM1176_ID_DFR0,  ARM1176_ID_AFR0,
+                    ARM1176_ID_MMFR0, ARM1176_ID_MMFR1,
+                    ARM1176_ID_MMFR2, ARM1176_ID_MMFR3,
+                };
+                static const uint32_t id_crm2[8] = {   /* ISA attributes     */
+                    ARM1176_ID_ISAR0, ARM1176_ID_ISAR1,
+                    ARM1176_ID_ISAR2, ARM1176_ID_ISAR3,
+                    ARM1176_ID_ISAR4, ARM1176_ID_ISAR5, 0, 0,
+                };
+                if (crm == 0) {
+                    if (opc2 == 0) v = ARM1176_MIDR;
+                    else if (opc2 == 1) v = ARM1176_CACHE_TYPE;
+                } else if (crm == 1) {
+                    v = id_crm1[opc2];
+                } else if (crm == 2) {
+                    v = id_crm2[opc2];
+                }
                 break;
+            }
             case 1:
                 if (opc2 == 0) v = p->sctlr; else if (opc2 == 1) v = p->actlr;
                 else if (opc2 == 2) v = p->cpacr;

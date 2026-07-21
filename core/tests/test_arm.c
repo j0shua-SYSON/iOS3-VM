@@ -596,6 +596,64 @@ static void test_cp15_reads_midr(void) {
     CHECK(c.r[0] == ARM1176_MIDR, "r0=%08x expect %08x (MIDR)", c.r[0], ARM1176_MIDR);
 }
 
+static void test_cp15_cpuid_feature_bank(void) {
+    /* CP15 c0 CRm=1 and CRm=2 are the ARMv6 CPUID feature identification
+     * registers. MIDR[19:16] on the ARM1176JZF-S reads 0xF, which means
+     * "the architecture version is described by this bank, not by MIDR" —
+     * so a kernel that wants to know what it is running on has to read it. */
+    uint32_t p[] = { 0xee100f11 /*MRC p15,0,r0,c0,c1,0  ID_PFR0 */,
+                     0xee101f91 /*MRC p15,0,r1,c0,c1,4  ID_MMFR0*/,
+                     0xee102f12 /*MRC p15,0,r2,c0,c2,0  ID_ISAR0*/,
+                     0xee103f32 /*MRC p15,0,r3,c0,c2,1  ID_ISAR1*/,
+                     0xee104f92 /*MRC p15,0,r4,c0,c2,4  ID_ISAR4*/ };
+    arm_cpu_t c; load_and_run(&c, p, 5, 5);
+    CHECK(c.r[0] == ARM1176_ID_PFR0,  "ID_PFR0=%08x expect %08x",  c.r[0], ARM1176_ID_PFR0);
+    CHECK(c.r[1] == ARM1176_ID_MMFR0, "ID_MMFR0=%08x expect %08x", c.r[1], ARM1176_ID_MMFR0);
+    CHECK(c.r[2] == ARM1176_ID_ISAR0, "ID_ISAR0=%08x expect %08x", c.r[2], ARM1176_ID_ISAR0);
+    CHECK(c.r[3] == ARM1176_ID_ISAR1, "ID_ISAR1=%08x expect %08x", c.r[3], ARM1176_ID_ISAR1);
+    CHECK(c.r[4] == ARM1176_ID_ISAR4, "ID_ISAR4=%08x expect %08x", c.r[4], ARM1176_ID_ISAR4);
+}
+
+static void test_cp15_cpuid_scheme_grades_as_armv6(void) {
+    /*
+     * This is xnu-1357.5.30's do_cpuid(), lifted verbatim from the kernel at
+     * 0xc006257c and run against our CP15. It reads MIDR, notices the 0xF
+     * architecture field, reads ID_ISAR1, and if the Jazelle field says 2 it
+     * rewrites the architecture field to 7 (ARMv6).
+     *
+     * cpu_init() then indexes a jump table with (arch - 2) and stores
+     * CPU_SUBTYPE_ARM_V6 for arch 7; anything it does not recognise stores
+     * CPU_SUBTYPE_ARM_ALL (0), and grade_binary() rejects every ARMv6 Mach-O
+     * on the disk with EBADARCH. If this assertion ever fails again, /sbin/launchd
+     * stops exec'ing.
+     */
+    uint32_t p[] = { 0xee101f10 /*MRC p15,0,r1,c0,c0,0   MIDR         */,
+                     0xee103f32 /*MRC p15,0,r3,c0,c2,1   ID_ISAR1     */,
+                     0xe1a03423 /*LSR   r3, r3, #8                    */,
+                     0xe20330f0 /*AND   r3, r3, #0xf0                 */,
+                     0xe3530020 /*CMP   r3, #0x20        Jazelle == 2 */,
+                     0x03c13702 /*BICEQ r3, r1, #0x80000              */,
+                     0x03833807 /*ORREQ r3, r3, #0x70000              */ };
+    arm_cpu_t c; load_and_run(&c, p, 7, 7);
+    CHECK(((c.r[1] >> 16) & 0xfu) == 0xfu,
+          "MIDR arch nibble=%x expect f (CPUID scheme)", (c.r[1] >> 16) & 0xfu);
+    CHECK(((c.r[3] >> 16) & 0xfu) == 7u,
+          "fixed-up arch nibble=%x expect 7 (ARMv6) — cpu_subtype would be ARM_ALL",
+          (c.r[3] >> 16) & 0xfu);
+}
+
+static void test_cp15_id_dfr0_matches_absent_debug_unit(void) {
+    /* We do not model the CP14 debug unit, so DBGDIDR reads zero. ID_DFR0 must
+     * agree and report "no debug architecture": XNU's do_debugid() treats a
+     * non-zero ID_DFR0 as licence to publish a breakpoint count derived from
+     * DBGDIDR, so the two answers have to be consistent with each other. */
+    uint32_t p[] = { 0xee100f51 /*MRC p15,0,r0,c0,c1,2   ID_DFR0 */,
+                     0xee101e10 /*MRC p14,0,r1,c0,c0,0   DBGDIDR */ };
+    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    CHECK(c.r[0] == 0, "ID_DFR0=%08x expect 0 (no debug unit modelled)", c.r[0]);
+    CHECK(c.r[1] == 0, "DBGDIDR=%08x expect 0", c.r[1]);
+}
+
 static void test_cp15_sctlr_roundtrip(void) {
     /* Deliberately write SCTLR.C (data cache) rather than SCTLR.M: setting M
      * would switch the MMU on mid-program and, with no page tables loaded, the
@@ -1483,6 +1541,9 @@ int main(void) {
     test_swi_enters_svc();
     test_exception_return_restores_mode();
     test_cp15_reads_midr();
+    test_cp15_cpuid_feature_bank();
+    test_cp15_cpuid_scheme_grades_as_armv6();
+    test_cp15_id_dfr0_matches_absent_debug_unit();
     test_cp15_sctlr_roundtrip();
     test_cp15_ttbr0_roundtrip();
     test_cp15_cache_op_is_accepted();
