@@ -103,6 +103,10 @@ static void test_cpu_state_round_trips(void) {
     a->cpu.excl_addr     = 0x08123450u;
     a->cpu.vfp_fpexc     = 0x40000000u;
     a->cpu.vfp_fpscr     = 0x00000010u;
+    /* The VFP register file. Distinct per register, because a snapshot that
+     * dropped or transposed one would restore a thread whose floating-point
+     * state is subtly wrong — the exact failure this file exists to prevent. */
+    for (unsigned i = 0; i < 32; i++) a->cpu.vfp_s[i] = 0x5f000000u + i * 0x37u;
 
     CHECK(roundtrip(a, b), "cpu round trip");
 
@@ -124,6 +128,7 @@ static void test_cpu_state_round_trips(void) {
     SAME(cpu.irq_line);      SAME(cpu.fiq_line);
     SAME(cpu.excl_valid);    SAME(cpu.excl_addr);
     SAME(cpu.vfp_fpexc);     SAME(cpu.vfp_fpscr);
+    for (unsigned i = 0; i < 32; i++) SAME(cpu.vfp_s[i]);
 
     /* The bus is host wiring, not guest state: it must point at the restored
      * machine's own bus, not at the machine the snapshot came from. */

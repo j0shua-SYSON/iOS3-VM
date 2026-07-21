@@ -2,6 +2,7 @@
 # This same static library is what the iOS app links against.
 add_library(emucore STATIC
     src/arm/arm_interp.c
+    src/arm/vfp.c
     src/mmu.c
     src/snapshot.c
     src/soc/uart.c
@@ -25,6 +26,14 @@ target_include_directories(emucore PUBLIC include)
 
 if(NOT MSVC)
     target_compile_options(emucore PRIVATE -Wall -Wextra)
+    # VFPv2 has no fused multiply-add: VMLA rounds the product and then rounds
+    # the sum. GCC's default -ffp-contract=fast is allowed to fuse those into
+    # one FMA, which differs from hardware in the last bit. vfp.c also anchors
+    # each rounding step behind a volatile store, so this flag is a second
+    # belt rather than the only one — but a last-bit difference in a float is
+    # exactly the silent wrongness this core refuses to ship.
+    set_source_files_properties(src/arm/vfp.c PROPERTIES
+        COMPILE_OPTIONS "-ffp-contract=off")
 endif()
 
 # --- dynamic recompiler (optional, off by default) --------------------------
@@ -66,6 +75,10 @@ endif()
 add_executable(test_arm tests/test_arm.c)
 target_link_libraries(test_arm PRIVATE emucore)
 add_test(NAME arm_interp COMMAND test_arm)
+
+add_executable(test_vfp tests/test_vfp.c)
+target_link_libraries(test_vfp PRIVATE emucore)
+add_test(NAME vfp COMMAND test_vfp)
 
 add_executable(test_soc tests/test_soc.c)
 target_link_libraries(test_soc PRIVATE emucore)
