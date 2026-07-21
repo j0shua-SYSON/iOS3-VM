@@ -52,6 +52,17 @@
 #define ARM_SCTLR_I (1u << 12)  /* instruction cache   */
 #define ARM_SCTLR_V (1u << 13)  /* high exception vectors @ 0xFFFF0000 */
 #define ARM_SCTLR_EE (1u << 25) /* CPSR.E value taken on exception entry */
+/*
+ * XP: extended page tables. Clear, the MMU reads the ARMv5-compatible
+ * descriptor layout, where a small page carries four sets of subpage AP bits
+ * and there is no execute-never attribute anywhere. Set, descriptors use the
+ * ARMv6 layout this core already decodes (single AP + APX) and the XN bit
+ * exists: bit 4 of a section/supersection, bit 15 of a large page, bit 0 of a
+ * small page. XN is therefore only meaningful with XP set, and the fetch path
+ * checks it only then. XNU sets XP as part of the 0xc0380d it ORs into SCTLR
+ * at __start+0x16c (0xc00691ac).
+ */
+#define ARM_SCTLR_XP (1u << 23) /* extended (ARMv6) page tables; enables XN */
 
 /* Main ID register value reported for the ARM1176JZF-S in the S5L8900. */
 #define ARM1176_MIDR       0x410fb767u
@@ -238,12 +249,30 @@ typedef struct arm_cpu {
 } arm_cpu_t;
 
 /*
+ * What an access is for. This is a three-way distinction, not a bool, because
+ * the two things the descriptor is checked against are independent: AP/APX
+ * decide read versus write, and XN decides fetch versus everything else. A
+ * fetch is not "a read" — a page can be readable and still refuse to execute —
+ * so a caller that cannot say "this is a fetch" can never raise the fault.
+ * The numbering keeps READ/WRITE where the old bool had them.
+ */
+typedef enum {
+    ARM_ACCESS_READ  = 0,
+    ARM_ACCESS_WRITE = 1,
+    ARM_ACCESS_FETCH = 2
+} arm_access_t;
+
+/*
  * Translate a virtual address. Returns 0 on success (writing the physical
  * address to *pa) or a non-zero ARMv6 fault status register value.
  * With the MMU disabled (SCTLR.M clear) translation is the identity map.
+ *
+ * Only ARM_ACCESS_WRITE sets FSR.WnR, and only ARM_ACCESS_FETCH is checked
+ * against XN. Translation covers one 4 KB page: a caller whose access straddles
+ * a page boundary must split it and translate each piece (see arm_interp.c).
  */
-uint32_t arm_mmu_translate(arm_cpu_t *cpu, uint32_t va, bool write, bool priv,
-                           uint32_t *pa);
+uint32_t arm_mmu_translate(arm_cpu_t *cpu, uint32_t va, arm_access_t acc,
+                           bool priv, uint32_t *pa);
 
 /* Which bank a CPSR mode value selects (USR and SYS share ARM_BANK_USR). */
 arm_bank_t arm_bank_of_mode(uint32_t mode);

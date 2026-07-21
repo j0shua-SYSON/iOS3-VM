@@ -42,14 +42,103 @@ static void note_abort(arm_cpu_t *c, uint32_t fsr, uint32_t va) {
     c->abort_fsr = fsr;
     c->abort_far = va;
 }
-/* The `priv` argument is explicit because the translation-mode load/stores
+/*
+ * Page-crossing unaligned accesses.
+ *
+ * XNU clears SCTLR.A and sets SCTLR.U (see the SCTLR write at __start+0x16c),
+ * so unaligned LDR/STR/LDRH/STRH are legal and the kernel and libSystem use
+ * them freely. Translation, however, maps one page: an access whose bytes
+ * straddle a 4 KB boundary lives in two pages that are almost never physically
+ * adjacent, and it can be permitted in the first and faulting in the second.
+ * Translating the base once and issuing one bus access at that PA reads the
+ * wrong bytes in the first case and raises no fault at all in the second.
+ *
+ * A crossing access is therefore split at the boundary and each side is
+ * translated on its own. Two deliberate choices:
+ *
+ *  - ORDER. The pieces are performed in ascending address order, so the piece
+ *    that faults first in program order is the one whose fault is reported.
+ *    note_abort keeps the first fault, and the VA handed to it is the address
+ *    of the byte that actually faulted — for a second-page fault that is the
+ *    page-aligned boundary, which is what DFAR must hold. sleh_abort page-
+ *    aligns DFAR and maps in that page; reporting the base instead would map
+ *    the page the access already had and spin on the same instruction forever.
+ *    This is the same rule the LDM/STM path already follows.
+ *
+ *  - A STORE THAT FAULTS ON ITS SECOND PAGE LEAVES THE FIRST PAGE WRITTEN.
+ *    The ARM abort model is base-*register*-restored: it restores Rn and the
+ *    destination registers, and says nothing about undoing memory. Hardware
+ *    breaks a crossing access into separate bus transactions and has no way to
+ *    retract one that has already completed, so on a real ARM1176 the low bytes
+ *    are in memory when the abort is taken. Buffering the whole store and
+ *    committing it only if both translations succeed would be *stronger* than
+ *    the architecture and would hide exactly the class of bug this exists to
+ *    expose. It is also safe under re-execution: the handler maps the second
+ *    page and restarts the instruction, which rewrites the same low bytes with
+ *    the same values. (A load is different, and is already handled: its result
+ *    is returned as a value and every caller drops it when abort_pending is
+ *    set, so no register moves.)
+ *
+ * Only the crossing case is split. A non-crossing access — aligned or not —
+ * still goes through one translation and one bus call of its natural width, so
+ * device registers keep seeing whole-word transactions.
+ *
+ * LDRD/STRD and LDM/STM need nothing extra: they are built from per-word
+ * mem_r32/mem_w32 calls at ascending addresses, so each word that happens to
+ * straddle a boundary is split here, in the right order, by itself.
+ *
+ * The `priv` argument is explicit because the translation-mode load/stores
  * (LDRT/STRT/LDRBT/STRBT, encoded P==0 && W==1) must translate as *unprivileged*
  * even when executing in a privileged mode. That is precisely the mechanism a
  * kernel uses to touch user memory safely, so getting it wrong would let a
  * guest kernel read pages it should fault on. */
+#define ARM_PAGE_MASK 0xfffu
+
+/* Does an n-byte access starting at va span two 4 KB pages? n is 2 or 4, so the
+ * access can straddle at most one boundary. */
+static inline bool mem_crosses_page(uint32_t va, unsigned n) {
+    return ((va & ARM_PAGE_MASK) + n) > (ARM_PAGE_MASK + 1u);
+}
+
+/* Byte-at-a-time little-endian read across a page boundary, re-translating at
+ * each page. Returns 0 with the abort latched if either side faults. */
+static uint32_t mem_read_crossing(arm_cpu_t *c, uint32_t va, unsigned n, bool priv) {
+    uint32_t val = 0, page_pa = 0;
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t a = va + i;
+        if (i == 0u || (a & ARM_PAGE_MASK) == 0u) {
+            uint32_t pa, f = arm_mmu_translate(c, a, ARM_ACCESS_READ, priv, &pa);
+            if (f) { note_abort(c, f, a); return 0; }
+            page_pa = pa & ~ARM_PAGE_MASK;
+        }
+        val |= (uint32_t)c->bus->read8(c->bus->ctx, page_pa | (a & ARM_PAGE_MASK))
+               << (8u * i);
+    }
+    return val;
+}
+
+/* The storing mirror. Bytes already written stay written if a later page
+ * faults — see the note above. */
+static void mem_write_crossing(arm_cpu_t *c, uint32_t va, unsigned n, uint32_t v,
+                               bool priv) {
+    uint32_t page_pa = 0;
+    for (unsigned i = 0; i < n; i++) {
+        uint32_t a = va + i;
+        if (i == 0u || (a & ARM_PAGE_MASK) == 0u) {
+            uint32_t pa, f = arm_mmu_translate(c, a, ARM_ACCESS_WRITE, priv, &pa);
+            if (f) { note_abort(c, f, a); return; }
+            page_pa = pa & ~ARM_PAGE_MASK;
+        }
+        c->bus->write8(c->bus->ctx, page_pa | (a & ARM_PAGE_MASK),
+                       (uint8_t)(v >> (8u * i)));
+    }
+}
+
 #define MEM_READ(bits)                                                        \
     static uint##bits##_t mem_r##bits##_as(arm_cpu_t *c, uint32_t va, bool priv) { \
-        uint32_t pa, f = arm_mmu_translate(c, va, false, priv, &pa);          \
+        if (mem_crosses_page(va, (bits) / 8u))                                \
+            return (uint##bits##_t)mem_read_crossing(c, va, (bits) / 8u, priv); \
+        uint32_t pa, f = arm_mmu_translate(c, va, ARM_ACCESS_READ, priv, &pa);\
         if (f) { note_abort(c, f, va); return 0; }                            \
         return c->bus->read##bits(c->bus->ctx, pa);                           \
     }                                                                         \
@@ -59,13 +148,19 @@ static void note_abort(arm_cpu_t *c, uint32_t fsr, uint32_t va) {
 #define MEM_WRITE(bits)                                                       \
     static void mem_w##bits##_as(arm_cpu_t *c, uint32_t va, uint##bits##_t v, \
                                  bool priv) {                                 \
-        uint32_t pa, f = arm_mmu_translate(c, va, true, priv, &pa);           \
+        if (mem_crosses_page(va, (bits) / 8u)) {                              \
+            mem_write_crossing(c, va, (bits) / 8u, v, priv); return;          \
+        }                                                                     \
+        uint32_t pa, f = arm_mmu_translate(c, va, ARM_ACCESS_WRITE, priv, &pa);\
         if (f) { note_abort(c, f, va); return; }                              \
         c->bus->write##bits(c->bus->ctx, pa, v);                              \
     }                                                                         \
     static inline void mem_w##bits(arm_cpu_t *c, uint32_t va, uint##bits##_t v) {\
         mem_w##bits##_as(c, va, v, cpu_is_priv(c));                           \
     }
+/* A byte access can never cross a page — (va & 0xfff) + 1 cannot exceed 0x1000 —
+ * so the test is unconditionally false in the 8-bit accessors and the split path
+ * there is dead. */
 MEM_READ(32)  MEM_READ(16)  MEM_READ(8)
 MEM_WRITE(32) MEM_WRITE(16) MEM_WRITE(8)
 
@@ -1557,9 +1652,13 @@ arm_status_t arm_step(arm_cpu_t *c) {
         return ARM_OK;
     }
 
-    /* Instruction fetch is translated too; a fault here is a prefetch abort. */
+    /* Instruction fetch is translated too; a fault here is a prefetch abort.
+     * ARM_ACCESS_FETCH rather than "a read": it is what lets the walker check
+     * XN, so branching into a data page dies here with IFAR pointing at the
+     * branch target instead of executing whatever the data happened to be. */
     uint32_t fetch_pa;
-    uint32_t fetch_fsr = arm_mmu_translate(c, pc, false, cpu_is_priv(c), &fetch_pa);
+    uint32_t fetch_fsr = arm_mmu_translate(c, pc, ARM_ACCESS_FETCH,
+                                           cpu_is_priv(c), &fetch_pa);
     if (fetch_fsr) {
         uint32_t vec;
         c->cycles++;

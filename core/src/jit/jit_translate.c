@@ -100,7 +100,24 @@ static bool jit_priv(const arm_cpu_t *c) {
 }
 static uint64_t jit_helper_load32(arm_cpu_t *c, uint32_t va) {
     uint32_t pa;
-    if (arm_mmu_translate(c, va, false, jit_priv(c), &pa)) return (uint64_t)1 << 32;
+    /* Same page-crossing split as the interpreter's mem_r32: a word straddling
+     * a 4 KB boundary lives in two pages that need translating separately. */
+    if (((va & 0xfffu) + 4u) > 0x1000u) {
+        uint32_t val = 0, page_pa = 0;
+        for (unsigned i = 0; i < 4u; i++) {
+            uint32_t a = va + i;
+            if (i == 0u || (a & 0xfffu) == 0u) {
+                if (arm_mmu_translate(c, a, ARM_ACCESS_READ, jit_priv(c), &pa))
+                    return (uint64_t)1 << 32;
+                page_pa = pa & ~0xfffu;
+            }
+            val |= (uint32_t)c->bus->read8(c->bus->ctx, page_pa | (a & 0xfffu))
+                   << (8u * i);
+        }
+        return val;
+    }
+    if (arm_mmu_translate(c, va, ARM_ACCESS_READ, jit_priv(c), &pa))
+        return (uint64_t)1 << 32;
     return c->bus->read32(c->bus->ctx, pa);
 }
 static uint64_t jit_helper_load16(arm_cpu_t *c, uint32_t va) {
@@ -110,12 +127,27 @@ static uint64_t jit_helper_load16(arm_cpu_t *c, uint32_t va) {
 }
 static uint64_t jit_helper_load8(arm_cpu_t *c, uint32_t va) {
     uint32_t pa;
-    if (arm_mmu_translate(c, va, false, jit_priv(c), &pa)) return (uint64_t)1 << 32;
+    if (arm_mmu_translate(c, va, ARM_ACCESS_READ, jit_priv(c), &pa))
+        return (uint64_t)1 << 32;
     return c->bus->read8(c->bus->ctx, pa);
 }
 static uint32_t jit_helper_store32(arm_cpu_t *c, uint32_t va, uint32_t val) {
     uint32_t pa;
-    if (arm_mmu_translate(c, va, true, jit_priv(c), &pa)) return 1u;
+    if (((va & 0xfffu) + 4u) > 0x1000u) {
+        uint32_t page_pa = 0;
+        for (unsigned i = 0; i < 4u; i++) {
+            uint32_t a = va + i;
+            if (i == 0u || (a & 0xfffu) == 0u) {
+                if (arm_mmu_translate(c, a, ARM_ACCESS_WRITE, jit_priv(c), &pa))
+                    return 1u;
+                page_pa = pa & ~0xfffu;
+            }
+            c->bus->write8(c->bus->ctx, page_pa | (a & 0xfffu),
+                           (uint8_t)(val >> (8u * i)));
+        }
+        return 0u;
+    }
+    if (arm_mmu_translate(c, va, ARM_ACCESS_WRITE, jit_priv(c), &pa)) return 1u;
     c->bus->write32(c->bus->ctx, pa, val);
     return 0u;
 }
@@ -127,7 +159,7 @@ static uint32_t jit_helper_store16(arm_cpu_t *c, uint32_t va, uint32_t val) {
 }
 static uint32_t jit_helper_store8(arm_cpu_t *c, uint32_t va, uint32_t val) {
     uint32_t pa;
-    if (arm_mmu_translate(c, va, true, jit_priv(c), &pa)) return 1u;
+    if (arm_mmu_translate(c, va, ARM_ACCESS_WRITE, jit_priv(c), &pa)) return 1u;
     c->bus->write8(c->bus->ctx, pa, (uint8_t)val);
     return 0u;
 }
@@ -1339,7 +1371,7 @@ bool jit_translate(arm_cpu_t *cpu, uint32_t va, uint32_t *code,
      * Thumb decoder off, which must leave the boot bit-identical. */
     if (t.thumb && (g_deny & JIT_DENY_THUMB)) return false;
 
-    if (arm_mmu_translate(cpu, va, false, t.priv, &pa)) {
+    if (arm_mmu_translate(cpu, va, ARM_ACCESS_FETCH, t.priv, &pa)) {
         out->end_reason = JIT_END_FETCH_FAULT;
         return false;
     }
@@ -1356,7 +1388,7 @@ bool jit_translate(arm_cpu_t *cpu, uint32_t va, uint32_t *code,
         if (t.index > 0 && (t.pc & 0xfffu) == 0)      { end = JIT_END_PAGE;  break; }
         if (t.e.n + JIT_INSN_HEADROOM + JIT_EPILOGUE_WORDS > t.e.cap)
                                                       { end = JIT_END_CODE_FULL; break; }
-        if (arm_mmu_translate(cpu, t.pc, false, t.priv, &ipa)) {
+        if (arm_mmu_translate(cpu, t.pc, ARM_ACCESS_FETCH, t.priv, &ipa)) {
             end = JIT_END_FETCH_FAULT; break;
         }
 
