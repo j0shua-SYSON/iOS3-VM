@@ -1008,6 +1008,215 @@ static void test_user_bank_stm(void) {
     CHECK(c.r[14] == 0xcccc0000u, "the SVC bank must be untouched");
 }
 
+/* ------------------------------------------------ TTBCR.N / TTBR1 split ---
+ * ARM ARM (ARMv6) B4.9.4 "Selecting between TTBR0 and TTBR1":
+ *
+ *   N == 0  -> every VA walks TTBR0; TTBR1 is not used at all.
+ *   N  > 0  -> if VA[31:32-N] are all zero the walk starts at TTBR0, whose
+ *              table is 2^(14-N) bytes based at TTBR0[31:14-N] and indexed by
+ *              VA[31-N:20] (12-N index bits); otherwise it starts at TTBR1,
+ *              which is ALWAYS a full 16 KB table indexed by VA[31:20].
+ *
+ * The tests below plant a decoy descriptor wherever a plausible mis-implementation
+ * (unmasked base, wrong index width, inverted or off-by-one selector, TTBR0
+ * fall-back) would land, so a wrong walker resolves to a recognisable PA rather
+ * than merely faulting.
+ */
+
+/* Point the CPU at a TTBR0/TTBR1 pair with a given TTBCR.N, MMU on, domain 0 a
+ * client so the AP bits are really checked. Clears RAM — plant descriptors
+ * after calling this, not before. */
+static void mmu_setup_split(arm_cpu_t *c, unsigned n,
+                            uint32_t ttbr0, uint32_t ttbr1) {
+    memset(g_ram, 0, sizeof g_ram);
+    arm_reset(c, &g_bus);
+    c->cp15.ttbr0  = ttbr0;
+    c->cp15.ttbr1  = ttbr1;
+    c->cp15.ttbcr  = n;
+    c->cp15.dacr   = 1u;                      /* domain 0: client */
+    c->cp15.sctlr |= ARM_SCTLR_M;             /* MMU on */
+}
+
+/* Plant a 1 MB section (AP=11, domain 0) at an explicit first-level index. The
+ * index is spelled out instead of derived from the VA because which table and
+ * which index the walker picks is precisely what is under test. The base and
+ * offset are OR-ed exactly as the walker combines them, so a decoy written at an
+ * unmasked base lands where a mis-masked walker would read. */
+static void mmu_put_section(uint32_t table, unsigned index, uint32_t pa) {
+    m_w32(NULL, table | (index << 2), (pa & 0xfff00000u) | (3u << 10) | 2u);
+}
+
+/* Privileged read translation; returns the PA, or 0xffffffff if it faulted. */
+static uint32_t mmu_xlate(arm_cpu_t *c, uint32_t va) {
+    uint32_t pa = 0;
+    return arm_mmu_translate(c, va, false, true, &pa) ? 0xffffffffu : pa;
+}
+
+static void test_mmu_ttbcr_n0_ignores_ttbr1(void) {
+    /* N == 0 is the reset state and must keep behaving exactly as the walker did
+     * before the split existed: a single 4096-entry TTBR0 table covering the
+     * whole 4 GB, based at TTBR0[31:14], with TTBR1 never consulted. */
+    arm_cpu_t c; mmu_setup_split(&c, 0, 0x4200u, 0x8000u); /* base masks to 0x4000 */
+    mmu_put_section(0x4000, 0x001, 0x00400000u);   /* VA 0x00100000 */
+    mmu_put_section(0x4000, 0xc00, 0x00200000u);   /* VA 0xc0000000 */
+    mmu_put_section(0x4000, 0xfff, 0x00500000u);   /* VA 0xfff00000, last entry */
+    mmu_put_section(0x4200, 0x001, 0x00900000u);   /* decoy: unmasked TTBR0 base */
+    mmu_put_section(0x8000, 0xc00, 0x00900000u);   /* decoy: TTBR1 must be ignored */
+    mmu_put_section(0x8000, 0xfff, 0x00900000u);   /* decoy: TTBR1 must be ignored */
+
+    uint32_t pa = mmu_xlate(&c, 0x00100abcu);
+    CHECK(pa == 0x00400abcu, "pa=%08x expect 00400abc (low VA via TTBR0)", pa);
+    pa = mmu_xlate(&c, 0xc0001234u);
+    CHECK(pa == 0x00201234u, "pa=%08x expect 00201234 (N=0: high VA still TTBR0)", pa);
+    pa = mmu_xlate(&c, 0xfff00010u);
+    CHECK(pa == 0x00500010u, "pa=%08x expect 00500010 (N=0 table is 4096 entries)", pa);
+}
+
+static void test_mmu_ttbcr_n2_low_va_uses_shrunk_ttbr0(void) {
+    /* N == 2 is what XNU-ARM runs with. TTBR0's table shrinks to 2^(14-2) = 4 KB
+     * / 1024 entries, its base is TTBR0[31:12] (the low 12 bits of the register
+     * are not part of the address), and it is indexed by VA[29:20] — ten bits. */
+    arm_cpu_t c; mmu_setup_split(&c, 2, 0x5400u, 0x8000u); /* base masks to 0x5000 */
+    mmu_put_section(0x5000, 0x001, 0x00700000u);   /* VA 0x00100000 */
+    mmu_put_section(0x5000, 0x3ff, 0x00800000u);   /* VA 0x3ff00000, last entry */
+    mmu_put_section(0x5400, 0x001, 0x00900000u);   /* decoy: unmasked TTBR0 base */
+
+    uint32_t pa = mmu_xlate(&c, 0x00100abcu);
+    CHECK(pa == 0x00700abcu,
+          "pa=%08x expect 00700abc (N=2 TTBR0 base masks to a 4 KB boundary)", pa);
+    pa = mmu_xlate(&c, 0x3ff00abcu);
+    CHECK(pa == 0x00800abcu,
+          "pa=%08x expect 00800abc (last entry of the 1024-entry TTBR0 table)", pa);
+}
+
+static void test_mmu_ttbcr_n2_kernel_va_uses_ttbr1(void) {
+    /* With N == 2 everything at or above 0x40000000 walks TTBR1: all of kernel
+     * text at 0xc0000000 and the 0xffff0000 exception-vector page. TTBR1's table
+     * is a full 16 KB indexed by VA[31:20] regardless of N. */
+    arm_cpu_t c; mmu_setup_split(&c, 2, 0x5000u, 0x8234u); /* base masks to 0x8000 */
+    mmu_put_section(0x8000, 0xc00, 0x00200000u);   /* kernel text  0xc0000000 */
+    mmu_put_section(0x8000, 0xfff, 0x00300000u);   /* vector page  0xffff0000 */
+    mmu_put_section(0x8234, 0xc00, 0x00900000u);   /* decoy: unmasked TTBR1 base */
+    /* 0xd0000000 has no TTBR1 entry. Give the TTBR0 table an entry at the index
+     * a truncated walk would use (0xd00 & 0x3ff) so a fall-back is visible. */
+    mmu_put_section(0x5000, 0x100, 0x00a00000u);
+
+    uint32_t pa = mmu_xlate(&c, 0xc0000abcu);
+    CHECK(pa == 0x00200abcu, "pa=%08x expect 00200abc (kernel text via TTBR1)", pa);
+    /* 0xffff000c lies 0xf000c into the 1 MB section based at 0xfff00000. */
+    pa = mmu_xlate(&c, 0xffff000cu);
+    CHECK(pa == 0x003f000cu, "pa=%08x expect 003f000c (vector page via TTBR1)", pa);
+
+    uint32_t p = 0;
+    uint32_t f = arm_mmu_translate(&c, 0xd0000000u, false, true, &p);
+    CHECK((f & 0xf) == ARM_FSR_SECTION_TRANSLATION,
+          "fsr=%x expect a translation fault: a TTBR1 miss must not fall back "
+          "to TTBR0 (got pa=%08x)", f, p);
+}
+
+static void test_mmu_ttbcr_n2_split_boundary(void) {
+    /* The selector with N == 2 is VA[31:30]: 0x3ff00000 is the last VA that
+     * still walks TTBR0 and 0x40000000 is the first that crosses to TTBR1. */
+    arm_cpu_t c; mmu_setup_split(&c, 2, 0x5000u, 0x8000u);
+    mmu_put_section(0x5000, 0x3ff, 0x00100000u);   /* TTBR0 side of the line */
+    mmu_put_section(0x8000, 0x400, 0x00200000u);   /* TTBR1 side of the line */
+    /* 0x40000000's index truncated to ten bits is 0 — where the walk would land
+     * if the index were shrunk but the table not switched. */
+    mmu_put_section(0x5000, 0x000, 0x00900000u);
+    /* and TTBR1 at the TTBR0-side index, in case the selector is inverted. */
+    mmu_put_section(0x8000, 0x3ff, 0x00a00000u);
+
+    uint32_t pa = mmu_xlate(&c, 0x3ff00abcu);
+    CHECK(pa == 0x00100abcu,
+          "pa=%08x expect 00100abc (0x3ff00000 is still TTBR0 with N=2)", pa);
+    pa = mmu_xlate(&c, 0x40000abcu);
+    CHECK(pa == 0x00200abcu,
+          "pa=%08x expect 00200abc (0x40000000 is the first TTBR1 VA with N=2)", pa);
+}
+
+static void test_mmu_kernel_mapping_survives_ttbr0_pmap_switch(void) {
+    /* THE regression the split exists to fix. XNU runs with N == 2, keeps the
+     * kernel in TTBR1 and the *current user* pmap in TTBR0, and rewrites TTBR0
+     * on every context switch (pmap_switch -> set_mmu_ttb). A walker that always
+     * used TTBR0 lost kernel text and the 0xffff0000 vector page the instant
+     * that happened, and the CPU stormed on prefetch aborts at 0xffff000c. */
+    const uint32_t pmap_a = 0x5000u, pmap_b = 0x6000u, kernel = 0x8000u;
+    arm_cpu_t c; mmu_setup_split(&c, 2, pmap_a, kernel);
+    mmu_put_section(kernel, 0xc00, 0x00200000u);   /* kernel text  0xc0000000 */
+    mmu_put_section(kernel, 0xfff, 0x00300000u);   /* vector page  0xffff0000 */
+    mmu_put_section(pmap_a, 0x001, 0x00500000u);   /* user 0x00100000 under A */
+    mmu_put_section(pmap_b, 0x001, 0x00600000u);   /* user 0x00100000 under B */
+
+    uint32_t text_a = mmu_xlate(&c, 0xc0001000u);
+    uint32_t vec_a  = mmu_xlate(&c, 0xffff000cu);
+    uint32_t usr_a  = mmu_xlate(&c, 0x00100000u);
+    CHECK(text_a == 0x00201000u, "pa=%08x expect 00201000 (kernel text, pmap A)", text_a);
+    CHECK(vec_a  == 0x003f000cu, "pa=%08x expect 003f000c (vector page, pmap A)", vec_a);
+    CHECK(usr_a  == 0x00500000u, "pa=%08x expect 00500000 (user VA via pmap A)", usr_a);
+
+    c.cp15.ttbr0 = pmap_b;                          /* pmap_switch() to another task */
+
+    uint32_t usr_b  = mmu_xlate(&c, 0x00100000u);
+    CHECK(usr_b == 0x00600000u,
+          "pa=%08x expect 00600000 — the TTBR0 switch must take effect for user VAs",
+          usr_b);
+    uint32_t text_b = mmu_xlate(&c, 0xc0001000u);
+    uint32_t vec_b  = mmu_xlate(&c, 0xffff000cu);
+    CHECK(text_b == text_a,
+          "pa=%08x expect %08x — kernel text must survive a TTBR0 pmap switch",
+          text_b, text_a);
+    CHECK(vec_b == vec_a,
+          "pa=%08x expect %08x — the vector page must survive a TTBR0 pmap switch",
+          vec_b, vec_a);
+}
+
+static void test_mmu_ttbcr_n1_table_geometry(void) {
+    /* N == 1: TTBR0's table is 2^(14-1) = 8 KB / 2048 entries based at
+     * TTBR0[31:13] and indexed by VA[30:20]; the split falls at 0x80000000. */
+    arm_cpu_t c; mmu_setup_split(&c, 1, 0x6800u, 0x8000u); /* base masks to 0x6000 */
+    mmu_put_section(0x6000, 0x001, 0x00300000u);   /* VA 0x00100000 */
+    mmu_put_section(0x6000, 0x7ff, 0x00100000u);   /* VA 0x7ff00000, last entry */
+    mmu_put_section(0x8000, 0x800, 0x00200000u);   /* VA 0x80000000, first TTBR1 VA */
+    mmu_put_section(0x6800, 0x001, 0x00900000u);   /* decoy: unmasked TTBR0 base */
+    mmu_put_section(0x6000, 0x000, 0x00a00000u);   /* decoy: index shrunk, table not switched */
+
+    uint32_t pa = mmu_xlate(&c, 0x00100abcu);
+    CHECK(pa == 0x00300abcu,
+          "pa=%08x expect 00300abc (N=1 TTBR0 base masks to an 8 KB boundary)", pa);
+    pa = mmu_xlate(&c, 0x7ff00abcu);
+    CHECK(pa == 0x00100abcu,
+          "pa=%08x expect 00100abc (0x7ff00000 is the last TTBR0 VA with N=1)", pa);
+    pa = mmu_xlate(&c, 0x80000abcu);
+    CHECK(pa == 0x00200abcu,
+          "pa=%08x expect 00200abc (0x80000000 is the first TTBR1 VA with N=1)", pa);
+}
+
+static void test_mmu_ttbcr_n3_table_geometry(void) {
+    /* N == 3: TTBR0's table is 2^(14-3) = 2 KB / 512 entries based at
+     * TTBR0[31:11] and indexed by VA[28:20]; the split falls at 0x20000000.
+     * TTBR1's table stays a full 16 KB indexed by VA[31:20] whatever N is. */
+    arm_cpu_t c; mmu_setup_split(&c, 3, 0x6400u, 0x8000u); /* base masks to 0x6000 */
+    mmu_put_section(0x6000, 0x001, 0x00300000u);   /* VA 0x00100000 */
+    mmu_put_section(0x6000, 0x1ff, 0x00100000u);   /* VA 0x1ff00000, last entry */
+    mmu_put_section(0x8000, 0x200, 0x00200000u);   /* VA 0x20000000, first TTBR1 VA */
+    mmu_put_section(0x8000, 0xfff, 0x00400000u);   /* VA 0xfff00000 via TTBR1 */
+    mmu_put_section(0x6400, 0x001, 0x00900000u);   /* decoy: unmasked TTBR0 base */
+    mmu_put_section(0x6000, 0x000, 0x00a00000u);   /* decoy: index shrunk, table not switched */
+
+    uint32_t pa = mmu_xlate(&c, 0x00100abcu);
+    CHECK(pa == 0x00300abcu,
+          "pa=%08x expect 00300abc (N=3 TTBR0 base masks to a 2 KB boundary)", pa);
+    pa = mmu_xlate(&c, 0x1ff00abcu);
+    CHECK(pa == 0x00100abcu,
+          "pa=%08x expect 00100abc (0x1ff00000 is the last TTBR0 VA with N=3)", pa);
+    pa = mmu_xlate(&c, 0x20000abcu);
+    CHECK(pa == 0x00200abcu,
+          "pa=%08x expect 00200abc (0x20000000 is the first TTBR1 VA with N=3)", pa);
+    pa = mmu_xlate(&c, 0xffff000cu);
+    CHECK(pa == 0x004f000cu,
+          "pa=%08x expect 004f000c (TTBR1 is a full 16 KB table for every N)", pa);
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -1081,6 +1290,13 @@ int main(void) {
     test_mmu_supersection();
     test_thumb_blx_suffix_is_not_a_branch();
     test_user_bank_stm();
+    test_mmu_ttbcr_n0_ignores_ttbr1();
+    test_mmu_ttbcr_n2_low_va_uses_shrunk_ttbr0();
+    test_mmu_ttbcr_n2_kernel_va_uses_ttbr1();
+    test_mmu_ttbcr_n2_split_boundary();
+    test_mmu_kernel_mapping_survives_ttbr0_pmap_switch();
+    test_mmu_ttbcr_n1_table_geometry();
+    test_mmu_ttbcr_n3_table_geometry();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

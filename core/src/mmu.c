@@ -54,8 +54,30 @@ uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, bool write, bool priv,
     /* MMU disabled: physical == virtual. This is how every boot ROM starts. */
     if (!(c->cp15.sctlr & ARM_SCTLR_M)) { *pa = va; return 0; }
 
-    /* --- first level ---------------------------------------------------- */
-    uint32_t l1_addr = (c->cp15.ttbr0 & 0xffffc000u) | ((va >> 20) << 2);
+    /* --- first level ---------------------------------------------------------
+     * ARMv6 TTBCR.N splits translation between TTBR0 and TTBR1. When the top N
+     * bits of the VA are zero the walk starts from TTBR0 (whose table shrinks to
+     * 2^(14-N) bytes and is indexed by VA[31-N:20]); otherwise it starts from
+     * TTBR1, always a full 16 KB table indexed by VA[31:20].
+     *
+     * This is not optional bookkeeping. XNU-ARM on the ARM1176 runs with N=2, so
+     * everything at and above 0x40000000 — all of kernel text and the 0xffff0000
+     * exception-vector page — resolves through TTBR1, while TTBR0 holds the
+     * *current user* pmap. Walking TTBR0 unconditionally happens to work only
+     * while TTBR0 still maps kernel space; the first time the kernel loads a user
+     * pmap into TTBR0 (pmap_switch calling set_mmu_ttb), kernel text and the
+     * vector page disappear from the walk and the CPU storms forever on prefetch
+     * aborts at 0xffff000c. Honouring N/TTBR1 is what keeps the kernel mapped
+     * across that switch. */
+    unsigned ttbcr_n = c->cp15.ttbcr & 7u;
+    uint32_t l1_addr;
+    if (ttbcr_n == 0u || (va >> (32u - ttbcr_n)) == 0u) {
+        uint32_t base = c->cp15.ttbr0 & (0xffffffffu << (14u - ttbcr_n));
+        uint32_t idx  = (va >> 20) & ((1u << (12u - ttbcr_n)) - 1u);
+        l1_addr = base | (idx << 2);
+    } else {
+        l1_addr = (c->cp15.ttbr1 & 0xffffc000u) | ((va >> 20) << 2);
+    }
     uint32_t l1      = c->bus->read32(c->bus->ctx, l1_addr);
     unsigned type    = l1 & 3u;
     unsigned domain  = (l1 >> 5) & 0xfu;
