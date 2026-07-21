@@ -24,6 +24,9 @@ keys.json
 *.img
 ios3vm_nand_*.img
 
+# Python wheels an agent may fetch to cross-check semantics (e.g. unicorn)
+*.whl
+
 # Agent scratch worktrees (created inside the repo by isolated subagents)
 /.claude/worktrees/
 
