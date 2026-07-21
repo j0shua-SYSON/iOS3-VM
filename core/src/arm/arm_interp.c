@@ -231,8 +231,10 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
                 else if (opc2 == 2) v = p->cpacr;
                 break;
             case 2:
-                if (opc2 == 0) v = p->ttbr0; else if (opc2 == 1) v = p->ttbr1;
-                else if (opc2 == 2) v = p->ttbcr;
+                if (crm == 0) {
+                    if (opc2 == 0) v = p->ttbr0; else if (opc2 == 1) v = p->ttbr1;
+                    else if (opc2 == 2) v = p->ttbcr;
+                }
                 break;
             case 3:  v = p->dacr; break;
             case 5:  v = (opc2 == 1) ? p->ifsr : p->dfsr; break;
@@ -257,8 +259,13 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
                 else if (opc2 == 2) p->cpacr = v;
                 break;
             case 2:
-                if (opc2 == 0) p->ttbr0 = v; else if (opc2 == 1) p->ttbr1 = v;
-                else if (opc2 == 2) p->ttbcr = v;
+                /* TTBCR[31:3] are SBZ/UNP on the ARM1176 and do not read back;
+                 * mask on write so an MRC matches hardware. The MMU walker
+                 * masks again at point of use, so translation is unaffected. */
+                if (crm == 0) {
+                    if (opc2 == 0) p->ttbr0 = v; else if (opc2 == 1) p->ttbr1 = v;
+                    else if (opc2 == 2) p->ttbcr = v & 7u;
+                }
                 break;
             case 3:  p->dacr = v; break;
             case 5:  if (opc2 == 1) p->ifsr = v; else p->dfsr = v; break;
