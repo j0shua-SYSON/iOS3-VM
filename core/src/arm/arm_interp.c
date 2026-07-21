@@ -43,6 +43,24 @@ static void note_abort(arm_cpu_t *c, uint32_t fsr, uint32_t va) {
     c->abort_fsr = fsr;
     c->abort_far = va;
 }
+
+static void note_alignment_abort(arm_cpu_t *c, uint32_t va, bool write) {
+    note_abort(c, ARM_FSR_ALIGNMENT | (write ? (1u << 11) : 0u), va);
+}
+
+static inline uint32_t legacy_rotate_word(uint32_t v, unsigned byte_offset) {
+    unsigned n = (byte_offset & 3u) * 8u;
+    return n ? (v >> n) | (v << (32u - n)) : v;
+}
+
+/* In the U=0/A=0 legacy model an odd ordinary halfword access is
+ * architecturally UNPREDICTABLE (ARM1176 TRM Table 4-3). The memory interface
+ * might align it down internally, but software is not entitled to that value. */
+static inline bool legacy_halfword_unpredictable(const arm_cpu_t *c,
+                                                  uint32_t va) {
+    return (va & 1u) != 0u &&
+           (c->cp15.sctlr & (ARM_SCTLR_U | ARM_SCTLR_A)) == 0u;
+}
 /*
  * Page-crossing unaligned accesses.
  *
@@ -137,18 +155,39 @@ static void mem_write_crossing(arm_cpu_t *c, uint32_t va, unsigned n, uint32_t v
 
 #define MEM_READ(bits)                                                        \
     static uint##bits##_t mem_r##bits##_as(arm_cpu_t *c, uint32_t va, bool priv) { \
-        if (mem_crosses_page(va, (bits) / 8u))                                \
-            return (uint##bits##_t)mem_read_crossing(c, va, (bits) / 8u, priv); \
-        uint32_t pa, f = arm_mmu_translate(c, va, ARM_ACCESS_READ, priv, &pa);\
-        if (f) { note_abort(c, f, va); return 0; }                            \
-        return c->bus->read##bits(c->bus->ctx, pa);                           \
+        uint32_t original = va;                                               \
+        if ((bits) > 8 && (va & ((bits) / 8u - 1u)) != 0u) {                 \
+            if ((c->cp15.sctlr & ARM_SCTLR_A) != 0u) {                       \
+                note_alignment_abort(c, va, false); return 0;                 \
+            }                                                                 \
+            if ((c->cp15.sctlr & ARM_SCTLR_U) == 0u)                         \
+                va &= ~((bits) / 8u - 1u);                                   \
+        }                                                                     \
+        uint##bits##_t value;                                                 \
+        if (mem_crosses_page(va, (bits) / 8u))                               \
+            value = (uint##bits##_t)mem_read_crossing(c, va, (bits) / 8u, priv); \
+        else {                                                                \
+            uint32_t pa, f = arm_mmu_translate(c, va, ARM_ACCESS_READ, priv, &pa);\
+            if (f) { note_abort(c, f, va); return 0; }                        \
+            value = c->bus->read##bits(c->bus->ctx, pa);                     \
+        }                                                                     \
+        if ((bits) == 32 && original != va)                                  \
+            value = (uint##bits##_t)legacy_rotate_word((uint32_t)value, original & 3u); \
+        return value;                                                         \
     }                                                                         \
     static inline uint##bits##_t mem_r##bits(arm_cpu_t *c, uint32_t va) {     \
         return mem_r##bits##_as(c, va, cpu_is_priv(c));                       \
     }
 #define MEM_WRITE(bits)                                                       \
     static void mem_w##bits##_as(arm_cpu_t *c, uint32_t va, uint##bits##_t v, \
-                                 bool priv) {                                 \
+                                  bool priv) {                                 \
+        if ((bits) > 8 && (va & ((bits) / 8u - 1u)) != 0u) {                 \
+            if ((c->cp15.sctlr & ARM_SCTLR_A) != 0u) {                       \
+                note_alignment_abort(c, va, true); return;                    \
+            }                                                                 \
+            if ((c->cp15.sctlr & ARM_SCTLR_U) == 0u)                         \
+                va &= ~((bits) / 8u - 1u);                                   \
+        }                                                                     \
         if (mem_crosses_page(va, (bits) / 8u)) {                              \
             mem_write_crossing(c, va, (bits) / 8u, v, priv); return;          \
         }                                                                     \
@@ -165,10 +204,62 @@ static void mem_write_crossing(arm_cpu_t *c, uint32_t va, unsigned n, uint32_t v
 MEM_READ(32)  MEM_READ(16)  MEM_READ(8)
 MEM_WRITE(32) MEM_WRITE(16) MEM_WRITE(8)
 
+/* Multiword and coprocessor transfers are stricter than ordinary halfword and
+ * word accesses. With U set, any misalignment is an alignment fault regardless
+ * of A. In legacy U=0/A=0 mode the ARM1176 aligns the transfer down instead. */
+static bool prepare_multiword_address(arm_cpu_t *c, uint32_t *va,
+                                      unsigned alignment, bool write) {
+    uint32_t mask = alignment - 1u;
+    if ((*va & mask) == 0u) return true;
+    if ((c->cp15.sctlr & (ARM_SCTLR_U | ARM_SCTLR_A)) != 0u) {
+        note_alignment_abort(c, *va, write);
+        return false;
+    }
+    *va &= ~mask;
+    return true;
+}
+
+/* Exclusive accesses do not get the legacy align-down behavior. If U or A is
+ * set the ARM1176 reports an alignment fault; in the legacy 00 configuration
+ * they are architecturally UNPREDICTABLE. SWP is the exception and has explicit
+ * legacy WLoad+WStore semantics; its decoder handles that separately. */
+static bool prepare_sync_address(arm_cpu_t *c, uint32_t va, unsigned alignment,
+                                 bool write, arm_status_t *status) {
+    if ((va & (alignment - 1u)) == 0u) return true;
+    if ((c->cp15.sctlr & (ARM_SCTLR_U | ARM_SCTLR_A)) != 0u) {
+        note_alignment_abort(c, va, write);
+        *status = ARM_OK;
+    } else {
+        *status = ARM_UNDEFINED;
+    }
+    return false;
+}
+
+/* VFP uses the coprocessor alignment rules, not the ordinary LDR/STR rules. */
+static uint32_t vfp_mem_r32(arm_cpu_t *c, uint32_t va) {
+    if (!prepare_multiword_address(c, &va, 4u, false)) return 0u;
+    return mem_r32(c, va);
+}
+static void vfp_mem_w32(arm_cpu_t *c, uint32_t va, uint32_t v) {
+    if (!prepare_multiword_address(c, &va, 4u, true)) return;
+    mem_w32(c, va, v);
+}
+
 /* The VFP unit reaches memory through the interpreter's own translating
  * accessors, so a VLDM that crosses into an unmapped page latches the fault
  * exactly like an LDM would and arm_step converts it to a data abort. */
-static const vfp_bus_t g_vfp_bus = { mem_r32, mem_w32 };
+static const vfp_bus_t g_vfp_bus = { vfp_mem_r32, vfp_mem_w32 };
+
+bool arm_mode_is_valid(uint32_t mode) {
+    switch (mode & ARM_CPSR_MODE_MASK) {
+        case ARM_MODE_USR: case ARM_MODE_FIQ: case ARM_MODE_IRQ:
+        case ARM_MODE_SVC: case ARM_MODE_ABT: case ARM_MODE_UND:
+        case ARM_MODE_SYS:
+            return true;
+        default:
+            return false;
+    }
+}
 
 arm_bank_t arm_bank_of_mode(uint32_t mode) {
     switch (mode & ARM_CPSR_MODE_MASK) {
@@ -184,6 +275,7 @@ arm_bank_t arm_bank_of_mode(uint32_t mode) {
 void arm_set_mode(arm_cpu_t *c, uint32_t mode) {
     uint32_t old = c->cpsr & ARM_CPSR_MODE_MASK;
     mode &= ARM_CPSR_MODE_MASK;
+    if (!arm_mode_is_valid(mode)) return;
     arm_bank_t ob = arm_bank_of_mode(old), nb = arm_bank_of_mode(mode);
 
     if (ob != nb) {
@@ -270,6 +362,18 @@ static void take_exception(arm_cpu_t *c, uint32_t vector, uint32_t mode,
      */
     c->excl_valid = false;
     *next = ((c->cp15.sctlr & ARM_SCTLR_V) ? 0xffff0000u : 0u) + vector;
+}
+
+/* Complete a data abort latched by the translating memory helpers. This is a
+ * helper rather than only arm_step's tail path because unconditional SRS/RFE
+ * return directly from their decoder and must take the same exception there. */
+static void take_pending_data_abort(arm_cpu_t *c, uint32_t pc) {
+    uint32_t vec;
+    c->abort_pending = false;
+    c->cp15.dfsr = c->abort_fsr;
+    c->cp15.dfar = c->abort_far;
+    take_exception(c, ARM_VEC_DATA_ABORT, ARM_MODE_ABT, pc + 8u, false, &vec);
+    c->r[15] = vec;
 }
 
 /* ============================ the Undefined-instruction discrimination =====
@@ -519,12 +623,13 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
                 else if (opc2 == 2) p->cpacr = v;
                 break;
             case 2:
-                /* TTBCR[31:3] are SBZ/UNP on the ARM1176 and do not read back;
-                 * mask on write so an MRC matches hardware. The MMU walker
-                 * masks again at point of use, so translation is unaffected. */
+                /* ARM1176 TTBCR keeps PD1[5], PD0[4], and N[2:0]. Bit 3 and
+                 * bits [31:6] are SBZ/UNP and do not read back. PD0/PD1 are
+                 * architecturally visible: they suppress a table walk and
+                 * force a section translation fault on a TLB miss. */
                 if (crm == 0) {
                     if (opc2 == 0) p->ttbr0 = v; else if (opc2 == 1) p->ttbr1 = v;
-                    else if (opc2 == 2) p->ttbcr = v & 7u;
+                    else if (opc2 == 2) p->ttbcr = v & 0x37u;
                 }
                 break;
             case 3:  p->dacr = v; break;
@@ -666,7 +771,7 @@ static uint32_t dp_operand2(arm_cpu_t *c, uint32_t pc, uint32_t insn, bool *carr
         if (insn & (1u << 4)) {               /* register-specified shift amount */
             unsigned rs  = (insn >> 8) & 0xf;
             unsigned amt = reg_read(c, pc, rs) & 0xff;
-            uint32_t rmv = reg_read(c, pc, rm); /* rm reads PC+12 if rm==15 & reg shift, but rare */
+            uint32_t rmv = reg_read(c, pc, rm);
             return barrel_shift(rmv, type, amt, true, carry);
         } else {                              /* immediate shift amount */
             unsigned amt = (insn >> 7) & 0x1f;
@@ -718,12 +823,15 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
         /* Bit 0 of the target selects the instruction set: set means Thumb. */
         if ((insn & 0x0ffffff0u) == 0x012fff10u) {          /* BX Rm */
             uint32_t t = reg_read(c, pc, insn & 0xf);
+            if ((t & 3u) == 2u) return ARM_UNDEFINED;
             if (t & 1u) c->cpsr |= ARM_CPSR_T;
             *next = t & ~1u;
             return ARM_OK;
         }
         if ((insn & 0x0ffffff0u) == 0x012fff30u) {          /* BLX Rm */
+            if ((insn & 0xfu) == 15u) return ARM_UNDEFINED;
             uint32_t t = reg_read(c, pc, insn & 0xf);
+            if ((t & 3u) == 2u) return ARM_UNDEFINED;
             c->r[14] = pc + 4;
             if (t & 1u) c->cpsr |= ARM_CPSR_T;
             *next = t & ~1u;
@@ -820,6 +928,9 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
                     if (!has_spsr && (c->cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR)
                         mask &= 0xff000000u;
                     uint32_t newcpsr = (c->cpsr & ~mask) | (val & mask);
+                    if ((mask & ARM_CPSR_MODE_MASK) != 0u &&
+                        !arm_mode_is_valid(newcpsr))
+                        return ARM_UNDEFINED;
                     if ((mask & 0x1fu) && (newcpsr & ARM_CPSR_MODE_MASK)
                                           != (c->cpsr & ARM_CPSR_MODE_MASK)) {
                         /* Mode field changed: rebank, then apply the rest. */
@@ -834,6 +945,28 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
             }
         }
         return ARM_UNDEFINED;                                /* CLZ, saturating/DSP: later */
+    }
+
+    /* ARMv6 register-specified shifts forbid R15 in every operand field. The
+     * old ARM7 pipeline quirk sometimes described as a PC+12 read is not a
+     * defined result for these ARM1176 encodings. Refuse them before the
+     * shifter, ALU, flags, or destination register can change state. */
+    if ((insn & (1u << 25)) == 0u && (insn & (1u << 4)) != 0u) {
+        unsigned rm = insn & 0xfu;
+        unsigned rs = (insn >> 8) & 0xfu;
+        if (rd == 15u || rn == 15u || rm == 15u || rs == 15u)
+            return ARM_UNDEFINED;
+    }
+
+    /* Data-processing writes to PC with S set are exception returns. User and
+     * System have no SPSR, and restoring an unimplemented/invalid mode would
+     * otherwise make arm_bank_of_mode silently alias it onto the User bank.
+     * Reject both cases before arithmetic changes flags or PC. */
+    bool writes_result = opcode < 8u || opcode >= 12u;
+    if (writes_result && rd == 15u && S) {
+        arm_bank_t b = arm_bank_of_mode(c->cpsr);
+        if (b == ARM_BANK_USR || !arm_mode_is_valid(c->spsr[b]))
+            return ARM_UNDEFINED;
     }
 
     bool shifter_carry = get_flag(c, ARM_CPSR_C);
@@ -912,6 +1045,17 @@ static arm_status_t exec_single_transfer(arm_cpu_t *c, uint32_t pc, uint32_t ins
     bool L = (insn >> 20) & 1u;  /* load/store */
     unsigned rn = (insn >> 16) & 0xf;
     unsigned rd = (insn >> 12) & 0xf;
+    bool writeback = !P || W;
+
+    /* Addressing mode 2 marks these operand combinations UNPREDICTABLE. Trap
+     * them before calculating an address or touching the bus: guessing at the
+     * writeback order when Rn==Rd can silently replace either the loaded value
+     * or the updated base, and an R15 offset/base has no defined writeback
+     * value. Byte transfers cannot name R15 as their data register at all. */
+    if (writeback && (rn == 15u || rn == rd)) return ARM_UNDEFINED;
+    if (I && (insn & 0xfu) == 15u) return ARM_UNDEFINED;
+    if (B && rd == 15u) return ARM_UNDEFINED;
+    if (L && !P && W && rd == 15u) return ARM_UNDEFINED; /* LDRT pc */
 
     uint32_t offset;
     if (!I) {
@@ -930,18 +1074,33 @@ static arm_status_t exec_single_transfer(arm_cpu_t *c, uint32_t pc, uint32_t ins
     bool priv = (!P && W) ? false : cpu_is_priv(c);
 
     if (L) { /* load */
+        /* LDR-to-PC is not an ordinary WLoad. With SCTLR.A set it raises the
+         * alignment fault; with A clear, both legacy and ARMv6 unaligned modes
+         * classify the operation as UNPREDICTABLE. Never rotate/fix it up or
+         * touch memory in either case. */
+        if (rd == 15u && (addr & 3u) != 0u) {
+            if ((c->cp15.sctlr & ARM_SCTLR_A) != 0u) {
+                note_alignment_abort(c, addr, false);
+                return ARM_OK;
+            }
+            return ARM_UNDEFINED;
+        }
         uint32_t val = B ? mem_r8_as(c, addr, priv)
                          : mem_r32_as(c, addr, priv);
         /* Base Restored Abort Model: on a fault the destination and base must
          * be left untouched so the handler can fix the mapping and re-execute. */
         if (c->abort_pending) return ARM_OK;
+        if (rd == 15u && (val & 3u) == 2u) return ARM_UNDEFINED;
         c->r[rd] = val;
         if (rd == 15) {                      /* LDR to PC interworks too */
             if (val & 1u) c->cpsr |= ARM_CPSR_T; else c->cpsr &= ~ARM_CPSR_T;
             *next = val & (uint32_t)((val & 1u) ? ~1u : ~3u);
         }
     } else {  /* store */
-        uint32_t val = reg_read(c, pc, rd); /* stored r15 is +12 on real HW; +8 is close enough here */
+        /* ARM STR stores PC as the address of the instruction plus 12. This is
+         * one of the few contexts where R15 does not have its usual PC+8
+         * operand value. */
+        uint32_t val = (rd == 15u) ? pc + 12u : c->r[rd];
         if (B) mem_w8_as(c, addr, (uint8_t)val, priv);
         else   mem_w32_as(c, addr, val, priv);
         if (c->abort_pending) return ARM_OK;
@@ -967,11 +1126,29 @@ static arm_status_t exec_extra_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
     unsigned rn = (insn >> 16) & 0xf;
     unsigned rd = (insn >> 12) & 0xf;
     unsigned sh = (insn >> 5) & 3u;
+    bool writeback = !P || W;
+
+    /* Every halfword/sign-extending form reserves R15 as the destination; do
+     * not let a malformed encoding branch through a truncated load. */
+    if (rd == 15u) return ARM_UNDEFINED;
+
+    /* Addressing mode 3 has no unprivileged P=0,W=1 form. In the register
+     * form bits[11:8] are SBZ and Rm cannot be R15. As in addressing mode 2,
+     * a writeback base cannot be R15 or alias the data register. Reject every
+     * case before even reading device-like memory. */
+    if (!P && W) return ARM_UNDEFINED;
+    if (writeback && (rn == 15u || rn == rd)) return ARM_UNDEFINED;
+    if (!I && ((((insn >> 8) & 0xfu) != 0u) || (insn & 0xfu) == 15u))
+        return ARM_UNDEFINED;
 
     uint32_t offset = I ? ((((insn >> 8) & 0xf) << 4) | (insn & 0xf))
                         : reg_read(c, pc, insn & 0xf);
     uint32_t base = reg_read(c, pc, rn);
     uint32_t addr = P ? (U ? base + offset : base - offset) : base;
+
+    if ((sh == 1u || (L && sh == 3u)) &&
+        legacy_halfword_unpredictable(c, addr))
+        return ARM_UNDEFINED;
 
     if (L) {
         uint32_t val;
@@ -1010,6 +1187,7 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
     uint32_t list = insn & 0xffffu;
 
     if (list == 0) return ARM_UNDEFINED;     /* empty list is unpredictable */
+    if (rn == 15u) return ARM_UNDEFINED;     /* PC as a multiple-transfer base */
 
     /*
      * S=1 has two meanings. With PC in a load list it is an exception return
@@ -1022,6 +1200,22 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
     if (S) {
         if (L && (list & (1u << 15))) restore_cpsr = true;
         else                          user_bank = true;
+    }
+
+    if (restore_cpsr) {
+        arm_bank_t b = arm_bank_of_mode(c->cpsr);
+        if (b == ARM_BANK_USR || !arm_mode_is_valid(c->spsr[b]))
+            return ARM_UNDEFINED;
+    }
+
+    /* LDM(2)/STM(2) are specifically privileged user-bank transfers. User and
+     * System modes have no distinct privileged/user register view for this
+     * encoding, so the architecture marks both cases UNPREDICTABLE. Refuse the
+     * instruction before it can touch attacker-selected memory. */
+    if (user_bank) {
+        uint32_t mode = c->cpsr & ARM_CPSR_MODE_MASK;
+        if (mode == ARM_MODE_USR || mode == ARM_MODE_SYS)
+            return ARM_UNDEFINED;
     }
 
     /*
@@ -1040,6 +1234,15 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
      */
     if (user_bank && W) return ARM_UNDEFINED;
 
+    /* Writeback with an ARM LDM base in the list has no defined final Rn.
+     * For STM it is defined only when Rn is the lowest register stored; in
+     * every other ordering the value emitted for Rn is UNPREDICTABLE. */
+    if (W && (list & (1u << rn)) != 0u) {
+        if (L) return ARM_UNDEFINED;
+        uint32_t lower = rn == 0u ? 0u : ((1u << rn) - 1u);
+        if ((list & lower) != 0u) return ARM_UNDEFINED;
+    }
+
     unsigned n = 0;
     for (unsigned i = 0; i < 16; i++) if (list & (1u << i)) n++;
 
@@ -1047,6 +1250,8 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
     uint32_t addr, wb;
     if (U) { addr = P ? base + 4u : base;                  wb = base + 4u * n; }
     else   { addr = P ? base - 4u * n : base - 4u * n + 4u; wb = base - 4u * n; }
+
+    if (!prepare_multiword_address(c, &addr, 4u, !L)) return ARM_OK;
 
     /* Loaded values are buffered and only committed once every access has
      * succeeded: the base-restored abort model requires that a data abort part
@@ -1058,14 +1263,33 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
         if (L) {
             loaded[i] = mem_r32(c, addr);
         } else {
-            mem_w32(c, addr, user_bank ? reg_read_user(c, pc, i)
-                                       : reg_read(c, pc, i));
+            /* Like STR, storing R15 in an STM writes PC+12. The S/user-bank
+             * form does not change that value. */
+            uint32_t value = (i == 15u) ? pc + 12u
+                              : user_bank ? reg_read_user(c, pc, i)
+                                          : c->r[i];
+            mem_w32(c, addr, value);
         }
         if (c->abort_pending) return ARM_OK;
         addr += 4u;
     }
 
     if (L) {
+        /* Plain LDM interworks from bit 0, so an ARM destination ending in
+         * 0b10 is not representable. The exception-return LDM(3) is kept on
+         * its established restored-state align-down path below. */
+        if (!restore_cpsr && (list & (1u << 15)) != 0u &&
+            (loaded[15] & 3u) == 2u)
+            return ARM_UNDEFINED;
+        /* LDM(3) takes instruction state from SPSR, not from loaded PC bit 0.
+         * Returning to ARM with bit 1 set is therefore an unrepresentable
+         * halfword target, not a value to round down. Validate before any
+         * destination register or writeback is committed. */
+        if (restore_cpsr && (list & (1u << 15)) != 0u) {
+            uint32_t s = c->spsr[arm_bank_of_mode(c->cpsr)];
+            if ((s & ARM_CPSR_T) == 0u && (loaded[15] & 2u) != 0u)
+                return ARM_UNDEFINED;
+        }
         for (unsigned i = 0; i < 16; i++) {
             if (!(list & (1u << i))) continue;
             if (user_bank) { reg_write_user(c, i, loaded[i]); continue; }
@@ -1095,7 +1319,6 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
      * then CPSR <- SPSR rebanks us into the interrupted mode. */
     if (restore_cpsr) {
         arm_bank_t b = arm_bank_of_mode(c->cpsr);
-        if (b == ARM_BANK_USR) return ARM_UNDEFINED;   /* no SPSR in USR/SYS */
         uint32_t s = c->spsr[b];
         arm_set_mode(c, s);
         c->cpsr = (c->cpsr & ARM_CPSR_MODE_MASK) | (s & ~ARM_CPSR_MODE_MASK);
@@ -1329,6 +1552,9 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
                     else c->r[rd] = sv;
                     return ARM_OK;
                 default:                                       /* BX / BLX */
+                    if ((insn & (1u << 7)) && rs == 15u)
+                        return ARM_UNDEFINED;                    /* BLX pc */
+                    if ((sv & 3u) == 2u) return ARM_UNDEFINED;
                     if (insn & (1u << 7)) c->r[14] = (pc + 2) | 1u;   /* BLX */
                     if (!(sv & 1u)) c->cpsr &= ~ARM_CPSR_T;           /* back to ARM */
                     *next = sv & ~1u;
@@ -1348,7 +1574,10 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
         uint32_t addr = c->r[rb] + c->r[ro];
         if (insn & (1u << 9)) {              /* sign-extended byte/halfword */
             uint32_t v;
-            switch ((insn >> 10) & 3u) {
+            unsigned op = (insn >> 10) & 3u;
+            if (op != 1u && legacy_halfword_unpredictable(c, addr))
+                return ARM_UNDEFINED;
+            switch (op) {
                 case 0:
                     mem_w16(c, addr, (uint16_t)c->r[rd]);            /* STRH  */
                     return ARM_OK;
@@ -1394,6 +1623,7 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
     case 0x8: {                              /* load/store halfword, imm5 */
         unsigned rd = TB(0), rb = TB(3);
         uint32_t addr = c->r[rb] + (((insn >> 6) & 0x1fu) << 1);
+        if (legacy_halfword_unpredictable(c, addr)) return ARM_UNDEFINED;
         if (insn & (1u << 11)) {
             uint32_t v = mem_r16(c, addr);
             if (c->abort_pending) return ARM_OK;
@@ -1430,25 +1660,35 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
         if ((insn & 0xf600u) == 0xb400u) {   /* PUSH / POP */
             uint32_t list = insn & 0xffu;
             bool load = (insn >> 11) & 1u, extra = (insn >> 8) & 1u;
+            if (list == 0u && !extra) return ARM_UNDEFINED;
+            unsigned n = extra ? 1u : 0u;
+            for (unsigned i = 0; i < 8; i++) if (list & (1u << i)) n++;
             if (load) {                       /* POP: ascending from SP */
-                uint32_t sp = c->r[13], loaded[8]; uint32_t pcv = 0;
+                uint32_t old_sp = c->r[13], addr = old_sp, loaded[8];
+                uint32_t pcv = 0;
+                if (!prepare_multiword_address(c, &addr, 4u, false))
+                    return ARM_OK;
                 for (unsigned i = 0; i < 8; i++) {
                     if (!(list & (1u << i))) continue;
-                    loaded[i] = mem_r32(c, sp);
+                    loaded[i] = mem_r32(c, addr);
                     if (c->abort_pending) return ARM_OK;
-                    sp += 4;
+                    addr += 4u;
                 }
-                if (extra) { pcv = mem_r32(c, sp); if (c->abort_pending) return ARM_OK; sp += 4; }
+                if (extra) {
+                    pcv = mem_r32(c, addr);
+                    if (c->abort_pending) return ARM_OK;
+                    if ((pcv & 3u) == 2u) return ARM_UNDEFINED;
+                }
                 for (unsigned i = 0; i < 8; i++) if (list & (1u << i)) c->r[i] = loaded[i];
-                c->r[13] = sp;
+                c->r[13] = old_sp + 4u * n;
                 if (extra) {                  /* POP {..,pc} may switch to ARM */
                     if (!(pcv & 1u)) c->cpsr &= ~ARM_CPSR_T;
                     *next = pcv & ~1u;
                 }
             } else {                          /* PUSH: descending, LR pushed last */
-                unsigned n = extra ? 1u : 0u;
-                for (unsigned i = 0; i < 8; i++) if (list & (1u << i)) n++;
-                uint32_t sp = c->r[13] - 4u * n, addr = sp;
+                uint32_t new_sp = c->r[13] - 4u * n, addr = new_sp;
+                if (!prepare_multiword_address(c, &addr, 4u, true))
+                    return ARM_OK;
                 for (unsigned i = 0; i < 8; i++) {
                     if (!(list & (1u << i))) continue;
                     mem_w32(c, addr, c->r[i]);
@@ -1456,7 +1696,7 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
                     addr += 4;
                 }
                 if (extra) { mem_w32(c, addr, c->r[14]); if (c->abort_pending) return ARM_OK; }
-                c->r[13] = sp;
+                c->r[13] = new_sp;
             }
             return ARM_OK;
         }
@@ -1516,9 +1756,17 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
     }
     case 0xc: {                              /* STMIA / LDMIA Rb!, {rlist} */
         unsigned rb = (insn >> 8) & 7u;
-        uint32_t list = insn & 0xffu, addr = c->r[rb];
+        uint32_t list = insn & 0xffu, base = c->r[rb], addr = base;
         if (list == 0) return ARM_UNDEFINED;
-        if (insn & (1u << 11)) {
+        unsigned n = 0u;
+        for (unsigned i = 0; i < 8; i++) if (list & (1u << i)) n++;
+        bool load = (insn & (1u << 11)) != 0u;
+        if (!load && (list & (1u << rb)) != 0u) {
+            uint32_t lower = rb == 0u ? 0u : ((1u << rb) - 1u);
+            if ((list & lower) != 0u) return ARM_UNDEFINED;
+        }
+        if (!prepare_multiword_address(c, &addr, 4u, !load)) return ARM_OK;
+        if (load) {
             uint32_t loaded[8];
             for (unsigned i = 0; i < 8; i++) {
                 if (!(list & (1u << i))) continue;
@@ -1527,7 +1775,7 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
                 addr += 4;
             }
             for (unsigned i = 0; i < 8; i++) if (list & (1u << i)) c->r[i] = loaded[i];
-            if (!(list & (1u << rb))) c->r[rb] = addr;
+            if (!(list & (1u << rb))) c->r[rb] = base + 4u * n;
         } else {
             for (unsigned i = 0; i < 8; i++) {
                 if (!(list & (1u << i))) continue;
@@ -1535,7 +1783,7 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
                 if (c->abort_pending) return ARM_OK;
                 addr += 4;
             }
-            c->r[rb] = addr;
+            c->r[rb] = base + 4u * n;
         }
         return ARM_OK;
     }
@@ -1587,6 +1835,10 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
 arm_status_t arm_step(arm_cpu_t *c) {
     uint32_t pc   = c->r[15];
 
+    /* A corrupted snapshot or malformed exception frame must not turn an
+     * unimplemented CPSR mode into privileged User-bank execution. */
+    if (!arm_mode_is_valid(c->cpsr)) return ARM_UNDEFINED;
+
     /* Sample the interrupt lines before fetching. FIQ outranks IRQ. The return
      * address convention is "next instruction + 4", so handlers return with
      * SUBS pc, lr, #4. */
@@ -1629,12 +1881,7 @@ arm_status_t arm_step(arm_cpu_t *c) {
         c->cycles++;
         arm_status_t tst = thumb_step(c, pc, tinsn, &tnext);
         if (c->abort_pending) {
-            uint32_t vec;
-            c->abort_pending = false;
-            c->cp15.dfsr = c->abort_fsr;
-            c->cp15.dfar = c->abort_far;
-            take_exception(c, ARM_VEC_DATA_ABORT, ARM_MODE_ABT, pc + 8, false, &vec);
-            c->r[15] = vec;
+            take_pending_data_abort(c, pc);
             return ARM_OK;
         }
         if (tst == ARM_OK) c->r[15] = tnext;
@@ -1696,6 +1943,7 @@ arm_status_t arm_step(arm_cpu_t *c) {
             if (!cpu_is_priv(c)) { c->r[15] = next; return ARM_OK; }
             unsigned imod = (insn >> 18) & 3u;
             bool     chg_mode = (insn >> 17) & 1u;
+            if (chg_mode && !arm_mode_is_valid(insn)) return ARM_UNDEFINED;
             if (imod & 2u) {
                 bool disable = (imod & 1u) != 0;
                 if (insn & ARM_CPSR_A) set_flag(c, ARM_CPSR_A, disable);
@@ -1727,6 +1975,16 @@ arm_status_t arm_step(arm_cpu_t *c) {
         if ((insn & 0xfe5fffe0u) == 0xf84d0500u) {
             bool P = (insn >> 24) & 1u, U = (insn >> 23) & 1u, W = (insn >> 21) & 1u;
             uint32_t mode = insn & ARM_CPSR_MODE_MASK;
+
+            /* SRS is undefined in User mode and has no meaningful SPSR in
+             * System mode. Treat the latter's architecturally unpredictable
+             * case like the other unpredictable encodings this core refuses,
+             * rather than fabricating an SPSR from CPSR. */
+            uint32_t cur_mode = c->cpsr & ARM_CPSR_MODE_MASK;
+            if (cur_mode == ARM_MODE_USR || cur_mode == ARM_MODE_SYS)
+                return ARM_UNDEFINED;
+            if (!arm_mode_is_valid(mode)) return ARM_UNDEFINED;
+
             arm_bank_t tb = arm_bank_of_mode(mode);
             arm_bank_t cur = arm_bank_of_mode(c->cpsr);
 
@@ -1734,9 +1992,15 @@ arm_status_t arm_step(arm_cpu_t *c) {
             uint32_t sp = (tb == cur) ? c->r[13] : c->bank_r13[tb];
             uint32_t base = U ? (P ? sp + 4u : sp) : (P ? sp - 8u : sp - 4u);
 
-            mem_w32(c, base,      c->r[14]);
-            mem_w32(c, base + 4u, (cur == ARM_BANK_USR) ? c->cpsr : c->spsr[cur]);
-            if (c->abort_pending) { c->r[15] = next; return ARM_OK; }
+            if (!prepare_multiword_address(c, &base, 4u, true)) {
+                take_pending_data_abort(c, pc);
+                return ARM_OK;
+            }
+
+            mem_w32(c, base, c->r[14]);
+            if (c->abort_pending) { take_pending_data_abort(c, pc); return ARM_OK; }
+            mem_w32(c, base + 4u, c->spsr[cur]);
+            if (c->abort_pending) { take_pending_data_abort(c, pc); return ARM_OK; }
 
             if (W) {
                 uint32_t wb = U ? sp + 8u : sp - 8u;
@@ -1753,12 +2017,30 @@ arm_status_t arm_step(arm_cpu_t *c) {
         if ((insn & 0xfe50ffffu) == 0xf8100a00u) {
             bool P = (insn >> 24) & 1u, U = (insn >> 23) & 1u, W = (insn >> 21) & 1u;
             unsigned rn = (insn >> 16) & 0xfu;
+
+            /* RFE writes the complete CPSR, including its mode bits, and is a
+             * privileged instruction. Checking before either memory access is
+             * essential: a User-mode RFE must not read attacker-selected MMIO
+             * before being rejected. */
+            if (!cpu_is_priv(c)) return ARM_UNDEFINED;
+            if (rn == 15u) return ARM_UNDEFINED;
+
             uint32_t sp = c->r[rn];
             uint32_t base = U ? (P ? sp + 4u : sp) : (P ? sp - 8u : sp - 4u);
 
-            uint32_t new_pc   = mem_r32(c, base);
+            if (!prepare_multiword_address(c, &base, 4u, false)) {
+                take_pending_data_abort(c, pc);
+                return ARM_OK;
+            }
+
+            uint32_t new_pc = mem_r32(c, base);
+            if (c->abort_pending) { take_pending_data_abort(c, pc); return ARM_OK; }
             uint32_t new_cpsr = mem_r32(c, base + 4u);
-            if (c->abort_pending) { c->r[15] = next; return ARM_OK; }
+            if (c->abort_pending) { take_pending_data_abort(c, pc); return ARM_OK; }
+
+            if (!arm_mode_is_valid(new_cpsr)) return ARM_UNDEFINED;
+            if ((new_cpsr & ARM_CPSR_T) == 0u && (new_pc & 2u) != 0u)
+                return ARM_UNDEFINED;
 
             if (W) c->r[rn] = U ? sp + 8u : sp - 8u;
             arm_set_mode(c, new_cpsr);
@@ -1820,23 +2102,44 @@ arm_status_t arm_step(arm_cpu_t *c) {
         st = exec_extra_transfer(c, pc, insn, &next);
     } else if ((insn & 0x0ff00ff0u) == 0x01900f90u) {     /* LDREX Rd,[Rn] */
         unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
-        uint32_t addr = reg_read(c, pc, rn);
-        uint32_t v = mem_r32(c, addr);
-        if (!c->abort_pending) {
-            c->r[rd] = v;
-            c->excl_valid = true;      /* tag the address as exclusive */
-            c->excl_addr  = addr;
+        if (rn == 15u || rd == 15u) { st = ARM_UNDEFINED; }
+        else {
+            uint32_t addr = c->r[rn];
+            if (prepare_sync_address(c, addr, 4u, false, &st)) {
+                uint32_t v = mem_r32(c, addr);
+                if (!c->abort_pending) {
+                    c->r[rd] = v;
+                    c->excl_valid = true;      /* tag the address as exclusive */
+                    c->excl_addr  = addr;
+                }
+            }
         }
     } else if ((insn & 0x0ff00ff0u) == 0x01800f90u) {     /* STREX Rd,Rm,[Rn] */
         unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
-        uint32_t addr = reg_read(c, pc, rn);
-        if (c->excl_valid && c->excl_addr == addr) {
-            mem_w32(c, addr, reg_read(c, pc, insn & 0xfu));
-            if (!c->abort_pending) c->r[rd] = 0;          /* 0 = stored */
-        } else {
-            c->r[rd] = 1;                                  /* 1 = failed */
+        unsigned rm = insn & 0xfu;
+        if (rn == 15u || rd == 15u || rm == 15u || rd == rn || rd == rm) {
+            st = ARM_UNDEFINED;
         }
-        c->excl_valid = false;         /* the monitor is consumed either way */
+        else {
+            uint32_t addr = c->r[rn];
+            if (prepare_sync_address(c, addr, 4u, true, &st)) {
+                /* The base ARMv6 STREX performs its write translation before
+                 * consulting the local monitor. A stale/cleared monitor cannot
+                 * turn an unmapped or read-only VA into a harmless status=1. */
+                uint32_t ignored_pa;
+                uint32_t fsr = arm_mmu_translate(c, addr, ARM_ACCESS_WRITE,
+                                                 cpu_is_priv(c), &ignored_pa);
+                if (fsr != 0u) {
+                    note_abort(c, fsr, addr);
+                } else if (c->excl_valid && c->excl_addr == addr) {
+                    mem_w32(c, addr, c->r[rm]);
+                    if (!c->abort_pending) c->r[rd] = 0;  /* 0 = stored */
+                } else {
+                    c->r[rd] = 1;                         /* 1 = failed */
+                }
+                c->excl_valid = false; /* monitor is consumed either way */
+            }
+        }
     /*
      * The rest of the ARMv6K exclusive family. These are not exotic: the real
      * kernel's 64-bit atomics go through LDREXD/STREXD (OSAddAtomic64 is the
@@ -1846,70 +2149,103 @@ arm_status_t arm_step(arm_cpu_t *c) {
      */
     } else if ((insn & 0x0ff00ff0u) == 0x01b00f90u) {     /* LDREXD Rd,Rd+1,[Rn] */
         unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
-        if (rd & 1u || rd == 14u) { st = ARM_UNDEFINED; }
+        if (rn == 15u || rd & 1u || rd == 14u) { st = ARM_UNDEFINED; }
         else {
-            uint32_t addr = reg_read(c, pc, rn);
-            uint32_t lo = mem_r32(c, addr);
-            uint32_t hi = mem_r32(c, addr + 4);
-            if (!c->abort_pending) {
-                c->r[rd] = lo; c->r[rd + 1] = hi;
-                c->excl_valid = true;
-                c->excl_addr  = addr;
+            uint32_t addr = c->r[rn];
+            if (prepare_sync_address(c, addr, 8u, false, &st)) {
+                uint32_t lo = mem_r32(c, addr);
+                if (!c->abort_pending) {
+                    uint32_t hi = mem_r32(c, addr + 4u);
+                    if (!c->abort_pending) {
+                        c->r[rd] = lo; c->r[rd + 1] = hi;
+                        c->excl_valid = true;
+                        c->excl_addr  = addr;
+                    }
+                }
             }
         }
     } else if ((insn & 0x0ff00ff0u) == 0x01a00f90u) {     /* STREXD Rd,Rm,Rm+1,[Rn] */
         unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
         unsigned rm = insn & 0xfu;
-        if (rm & 1u || rm == 14u) { st = ARM_UNDEFINED; }
+        if (rn == 15u || rd == 15u || rm & 1u || rm == 14u ||
+            rd == rn || rd == rm || rd == rm + 1u) {
+            st = ARM_UNDEFINED;
+        }
         else {
-            uint32_t addr = reg_read(c, pc, rn);
+            uint32_t addr = c->r[rn];
+            if (prepare_sync_address(c, addr, 8u, true, &st)) {
+                if (c->excl_valid && c->excl_addr == addr) {
+                    mem_w32(c, addr, c->r[rm]);
+                    if (!c->abort_pending) {
+                        mem_w32(c, addr + 4u, c->r[rm + 1u]);
+                        if (!c->abort_pending) c->r[rd] = 0;
+                    }
+                } else {
+                    c->r[rd] = 1;
+                }
+                c->excl_valid = false;
+            }
+        }
+    } else if ((insn & 0x0ff00ff0u) == 0x01d00f90u) {     /* LDREXB Rd,[Rn] */
+        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        if (rn == 15u || rd == 15u) { st = ARM_UNDEFINED; }
+        else {
+            uint32_t addr = c->r[rn];
+            uint32_t v = mem_r8(c, addr);
+            if (!c->abort_pending) {
+                c->r[rd] = v;
+                c->excl_valid = true;
+                c->excl_addr  = addr;
+            }
+        }
+    } else if ((insn & 0x0ff00ff0u) == 0x01c00f90u) {     /* STREXB Rd,Rm,[Rn] */
+        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        unsigned rm = insn & 0xfu;
+        if (rn == 15u || rd == 15u || rm == 15u || rd == rn || rd == rm) {
+            st = ARM_UNDEFINED;
+        }
+        else {
+            uint32_t addr = c->r[rn];
             if (c->excl_valid && c->excl_addr == addr) {
-                mem_w32(c, addr,     reg_read(c, pc, rm));
-                mem_w32(c, addr + 4, reg_read(c, pc, rm + 1));
+                mem_w8(c, addr, (uint8_t)c->r[rm]);
                 if (!c->abort_pending) c->r[rd] = 0;
             } else {
                 c->r[rd] = 1;
             }
             c->excl_valid = false;
         }
-    } else if ((insn & 0x0ff00ff0u) == 0x01d00f90u) {     /* LDREXB Rd,[Rn] */
-        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
-        uint32_t addr = reg_read(c, pc, rn);
-        uint32_t v = mem_r8(c, addr);
-        if (!c->abort_pending) {
-            c->r[rd] = v;
-            c->excl_valid = true;
-            c->excl_addr  = addr;
-        }
-    } else if ((insn & 0x0ff00ff0u) == 0x01c00f90u) {     /* STREXB Rd,Rm,[Rn] */
-        unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
-        uint32_t addr = reg_read(c, pc, rn);
-        if (c->excl_valid && c->excl_addr == addr) {
-            mem_w8(c, addr, (uint8_t)reg_read(c, pc, insn & 0xfu));
-            if (!c->abort_pending) c->r[rd] = 0;
-        } else {
-            c->r[rd] = 1;
-        }
-        c->excl_valid = false;
     } else if ((insn & 0x0ff00ff0u) == 0x01f00f90u) {     /* LDREXH Rd,[Rn] */
         unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
-        uint32_t addr = reg_read(c, pc, rn);
-        uint32_t v = mem_r16(c, addr);
-        if (!c->abort_pending) {
-            c->r[rd] = v;
-            c->excl_valid = true;
-            c->excl_addr  = addr;
+        if (rn == 15u || rd == 15u) { st = ARM_UNDEFINED; }
+        else {
+            uint32_t addr = c->r[rn];
+            if (prepare_sync_address(c, addr, 2u, false, &st)) {
+                uint32_t v = mem_r16(c, addr);
+                if (!c->abort_pending) {
+                    c->r[rd] = v;
+                    c->excl_valid = true;
+                    c->excl_addr  = addr;
+                }
+            }
         }
     } else if ((insn & 0x0ff00ff0u) == 0x01e00f90u) {     /* STREXH Rd,Rm,[Rn] */
         unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
-        uint32_t addr = reg_read(c, pc, rn);
-        if (c->excl_valid && c->excl_addr == addr) {
-            mem_w16(c, addr, (uint16_t)reg_read(c, pc, insn & 0xfu));
-            if (!c->abort_pending) c->r[rd] = 0;
-        } else {
-            c->r[rd] = 1;
+        unsigned rm = insn & 0xfu;
+        if (rn == 15u || rd == 15u || rm == 15u || rd == rn || rd == rm) {
+            st = ARM_UNDEFINED;
         }
-        c->excl_valid = false;
+        else {
+            uint32_t addr = c->r[rn];
+            if (prepare_sync_address(c, addr, 2u, true, &st)) {
+                if (c->excl_valid && c->excl_addr == addr) {
+                    mem_w16(c, addr, (uint16_t)c->r[rm]);
+                    if (!c->abort_pending) c->r[rd] = 0;
+                } else {
+                    c->r[rd] = 1;
+                }
+                c->excl_valid = false;
+            }
+        }
     /*
      * SWP/SWPB — the pre-ARMv6 atomic. Deprecated in favour of LDREX/STREX but
      * still present in shipping code of this vintage. On a single core an
@@ -1917,14 +2253,29 @@ arm_status_t arm_step(arm_cpu_t *c) {
      */
     } else if ((insn & 0x0fb00ff0u) == 0x01000090u) {     /* SWP / SWPB */
         unsigned rn = (insn >> 16) & 0xfu, rd = (insn >> 12) & 0xfu;
+        unsigned rm = insn & 0xfu;
         bool byte = (insn >> 22) & 1u;
-        uint32_t addr = reg_read(c, pc, rn);
-        uint32_t rm_v = reg_read(c, pc, insn & 0xfu);
-        uint32_t old  = byte ? mem_r8(c, addr) : mem_r32(c, addr);
-        if (!c->abort_pending) {
-            if (byte) mem_w8(c, addr, (uint8_t)rm_v);
-            else      mem_w32(c, addr, rm_v);
-            if (!c->abort_pending) c->r[rd] = old;
+        if (rn == 15u || rd == 15u || rm == 15u || rn == rm || rn == rd) {
+            st = ARM_UNDEFINED;
+        }
+        else {
+            uint32_t addr = c->r[rn];
+            bool access = true;
+            if (!byte && (addr & 3u) != 0u &&
+                (c->cp15.sctlr & (ARM_SCTLR_U | ARM_SCTLR_A)) != 0u) {
+                note_alignment_abort(c, addr, true);
+                access = false;
+            }
+            if (access) {
+                /* With U=0,A=0, mem_r32 performs the legacy aligned read plus
+                 * rotate and mem_w32 performs the aligned unrotated write. */
+                uint32_t old = byte ? mem_r8(c, addr) : mem_r32(c, addr);
+                if (!c->abort_pending) {
+                    if (byte) mem_w8(c, addr, (uint8_t)c->r[rm]);
+                    else      mem_w32(c, addr, c->r[rm]);
+                    if (!c->abort_pending) c->r[rd] = old;
+                }
+            }
         }
     } else if ((insn & 0x0e000000u) == 0x00000000u &&
                (insn & 0x00000090u) == 0x00000090u) {
@@ -1954,12 +2305,7 @@ arm_status_t arm_step(arm_cpu_t *c) {
     /* A translation fault latched during the instruction becomes a data abort.
      * LR_abt is the aborting instruction's address + 8, per the architecture. */
     if (c->abort_pending) {
-        uint32_t vec;
-        c->abort_pending = false;
-        c->cp15.dfsr = c->abort_fsr;
-        c->cp15.dfar = c->abort_far;
-        take_exception(c, ARM_VEC_DATA_ABORT, ARM_MODE_ABT, pc + 8, false, &vec);
-        c->r[15] = vec;
+        take_pending_data_abort(c, pc);
         return ARM_OK;
     }
 

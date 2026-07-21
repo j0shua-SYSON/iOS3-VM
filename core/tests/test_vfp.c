@@ -879,6 +879,52 @@ static void test_ldm_uses_the_translating_bus(void) {
           (unsigned long long)vfp_get_d(&c, 3));
 }
 
+static unsigned g_fault_reads32, g_fault_writes32;
+static uint32_t fault_first_r32(arm_cpu_t *c, uint32_t va) {
+    g_fault_reads32++;
+    c->abort_pending = true;
+    c->abort_fsr = ARM_FSR_PAGE_TRANSLATION;
+    c->abort_far = va;
+    return 0x11223344u;
+}
+static void fault_first_w32(arm_cpu_t *c, uint32_t va, uint32_t v) {
+    (void)v;
+    g_fault_writes32++;
+    c->abort_pending = true;
+    c->abort_fsr = ARM_FSR_PAGE_TRANSLATION | (1u << 11);
+    c->abort_far = va;
+}
+static const vfp_bus_t g_fault_first_bus = { fault_first_r32, fault_first_w32 };
+
+static void test_double_transfers_stop_after_the_first_abort(void) {
+    arm_cpu_t c;
+    static const uint32_t insns[] = {
+        VFP_LS(1,1,0,0,1, 1,0,1,0),            /* VLDR   d0,[r1]   */
+        VFP_LS(0,1,0,0,1, 1,0,1,2),            /* VLDMIA r1,{d0}  */
+        VFP_LS(1,1,0,0,0, 1,0,1,0),            /* VSTR   d0,[r1]   */
+        VFP_LS(0,1,0,0,0, 1,0,1,2),            /* VSTMIA r1,{d0}  */
+    };
+
+    for (unsigned i = 0; i < 4u; i++) {
+        vfp_reset(&c);
+        c.r[1] = 0x800u;
+        vfp_set_d(&c, 0, 0x8877665544332211ull);
+        c.abort_pending = false;
+        g_fault_reads32 = g_fault_writes32 = 0u;
+        CHECK(vfp_execute(&c, 0u, insns[i], &g_fault_first_bus) == ARM_OK,
+              "faulting double transfer %u returned a decode error", i);
+        CHECK(c.abort_pending, "double transfer %u did not preserve its abort", i);
+        if (i < 2u)
+            CHECK(g_fault_reads32 == 1u && g_fault_writes32 == 0u,
+                  "double load %u issued %u reads/%u writes after first abort",
+                  i, g_fault_reads32, g_fault_writes32);
+        else
+            CHECK(g_fault_writes32 == 1u && g_fault_reads32 == 0u,
+                  "double store %u issued %u writes/%u reads after first abort",
+                  i, g_fault_writes32, g_fault_reads32);
+    }
+}
+
 /* Conditional execution applies to VFP like everything else. */
 static void test_condition_codes_apply(void) {
     arm_cpu_t c; vfp_reset(&c);
@@ -919,6 +965,7 @@ int main(void) {
     test_flush_to_zero();
     test_default_nan();
     test_ldm_uses_the_translating_bus();
+    test_double_transfers_stop_after_the_first_abort();
     test_condition_codes_apply();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

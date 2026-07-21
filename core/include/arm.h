@@ -49,9 +49,13 @@
 #define ARM_SCTLR_M (1u << 0)   /* MMU enable          */
 #define ARM_SCTLR_A (1u << 1)   /* alignment check     */
 #define ARM_SCTLR_C (1u << 2)   /* data cache enable   */
+#define ARM_SCTLR_S (1u << 8)   /* legacy system protection */
+#define ARM_SCTLR_R (1u << 9)   /* legacy ROM protection    */
 #define ARM_SCTLR_I (1u << 12)  /* instruction cache   */
 #define ARM_SCTLR_V (1u << 13)  /* high exception vectors @ 0xFFFF0000 */
+#define ARM_SCTLR_U (1u << 22)  /* ARMv6 unaligned half/word support */
 #define ARM_SCTLR_EE (1u << 25) /* CPSR.E value taken on exception entry */
+#define ARM_SCTLR_FA (1u << 29) /* force extended-descriptor access flag */
 /*
  * XP: extended page tables. Clear, the MMU reads the ARMv5-compatible
  * descriptor layout, where a small page carries four sets of subpage AP bits
@@ -109,7 +113,7 @@
  * makes grade_binary() reject every ARMv6 executable on the disk.
  */
 #define ARM1176_ID_PFR0    0x00000111u  /* ARM + Thumb + Jazelle state     */
-#define ARM1176_ID_PFR1    0x00000011u  /* programmers' model: v6, no TrustZone */
+#define ARM1176_ID_PFR1    0x00000001u  /* v6 programmer model; no Security Extensions */
 /*
  * ID_DFR0 is the one deliberate zero. The real part answers 0x00000033 —
  * "coprocessor-accessed debug, ARMv6.1" — but we do not implement the CP14
@@ -133,7 +137,10 @@
 #define ARM1176_ID_ISAR5   0x00000000u
 
 /* ARMv6 fault status codes (FSR[3:0]); FSR[7:4] carries the domain. */
+#define ARM_FSR_ALIGNMENT           0x1u
+#define ARM_FSR_SECTION_ACCESS_FLAG 0x3u
 #define ARM_FSR_SECTION_TRANSLATION 0x5u
+#define ARM_FSR_PAGE_ACCESS_FLAG    0x6u
 #define ARM_FSR_PAGE_TRANSLATION    0x7u
 #define ARM_FSR_SECTION_DOMAIN      0x9u
 #define ARM_FSR_PAGE_DOMAIN         0xbu
@@ -285,6 +292,9 @@ uint32_t arm_mmu_translate(arm_cpu_t *cpu, uint32_t va, arm_access_t acc,
 
 /* Which bank a CPSR mode value selects (USR and SYS share ARM_BANK_USR). */
 arm_bank_t arm_bank_of_mode(uint32_t mode);
+
+/* True only for processor modes implemented by this ARM1176 core. */
+bool arm_mode_is_valid(uint32_t mode);
 
 /* Switch processor mode, swapping the banked registers in and out. */
 void arm_set_mode(arm_cpu_t *cpu, uint32_t mode);

@@ -493,12 +493,14 @@ static arm_status_t vfp_ldst(arm_cpu_t *c, uint32_t pc, uint32_t insn,
             if (D) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
             if (L) {
                 uint32_t lo = bus->read32(c, addr);
+                if (c->abort_pending) return ARM_OK;
                 uint32_t hi = bus->read32(c, addr + 4u);
                 if (!c->abort_pending)
                     vfp_set_d(c, vd, (uint64_t)lo | ((uint64_t)hi << 32));
             } else {
                 uint64_t v = vfp_get_d(c, vd);
                 bus->write32(c, addr,      (uint32_t)v);
+                if (c->abort_pending) return ARM_OK;
                 bus->write32(c, addr + 4u, (uint32_t)(v >> 32));
             }
         } else {
@@ -543,12 +545,14 @@ static arm_status_t vfp_ldst(arm_cpu_t *c, uint32_t pc, uint32_t insn,
         if (dbl) {
             if (L) {
                 uint32_t lo = bus->read32(c, addr + i * 8u);
+                if (c->abort_pending) return ARM_OK;
                 uint32_t hi = bus->read32(c, addr + i * 8u + 4u);
                 if (c->abort_pending) return ARM_OK;
                 vfp_set_d(c, first + i, (uint64_t)lo | ((uint64_t)hi << 32));
             } else {
                 uint64_t v = vfp_get_d(c, first + i);
                 bus->write32(c, addr + i * 8u,      (uint32_t)v);
+                if (c->abort_pending) return ARM_OK;
                 bus->write32(c, addr + i * 8u + 4u, (uint32_t)(v >> 32));
                 if (c->abort_pending) return ARM_OK;
             }
