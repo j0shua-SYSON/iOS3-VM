@@ -3,6 +3,7 @@
 add_library(emucore STATIC
     src/arm/arm_interp.c
     src/mmu.c
+    src/snapshot.c
     src/soc/uart.c
     src/soc/vic.c
     src/soc/timer.c
@@ -59,6 +60,10 @@ add_executable(test_ksyms tests/test_ksyms.c)
 target_link_libraries(test_ksyms PRIVATE emucore)
 add_test(NAME ksyms COMMAND test_ksyms)
 
+add_executable(test_snapshot tests/test_snapshot.c)
+target_link_libraries(test_snapshot PRIVATE emucore)
+add_test(NAME snapshot COMMAND test_snapshot)
+
 add_executable(test_nand tests/test_nand.c)
 target_link_libraries(test_nand PRIVATE emucore)
 add_test(NAME nand_device COMMAND test_nand)
@@ -82,3 +87,10 @@ target_link_libraries(machoinfo PRIVATE emucore)
 
 add_executable(bootkernel ../tools/bootkernel.c)
 target_link_libraries(bootkernel PRIVATE emucore)
+
+# snapboot is the snapshot acceptance harness: it boots to a checkpoint, saves,
+# and can restore into a fresh process. Comparing snapshot bytes alone is not
+# enough — a field the format never stores is absent from both sides and
+# cancels out — so it also prints a machine-derived report to diff.
+add_executable(snapboot ../tools/snapboot.c)
+target_link_libraries(snapboot PRIVATE emucore)
