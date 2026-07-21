@@ -516,17 +516,34 @@ display controller and a panel that do not exist yet.
 - **Multitouch**, mapped from the host touchscreen to the guest's controller.
   `AppleMultitouchZ2SPI` already starts and reports "using DMA for bootloading",
   so the driver side is live and waiting for a device.
-- **Free space on the root volume.** `/` is now remounted read-write (see
-  BOOTLOG "Stage 8"), but the volume Apple ships has `freeBlocks == 0` and all
-  105,780 allocation bits set — it is sized exactly to its contents, because on
-  a real restore `asr` writes it to `disk0s1` and *then* the volume is grown.
-  Nothing can be allocated until we do the same. The grow itself is small and
-  fully documented (TN1150): the allocation bitmap is already 16 KB = 131,072
-  bits, so any size up to 512 MB needs only `totalBlocks`/`freeBlocks` updated,
-  one bit set for the block holding the new alternate volume header, and that
-  header written at `totalBlocks * 4096 - 1024`. The real constraint is DRAM:
-  the RAM disk lives in guest memory and the kernel's static map ceiling is
-  512 MB, of which the 413 MB volume already takes most.
+- ~~**Free space on the root volume.**~~ **DONE** — `bootkernel --grow <MB>`
+  (default 32) grows the HFS+ volume in the loaded copy of the RAM disk;
+  `firmware/rootfs.img` is untouched. TN1150 layout, four edits, validated
+  before and after and refusing loudly on anything unexpected; see BOOTLOG
+  "The volume had zero free blocks" for the detail and the numbers. Two things
+  came out of it that are *not* done:
+  - **`fsck_hfs` cannot do a full check here.** It quick-exits on a clean
+    volume, and forcing the real scan stops the machine on `SMULBB r6, r3, r5`
+    at `fsck_hfs+0x12130` — `arm_interp.c` traps the whole SMULxy/SMLAxy DSP
+    space by design. Closing that gap turns every boot's `fsck` from a
+    formality into a real filesystem check.
+  - **It changed nothing yet.** Out to 3 G instructions the console is
+    identical with and without `--grow`. And `_execve` stuck at 11 was never
+    the daemon counter it looked like: launchd spawns jobs with `posix_spawn`,
+    which that probe does not see, and `mDNSResponder[14]` is running in both
+    runs. Free space was not what was holding the LaunchDaemons — and neither
+    was `execve`.
+- **`-V` below `0xc0000000`, so that `-Y` becomes usable.** The RAM disk is
+  static memory below `topOfKernelData`, so every megabyte of volume is a
+  megabyte off the guest's free page pool: 58.93 MB at the documented `-R 512`
+  with `--grow 32`. `topOfKernelData` is a single line, not a list, so putting
+  the disk *below* the kernel (`-Y`) stops it pushing that line up at all —
+  312 MB of pool at `-V 0xa4000000 -R 768 -Y`, and `-V 0xa0000000 -R 768 -Y
+  --grow 100` fits a 512 MB volume (the allocation file's ceiling) and still
+  leaves 248 MB. **Neither reaches `_load_init_program`**: both stop at
+  `BSD root: md0` and go idle, which is the failure the `-V` note in
+  `bootkernel.c` predicted for a `gVirtBase` below the kernel's compiled-in
+  `VM_MIN_KERNEL_ADDRESS`. Fixing that is worth 5x the guest's memory.
 - **NAND VFL/FTL**, if we ever mount a real NAND image rather than a RAM disk.
   This is the only route to a genuine `disk0`, and it is a large one. Both
   layers read undocumented Apple on-media formats: `AppleNANDFTL`'s FTL/VFL

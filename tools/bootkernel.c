@@ -143,6 +143,347 @@ static size_t rd_rewrite_fstab(uint8_t *rd, size_t rd_n, const char *line) {
 }
 
 /* ---------------------------------------------------------------------------
+ * The system volume has ZERO free blocks, and on this machine that is fatal to
+ * everything launchd tries to start.
+ *
+ * MEASURED on firmware/rootfs.img (iPhone1,2 3.1.3 7E18, 018-6482-014.dmg):
+ *
+ *     signature HX  version 5  blockSize 4096
+ *     totalBlocks 105780  (x 4096 == 433274880 == the image, exactly)
+ *     freeBlocks  0
+ *     allocation file: 16384 bytes, 1 extent at block 1, 4 blocks
+ *     bits 0..105779 all set, bits 105780..131071 all clear
+ *
+ * That is not damage, it is Apple's build process. The system dmg is sized to
+ * fit its contents because on hardware "/" is disk0s1 and stays read-only
+ * forever; everything writable lives on disk0s2, a separate volume the restore
+ * newfs'es. We have no disk0 at all (see the fstab note above), so "/" is the
+ * only volume, we mount it rw — and there is not one free block on it. launchd
+ * can create nothing: no /private/var/log/asl, no /private/var/db, no
+ * lockdown records, no SpringBoard caches.
+ *
+ * The volume is therefore grown to make room. HFS+ is a documented format
+ * (Apple TN1150), the image is not encrypted or compressed, and every one of
+ * the four edits below is named in the spec, so this is not a guess at an
+ * Apple layout — it is the layout, applied:
+ *
+ *   1. volumeHeader.totalBlocks  += n           (the volume gets bigger)
+ *   2. volumeHeader.freeBlocks    = recount     (from the bitmap, not arithmetic)
+ *   3. allocation file: free the block(s) covering the OLD reserved tail, and
+ *      allocate the block(s) covering the NEW one
+ *   4. write the alternate volume header at totalBlocks*blockSize - 1024
+ *
+ * Point 3 is the one worth spelling out. TN1150 puts the alternate volume
+ * header 1024 bytes before the end of the volume and reserves the final 512
+ * bytes; the allocation block(s) containing that tail are marked in-use and
+ * belong to no file. (Verified independently: walking the catalog and the
+ * extents overflow file over this image accounts for 105778 of the 105780
+ * in-use blocks — the two left over are block 0, which holds the boot blocks
+ * plus the primary header, and block 105779, which holds the alternate. Nor
+ * COULD a file own that block: extents are whole allocation blocks, so a file
+ * owning it would own the alternate header's bytes and be scribbled on every
+ * time the volume was flushed.) So when the tail moves, the block it used to
+ * occupy becomes ordinary free space and the block it moves to becomes
+ * reserved.
+ *
+ * Getting that wrong in either direction is exactly what fsck_hfs exists to
+ * catch, and launchd's bootstrap runs fsck_hfs on every boot here — but do not
+ * lean on it. `fsck_hfs -p` QUICK-EXITS on a volume carrying
+ * kHFSVolumeUnmounted, and forcing the real scan (by clearing that bit) stops
+ * the machine on `SMULBB r6, r3, r5` at fsck_hfs+0x12130, which arm_interp.c
+ * traps along with the rest of the SMULxy/SMLAxy DSP space. So the checking
+ * here has to stand on its own: hfs_validate() runs over the bytes before the
+ * edit AND again after it, and refuses rather than warns.
+ *
+ * The 16 KB allocation file is the ceiling: 16384 * 8 == 131072 bits, i.e.
+ * 512 MB at this block size. Growing past that would mean allocating more
+ * blocks TO the allocation file and rewriting its fork extents, which is a
+ * different and much more invasive operation. We stop at the ceiling and say
+ * so. (TN1150 explicitly allows an allocation file larger than the volume
+ * needs, requiring only that the surplus bits be zero — which is why the
+ * headroom is there in the first place: newfs_hfs rounded 105780 bits up to a
+ * whole 4-block clump.)
+ *
+ * As with the fstab rewrite, only the in-memory copy is touched, and the RAM
+ * disk published to the guest is the grown one, so the device the guest sees
+ * and the volume on it are the same size — which fsck_hfs checks (it locates
+ * the alternate header from the DEVICE size, via DKIOCGETBLOCKCOUNT).
+ * ------------------------------------------------------------------------- */
+static uint16_t hbe16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
+static uint32_t hbe32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+}
+static uint64_t hbe64(const uint8_t *p) {
+    return ((uint64_t)hbe32(p) << 32) | hbe32(p + 4);
+}
+static void hput32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+
+#define HFS_VH_OFF      1024u     /* TN1150: volume header at byte 1024      */
+#define HFS_VH_LEN      512u      /* ...and it is 512 bytes long             */
+#define HFS_SIG_HFSPLUS 0x482Bu   /* 'H+' */
+#define HFS_SIG_HFSX    0x4858u   /* 'HX' */
+#define HFS_ATTR_JOURNALED (1u << 13)
+
+typedef struct {
+    uint32_t block_size, total_blocks, free_blocks, next_alloc, attributes;
+    uint64_t alloc_bytes;             /* allocation file logicalSize          */
+    uint32_t alloc_fork_blocks;
+    uint32_t ext_start[8], ext_count[8];
+    uint32_t nbits;                   /* bits the allocation file can address */
+} hfsvol_t;
+
+/* Image offset of byte `off` of the allocation file, or (size_t)-1 if that
+ * byte is past the fork's extents. */
+static size_t hfs_alloc_off(const hfsvol_t *v, uint64_t off) {
+    uint64_t seen = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        uint64_t span = (uint64_t)v->ext_count[i] * v->block_size;
+        if (!span) continue;
+        if (off < seen + span)
+            return (size_t)((uint64_t)v->ext_start[i] * v->block_size + (off - seen));
+        seen += span;
+    }
+    return (size_t)-1;
+}
+
+static int hfs_bit_get(const uint8_t *img, const hfsvol_t *v, uint32_t bit) {
+    size_t o = hfs_alloc_off(v, bit >> 3);
+    return (img[o] >> (7 - (bit & 7))) & 1;
+}
+static void hfs_bit_set(uint8_t *img, const hfsvol_t *v, uint32_t bit, int on) {
+    size_t o = hfs_alloc_off(v, bit >> 3);
+    uint8_t m = (uint8_t)(1u << (7 - (bit & 7)));
+    if (on) img[o] |= m; else img[o] &= (uint8_t)~m;
+}
+
+/*
+ * Parse and FULLY validate the volume. Every field this tool is about to touch
+ * or rely on is checked, and anything unexpected is a refusal, not a warning:
+ * a half-understood volume that boots is worse than one that does not, because
+ * the damage shows up later as an unexplained guest failure.
+ *
+ * Run before the edit and again after it, so the "after" pass is an
+ * independent re-derivation from the bytes rather than a restatement of what
+ * the edit intended.
+ */
+static bool hfs_validate(const uint8_t *img, size_t n, hfsvol_t *v,
+                         const char *when) {
+#define VBAD(...) do { fprintf(stderr, "rd-grow (%s): ", when); \
+                       fprintf(stderr, __VA_ARGS__); return false; } while (0)
+    memset(v, 0, sizeof *v);
+    if (n < HFS_VH_OFF + HFS_VH_LEN)
+        VBAD("image is %llu bytes — too small for a volume header\n",
+             (unsigned long long)n);
+
+    const uint8_t *vh = img + HFS_VH_OFF;
+    uint16_t sig = hbe16(vh), ver = hbe16(vh + 2);
+    if (!((sig == HFS_SIG_HFSPLUS && ver == 4) || (sig == HFS_SIG_HFSX && ver == 5)))
+        VBAD("signature '%c%c' version %u is neither HFS+ (H+/4) nor HFSX "
+             "(HX/5) — not growing something this tool does not understand\n",
+             vh[0] >= 32 && vh[0] < 127 ? vh[0] : '?',
+             vh[1] >= 32 && vh[1] < 127 ? vh[1] : '?', ver);
+
+    v->attributes   = hbe32(vh + 4);
+    v->block_size   = hbe32(vh + 40);
+    v->total_blocks = hbe32(vh + 44);
+    v->free_blocks  = hbe32(vh + 48);
+    v->next_alloc   = hbe32(vh + 52);
+    uint32_t journal_info_block = hbe32(vh + 12);
+
+    if (v->block_size < 512 || v->block_size > (1u << 20) ||
+        (v->block_size & (v->block_size - 1)) || (v->block_size % 512))
+        VBAD("blockSize %u is not a power-of-two multiple of 512\n", v->block_size);
+    if (!v->total_blocks) VBAD("totalBlocks is 0\n");
+    if ((uint64_t)v->total_blocks * v->block_size != (uint64_t)n)
+        VBAD("totalBlocks %u x blockSize %u = %llu but the image is %llu bytes "
+             "— the volume does not fill the image, and this tool only handles "
+             "a bare volume with no partition map around it\n",
+             v->total_blocks, v->block_size,
+             (unsigned long long)v->total_blocks * v->block_size,
+             (unsigned long long)n);
+    if (v->free_blocks > v->total_blocks)
+        VBAD("freeBlocks %u exceeds totalBlocks %u\n", v->free_blocks, v->total_blocks);
+    if (v->next_alloc >= v->total_blocks)
+        VBAD("nextAllocation %u is outside the volume (%u blocks)\n",
+             v->next_alloc, v->total_blocks);
+    /* A journalled volume has a transaction log that would also have to be
+     * reasoned about; this image is not journalled and we do not pretend to
+     * handle one that is. */
+    if ((v->attributes & HFS_ATTR_JOURNALED) || journal_info_block)
+        VBAD("volume is journalled (attributes 0x%08x, journalInfoBlock %u) — "
+             "not supported\n", v->attributes, journal_info_block);
+
+    /* The alternate volume header, 1024 bytes before the end (TN1150). */
+    const uint8_t *avh = img + n - HFS_VH_OFF;
+    if (memcmp(vh, avh, HFS_VH_LEN))
+        VBAD("the alternate volume header at 0x%llx does not match the primary "
+             "— refusing to edit a volume whose two headers already disagree\n",
+             (unsigned long long)(n - HFS_VH_OFF));
+
+    /* Allocation file fork descriptor, at offset 112 of the volume header. */
+    const uint8_t *af = vh + 112;
+    v->alloc_bytes      = hbe64(af);
+    v->alloc_fork_blocks = hbe32(af + 12);
+    uint32_t summed = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        v->ext_start[i] = hbe32(af + 16 + i * 8);
+        v->ext_count[i] = hbe32(af + 20 + i * 8);
+        if (!v->ext_count[i]) continue;
+        if ((uint64_t)v->ext_start[i] + v->ext_count[i] > v->total_blocks)
+            VBAD("allocation file extent %u (%u+%u) runs past the volume\n",
+                 i, v->ext_start[i], v->ext_count[i]);
+        summed += v->ext_count[i];
+    }
+    if (summed != v->alloc_fork_blocks)
+        VBAD("allocation file has %u blocks but its 8 inline extents cover %u "
+             "— it spills into the extents overflow file, which this tool does "
+             "not read\n", v->alloc_fork_blocks, summed);
+    if (v->alloc_bytes > (uint64_t)v->alloc_fork_blocks * v->block_size)
+        VBAD("allocation file logicalSize %llu exceeds its %u allocated blocks\n",
+             (unsigned long long)v->alloc_bytes, v->alloc_fork_blocks);
+    if (v->alloc_bytes > 0xffffffffull / 8)
+        VBAD("allocation file is implausibly large (%llu bytes)\n",
+             (unsigned long long)v->alloc_bytes);
+    v->nbits = (uint32_t)(v->alloc_bytes * 8);
+    if (v->nbits < v->total_blocks)
+        VBAD("allocation file addresses %u blocks, volume has %u\n",
+             v->nbits, v->total_blocks);
+
+    /* The bitmap must agree with freeBlocks, and every bit past the end of the
+     * volume must be zero (TN1150 requires the surplus to be clear). Both are
+     * cheap and both are exactly what a bad edit would break. */
+    uint32_t used = 0;
+    for (uint32_t b = 0; b < v->total_blocks; b++) used += (uint32_t)hfs_bit_get(img, v, b);
+    if (used != v->total_blocks - v->free_blocks)
+        VBAD("the bitmap marks %u blocks in use but freeBlocks %u says %u\n",
+             used, v->free_blocks, v->total_blocks - v->free_blocks);
+    for (uint32_t b = v->total_blocks; b < v->nbits; b++)
+        if (hfs_bit_get(img, v, b))
+            VBAD("bit %u is set but lies past the end of the volume (%u blocks)"
+                 " — TN1150 requires the surplus bits to be zero\n",
+                 b, v->total_blocks);
+    return true;
+#undef VBAD
+}
+
+/* First and last allocation block covering the volume's reserved tail: the
+ * alternate volume header (last 1024 bytes) and the reserved 512 after it. */
+static uint32_t hfs_tail_first(uint32_t total_blocks, uint32_t block_size) {
+    return (uint32_t)(((uint64_t)total_blocks * block_size - HFS_VH_OFF) / block_size);
+}
+
+/*
+ * Grow the volume in the loaded RAM disk by `want_mb` megabytes of FREE space.
+ * On success rdp/rd_np are updated to point at a larger buffer. Returns false,
+ * with an explanation, on any refusal — the caller aborts the boot rather than
+ * booting an image it did not fully understand.
+ */
+static bool rd_grow_volume(uint8_t **rdp, size_t *rd_np, uint32_t want_mb) {
+    uint8_t *img = *rdp;
+    size_t   n   = *rd_np;
+    hfsvol_t v;
+
+    if (!hfs_validate(img, n, &v, "before")) return false;
+
+    uint32_t bs = v.block_size;
+    uint64_t want_blocks = ((uint64_t)want_mb << 20) / bs;
+    /* The tail block we hand back when the reserved region moves is one free
+     * block we get for nothing, so ask for one fewer. */
+    if (want_blocks) want_blocks--;
+
+    uint64_t want_total = (uint64_t)v.total_blocks + want_blocks;
+    uint32_t new_total  = want_total > v.nbits ? v.nbits : (uint32_t)want_total;
+    if (new_total <= v.total_blocks) {
+        fprintf(stderr, "rd-grow: %u MB is less than one allocation block "
+                        "(%u bytes) of growth\n", want_mb, bs);
+        return false;
+    }
+    if (want_total > v.nbits)
+        printf("rd-grow    : clamped to the allocation file's %u-bit ceiling "
+               "(%llu MB volume);\n"
+               "             growing past it means enlarging the allocation "
+               "file itself.\n",
+               v.nbits, (unsigned long long)((uint64_t)v.nbits * bs) >> 20);
+
+    uint32_t old_tail = hfs_tail_first(v.total_blocks, bs);
+    uint32_t new_tail = hfs_tail_first(new_total, bs);
+
+    /* The old reserved tail must be exactly as TN1150 describes it before we
+     * hand those blocks back. If it is not, something else owns them and
+     * freeing them would corrupt a file. */
+    for (uint32_t b = old_tail; b < v.total_blocks; b++)
+        if (!hfs_bit_get(img, &v, b)) {
+            fprintf(stderr, "rd-grow: block %u holds the alternate volume "
+                    "header but is marked FREE — refusing to touch this "
+                    "volume\n", b);
+            return false;
+        }
+    for (uint32_t b = new_tail; b < new_total; b++)
+        if (b >= v.total_blocks && hfs_bit_get(img, &v, b)) {
+            fprintf(stderr, "rd-grow: block %u is past the volume yet already "
+                    "allocated\n", b);
+            return false;
+        }
+
+    size_t new_n = (size_t)((uint64_t)new_total * bs);
+    uint8_t *grown = realloc(img, new_n);
+    if (!grown) { fprintf(stderr, "rd-grow: out of memory for a %llu MB image\n",
+                          (unsigned long long)(new_n >> 20)); return false; }
+    memset(grown + n, 0, new_n - n);
+    *rdp = img = grown;
+
+    /* (3) the reserved tail moves. */
+    for (uint32_t b = old_tail; b < v.total_blocks; b++) hfs_bit_set(img, &v, b, 0);
+    for (uint32_t b = new_tail; b < new_total;      b++) hfs_bit_set(img, &v, b, 1);
+
+    /* (2) freeBlocks is RECOUNTED from the bitmap, never computed from the
+     * growth, so the header cannot end up describing a bitmap we did not
+     * actually write. */
+    uint32_t used = 0;
+    for (uint32_t b = 0; b < new_total; b++) used += (uint32_t)hfs_bit_get(img, &v, b);
+
+    uint8_t *vh = img + HFS_VH_OFF;
+    hput32(vh + 44, new_total);              /* (1) totalBlocks               */
+    hput32(vh + 48, new_total - used);       /* (2) freeBlocks                */
+    hput32(vh + 52, old_tail);               /* nextAllocation: first free    */
+
+    /* (4) the alternate header, 1024 bytes before the new end. */
+    memcpy(img + new_n - HFS_VH_OFF, vh, HFS_VH_LEN);
+
+    *rd_np = new_n;
+
+    hfsvol_t after;
+    if (!hfs_validate(img, new_n, &after, "after")) return false;
+    if (after.total_blocks != new_total || after.free_blocks != new_total - used) {
+        fprintf(stderr, "rd-grow (after): header re-read as %u/%u blocks, "
+                "expected %u/%u\n", after.total_blocks, after.free_blocks,
+                new_total, new_total - used);
+        return false;
+    }
+
+    printf("rd-grow    : volume %u -> %u blocks of %u  (%llu -> %llu MB), "
+           "free %u -> %u blocks (%llu MB)\n"
+             /* NOT "fsck_hfs will check this": it quick-exits on a volume
+              * carrying kHFSVolumeUnmounted, and forcing the full scan stops
+              * the machine on an unimplemented SMULBB inside fsck_hfs. The
+              * guarantee here is hfs_validate() before and after, plus the
+              * kernel's own mount. See docs/BOOTLOG.md. */
+           "             alternate volume header rewritten at image+0x%llx; "
+           "revalidated from the bytes after writing.\n",
+           v.total_blocks, new_total, bs,
+           (unsigned long long)((uint64_t)v.total_blocks * bs) >> 20,
+           (unsigned long long)((uint64_t)new_total * bs) >> 20,
+           v.free_blocks, new_total - used,
+           (unsigned long long)((uint64_t)(new_total - used) * bs) >> 20,
+           (unsigned long long)(new_n - HFS_VH_OFF));
+    return true;
+}
+
+/* ---------------------------------------------------------------------------
  * Address naming.
  *
  * Both sources — the kernel's own LC_SYMTAB and the prelinked kext load map in
@@ -1394,6 +1735,28 @@ int main(int argc, char **argv) {
             "      backed disk0, so launchd's fsck fails and it halts the\n"
             "      machine. The image on disk is never modified.\n"
             "  --keep-fstab    leave the stock record alone (reproduces the halt)\n"
+            "  --grow <MB>  free space to give the guest by growing the HFS+\n"
+            "      volume in the loaded RAM disk (default 32, 0 disables). The\n"
+            "      stock system dmg is sized exactly to its contents —\n"
+            "      freeBlocks is 0 — because on hardware everything writable\n"
+            "      lives on disk0s2, which this machine does not have. Without\n"
+            "      this, launchd, the daemons and SpringBoard cannot create a\n"
+            "      single file. Costs the guest's free page pool 1:1 (the RAM\n"
+            "      disk is static memory below topOfKernelData), and is capped\n"
+            "      by the allocation file at a 512 MB volume. The image on disk\n"
+            "      is never modified.\n"
+            "  -Y  EXPERIMENT: put the RAM disk at the BOTTOM of DRAM, below\n"
+            "      the kernel, instead of above it. Both are below\n"
+            "      topOfKernelData and so equally protected, but below the\n"
+            "      kernel the disk stops pushing that line up and the free\n"
+            "      page pool grows by its whole size — 312 MB at\n"
+            "      -V 0xa4000000 -R 768 -Y against 59 at the default, and\n"
+            "      -V 0xa0000000 -R 768 -Y --grow 100 fits a 512 MB volume\n"
+            "      (the allocation file's ceiling) with 248 MB left over.\n"
+            "      It needs -V to open a gap under the kernel, and THAT is\n"
+            "      what does not work yet: with -V below 0xc0000000 the boot\n"
+            "      reaches \"BSD root: md0\" and then goes idle without ever\n"
+            "      reaching _load_init_program. Headroom on paper only.\n"
             "  -L  print the prelinked kext load map (bundle id, load address,\n"
             "      size) read out of __PRELINK_INFO, then exit without booting\n"
             "  -R  guest DRAM size in MB (default 128, the iPhone1,2 fitment)\n"
@@ -1488,6 +1851,66 @@ int main(int argc, char **argv) {
     const char *fstab_line  = "/dev/md0 / hfs rw,update 0 1";
     bool        fstab_fixup = true;
 
+    /*
+     * --grow <MB>: free space to give the guest, by growing the HFS+ volume in
+     * the loaded RAM disk. See rd_grow_volume() above for the format work; this
+     * is the size question.
+     *
+     * The stock volume has freeBlocks == 0, so ANY nonzero amount is the
+     * qualitative change. The number is a trade against the free page pool,
+     * because the RAM disk sits below topOfKernelData and every megabyte of it
+     * is a megabyte the guest VM never gets: at the documented -R 512 the pool
+     * is 90.9 MB before this and 58.9 MB after.
+     *
+     * 32 MB is picked as comfortably more than a boot needs and visibly less
+     * than the pool can spare. What actually gets written on the way to
+     * SpringBoard is /private/var/log/asl, /private/var/db (launchd.db,
+     * timezone), /private/var/root/Library/Lockdown, /private/var/preferences
+     * and the mobile user's caches — plists and logs, single-digit megabytes.
+     * (The whole /private/var skeleton is already present on the system dmg:
+     * 16 entries including db, log, mobile, root, preferences, run and tmp, so
+     * nothing has to be created wholesale first.) On hardware /private/var is
+     * a multi-gigabyte disk0s2 and none of this is a constraint; here it is,
+     * so raise it deliberately rather than by default. --grow 0 disables.
+     */
+    uint32_t rd_grow_mb = 32;
+
+    /*
+     * -Y: put the RAM disk at the BOTTOM of DRAM, below the kernel image.
+     *
+     * topOfKernelData is a single LINE, not a list: everything below it is the
+     * kernel's static pre-loaded data and is never handed to the VM. So a RAM
+     * disk placed below the kernel's load address is exactly as protected as
+     * one placed above it — and it costs the free page pool nothing, because
+     * topOfKernelData then only has to clear the kernel's own image instead of
+     * the kernel's image plus 413 MB of root filesystem.
+     *
+     * It only buys anything with -V, which is what decides where the kernel
+     * lands physically (phys = vmaddr - virt_base + phys_base): the RAM disk
+     * has to fit in [phys_base, kernel load address), and at the default
+     * -V 0xc0000000 that gap is zero. The arithmetic works, MEASURED:
+     *
+     *   -R 512 (default)                       445 MB disk,  58.93 MB pool
+     *   -V 0xa4000000 -R 768 -Y                445 MB disk, 312.14 MB pool
+     *   -V 0xa0000000 -R 768 -Y --grow 100     512 MB disk, 248.14 MB pool
+     *
+     * 768 MB is the most DRAM this machine can have: SDRAM base 0x08000000
+     * plus 768 MB is 0x38000000, the first peripheral aperture, and the DRAM
+     * window silently shadows anything it covers. 512 MB is the largest volume
+     * the allocation file can describe. So the last line is the ceiling in
+     * both directions at once.
+     *
+     * EXPERIMENT, NOT YET A WORKING BOOT, and the reason is -V rather than -Y:
+     * both -V rows above reach "BSD root: md0" and then go idle without ever
+     * reaching _load_init_program, where the default -V 0xc0000000 execs
+     * launchd at ~225 M instructions. That is the failure the -V note further
+     * down predicted — VM_MIN_KERNEL_ADDRESS is compiled into this kernel, and
+     * below it the pmap is looking at what it thinks is user space. Until that
+     * is understood, the headroom here is arithmetic rather than usable, which
+     * is exactly why -Y is off by default.
+     */
+    bool rd_low = false;
+
     /* -W <lo>[:<hi>] profile window, -Z <n> heartbeat. Defaults are "the whole
      * run" and "silent", so neither changes an existing invocation. */
     unsigned win_lo = 0, win_hi = 0xffffffffu, heartbeat = 0;
@@ -1531,6 +1954,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-M")) { patch_memnode = false; continue; }
         if (!strcmp(argv[i], "-L")) { want_kextmap = true; continue; }
         if (!strcmp(argv[i], "--keep-fstab")) { fstab_fixup = false; continue; }
+        if (!strcmp(argv[i], "-Y")) { rd_low = true; continue; }
         /* Three-argument flag: must be recognised before the two-argument
          * guard below, which would otherwise stop the walk on the last pair. */
         if (!strcmp(argv[i], "--snapshot-at") && i + 2 < argc) {
@@ -1578,6 +2002,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-w")) ba_ver    = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-r")) rdpath    = argv[++i];
         else if (!strcmp(argv[i], "--fstab")) fstab_line = argv[++i];
+        else if (!strcmp(argv[i], "--grow")) rd_grow_mb = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-R")) ram_size  = (uint32_t)strtoul(argv[++i], NULL, 0) << 20;
         else if (!strcmp(argv[i], "-X")) {
             const char *v = argv[++i];
@@ -1784,6 +2209,20 @@ int main(int argc, char **argv) {
                (unsigned)at, fstab_line);
     }
 
+    /* Give the guest somewhere to write. The stock volume is sized exactly to
+     * its contents (freeBlocks == 0) because on hardware everything writable
+     * lives on disk0s2; here "/" is all there is. Again the in-memory copy
+     * only — and it has to happen before rd_len is taken below, because the
+     * grown image is the device the guest is handed. */
+    if (rd && rd_grow_mb) {
+        if (!rd_grow_volume(&rd, &rd_n, rd_grow_mb)) {
+            fprintf(stderr, "             pass --grow 0 to boot the volume "
+                            "untouched (it has zero free blocks, so launchd "
+                            "can create nothing).\n");
+            return 1;
+        }
+    }
+
     /*
      * Reserve a linear framebuffer and advertise it in Boot_Video. With
      * v_baseAddr left at 0 the kernel's PE_create_console reads address 0,
@@ -1808,7 +2247,10 @@ int main(int argc, char **argv) {
      * mdevadd takes base and size as PAGE NUMBERS (addr >> 12), so both have to
      * be page-multiples or the disk is silently truncated / misaligned.
      */
-    uint32_t rd_pa = (ba_pa + 0x1000u + 0xfffu) & ~0xfffu;
+    /* -Y moves it BELOW the kernel instead (see the flag's note): still below
+     * topOfKernelData, still static, but no longer pushing that line — and
+     * therefore the free page pool — up by the size of the root filesystem. */
+    uint32_t rd_pa = rd_low ? phys_base : ((ba_pa + 0x1000u + 0xfffu) & ~0xfffu);
     uint32_t rd_len = (uint32_t)((rd_n + 0xfffu) & ~(size_t)0xfffu);
 
     /*
@@ -1841,8 +2283,26 @@ int main(int argc, char **argv) {
      * this never showed up before — and why the framebuffer regression noted
      * above looked like a framebuffer problem.
      */
-    uint32_t top_of_kernel_data = rd ? ((rd_pa + rd_len + 0x3fffu) & ~0x3fffu)
-                                     : ((ba_pa + 0x1000u + 0x3fffu) & ~0x3fffu);
+    uint32_t top_of_kernel_data = (rd && !rd_low)
+                                  ? ((rd_pa + rd_len + 0x3fffu) & ~0x3fffu)
+                                  : ((ba_pa + 0x1000u + 0x3fffu) & ~0x3fffu);
+    /* With -Y the disk is below the kernel, so the only thing that can go
+     * wrong is running into it. Say so in those terms rather than as a
+     * generic "does not fit". */
+    if (rd && rd_low) {
+        uint32_t kern_pa = m.vm_low - virt_base + phys_base;
+        if (rd_pa + rd_len > kern_pa) {
+            fprintf(stderr,
+                "-Y: a %u MB RAM disk at 0x%08x overruns the kernel's load "
+                "address 0x%08x.\n"
+                "    The gap below the kernel is (kernel vmaddr 0x%08x - "
+                "virt base 0x%08x) = %u MB;\n"
+                "    lower -V to widen it.\n",
+                rd_len >> 20, rd_pa, kern_pa, m.vm_low, virt_base,
+                (m.vm_low - virt_base) >> 20);
+            return 1;
+        }
+    }
     uint32_t fb_pa = want_fb
         ? ((phys_base + ram_size - fb_bytes) & ~0xfffu)   /* top of DRAM */
         : top_of_kernel_data;
@@ -2032,12 +2492,21 @@ int main(int argc, char **argv) {
         printf("=== GUEST MEMORY BUDGET ===\n");
         printf("  DRAM                 : 0x%08x..0x%08x  %u MB\n",
                phys_base, dram_end, ram_size >> 20);
+        uint32_t kern_pa = m.vm_low - virt_base + phys_base;
+        uint32_t kern_bytes = (rd && rd_low) ? top_of_kernel_data - kern_pa
+                                             : rd_pa - phys_base;
         printf("  kernel image+DT+args : %u.%02u MB\n",
-               (rd_pa - phys_base) >> 20,
-               (((rd_pa - phys_base) & 0xfffffu) * 100u) >> 20);
+               kern_bytes >> 20, ((kern_bytes & 0xfffffu) * 100u) >> 20);
         printf("  RAM disk             : %u.%02u MB%s\n",
                rd_len >> 20, ((rd_len & 0xfffffu) * 100u) >> 20,
-               rd ? "" : "  (none)");
+               rd ? (rd_low ? "  (-Y: at the bottom, below the kernel)" : "")
+                  : "  (none)");
+        if (rd && rd_low) {
+            uint32_t gap = kern_pa - (rd_pa + rd_len);
+            printf("  unused gap           : %u.%02u MB   [-V puts the kernel "
+                   "at 0x%08x; lower it to reclaim this]\n",
+                   gap >> 20, ((gap & 0xfffffu) * 100u) >> 20, kern_pa);
+        }
         printf("  static (below TOKD)  : %u.%02u MB   [never given to the VM]\n",
                kern_static >> 20, ((kern_static & 0xfffffu) * 100u) >> 20);
         printf("  FREE PAGE POOL       : %u.%02u MB   [everything else lives here]\n",

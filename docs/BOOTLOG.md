@@ -640,10 +640,149 @@ chases them:
 - `Bug: launchctl.c:3094 ... value != NULL` — the `boot-args` property lookup
   on `IODeviceTree:/options`, used only to decide whether the boot is verbose.
 
-**The volume has zero free blocks.** `freeBlocks == 0` in the volume header and
-every one of the 105,780 bits in the allocation bitmap is set: Apple ships the
-system dmg sized exactly to its contents. `/` is writable now, but nothing can
-be *allocated* on it until the volume is grown, which is the next wall.
+### The volume had zero free blocks
+
+`freeBlocks == 0` in the volume header and every one of the 105,780 bits in the
+allocation bitmap set: Apple ships the system dmg sized exactly to its contents,
+because on hardware `/` is `disk0s1` and stays read-only forever while
+everything writable lives on `disk0s2` — a volume the restore `newfs`es and
+which this machine does not have. So `/` was writable and nothing could be
+*allocated* on it.
+
+`bootkernel --grow <MB>` (default **32**, `0` disables) grows the volume in the
+**loaded copy** of the RAM disk, so `firmware/rootfs.img` stays as it came out
+of the IPSW. HFS+ is specified in Apple's TN1150 and the image is a bare,
+unencrypted volume, so this is the documented layout applied rather than a
+guess at one — four edits, in `rd_grow_volume()`:
+
+1. `volumeHeader.totalBlocks += n`;
+2. `volumeHeader.freeBlocks` **recounted from the bitmap**, never derived from
+   the growth, so the header cannot end up describing a bitmap that was not
+   written;
+3. the allocation block holding the **reserved tail** moves: the old one is
+   freed, the new one allocated;
+4. the alternate volume header is rewritten at `totalBlocks × blockSize − 1024`.
+
+Step 3 is the one with a trap in it. TN1150 puts the alternate volume header
+1024 bytes before the end of the volume and reserves the final 512; the block
+containing that tail is marked in use and belongs to no file. Walking the
+catalog and the extents overflow file over this image accounts for 105,778 of
+the 105,780 in-use blocks, and the two left over are exactly block 0 (boot
+blocks + primary header) and block 105,779 (the alternate) — and no file
+*could* own that last block, because extents are whole allocation blocks, so an
+owner would own the alternate header's bytes and be scribbled on at every
+flush. When the tail moves, that block becomes ordinary free space.
+
+The 16 KB allocation file is the ceiling: 16384 × 8 = 131,072 bits, a 512 MB
+volume at this block size. `--grow` clamps there and says so. (The headroom
+exists because `newfs_hfs` rounded 105,780 bits up to a whole 4-block clump;
+TN1150 allows a bitmap larger than the volume needs and requires only that the
+surplus bits be zero, which they are.)
+
+Rebuilding the bitmap from scratch — a full catalog walk, which is what
+`fsck_hfs` phase 5 does — reproduces the on-disk bitmap exactly on all 113,971
+blocks of the grown volume, and `freeBlocks` matches the recount: 8191 blocks,
+32.00 MB.
+
+**What the guest says about it.** `fsck_hfs -p` accepts the grown volume and
+launchd goes on to remount `/` read-write, which is the kernel's own HFS mount
+code independently accepting the new `totalBlocks` against the new device size
+(`md0`'s size comes from the same grown buffer, so the volume exactly fills the
+device — which is where `fsck_hfs` looks for the alternate header). But
+`fsck_hfs -p` **quick-exits on a volume carrying `kHFSVolumeUnmounted`**, so
+that is a weaker check than it sounds.
+
+Forcing the full one — clearing the clean bit so preen has to do the real scan
+— does not currently work, and the reason is ours, not the volume's:
+
+```
+Running fsck on the boot volume...
+=== ABNORMAL STOP: UNDEFINED INSTRUCTION ===
+  pc 0x00013130  cpsr 0x60000010 (User, ARM)
+```
+
+`0x13130` is `fsck_hfs+0x12130` (its `__TEXT` is at `0x1000`), and the word
+there is `0xe1660385` — **`SMULBB r6, r3, r5`**. `arm_interp.c` traps the whole
+SMULxy/SMLAxy DSP-multiply space deliberately ("unimplemented — trap rather
+than corrupt Rd"), so `fsck_hfs`'s full-check path cannot run here at all yet.
+That is a core gap worth closing on its own merits: until it is, every `fsck`
+this boot performs is a quick-exit.
+
+So the volume is checked where it actually lives instead. Snapshotting the
+machine at 2.9 G instructions and reading the volume header and allocation
+bitmap straight out of guest DRAM, at the RAM disk's own physical address:
+
+```
+LIVE GUEST VOLUME HEADER (guest DRAM, 2.9 G instructions in)
+  signature HX  version 5  blockSize 4096
+  totalBlocks 113971   freeBlocks 8191   nextAllocation 105779
+  attributes  0x00000000
+live bitmap: 105780 of 113971 blocks in use, 8191 free
+bits set in the newly-added range 105779..113970: [113970]
+```
+
+Every number is the one written into the image, unchanged after billions of
+instructions of guest execution — and the one bit set in the new range is the
+new alternate volume header's block, exactly where TN1150 puts it. The
+interesting field is `attributes`, which the image carries as `0x00000100`
+(`kHFSVolumeUnmounted`) and the guest has **cleared**: that is the kernel's own
+`hfs_mountfs` marking the volume mounted and flushing the header back. Writes
+to `md0` reach the volume, and the volume they reach is the grown one.
+
+`freeBlocks` is still the full 8191, so nothing had been allocated yet at that
+point — though HFS+ updates the on-disk header lazily, so that is evidence of
+"no sync since a write" as much as "no write".
+
+**The free space did not, by itself, change the boot.** Run out to 3 billion
+instructions with and without `--grow`, the console is identical line for line.
+`_execve` stays at 11 either way — but that number was never measuring what it
+looked like it was measuring:
+
+```
+mDNSResponder[14] syscall_builtin_profile: mDNSResponder (seatbelt)
+mDNSResponder[14] Builtin profile: mDNSResponder (seatbelt)
+```
+
+**A LaunchDaemon is running, as pid 14, in both runs.** launchd starts its jobs
+with `posix_spawn`, not `execve`, so the `_execve` probe never sees one; the 11
+hits are `load_init_program` plus the `fwexec()` helpers of launchd's own
+bootstrap. Nothing was stuck at 11. Both runs simply need ~3 G instructions
+rather than 800 M to get there, and both then stall in the same place.
+
+### Where the free space has to come from
+
+Growing the volume comes straight out of the guest's free page pool, because
+the RAM disk is static memory below `topOfKernelData`: 90.93 MB before,
+58.93 MB after, at the documented `-R 512`.
+
+`topOfKernelData` is a single **line**, not a list — everything below it is
+static — so a RAM disk placed *below* the kernel image is exactly as protected
+as one placed above it, and stops pushing that line up by the size of the root
+filesystem. `-Y` does that, and needs `-V` to open a gap under the kernel
+(`phys = vmaddr − virt_base + phys_base`). Measured:
+
+| flags | RAM disk | free page pool | volume free | reaches |
+|---|---|---|---|---|
+| `-R 512` (default) | 445 MB | 58.93 MB | 32 MB | launchd, daemons |
+| `-V 0xa4000000 -R 768 -Y` | 445 MB | 312.14 MB | 32 MB | `BSD root: md0`, then idle |
+| `-V 0xa0000000 -R 768 -Y --grow 100` | 512 MB | 248.14 MB | 98 MB | `BSD root: md0`, then idle |
+
+768 MB is the most DRAM this machine can have: SDRAM base `0x08000000` plus
+768 MB is `0x38000000`, the first peripheral aperture, and the DRAM window
+silently shadows anything it covers. 512 MB is the largest volume the 16 KB
+allocation file can describe. So the last row is the ceiling in both directions
+at once — and it does not work.
+
+**The last column is the point.** Both `-V` rows reach `BSD root: md0` and then
+go idle without ever reaching `_load_init_program`, where the default reaches it
+at ~225 M instructions and execs launchd. The cause is `-V`, not `-Y`: this is
+the failure `bootkernel`'s own `-V` note predicted — `VM_MIN_KERNEL_ADDRESS` is
+compiled into this kernel at `0xc0000000`, and a `gVirtBase` below it puts the
+whole static map in what the pmap believes is user space. Until that is
+understood, the headroom is arithmetic, not usable, which is why `-Y` is off by
+default and labelled an experiment. It is worth understanding, because the
+right-hand columns are the difference between a guest with 59 MB to run in and
+one with 312.
 
 ---
 

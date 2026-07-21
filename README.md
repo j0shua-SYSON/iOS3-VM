@@ -215,6 +215,18 @@ the kernel's zone bootstrap fault. `nand-enable-adm=0` keeps
 further workarounds (the IORTC wait, un-matching the MBX GPU driver) are applied
 automatically and printed in the run header, so they are never invisible.
 
+Two more are applied to the **loaded copy** of the RAM disk — `firmware/rootfs.img`
+itself is never written — and are likewise printed on every run. The guest's
+`/private/etc/fstab` is retargeted at `md0`, because the stock record names a
+`disk0` that only exists behind the undocumented NAND stack (`--keep-fstab` to
+watch launchd halt instead). And the volume is **grown** by `--grow` MB, default
+32: Apple sizes the system dmg exactly to its contents — `freeBlocks == 0` —
+because on hardware everything writable lives on `disk0s2`, which this machine
+does not have, so without this launchd and the daemons cannot create a single
+file. It comes out of the guest's free page pool 1:1; `-Y` (RAM disk below the
+kernel) buys that back several times over. `docs/BOOTLOG.md` has the numbers and
+the TN1150 detail.
+
 ### The tools
 
 | | |
