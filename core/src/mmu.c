@@ -14,9 +14,26 @@
  */
 #include "arm.h"
 
-/* Pack an ARMv6 fault status register value: status in [3:0], domain in [7:4]. */
-static inline uint32_t fsr_make(uint32_t status, unsigned domain) {
-    return (status & 0xfu) | ((domain & 0xfu) << 4);
+/*
+ * Pack an ARMv6 fault status register value: status in [3:0], domain in [7:4],
+ * and WnR in [11].
+ *
+ * DFSR[11] ("W: the abort was caused by a write access", DDI0100I) is not
+ * optional bookkeeping. XNU's sleh_abort tests it to build the fault_type it
+ * hands to arm_fast_fault; with the bit clear, every write fault is repaired as
+ * if it were a read, so the PTE is rewritten with AP=0b10 (privileged RW, user
+ * read-only) and an unprivileged store faults again on exactly the same
+ * instruction, forever.
+ *
+ * This hid for ~230M instructions of boot because privileged writes are
+ * accidentally satisfied by AP=0b10. Only an unprivileged access — STRT/LDRT,
+ * or real user mode — can expose it, and the first one the kernel makes is the
+ * copyout of "/sbin/launchd" into the pid-1 address space.
+ *
+ * IFSR has no WnR field, so the instruction-fetch path must pass write=false.
+ */
+static inline uint32_t fsr_make(uint32_t status, unsigned domain, bool write) {
+    return (status & 0xfu) | ((domain & 0xfu) << 4) | (write ? (1u << 11) : 0u);
 }
 
 /*
@@ -82,19 +99,19 @@ uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, bool write, bool priv,
     unsigned type    = l1 & 3u;
     unsigned domain  = (l1 >> 5) & 0xfu;
 
-    if (type == 0) return fsr_make(ARM_FSR_SECTION_TRANSLATION, 0);
+    if (type == 0) return fsr_make(ARM_FSR_SECTION_TRANSLATION, 0, write);
 
     unsigned dac = (c->cp15.dacr >> (domain * 2u)) & 3u;
     /* 00 = no access, 01 = client (check AP), 10 = reserved, 11 = manager. */
     if (dac == 0u || dac == 2u)
         return fsr_make(type == 2u ? ARM_FSR_SECTION_DOMAIN : ARM_FSR_PAGE_DOMAIN,
-                        domain);
+                        domain, write);
 
     if (type == 2u) {                       /* section or supersection */
         unsigned ap  = (l1 >> 10) & 3u;
         bool     apx = (l1 >> 15) & 1u;
         if (dac != 3u && !ap_permits(ap, apx, write, priv))
-            return fsr_make(ARM_FSR_SECTION_PERMISSION, domain);
+            return fsr_make(ARM_FSR_SECTION_PERMISSION, domain, write);
 
         /*
          * Bit 18 selects a 16 MB supersection, which takes its base from
@@ -115,12 +132,12 @@ uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, bool write, bool priv,
         uint32_t l2      = c->bus->read32(c->bus->ctx, l2_addr);
         unsigned t2      = l2 & 3u;
 
-        if (t2 == 0u) return fsr_make(ARM_FSR_PAGE_TRANSLATION, domain);
+        if (t2 == 0u) return fsr_make(ARM_FSR_PAGE_TRANSLATION, domain, write);
 
         unsigned ap  = (l2 >> 4) & 3u;
         bool     apx = (l2 >> 9) & 1u;
         if (dac != 3u && !ap_permits(ap, apx, write, priv))
-            return fsr_make(ARM_FSR_PAGE_PERMISSION, domain);
+            return fsr_make(ARM_FSR_PAGE_PERMISSION, domain, write);
 
         if (t2 == 1u) *pa = (l2 & 0xffff0000u) | (va & 0x0000ffffu); /* 64 KB */
         else          *pa = (l2 & 0xfffff000u) | (va & 0x00000fffu); /* 4 KB  */
@@ -128,5 +145,5 @@ uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, bool write, bool priv,
     }
 
     /* Supersections and reserved encodings: not modelled yet — fault loudly. */
-    return fsr_make(ARM_FSR_SECTION_TRANSLATION, domain);
+    return fsr_make(ARM_FSR_SECTION_TRANSLATION, domain, write);
 }
