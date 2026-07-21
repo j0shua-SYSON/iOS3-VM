@@ -19,6 +19,7 @@
 #import "VMGuest.h"
 
 #import <QuartzCore/QuartzCore.h>
+#import <libkern/OSCacheControl.h>
 #import <math.h>
 #import <stdlib.h>
 #import <string.h>
@@ -234,12 +235,36 @@ static const NSUInteger kConsoleScrollback = 12000;
                     && (flags & CS_DEBUGGED);
     [self append:[NSString stringWithFormat:@"CS_DEBUGGED : %@", debugged ? @"YES" : @"no"]];
 
-    // On A9 (no APRR) a plain RWX mapping is all the future dynarec needs.
+    // On A9 (no APRR/PAC/PPL) a plain RWX mapping is all the future dynarec
+    // needs — but a successful mmap does NOT prove that. The kernel can hand
+    // back a page that is writable and looks executable, and still fault the
+    // instant it is branched to. The only conclusive test is to emit real
+    // arm64 and call it, so that is what we do.
     void *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
                       MAP_PRIVATE | MAP_ANON, -1, 0);
     BOOL rwx = (page != MAP_FAILED);
     [self append:[NSString stringWithFormat:@"RWX mmap    : %@",
-                  rwx ? @"YES  (dynarec-ready)" : @"no"]];
+                  rwx ? @"YES" : @"no"]];
+#if defined(__arm64__)
+    if (rwx) {
+        uint32_t *code = (uint32_t *)page;
+        code[0] = 0x52824680u;   /* movz w0, #0x1234 */
+        code[1] = 0xd65f03c0u;   /* ret              */
+        // Writes land in D-cache; the fetch side will not see them without this.
+        sys_icache_invalidate(page, 2 * sizeof(uint32_t));
+
+        // Printed BEFORE the call on purpose: if the branch faults, the process
+        // dies here and this is the last line on screen, which is itself the
+        // answer. A missing verdict line means "no".
+        [self append:@"JIT execute : calling emitted code…"];
+        uint32_t got = ((uint32_t (*)(void))page)();
+        [self append:[NSString stringWithFormat:@"JIT execute : %@ (got 0x%04x)",
+                      got == 0x1234u ? @"YES  — dynarec viable"
+                                     : @"ran, but WRONG RESULT", got]];
+    }
+#else
+    if (rwx) [self append:@"JIT execute : skipped (host is not arm64)"];
+#endif
     if (rwx) munmap(page, 4096);
 
     [self append:[NSString stringWithFormat:@"footprint   : %.1f MB at launch",
