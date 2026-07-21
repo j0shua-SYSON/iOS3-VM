@@ -173,6 +173,26 @@ typedef enum {
 } arm_status_t;
 
 /*
+ * Result from the optional privileged-SVC host hook below. Only the exact
+ * HANDLED value consumes the instruction. UNHANDLED and values not named by
+ * this enum take the ordinary guest SVC exception. ERROR stops arm_step with
+ * ARM_HALT after rolling back CPU changes, so a failed host service cannot be
+ * mistaken for a guest syscall or let execution continue.
+ */
+typedef enum {
+    ARM_SVC_UNHANDLED = 0,
+    ARM_SVC_HANDLED   = 1,
+    ARM_SVC_ERROR     = -1
+} arm_svc_result_t;
+
+struct arm_cpu;
+
+typedef arm_svc_result_t (*arm_privileged_svc_handler_t)(void *ctx,
+                                                          struct arm_cpu *cpu,
+                                                          uint32_t pc,
+                                                          uint32_t encoding);
+
+/*
  * The system bus. The CPU is agnostic about what lives behind these; the test
  * harness supplies flat RAM, the machine layer supplies the S5L8900 memory map.
  * All accesses are little-endian, matching the guest.
@@ -199,6 +219,30 @@ typedef struct arm_bus {
      * bit.  The WFI itself still retires exactly once.
      */
     bool     (*wait_for_interrupt)(void *ctx);
+
+    /*
+     * Optional host-service seam for an SVC executed from a privileged mode.
+     * User-mode SVCs never reach this callback. `pc` is the exact address of
+     * the current instruction and `encoding` is the raw A32 word or the
+     * zero-extended Thumb halfword. The callback receives the separate
+     * privileged_svc_ctx and the CPU in its pre-exception state, including
+     * CPSR mode/T and all registers.
+     *
+     * ARM_SVC_HANDLED commits CPU-register changes and retires sequentially
+     * past the SVC. The core writes r15=pc+4 for A32 or r15=pc+2 for Thumb
+     * afterward, so a callback's r15 write is deliberately not retained.
+     * ARM_SVC_UNHANDLED and unknown values roll the CPU back and follow the
+     * normal guest exception path. ARM_SVC_ERROR rolls back and makes
+     * arm_step return ARM_HALT without entering the guest exception handler
+     * or retiring the SVC; PC and the retired-instruction count stay fixed.
+     *
+     * Validate every argument, range, and operation before causing platform
+     * side effects through privileged_svc_ctx. CPU state is transactional,
+     * but the core cannot undo host I/O. Both fields are host-owned runtime
+     * configuration and are deliberately excluded from snapshots.
+     */
+    arm_privileged_svc_handler_t privileged_svc_handler;
+    void                         *privileged_svc_ctx;
 } arm_bus_t;
 
 /*
@@ -315,6 +359,11 @@ void arm_set_mode(arm_cpu_t *cpu, uint32_t mode);
 
 /* Put the core into a defined post-reset state (SVC mode, IRQ/FIQ masked). */
 void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus);
+
+/* Install or clear the optional privileged-SVC host-service callback. */
+void arm_bus_set_privileged_svc_handler(arm_bus_t *bus,
+                                        arm_privileged_svc_handler_t handler,
+                                        void *handler_ctx);
 
 /* Fetch, decode, and execute exactly one instruction. */
 arm_status_t arm_step(arm_cpu_t *cpu);

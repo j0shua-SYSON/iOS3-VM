@@ -116,11 +116,12 @@ SNAP_SIZE_GUARD(s5l_clcd_t,        3360,  "snap_clcd");
 SNAP_SIZE_GUARD(s5l_nor_entry_t,   12,    "snap_nor");
 SNAP_SIZE_GUARD(s5l_nor_t,         208,   "snap_nor");
 SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
-/* arm_bus_t's optional WFI platform callback is a host function pointer.  It
- * grows the containing machine ABI but is deliberately excluded from MACH for
- * the same reason as every other bus callback; snapshot_load preserves the
- * live machine's vtable.  The byte format therefore does not change. */
-SNAP_SIZE_GUARD(s5l8900_t,         15776, "snap_mach");
+/* arm_bus_t's optional WFI and privileged-SVC hooks plus their contexts are
+ * host-owned runtime configuration. They grow the containing machine ABI but
+ * are deliberately excluded from MACH for the same reason as every other bus
+ * callback; snapshot_load preserves the live machine's hooks and dedicated
+ * privileged-SVC context. The byte format therefore does not change. */
+SNAP_SIZE_GUARD(s5l8900_t,         15792, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
@@ -411,7 +412,8 @@ static void snap_nor(sn_io_t *io, s5l_nor_t *n) {
  * CPU (each of which has its own section).
  *
  * Deliberately NOT serialised: `cpu` (own section), `bus` (host function
- * pointers — a tool may have interposed on them), `ram` (host allocation),
+ * pointers and callback contexts — a tool may have interposed on them),
+ * `ram` (host allocation),
  * `nor.data` and `stubs[].regs`/`stubs[].name` (host allocations / string
  * literals). ram_base/ram_size live in GEOM.
  */
@@ -832,8 +834,9 @@ static snapshot_status_t snap_apply(s5l8900_t *m, FILE *f,
     if (io.err != SNAP_OK) return io.err;
     if (io.pos - body_start != plen) return SNAP_ERR_CORRUPT;
 
-    /* Host-owned wiring the visitors deliberately never touched. Re-pointing
-     * the CPU at the live machine's bus is what makes restoring underneath an
+    /* Host-owned wiring the visitors deliberately never touched, including
+     * the privileged-SVC hook and its dedicated context. Re-pointing the CPU
+     * at the live machine's bus is what makes restoring underneath an
      * interposed bus (bootkernel's tracing wrapper) work. */
     m->cpu.bus = &m->bus;
     m->bus.ctx = m;

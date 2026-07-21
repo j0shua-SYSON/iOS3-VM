@@ -33,6 +33,37 @@ static inline bool cpu_is_priv(const arm_cpu_t *c) {
 }
 
 /*
+ * Give an explicitly opted-in platform one chance to consume a privileged
+ * SVC as a host service. The architectural CPU state is transactional: any
+ * result other than HANDLED discards callback register changes. ERROR remains
+ * distinct so arm_step can stop instead of misreading failed host I/O as an
+ * ordinary guest SVC. Platform state reached through the callback context is
+ * outside the CPU's control and is covered by the contract in arm.h.
+ */
+static arm_svc_result_t privileged_svc_result(arm_cpu_t *c, uint32_t pc,
+                                               uint32_t encoding) {
+    if (!cpu_is_priv(c) || c->bus->privileged_svc_handler == NULL)
+        return ARM_SVC_UNHANDLED;
+
+    arm_cpu_t saved = *c;
+    arm_svc_result_t result =
+        c->bus->privileged_svc_handler(c->bus->privileged_svc_ctx,
+                                       c, pc, encoding);
+    if (result == ARM_SVC_HANDLED) return ARM_SVC_HANDLED;
+
+    *c = saved;
+    if (result == ARM_SVC_ERROR) {
+        /* arm_step counted the SVC before decode, but a failed host service
+         * did not retire and the machine will not tick devices after HALT.
+         * Unsigned decrement deliberately reverses the increment even when
+         * the pre-step count was UINT64_MAX and that increment wrapped to 0. */
+        c->cycles--;
+        return ARM_SVC_ERROR;
+    }
+    return ARM_SVC_UNHANDLED;
+}
+
+/*
  * Data-side memory accessors. Every guest load/store goes through translation;
  * a fault is latched on the CPU and converted into a data abort by arm_step
  * once the instruction finishes.
@@ -708,6 +739,13 @@ void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
     cpu->cpsr   = ARM_MODE_SVC | ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_A;
     cpu->cycles = 0;
     cpu->bus    = bus;
+}
+
+void arm_bus_set_privileged_svc_handler(arm_bus_t *bus,
+                                        arm_privileged_svc_handler_t handler,
+                                        void *handler_ctx) {
+    bus->privileged_svc_handler = handler;
+    bus->privileged_svc_ctx = handler != NULL ? handler_ctx : NULL;
 }
 
 bool arm_cond_passed(const arm_cpu_t *c, uint32_t cond) {
@@ -1973,7 +2011,11 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
     case 0xd: {
         unsigned cond = (insn >> 8) & 0xfu;
         if (cond == 0xf) {                   /* SWI */
-            take_exception(c, ARM_VEC_SWI, ARM_MODE_SVC, pc + 2, false, next);
+            arm_svc_result_t result =
+                privileged_svc_result(c, pc, (uint32_t)insn);
+            if (result == ARM_SVC_ERROR) return ARM_HALT;
+            if (result != ARM_SVC_HANDLED)
+                take_exception(c, ARM_VEC_SWI, ARM_MODE_SVC, pc + 2, false, next);
             return ARM_OK;
         }
         if (cond == 0xe) return ARM_UNDEFINED;   /* permanently undefined */
@@ -2063,6 +2105,7 @@ arm_status_t arm_step(arm_cpu_t *c) {
         uint32_t tnext = pc + 2;
         c->cycles++;
         arm_status_t tst = thumb_step(c, pc, tinsn, &tnext);
+        if (tst == ARM_HALT) return ARM_HALT;
         if (c->abort_pending) {
             take_pending_data_abort(c, pc);
             return ARM_OK;
@@ -2483,7 +2526,10 @@ arm_status_t arm_step(arm_cpu_t *c) {
          * counterpart and so reach the unit directly. */
         st = vfp_execute(c, pc, insn, &g_vfp_bus);
     } else if ((insn & 0x0f000000u) == 0x0f000000u) {     /* SWI / SVC */
-        take_exception(c, ARM_VEC_SWI, ARM_MODE_SVC, pc + 4, false, &next);
+        arm_svc_result_t result = privileged_svc_result(c, pc, insn);
+        if (result == ARM_SVC_ERROR) return ARM_HALT;
+        if (result != ARM_SVC_HANDLED)
+            take_exception(c, ARM_VEC_SWI, ARM_MODE_SVC, pc + 4, false, &next);
     } else if ((insn & 0x0c000000u) == 0x00000000u) {     /* data processing / PSR */
         st = exec_data_processing(c, pc, insn, &next);
     } else {

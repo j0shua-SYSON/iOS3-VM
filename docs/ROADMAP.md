@@ -628,9 +628,13 @@ still runs only a synthetic guest and has no touch or audio path.
   but such headroom is still unsafe for an iOS host and the roughly 445 MiB
   pinned disk remains a major architecture frontier. The audit has ruled out a
   simple external PA aperture: `_bcopy_phys` converts both operands through one
-  fixed DRAM direct-map delta. The selected near-term design is a writable,
-  range-gated bulk-copy path limited to md strategy, with snapshot identity and
-  overlay state; global `_bcopy_phys` replacement is forbidden. Historical
+  fixed DRAM direct-map delta. The portable bounded writable-block API and
+  privileged-only, transactional SVC seam are now implemented and tested, but
+  they are not yet wired to the guest. The selected near-term integration is a
+  writable, range-gated bulk-copy path limited to md strategy, with snapshot
+  identity and overlay state; global `_bcopy_phys` replacement is forbidden.
+  The raw `/dev/rmd0` path instead reaches `_uiomove64`/`_copypv`, so it must be
+  separately instrumented and fail closed until bridged. Historical
   older-source experiments reported 312 MiB and
   248 MiB pools with `-R 768 -Y`, but neither reached `_load_init_program` and
   current source correctly rejects both configurations because their RAM

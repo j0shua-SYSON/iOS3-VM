@@ -133,18 +133,28 @@ guest memory without baking a desktop file API into the core. The old `UXTB16` s
 is now replay-cleared by a complete paired-extend implementation.
 
 The audited near-term storage design retains the proven md0/HFS path but moves
-its writable bytes behind a portable block backend. Three exact, hash-gated
-7E18 guest patches select md physical mode and replace only md strategy's two
-`_bcopy_phys` calls with privileged, range-gated bulk-copy exits. A plain
+its writable bytes behind a portable block backend. The core now has exact
+64-bit ranged reads/writes, bounded host callback sizes, flush, cancellation,
+and explicit identity/generation metadata. Its ARM bus also has a
+privileged-only SVC seam: handled calls retire normally, ordinary calls remain
+guest SVCs, and backend errors restore CPU state and halt without incrementing
+the retired-instruction counter. Neither foundation is wired to md0 yet.
+
+The boot integration uses three exact, kernel-identity-gated 7E18 patches to
+select md physical mode and replace only md strategy's two `_bcopy_phys` calls
+with privileged, range-gated bulk-copy exits. A plain
 external physical aperture is not sufficient because this kernel's
 `_bcopy_phys` converts both operands through the fixed DRAM direct-map delta and
 calls ordinary `_bcopy`; it never reaches the emulator bus. The portable layer
-therefore needs exact 64-bit ranged reads/writes, flush, cancellation, bounded
-cache, immutable source plus generational COW, and snapshot coupling to backing
-identity and overlay generation. Backend failure pauses the VM visibly; it must
-never be converted to zero-filled successful I/O. A future IOMedia device or
-full NAND/VFL/FTL model can replace this compatibility seam without changing
-the block/session API.
+still needs a host adapter, immutable source plus generational COW, and snapshot
+coupling to backing identity and overlay generation. Backend failure pauses the
+VM visibly; it must never be converted to zero-filled successful I/O.
+`/dev/rmd0` is a separate raw-character path through `_uiomove64`/`_copypv`, not
+one of the two strategy calls, so host-md mode must instrument and refuse that
+path until it has its own proven bridge. Merely setting fstab's pass number to
+zero can be a labelled boot diagnostic, not a claim of raw-I/O or crash-recovery
+support. A future IOMedia device or full NAND/VFL/FTL model can replace this
+compatibility seam without changing the block/session API.
 
 In the planned shared-session design, host services cross explicit non-blocking
 seams: frame descriptors out; bounded touch, PCM and network queues in/out;

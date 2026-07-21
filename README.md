@@ -142,9 +142,13 @@ layout safe: the roughly 445 MiB pinned RAM disk consumes pages that a real
 device would keep on storage. The
 host-backed-storage audit ruled out merely relocating md0 or flipping its
 physical-mode flag: this kernel's `_bcopy_phys` only understands the normal
-DRAM direct map. The practical route is a narrow, writable, range-checked bulk
-copy bridge for md strategy I/O, with the backing identity and overlay included
-in snapshots. That remains a major device-memory prerequisite.
+DRAM direct map. The portable exact-I/O block API and a privileged-only,
+fail-closed SVC host-service seam now exist and are host-tested; backend errors
+halt without falsely retiring the trapping instruction. They are foundations,
+not a mounted external disk yet. The remaining boot integration is a narrow,
+writable, range-checked bulk-copy bridge for md strategy I/O, plus explicit
+handling of the separate raw `/dev/rmd0` path and snapshot-coupled immutable
+backing/overlay generations. That remains a major device-memory prerequisite.
 
 That is sustained real userspace, not a completed boot. There is still no
 captured SpringBoard frame, no proof that the current userland reached the home

@@ -30,13 +30,50 @@ static void m_w16(void *ctx, uint32_t a, uint16_t v){ (void)ctx; if(a==g_watch_a
 static void m_w8 (void *ctx, uint32_t a, uint8_t  v){ (void)ctx; if(a==g_watch_addr)g_watch_writes8++; g_ram[a&(RAM_SIZE-1)]=v; }
 
 static const arm_bus_t g_bus = {
-    NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8, NULL
+    NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8, NULL, NULL, NULL
 };
 
 static bool count_wfi(void *ctx) {
     unsigned *calls = ctx;
     (*calls)++;
     return false;                 /* exercise the core's non-blocking fallback */
+}
+
+typedef struct svc_probe {
+    arm_svc_result_t result;
+    arm_cpu_t       *expected_cpu;
+    unsigned         calls;
+    uint32_t         seen_pc;
+    uint32_t         seen_encoding;
+    uint32_t         seen_cpsr;
+    uint32_t         seen_r0;
+    uint32_t         seen_cpu_pc;
+    bool             saw_expected_cpu;
+    bool             mutate;
+} svc_probe_t;
+
+static arm_svc_result_t probe_privileged_svc(void *ctx, arm_cpu_t *cpu,
+                                              uint32_t pc,
+                                              uint32_t encoding) {
+    svc_probe_t *probe = ctx;
+    probe->calls++;
+    probe->seen_pc = pc;
+    probe->seen_encoding = encoding;
+    probe->seen_cpsr = cpu->cpsr;
+    probe->seen_r0 = cpu->r[0];
+    probe->seen_cpu_pc = cpu->r[15];
+    probe->saw_expected_cpu = cpu == probe->expected_cpu;
+
+    if (probe->mutate) {
+        cpu->r[0] = 0xfeed0001u;
+        cpu->r[7] = 0xfeed0007u;
+        cpu->r[15] = 0xfeed0015u;
+        cpu->cp15.context_id = 0xfeedc013u;
+        cpu->cpsr ^= ARM_CPSR_N;
+        cpu->excl_valid = false;
+        cpu->excl_addr = 0xfeedeeeeu;
+    }
+    return probe->result;
 }
 
 /* ------------------------------------------------------------- test runner */
@@ -3408,6 +3445,308 @@ static void user_mode_at(arm_cpu_t *c, const uint32_t *prog, size_t words,
     c->r[15] = pc;
 }
 
+static arm_bus_t bus_with_svc_probe(svc_probe_t *probe) {
+    arm_bus_t bus = g_bus;
+    arm_bus_set_privileged_svc_handler(&bus, probe_privileged_svc, probe);
+    return bus;
+}
+
+static void test_privileged_svc_hook_handles_a32(void) {
+    const uint32_t svc = 0xefabc123u;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0x100u, svc);
+
+    svc_probe_t probe = {0};
+    probe.result = ARM_SVC_HANDLED;
+    probe.mutate = true;
+    arm_bus_t bus = bus_with_svc_probe(&probe);
+    arm_cpu_t c;
+    arm_reset(&c, &bus);
+    arm_set_mode(&c, ARM_MODE_SYS);
+    c.cpsr = ARM_MODE_SYS | ARM_CPSR_Z | ARM_CPSR_C;
+    c.r[0] = 0x12345678u;
+    c.r[7] = 0x77777777u;
+    c.r[15] = 0x100u;
+    c.cp15.context_id = 0x13572468u;
+    c.excl_valid = true;
+    c.excl_addr = 0x400u;
+    c.spsr[ARM_BANK_SVC] = 0xa5a5a5a5u;
+    c.bank_r14[ARM_BANK_SVC] = 0x5a5a5a5au;
+    probe.expected_cpu = &c;
+
+    arm_status_t st = arm_step(&c);
+    CHECK(st == ARM_OK && probe.calls == 1u,
+          "status=%d calls=%u expect handled OK/1", (int)st, probe.calls);
+    CHECK(probe.saw_expected_cpu, "hook did not receive the live CPU object");
+    CHECK(probe.seen_pc == 0x100u && probe.seen_cpu_pc == 0x100u,
+          "pc arg=%08x cpu.pc=%08x expect exact current PC 00000100",
+          probe.seen_pc, probe.seen_cpu_pc);
+    CHECK(probe.seen_encoding == svc,
+          "encoding=%08x expect raw A32 word %08x", probe.seen_encoding, svc);
+    CHECK(probe.seen_cpsr == (ARM_MODE_SYS | ARM_CPSR_Z | ARM_CPSR_C),
+          "cpsr seen=%08x expect pre-exception SYS state", probe.seen_cpsr);
+    CHECK(probe.seen_r0 == 0x12345678u,
+          "r0 seen=%08x expect complete pre-hook register state", probe.seen_r0);
+    CHECK(c.r[15] == 0x104u && c.cycles == 1u,
+          "pc=%08x cycles=%llu expect sequentially retired A32 SVC",
+          c.r[15], (unsigned long long)c.cycles);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SYS &&
+          (c.cpsr & ARM_CPSR_N) != 0u,
+          "handled SVC must stay in SYS and commit hook CPSR changes (%08x)",
+          c.cpsr);
+    CHECK(c.r[0] == 0xfeed0001u && c.r[7] == 0xfeed0007u &&
+          c.cp15.context_id == 0xfeedc013u,
+          "handled hook register writes were not committed");
+    CHECK(c.spsr[ARM_BANK_SVC] == 0xa5a5a5a5u &&
+          c.bank_r14[ARM_BANK_SVC] == 0x5a5a5a5au,
+          "handled host service must not enter or alter the SVC exception bank");
+}
+
+static void test_privileged_svc_hook_nonhandled_is_transactional(void) {
+    static const arm_svc_result_t results[] = {
+        ARM_SVC_UNHANDLED,
+        (arm_svc_result_t)7
+    };
+    const uint32_t svc = 0xef765432u;
+
+    for (size_t i = 0; i < sizeof results / sizeof results[0]; i++) {
+        memset(g_ram, 0, sizeof g_ram);
+        m_w32(NULL, 0, svc);
+        svc_probe_t probe = {0};
+        probe.result = results[i];
+        probe.mutate = true;
+        arm_bus_t bus = bus_with_svc_probe(&probe);
+        arm_cpu_t c;
+        arm_reset(&c, &bus);
+        arm_set_mode(&c, ARM_MODE_IRQ);
+        const uint32_t old_cpsr = ARM_MODE_IRQ | ARM_CPSR_C;
+        c.cpsr = old_cpsr;
+        c.r[0] = 0x01020304u;
+        c.r[7] = 0x07070707u;
+        c.cp15.context_id = 0x89abcdefu;
+        c.excl_valid = true;
+        c.excl_addr = 0x400u;
+        probe.expected_cpu = &c;
+
+        arm_status_t st = arm_step(&c);
+        CHECK(st == ARM_OK && probe.calls == 1u,
+              "case %u status=%d calls=%u expect callback then guest SVC",
+              (unsigned)i, (int)st, probe.calls);
+        CHECK(probe.saw_expected_cpu && probe.seen_pc == 0u &&
+              probe.seen_cpu_pc == 0u && probe.seen_encoding == svc,
+              "case %u callback did not receive exact CPU/PC/encoding",
+              (unsigned)i);
+        CHECK(c.r[15] == ARM_VEC_SWI &&
+              (c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC && c.r[14] == 4u &&
+              c.cycles == 1u,
+              "case %u did not fail closed through the ordinary SVC vector",
+              (unsigned)i);
+        CHECK(c.spsr[ARM_BANK_SVC] == old_cpsr,
+              "case %u SPSR=%08x expect pristine pre-hook CPSR %08x",
+              (unsigned)i, c.spsr[ARM_BANK_SVC], old_cpsr);
+        CHECK(c.r[0] == 0x01020304u && c.r[7] == 0x07070707u &&
+              c.cp15.context_id == 0x89abcdefu,
+              "case %u leaked a declined/unknown hook's CPU mutations",
+              (unsigned)i);
+        CHECK(!c.excl_valid,
+              "case %u must still clear the monitor on ordinary exception entry",
+              (unsigned)i);
+    }
+}
+
+static void test_privileged_svc_hook_a32_error_halts_transactionally(void) {
+    const uint32_t svc = 0xef2468acu;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, svc);
+    svc_probe_t probe = {0};
+    probe.result = ARM_SVC_ERROR;
+    probe.mutate = true;
+    arm_bus_t bus = bus_with_svc_probe(&probe);
+    arm_cpu_t c;
+    arm_reset(&c, &bus);
+    arm_set_mode(&c, ARM_MODE_IRQ);
+    const uint32_t old_cpsr = ARM_MODE_IRQ | ARM_CPSR_C;
+    c.cpsr = old_cpsr;
+    c.r[0] = 0x01020304u;
+    c.r[7] = 0x07070707u;
+    c.r[14] = 0x14141414u;
+    c.cp15.context_id = 0x89abcdefu;
+    c.excl_valid = true;
+    c.excl_addr = 0x400u;
+    c.spsr[ARM_BANK_SVC] = 0xa5a5a5a5u;
+    c.bank_r14[ARM_BANK_SVC] = 0x51515151u;
+    c.cycles = UINT64_MAX;              /* increment wraps; ERROR must undo it */
+    probe.expected_cpu = &c;
+
+    arm_status_t st = arm_step(&c);
+    CHECK(st == ARM_HALT && probe.calls == 1u,
+          "A32 ERROR status=%d calls=%u expect HALT/1", (int)st, probe.calls);
+    CHECK(probe.saw_expected_cpu && probe.seen_pc == 0u &&
+          probe.seen_cpu_pc == 0u && probe.seen_encoding == svc,
+          "A32 ERROR callback did not receive exact CPU/PC/encoding");
+    CHECK(c.r[15] == 0u && c.cycles == UINT64_MAX && c.cpsr == old_cpsr,
+          "A32 ERROR pc=%08x cycles=%llu cpsr=%08x must not retire the SVC",
+          c.r[15], (unsigned long long)c.cycles, c.cpsr);
+    CHECK(c.r[0] == 0x01020304u && c.r[7] == 0x07070707u &&
+          c.r[14] == 0x14141414u && c.cp15.context_id == 0x89abcdefu,
+          "A32 ERROR leaked callback register mutations");
+    CHECK(c.excl_valid && c.excl_addr == 0x400u,
+          "A32 ERROR must restore the pre-hook exclusive monitor");
+    CHECK(c.spsr[ARM_BANK_SVC] == 0xa5a5a5a5u &&
+          c.bank_r14[ARM_BANK_SVC] == 0x51515151u,
+          "A32 ERROR must not enter or alter the guest SVC exception bank");
+}
+
+static void test_privileged_svc_hook_obeys_a32_guards(void) {
+    svc_probe_t probe = {0};
+    probe.result = ARM_SVC_HANDLED;
+    arm_bus_t bus = bus_with_svc_probe(&probe);
+
+    /* User SVC is always owned by the guest, even when a host callback says it
+     * would handle that encoding. */
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, 0xef000080u);
+    arm_cpu_t c;
+    arm_reset(&c, &bus);
+    arm_set_mode(&c, ARM_MODE_USR);
+    c.cpsr = ARM_MODE_USR;
+    probe.expected_cpu = &c;
+    arm_step(&c);
+    CHECK(probe.calls == 0u, "user-mode A32 SVC called the privileged hook");
+    CHECK(c.r[15] == ARM_VEC_SWI &&
+          (c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC && c.r[14] == 4u,
+          "user A32 SVC must retain the ordinary guest exception path");
+
+    /* EQ SVC with Z clear is a condition-failed instruction, not a service
+     * request. It retires without either callback or exception. */
+    probe.calls = 0;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, 0x0f13579bu);
+    arm_reset(&c, &bus);
+    arm_set_mode(&c, ARM_MODE_SYS);
+    c.cpsr = ARM_MODE_SYS;                    /* Z clear: EQ fails */
+    probe.expected_cpu = &c;
+    arm_status_t st = arm_step(&c);
+    CHECK(st == ARM_OK && probe.calls == 0u && c.r[15] == 4u,
+          "condition-failed SVC status=%d calls=%u pc=%08x expect OK/0/4",
+          (int)st, probe.calls, c.r[15]);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SYS,
+          "condition-failed SVC incorrectly entered mode %02x",
+          c.cpsr & ARM_CPSR_MODE_MASK);
+
+    /* Clearing the bus hook must clear its independent context too and restore
+     * the byte-for-byte default privileged SVC path. */
+    arm_bus_set_privileged_svc_handler(&bus, NULL, &probe);
+    CHECK(bus.privileged_svc_handler == NULL && bus.privileged_svc_ctx == NULL,
+          "clearing the SVC hook left a handler or dangling context");
+    probe.calls = 0;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, 0xef000000u);
+    arm_reset(&c, &bus);
+    arm_set_mode(&c, ARM_MODE_SYS);
+    c.cpsr = ARM_MODE_SYS;
+    st = arm_step(&c);
+    CHECK(st == ARM_OK && probe.calls == 0u && c.r[15] == ARM_VEC_SWI &&
+          (c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC,
+          "cleared hook did not restore the ordinary privileged SVC path");
+}
+
+static void test_privileged_svc_hook_handles_thumb(void) {
+    const uint16_t svc = 0xdfa5u;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w16(NULL, 0x100u, svc);
+    svc_probe_t probe = {0};
+    probe.result = ARM_SVC_HANDLED;
+    probe.mutate = true;
+    arm_bus_t bus = bus_with_svc_probe(&probe);
+    arm_cpu_t c;
+    arm_reset(&c, &bus);
+    arm_set_mode(&c, ARM_MODE_SYS);
+    c.cpsr = ARM_MODE_SYS | ARM_CPSR_T | ARM_CPSR_Z;
+    c.r[0] = 0x2468ace0u;
+    c.r[15] = 0x100u;
+    c.spsr[ARM_BANK_SVC] = 0x55aa55aau;
+    probe.expected_cpu = &c;
+
+    arm_status_t st = arm_step(&c);
+    CHECK(st == ARM_OK && probe.calls == 1u && probe.saw_expected_cpu,
+          "Thumb handled status=%d calls=%u", (int)st, probe.calls);
+    CHECK(probe.seen_pc == 0x100u && probe.seen_cpu_pc == 0x100u &&
+          probe.seen_encoding == (uint32_t)svc,
+          "Thumb hook saw pc=%08x cpu.pc=%08x encoding=%08x",
+          probe.seen_pc, probe.seen_cpu_pc, probe.seen_encoding);
+    CHECK((probe.seen_cpsr & (ARM_CPSR_MODE_MASK | ARM_CPSR_T)) ==
+          (ARM_MODE_SYS | ARM_CPSR_T) && probe.seen_r0 == 0x2468ace0u,
+          "Thumb hook did not see the exact ISA/mode/register state");
+    CHECK(c.r[15] == 0x102u && c.cycles == 1u &&
+          (c.cpsr & (ARM_CPSR_MODE_MASK | ARM_CPSR_T)) ==
+          (ARM_MODE_SYS | ARM_CPSR_T),
+          "handled Thumb SVC did not retire sequentially in Thumb/SYS");
+    CHECK(c.r[0] == 0xfeed0001u && c.cp15.context_id == 0xfeedc013u,
+          "handled Thumb hook writes were not committed");
+    CHECK(c.spsr[ARM_BANK_SVC] == 0x55aa55aau,
+          "handled Thumb SVC incorrectly entered the SVC exception bank");
+}
+
+static void test_privileged_svc_hook_thumb_error_and_user_guard(void) {
+    const uint16_t svc = 0xdf3cu;
+    svc_probe_t probe = {0};
+    probe.result = ARM_SVC_ERROR;
+    probe.mutate = true;
+    arm_bus_t bus = bus_with_svc_probe(&probe);
+
+    memset(g_ram, 0, sizeof g_ram);
+    m_w16(NULL, 0x100u, svc);
+    arm_cpu_t c;
+    arm_reset(&c, &bus);
+    arm_set_mode(&c, ARM_MODE_SYS);
+    const uint32_t old_cpsr = ARM_MODE_SYS | ARM_CPSR_T | ARM_CPSR_C;
+    c.cpsr = old_cpsr;
+    c.r[0] = 0x11223344u;
+    c.r[7] = 0x55667788u;
+    c.r[14] = 0x14141414u;
+    c.r[15] = 0x100u;
+    c.cp15.context_id = 0x10203040u;
+    c.excl_valid = true;
+    c.excl_addr = 0x400u;
+    c.spsr[ARM_BANK_SVC] = 0xa5a5a5a5u;
+    c.bank_r14[ARM_BANK_SVC] = 0x51515151u;
+    c.cycles = UINT64_MAX;              /* increment wraps; ERROR must undo it */
+    probe.expected_cpu = &c;
+    arm_status_t st = arm_step(&c);
+    CHECK(st == ARM_HALT && probe.calls == 1u &&
+          probe.seen_encoding == (uint32_t)svc,
+          "Thumb ERROR status=%d calls=%u encoding=%08x expect HALT/1/%04x",
+          (int)st, probe.calls, probe.seen_encoding, svc);
+    CHECK(c.r[15] == 0x100u && c.cycles == UINT64_MAX && c.cpsr == old_cpsr,
+          "Thumb ERROR pc=%08x cycles=%llu cpsr=%08x must not retire the SVC",
+          c.r[15], (unsigned long long)c.cycles, c.cpsr);
+    CHECK(c.r[0] == 0x11223344u && c.r[7] == 0x55667788u &&
+          c.r[14] == 0x14141414u && c.cp15.context_id == 0x10203040u,
+          "Thumb ERROR leaked callback register mutations");
+    CHECK(c.excl_valid && c.excl_addr == 0x400u,
+          "Thumb ERROR must restore the pre-hook exclusive monitor");
+    CHECK(c.spsr[ARM_BANK_SVC] == 0xa5a5a5a5u &&
+          c.bank_r14[ARM_BANK_SVC] == 0x51515151u,
+          "Thumb ERROR must not enter or alter the guest SVC exception bank");
+
+    /* Thumb has no condition field, but it has the same hard User-mode gate. */
+    memset(g_ram, 0, sizeof g_ram);
+    m_w16(NULL, 0x100u, svc);
+    probe.calls = 0;
+    probe.result = ARM_SVC_HANDLED;
+    arm_reset(&c, &bus);
+    arm_set_mode(&c, ARM_MODE_USR);
+    c.cpsr = ARM_MODE_USR | ARM_CPSR_T;
+    c.r[15] = 0x100u;
+    probe.expected_cpu = &c;
+    st = arm_step(&c);
+    CHECK(probe.calls == 0u, "user-mode Thumb SVC called the privileged hook");
+    CHECK(st == ARM_OK && c.r[15] == ARM_VEC_SWI && c.r[14] == 0x102u &&
+          (c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC,
+          "user Thumb SVC must retain the ordinary guest exception path");
+}
+
 static void test_swi_entry_state_from_user_mode(void) {
     /* The full ARM ARM (ARMv6, A2.6.4) entry contract for SWI, taken from User
      * mode — the only mode it will ever be taken from once launchd runs. */
@@ -4271,6 +4610,12 @@ int main(void) {
     test_vfp_sysreg_access_follows_fpexc();
     test_vfp_cpacr_denial_vectors();
     test_vfp_lazy_trap_cannot_loop();
+    test_privileged_svc_hook_handles_a32();
+    test_privileged_svc_hook_nonhandled_is_transactional();
+    test_privileged_svc_hook_a32_error_halts_transactionally();
+    test_privileged_svc_hook_obeys_a32_guards();
+    test_privileged_svc_hook_handles_thumb();
+    test_privileged_svc_hook_thumb_error_and_user_guard();
     test_swi_entry_state_from_user_mode();
     test_thumb_swi_lr_is_the_next_halfword();
     test_irq_sets_a_but_swi_does_not();
