@@ -185,6 +185,20 @@ typedef struct arm_bus {
     void     (*write32)(void *ctx, uint32_t addr, uint32_t val);
     void     (*write16)(void *ctx, uint32_t addr, uint16_t val);
     void     (*write8 )(void *ctx, uint32_t addr, uint8_t  val);
+
+    /*
+     * Optional platform hook for the ARM1176 CP15 Wait For Interrupt
+     * operation.  A system model can synchronously advance its autonomous
+     * devices to the first interrupt edge and return true.  Returning false
+     * means that no modeled wake source can currently make progress; the core
+     * then retains the historical no-op fallback instead of hanging its host.
+     *
+     * The callback is deliberately part of the host bus, not arm_cpu_t: WFI
+     * has no architecturally visible state once it completes, and keeping the
+     * wait synchronous means snapshots need no hidden "halfway through WFI"
+     * bit.  The WFI itself still retires exactly once.
+     */
+    bool     (*wait_for_interrupt)(void *ctx);
 } arm_bus_t;
 
 /*

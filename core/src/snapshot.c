@@ -116,7 +116,11 @@ SNAP_SIZE_GUARD(s5l_clcd_t,        3360,  "snap_clcd");
 SNAP_SIZE_GUARD(s5l_nor_entry_t,   12,    "snap_nor");
 SNAP_SIZE_GUARD(s5l_nor_t,         208,   "snap_nor");
 SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
-SNAP_SIZE_GUARD(s5l8900_t,         15768, "snap_mach");
+/* arm_bus_t's optional WFI platform callback is a host function pointer.  It
+ * grows the containing machine ABI but is deliberately excluded from MACH for
+ * the same reason as every other bus callback; snapshot_load preserves the
+ * live machine's vtable.  The byte format therefore does not change. */
+SNAP_SIZE_GUARD(s5l8900_t,         15776, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */

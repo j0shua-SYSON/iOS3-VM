@@ -291,7 +291,9 @@ static uint8_t  m_r8 (void *c, uint32_t a){ (void)c; return g_ram[a&(RAM_SIZE-1)
 static void m_w32(void *c, uint32_t a, uint32_t v){ (void)c; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,4); }
 static void m_w16(void *c, uint32_t a, uint16_t v){ (void)c; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,2); }
 static void m_w8 (void *c, uint32_t a, uint8_t  v){ (void)c; g_ram[a&(RAM_SIZE-1)]=v; }
-static const arm_bus_t g_bus = { NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8 };
+static const arm_bus_t g_bus = {
+    NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8, NULL
+};
 
 /*
  * `prog` is an array of 32-bit ARM words or, when `thumb`, of 16-bit halfwords.

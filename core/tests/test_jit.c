@@ -39,7 +39,9 @@ static uint8_t  m_r8 (void *c, uint32_t a){ (void)c; g_read8_calls++; return g_r
 static void m_w32(void *c, uint32_t a, uint32_t v){ (void)c; g_write32_calls++; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,4); }
 static void m_w16(void *c, uint32_t a, uint16_t v){ (void)c; g_write16_calls++; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,2); }
 static void m_w8 (void *c, uint32_t a, uint8_t  v){ (void)c; g_write8_calls++; g_ram[a&(RAM_SIZE-1)]=v; }
-static const arm_bus_t g_bus = { NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8 };
+static const arm_bus_t g_bus = {
+    NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8, NULL
+};
 
 #define CODE_WORDS 4096
 static uint32_t g_code[CODE_WORDS];

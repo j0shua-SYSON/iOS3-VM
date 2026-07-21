@@ -32,7 +32,9 @@ static void m_w32(void *ctx, uint32_t a, uint32_t v){ (void)ctx; memcpy(&g_ram[a
 static void m_w16(void *ctx, uint32_t a, uint16_t v){ (void)ctx; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,2); }
 static void m_w8 (void *ctx, uint32_t a, uint8_t  v){ (void)ctx; g_ram[a&(RAM_SIZE-1)]=v; }
 
-static const arm_bus_t g_bus = { NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8 };
+static const arm_bus_t g_bus = {
+    NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8, NULL
+};
 
 /* ------------------------------------------------------------- test runner */
 static int g_pass = 0, g_fail = 0;

@@ -29,7 +29,15 @@ static void m_w32(void *ctx, uint32_t a, uint32_t v){ (void)ctx; if(a==g_watch_a
 static void m_w16(void *ctx, uint32_t a, uint16_t v){ (void)ctx; if(a==g_watch_addr)g_watch_writes16++; memcpy(&g_ram[a&(RAM_SIZE-1)],&v,2); }
 static void m_w8 (void *ctx, uint32_t a, uint8_t  v){ (void)ctx; if(a==g_watch_addr)g_watch_writes8++; g_ram[a&(RAM_SIZE-1)]=v; }
 
-static const arm_bus_t g_bus = { NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8 };
+static const arm_bus_t g_bus = {
+    NULL, m_r32, m_r16, m_r8, m_w32, m_w16, m_w8, NULL
+};
+
+static bool count_wfi(void *ctx) {
+    unsigned *calls = ctx;
+    (*calls)++;
+    return false;                 /* exercise the core's non-blocking fallback */
+}
 
 /* ------------------------------------------------------------- test runner */
 static int g_pass = 0, g_fail = 0;
@@ -220,6 +228,211 @@ static void test_mul(void) {
     uint32_t p[] = { 0xe3a01006, 0xe3a02007, 0xe0000291 };
     arm_cpu_t c; load_and_run(&c, p, 3, 3);
     CHECK(c.r[0] == 42, "r0=%u expect 42", c.r[0]);
+}
+
+/* ARMv5TE's halfword multiply encodings are easy to transpose: x (bit 5)
+ * selects Rm while y (bit 6) selects Rs.  Use four different signed halves so
+ * every selector combination has a distinct answer. */
+static void test_dsp_smul_halfword_selectors_and_real_alias(void) {
+    static const struct {
+        uint32_t insn, expect;
+        const char *name;
+    } cases[] = {
+        { 0xe1600281u, 0xfffffff1u, "SMULBB" }, /*  3 * -5 = -15 */
+        { 0xe16002a1u, 0x0000000au, "SMULTB" }, /* -2 * -5 =  10 */
+        { 0xe16002c1u, 0x0000000cu, "SMULBT" }, /*  3 *  4 =  12 */
+        { 0xe16002e1u, 0xfffffff8u, "SMULTT" }, /* -2 *  4 =  -8 */
+    };
+
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        arm_cpu_t c;
+        load_and_run(&c, &cases[i].insn, 1, 0);
+        c.r[1] = 0xfffe0003u;
+        c.r[2] = 0x0004fffbu;
+        c.cpsr |= ARM_CPSR_N | ARM_CPSR_C | ARM_CPSR_Q;
+        uint32_t flags = c.cpsr;
+        arm_status_t st = arm_step(&c);
+        CHECK(st == ARM_OK && c.r[0] == cases[i].expect,
+              "%s status=%d result=%08x expect %08x", cases[i].name,
+              (int)st, c.r[0], cases[i].expect);
+        CHECK(c.cpsr == flags, "%s changed CPSR %08x -> %08x",
+              cases[i].name, flags, c.cpsr);
+    }
+
+    /* Exact instruction and live register values at the current real-guest
+     * stop.  Rd aliases Rs, so all sources must be read before writeback. */
+    const uint32_t blocker = 0xe1630381u;       /* SMULBB r3,r1,r3 */
+    arm_cpu_t c;
+    load_and_run(&c, &blocker, 1, 0);
+    c.r[1] = 1u;
+    c.r[3] = 0x34u;
+    CHECK(arm_step(&c) == ARM_OK && c.r[3] == 0x34u && c.r[15] == 4u,
+          "real SMULBB alias result=%08x pc=%08x", c.r[3], c.r[15]);
+}
+
+static void test_dsp_smla_wraps_and_sets_sticky_q(void) {
+    const uint32_t smlabb = 0xe1003281u;        /* SMLABB r0,r1,r2,r3 */
+    arm_cpu_t c;
+
+    load_and_run(&c, &smlabb, 1, 0);
+    c.r[1] = 1u; c.r[2] = 1u; c.r[3] = 0x7fffffffu;
+    c.cpsr |= ARM_CPSR_N | ARM_CPSR_C;
+    uint32_t nzcv = c.cpsr & (ARM_CPSR_N | ARM_CPSR_Z | ARM_CPSR_C | ARM_CPSR_V);
+    CHECK(arm_step(&c) == ARM_OK && c.r[0] == 0x80000000u,
+          "positive-overflow SMLABB result=%08x", c.r[0]);
+    CHECK((c.cpsr & ARM_CPSR_Q) != 0u &&
+          (c.cpsr & (ARM_CPSR_N | ARM_CPSR_Z | ARM_CPSR_C | ARM_CPSR_V)) == nzcv,
+          "positive-overflow SMLABB flags=%08x", c.cpsr);
+
+    load_and_run(&c, &smlabb, 1, 0);
+    c.r[1] = 0xffffu; c.r[2] = 1u; c.r[3] = 0x80000000u;
+    CHECK(arm_step(&c) == ARM_OK && c.r[0] == 0x7fffffffu &&
+          (c.cpsr & ARM_CPSR_Q) != 0u,
+          "negative-overflow SMLABB result=%08x flags=%08x", c.r[0], c.cpsr);
+
+    /* Q is sticky, and an accumulator may alias the destination. */
+    const uint32_t alias = 0xe1033281u;         /* SMLABB r3,r1,r2,r3 */
+    load_and_run(&c, &alias, 1, 0);
+    c.r[1] = 2u; c.r[2] = 3u; c.r[3] = 4u;
+    c.cpsr |= ARM_CPSR_Q | ARM_CPSR_Z | ARM_CPSR_V;
+    uint32_t before = c.cpsr;
+    CHECK(arm_step(&c) == ARM_OK && c.r[3] == 10u,
+          "aliased SMLABB result=%08x", c.r[3]);
+    CHECK(c.cpsr == before, "non-overflow SMLABB changed sticky flags %08x -> %08x",
+          before, c.cpsr);
+}
+
+static void test_dsp_smlal_sign_carry_wrap_and_alias(void) {
+    const uint32_t smlalbb = 0xe1410382u;       /* SMLALBB r0,r1,r2,r3 */
+    static const struct {
+        uint32_t lo, hi, rm, rs, expect_lo, expect_hi;
+        const char *name;
+    } cases[] = {
+        { 0xffffffffu, 0u, 1u, 1u, 0u, 1u, "low-word carry" },
+        { 0u, 0u, 0xffffu, 1u, 0xffffffffu, 0xffffffffu, "negative sign extension" },
+        { 0xffffffffu, 0xffffffffu, 1u, 1u, 0u, 0u, "modulo-2^64 wrap" },
+    };
+
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        arm_cpu_t c;
+        load_and_run(&c, &smlalbb, 1, 0);
+        c.r[0] = cases[i].lo; c.r[1] = cases[i].hi;
+        c.r[2] = cases[i].rm; c.r[3] = cases[i].rs;
+        c.cpsr |= ARM_CPSR_N | ARM_CPSR_Z | ARM_CPSR_C | ARM_CPSR_V | ARM_CPSR_Q;
+        uint32_t flags = c.cpsr;
+        arm_status_t st = arm_step(&c);
+        CHECK(st == ARM_OK && c.r[0] == cases[i].expect_lo &&
+              c.r[1] == cases[i].expect_hi,
+              "SMLALBB %s status=%d got=%08x:%08x expect=%08x:%08x",
+              cases[i].name, (int)st, c.r[1], c.r[0],
+              cases[i].expect_hi, cases[i].expect_lo);
+        CHECK(c.cpsr == flags, "SMLALBB %s changed flags", cases[i].name);
+    }
+
+    /* Rm aliases RdLo. The old low accumulator value is both an input to the
+     * multiplication and part of the 64-bit add. */
+    const uint32_t alias = 0xe1410280u;         /* SMLALBB r0,r1,r0,r2 */
+    arm_cpu_t c;
+    load_and_run(&c, &alias, 1, 0);
+    c.r[0] = 2u; c.r[1] = 0u; c.r[2] = 3u;
+    CHECK(arm_step(&c) == ARM_OK && c.r[0] == 8u && c.r[1] == 0u,
+          "aliased SMLALBB got=%08x:%08x", c.r[1], c.r[0]);
+}
+
+static void test_dsp_word_halfword_extract_and_accumulate(void) {
+    const uint32_t smulwb = 0xe12002a1u;        /* SMULWB r0,r1,r2 */
+    const uint32_t smulwt = 0xe12002e1u;        /* SMULWT r0,r1,r2 */
+    arm_cpu_t c;
+
+    /* Bits[47:16] of -1 are all ones. C division by 65536 would incorrectly
+     * truncate toward zero here, so this pins the required arithmetic extract. */
+    load_and_run(&c, &smulwb, 1, 0);
+    c.r[1] = 0xffffffffu; c.r[2] = 1u;
+    CHECK(arm_step(&c) == ARM_OK && c.r[0] == 0xffffffffu,
+          "SMULWB(-1,1)=%08x expect ffffffff", c.r[0]);
+
+    load_and_run(&c, &smulwb, 1, 0);
+    c.r[1] = 0x80000000u; c.r[2] = 0x8000u;
+    CHECK(arm_step(&c) == ARM_OK && c.r[0] == 0x40000000u,
+          "SMULWB(INT_MIN,-32768)=%08x expect 40000000", c.r[0]);
+
+    load_and_run(&c, &smulwt, 1, 0);
+    c.r[1] = 0x00010000u; c.r[2] = 0xfffe0001u;
+    CHECK(arm_step(&c) == ARM_OK && c.r[0] == 0xfffffffeu,
+          "SMULWT top-half result=%08x expect fffffffe", c.r[0]);
+
+    const uint32_t smlawb = 0xe1203281u;        /* SMLAWB r0,r1,r2,r3 */
+    load_and_run(&c, &smlawb, 1, 0);
+    c.r[1] = 0x00010000u; c.r[2] = 1u; c.r[3] = 0x7fffffffu;
+    c.cpsr |= ARM_CPSR_N | ARM_CPSR_C;
+    uint32_t nzcv = c.cpsr & (ARM_CPSR_N | ARM_CPSR_Z | ARM_CPSR_C | ARM_CPSR_V);
+    CHECK(arm_step(&c) == ARM_OK && c.r[0] == 0x80000000u &&
+          (c.cpsr & ARM_CPSR_Q) != 0u,
+          "overflowing SMLAWB result=%08x flags=%08x", c.r[0], c.cpsr);
+    CHECK((c.cpsr & (ARM_CPSR_N | ARM_CPSR_Z | ARM_CPSR_C | ARM_CPSR_V)) == nzcv,
+          "SMLAWB changed NZCV flags=%08x", c.cpsr);
+
+    const uint32_t smlawt = 0xe12032c1u;        /* SMLAWT r0,r1,r2,r3 */
+    load_and_run(&c, &smlawt, 1, 0);
+    c.r[1] = 0x00010000u; c.r[2] = 0x00010000u; c.r[3] = 5u;
+    c.cpsr |= ARM_CPSR_Q | ARM_CPSR_Z | ARM_CPSR_V;
+    uint32_t flags = c.cpsr;
+    CHECK(arm_step(&c) == ARM_OK && c.r[0] == 6u && c.cpsr == flags,
+          "non-overflow SMLAWT result=%08x flags=%08x", c.r[0], c.cpsr);
+}
+
+static void test_dsp_multiply_unpredictable_and_reserved_forms_trap(void) {
+    /* Every named R15 operand, SMLAL's equal destination pair, and reserved
+     * near-misses must stop without corrupting registers or flags. */
+#define SMLA(rd,rn,rs,rm)  (0xe1000080u | ((rd)<<16) | ((rn)<<12) | ((rs)<<8) | (rm))
+#define SMLAL(hi,lo,rs,rm) (0xe1400080u | ((hi)<<16) | ((lo)<<12) | ((rs)<<8) | (rm))
+#define SMLAW(rd,rn,rs,rm) (0xe1200080u | ((rd)<<16) | ((rn)<<12) | ((rs)<<8) | (rm))
+#define SMUL(rd,rs,rm)     (0xe1600080u | ((rd)<<16) | ((rs)<<8) | (rm))
+#define SMULW(rd,rs,rm)    (0xe12000a0u | ((rd)<<16) | ((rs)<<8) | (rm))
+    static const uint32_t bad[] = {
+        SMLA(15u,4u,2u,1u), SMLA(3u,15u,2u,1u),
+        SMLA(3u,4u,15u,1u), SMLA(3u,4u,2u,15u),
+        SMLAL(15u,4u,2u,1u), SMLAL(3u,15u,2u,1u),
+        SMLAL(3u,4u,15u,1u), SMLAL(3u,4u,2u,15u),
+        SMLAL(3u,3u,2u,1u),
+        SMLAW(15u,4u,2u,1u), SMLAW(3u,15u,2u,1u),
+        SMLAW(3u,4u,15u,1u), SMLAW(3u,4u,2u,15u),
+        SMUL(15u,2u,1u), SMUL(3u,15u,1u), SMUL(3u,2u,15u),
+        SMULW(15u,2u,1u), SMULW(3u,15u,1u), SMULW(3u,2u,15u),
+        0xe1601281u,                         /* SMULxy with SBZ[15:12] != 0 */
+        0xe12012a1u,                         /* SMULWy with SBZ[15:12] != 0 */
+        0xe1600291u,                         /* reserved bit 4 set */
+        0xe1600201u,                         /* required bit 7 clear */
+        0xf1600281u,                         /* cond=1111 is not this instruction */
+    };
+#undef SMLA
+#undef SMLAL
+#undef SMLAW
+#undef SMUL
+#undef SMULW
+
+    for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        arm_cpu_t c;
+        load_and_run(&c, &bad[i], 1, 0);
+        for (unsigned r = 0; r < 15u; r++) c.r[r] = 0x11110000u + r;
+        c.cpsr |= ARM_CPSR_N | ARM_CPSR_C | ARM_CPSR_Q;
+        uint32_t regs[15]; memcpy(regs, c.r, sizeof regs);
+        uint32_t cpsr = c.cpsr;
+        arm_status_t st = arm_step(&c);
+        CHECK(st == ARM_UNDEFINED, "bad DSP encoding %08x status=%d", bad[i], (int)st);
+        CHECK(memcmp(regs, c.r, sizeof regs) == 0 && c.r[15] == 0u && c.cpsr == cpsr,
+              "bad DSP encoding %08x changed architectural state", bad[i]);
+    }
+
+    /* A legal instruction with a failed condition is a true NOP. */
+    const uint32_t eq = 0x01630381u;          /* SMULBBEQ r3,r1,r3 */
+    arm_cpu_t c;
+    load_and_run(&c, &eq, 1, 0);
+    c.r[1] = 7u; c.r[3] = 9u;                /* Z is clear after reset */
+    uint32_t cpsr = c.cpsr;
+    CHECK(arm_step(&c) == ARM_OK && c.r[3] == 9u && c.r[15] == 4u &&
+          c.cpsr == cpsr,
+          "condition-failed DSP instruction was not a NOP");
 }
 
 static void test_orr_bic_mvn(void) {
@@ -1055,6 +1268,92 @@ static void test_cp15_cache_op_is_accepted(void) {
     uint32_t p[] = { 0xee070f15 };
     arm_cpu_t c; arm_status_t st = run_status(&c, p, 1, 1);
     CHECK(st == ARM_OK, "status=%d expect ARM_OK for cache maintenance", (int)st);
+}
+
+static void test_cp15_wfi_uses_only_the_exact_privileged_hook(void) {
+    /* ARM1176's legacy WFI coordinates: MCR p15,0,<Rd>,c7,c0,4, with
+     * the VALUE in Rd SBZ.  The platform callback returning false must not turn
+     * a CPU-only harness into a hang; the one WFI still retires and advances
+     * to the following instruction. */
+    const uint32_t wfi = 0xee070f90u;
+    unsigned calls = 0;
+    arm_bus_t bus = g_bus;
+    bus.ctx = &calls;
+    bus.wait_for_interrupt = count_wfi;
+
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, wfi);
+    arm_cpu_t c;
+    arm_reset(&c, &bus);
+    c.cpsr = ARM_MODE_SYS | ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_N;
+    arm_status_t st = arm_step(&c);
+    CHECK(st == ARM_OK && calls == 1, "status=%d calls=%u expect OK/1",
+          (int)st, calls);
+    CHECK(c.r[15] == 4u && c.cycles == 1u,
+          "pc=%08x cycles=%llu expect one retired WFI at pc 0",
+          c.r[15], (unsigned long long)c.cycles);
+    CHECK(c.cpsr == (ARM_MODE_SYS | ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_N),
+          "WFI changed CPSR to %08x", c.cpsr);
+
+    /* This is the exact instruction in iPhone OS 3.1.3's _cpu_idle: XNU clears
+     * r2, executes DSB through c7,c10,4, then WFI through c7,c0,4.  "Rd SBZ"
+     * describes r2's transferred value; it does not require the r0 field. */
+    calls = 0;
+    m_w32(NULL, 0, 0xee072f90u);                /* MCR p15,0,r2,c7,c0,4 */
+    arm_reset(&c, &bus);
+    c.cpsr = ARM_MODE_SYS;
+    c.r[2] = 0u;
+    st = arm_step(&c);
+    CHECK(st == ARM_OK && calls == 1 && c.r[15] == 4u,
+          "XNU r2 WFI status=%d calls=%u pc=%08x",
+          (int)st, calls, c.r[15]);
+
+    /* No platform hook preserves the flat core's historical accepted-no-op
+     * behavior.  This is intentional: a standalone CPU has no clock source it
+     * could safely advance and must not block its host indefinitely. */
+    m_w32(NULL, 0, wfi);
+    arm_reset(&c, &g_bus);
+    c.cpsr = ARM_MODE_SYS;
+    st = arm_step(&c);
+    CHECK(st == ARM_OK && c.r[15] == 4u && c.cycles == 1u,
+          "hookless WFI status=%d pc=%08x cycles=%llu",
+          (int)st, c.r[15], (unsigned long long)c.cycles);
+
+    /* WFI is privileged-only.  User mode must fault before the hook can make
+     * any platform state advance. */
+    calls = 0;
+    m_w32(NULL, 0, wfi);
+    arm_reset(&c, &bus);
+    c.cpsr = ARM_MODE_USR;
+    st = arm_step(&c);
+    CHECK(st == ARM_UNDEFINED && calls == 0,
+          "user WFI status=%d calls=%u expect undefined/0", (int)st, calls);
+
+    /* A non-zero transferred value violates SBZ and must fail before changing
+     * platform time. */
+    calls = 0;
+    m_w32(NULL, 0, 0xee072f90u);
+    arm_reset(&c, &bus);
+    c.cpsr = ARM_MODE_SYS;
+    c.r[2] = 1u;
+    st = arm_step(&c);
+    CHECK(st == ARM_UNDEFINED && calls == 0,
+          "non-zero WFI operand status=%d calls=%u expect undefined/0",
+          (int)st, calls);
+
+    /* An MRC and a non-zero Opcode_1 at the same c7 coordinates are not the
+     * WFI operation and must not invoke the wait hook. */
+    const uint32_t not_wfi[] = { 0xee170f90u, 0xee270f90u };
+    for (unsigned i = 0; i < sizeof not_wfi / sizeof not_wfi[0]; i++) {
+        calls = 0;
+        memset(g_ram, 0, sizeof g_ram);
+        m_w32(NULL, 0, not_wfi[i]);
+        arm_reset(&c, &bus);
+        c.cpsr = ARM_MODE_SYS;
+        st = arm_step(&c);
+        CHECK(calls == 0, "non-WFI encoding %08x called hook %u times",
+              not_wfi[i], calls);
+    }
 }
 
 static void test_high_vectors(void) {
@@ -3667,6 +3966,11 @@ int main(void) {
     test_ldrb();
     test_cond_not_taken();
     test_mul();
+    test_dsp_smul_halfword_selectors_and_real_alias();
+    test_dsp_smla_wraps_and_sets_sticky_q();
+    test_dsp_smlal_sign_carry_wrap_and_alias();
+    test_dsp_word_halfword_extract_and_accumulate();
+    test_dsp_multiply_unpredictable_and_reserved_forms_trap();
     test_orr_bic_mvn();
     test_bx_branches();
     test_exception_return_to_thumb_keeps_halfword();
@@ -3709,6 +4013,7 @@ int main(void) {
     test_cp15_ttbr0_roundtrip();
     test_cp15_ttbcr_masks_only_reserved_bits();
     test_cp15_cache_op_is_accepted();
+    test_cp15_wfi_uses_only_the_exact_privileged_hook();
     test_high_vectors();
     test_mmu_disabled_is_identity();
     test_mmu_section_translation();

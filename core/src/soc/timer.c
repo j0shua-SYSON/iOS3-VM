@@ -76,18 +76,33 @@ void s5l_timer_write(s5l_timer_t *t, uint32_t off, uint32_t val) {
 bool s5l_timer_tick(s5l_timer_t *t, uint32_t ticks) {
     t->ticks += ticks;                        /* unconditional: this is time */
 
-    if (t->t4_state & TIMER4_STATE_START) {
-        while (ticks--) {
-            if (t->t4_value == 0) {
-                t->t4_value = t->t4_count;
-                if (t->t4_value == 0) break;  /* count 0: nothing to count */
-            }
-            /* Exactly one expiry per period: latching on both the
-             * decrement-to-zero and the reload-from-zero paths would raise two
-             * interrupts per period, at intervals N, 1, N, 1, ... */
-            if (--t->t4_value == 0) {
+    if ((t->t4_state & TIMER4_STATE_START) && ticks) {
+        /*
+         * Advance algebraically.  WFI can legitimately move guest time by a
+         * complete decrementer interval in one call; iterating once per
+         * timebase tick would turn a safe idle fast-forward back into another
+         * busy loop.  The status is a level latch rather than an expiry count,
+         * so the observable state is exactly: whether at least one boundary
+         * was crossed, and the down-counter phase after all elapsed ticks.
+         */
+        uint32_t value = t->t4_value;
+        uint32_t period = t->t4_count;
+
+        if (value == 0) value = period;       /* reload before the first tick */
+        if (value != 0) {
+            if (ticks < value) {
+                t->t4_value = value - ticks;
+            } else {
+                uint32_t after_first = ticks - value;
                 t->irqlatch |= TIMER4_IRQ_BITS;
-                t->t4_value = t->t4_count;    /* reload for the next period */
+                if (period == 0) {
+                    /* A non-zero live value with a zero reload can expire
+                     * once, then remains stopped at zero. */
+                    t->t4_value = 0;
+                } else {
+                    uint32_t phase = after_first % period;
+                    t->t4_value = phase ? period - phase : period;
+                }
             }
         }
     }

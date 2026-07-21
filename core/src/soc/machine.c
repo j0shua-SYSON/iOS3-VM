@@ -334,6 +334,90 @@ static void w32(void *c, uint32_t a, uint32_t v) { bus_write(c, a, v, 4); }
 static void w16(void *c, uint32_t a, uint16_t v) { bus_write(c, a, v, 2); }
 static void w8 (void *c, uint32_t a, uint8_t  v) { bus_write(c, a, v, 1); }
 
+/*
+ * Complete one ARM1176 Wait For Interrupt operation without manufacturing CPU
+ * work.  Only the timer and CLCD currently advance autonomously, so the first
+ * edge either can route through the VIC is the earliest point at which this
+ * model can wake the core.  Advancing farther would coalesce guest-visible
+ * work across an interrupt; advancing less would merely replace the kernel's
+ * idle loop with a host idle loop.
+ */
+static bool machine_wait_for_interrupt(void *ctx) {
+    s5l8900_t *m = ctx;
+    if (!m) return false;
+
+    /* A line that is already high completes WFI even when CPSR masks it.  This
+     * check precedes the controller refresh so an externally injected CPU line
+     * is not lost. */
+    if (m->cpu.irq_line || m->cpu.fiq_line) return true;
+
+    /* Guest writes can change a VIC enable/mask or acknowledge a source after
+     * the preceding instruction's tick.  Refresh level outputs at zero elapsed
+     * time before deciding whether a future edge is necessary. */
+    s5l8900_tick(m, 0);
+    if (m->cpu.irq_line || m->cpu.fiq_line) return true;
+
+    bool have_edge = false;
+    uint32_t edge_tb = 0;
+    const uint32_t timer_bit = 1u << S5L8900_IRQ_TIMER;
+    const uint32_t clcd_bit  = 1u << S5L8900_IRQ_CLCD;
+
+    if ((m->vic[0].enable & timer_bit) != 0u &&
+        (m->timer.t4_state & TIMER4_STATE_START) != 0u) {
+        uint32_t until_timer = m->timer.t4_value
+                             ? m->timer.t4_value : m->timer.t4_count;
+        if (until_timer != 0u) {
+            edge_tb = until_timer;
+            have_edge = true;
+        }
+    }
+
+    if ((m->vic[0].enable & clcd_bit) != 0u &&
+        (m->clcd.intmask & CLCD_INT_FRAME) != 0u &&
+        m->clcd.scanning && m->clcd.frame_ticks != 0u) {
+        /* frame_accum is normally strictly below frame_ticks.  If a malformed
+         * in-memory caller violates that invariant, one tick is the only safe
+         * boundary: the CLCD normalizes it and asserts the frame latch there. */
+        uint32_t until_frame = m->clcd.frame_accum < m->clcd.frame_ticks
+                             ? m->clcd.frame_ticks - m->clcd.frame_accum
+                             : 1u;
+        if (!have_edge || until_frame < edge_tb) {
+            edge_tb = until_frame;
+            have_edge = true;
+        }
+    }
+
+    /* With no enabled autonomous source there is nothing safe to fast-forward
+     * to.  Return to the interpreter's documented no-op fallback rather than
+     * hanging the host forever or inventing an interrupt. */
+    if (!have_edge || edge_tb == 0u) return false;
+
+    uint64_t cpu_ticks;
+    if (m->cpu_hz && m->tb_hz) {
+        /* s5l8900_tick's integer converter can cross at most one timebase edge
+         * per CPU tick only in this direction.  Refuse unusual inverted or
+         * corrupt ratios instead of jumping past the earliest edge. */
+        if (m->tb_hz > m->cpu_hz || m->tb_accum >= m->cpu_hz) return false;
+        uint64_t need = (uint64_t)edge_tb * m->cpu_hz - m->tb_accum;
+        cpu_ticks = need / m->tb_hz + (need % m->tb_hz != 0u);
+    } else {
+        /* Existing zero-clock fallback: s5l8900_tick treats its input as raw
+         * timebase ticks when either advertised rate is zero. */
+        cpu_ticks = edge_tb;
+    }
+
+    /* The public tick API is 32-bit.  Split a very long wait without changing
+     * the exact fractional accumulator; no selected wake edge occurs before
+     * the total derived above. */
+    while (cpu_ticks > UINT32_MAX) {
+        s5l8900_tick(m, UINT32_MAX);
+        cpu_ticks -= UINT32_MAX;
+        if (m->cpu.irq_line || m->cpu.fiq_line) return true;
+    }
+    if (cpu_ticks) s5l8900_tick(m, (uint32_t)cpu_ticks);
+    return m->cpu.irq_line || m->cpu.fiq_line;
+}
+
 /* ----------------------------------------------------------- lifecycle --- */
 
 bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
@@ -405,6 +489,7 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
     m->bus.ctx = m;
     m->bus.read32 = r32; m->bus.read16 = r16; m->bus.read8 = r8;
     m->bus.write32 = w32; m->bus.write16 = w16; m->bus.write8 = w8;
+    m->bus.wait_for_interrupt = machine_wait_for_interrupt;
 
     arm_reset(&m->cpu, &m->bus);
     return true;
@@ -432,10 +517,12 @@ void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
 
 void s5l8900_tick(s5l8900_t *m, uint32_t ticks) {
     /*
-     * Convert retired instructions into timebase ticks at the guest's own
-     * CPU:timebase ratio, carrying the remainder so it stays exact rather than
-     * drifting. Feeding instructions straight in runs guest time ~68x fast and
-     * livelocks the kernel's decrementer (see S5L8900_CPU_HZ).
+     * Convert elapsed emulated CPU-clock ticks into timebase ticks at the
+     * guest's own CPU:timebase ratio, carrying the remainder so it stays exact
+     * rather than drifting. Active execution contributes one such tick per
+     * retired instruction; WFI contributes elapsed idle ticks without
+     * changing cpu.cycles. Feeding ticks straight into the timebase runs guest
+     * time ~68x fast and livelocks the kernel's decrementer.
      */
     uint32_t tb = ticks;
     if (m->cpu_hz && m->tb_hz) {

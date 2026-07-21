@@ -209,8 +209,10 @@ uint32_t s5l_vic_vectaddr(const s5l_vic_t *v, unsigned base_source);
  * re-enters immediately, and livelocks. That is not a hypothetical -- it burned
  * 66% of a 200M-instruction boot in the FIQ handler.
  *
- * One retired instruction is treated as one CPU cycle, which is optimistic for
- * an ARM1176 but keeps the ratio honest in the direction that matters.
+ * During active execution one retired instruction is treated as one CPU
+ * cycle, which is optimistic for an ARM1176 but keeps the ratio honest in the
+ * direction that matters.  WFI can advance the same clock without retiring
+ * instructions; cpu.cycles remains a retired-instruction counter.
  */
 #define S5L8900_CPU_HZ 412000000u
 #define S5L8900_TB_HZ    6000000u
@@ -631,8 +633,10 @@ typedef struct {
 
     /*
      * How fast guest time runs relative to guest work. See S5L8900_CPU_HZ.
-     * cpu_hz retired instructions advance the timebase by tb_hz ticks;
-     * tb_accum carries the remainder so the ratio stays exact over time.
+     * cpu_hz elapsed CPU-clock ticks advance the timebase by tb_hz ticks;
+     * tb_accum carries the remainder so the ratio stays exact over time. Active
+     * execution supplies one clock tick per retired instruction; WFI can
+     * supply an idle interval without changing cpu.cycles.
      */
     uint32_t   cpu_hz, tb_hz;
     uint64_t   tb_accum;
@@ -727,7 +731,8 @@ unsigned s5l8900_soc_regions(const s5l_window_t **out);
  * false negative. */
 bool s5l8900_overlaps(uint32_t a, uint32_t alen, uint32_t b, uint32_t blen);
 
-/* Advance the devices and refresh the CPU's interrupt lines. */
+/* Advance devices by elapsed guest CPU-clock ticks and refresh the CPU's
+ * interrupt lines.  This does not retire CPU instructions. */
 void s5l8900_tick(s5l8900_t *m, uint32_t ticks);
 
 /*

@@ -531,11 +531,43 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     if (cp != 15) return ARM_UNDEFINED;         /* CP10/11/14/15 only */
 
     bool     load = (insn >> 20) & 1u;          /* 1 = MRC (read), 0 = MCR */
+    unsigned opc1 = (insn >> 21) & 7u;
     unsigned crn  = (insn >> 16) & 0xfu;
     unsigned rd   = (insn >> 12) & 0xfu;
     unsigned opc2 = (insn >> 5)  & 7u;
     unsigned crm  = insn & 0xfu;
     arm_cp15_t *p = &c->cp15;
+
+    /*
+     * ARM1176JZ-S TRM (DDI0333H) 3.2.22:
+     *
+     *   MCR p15,0,<Rd>,c7,c0,4      Wait For Interrupt
+     *
+     * Opcode_1 is zero, the VALUE supplied through Rd is SBZ, and the operation
+     * is privileged-only.  Rd is not fixed to r0: shipping XNU's _cpu_idle
+     * explicitly clears r2 and emits 0xEE072F90.  It stops following execution
+     * until IRQ/FIQ (masked or unmasked), external abort, debug, or reset. This
+     * emulator currently has only modeled IRQ/FIQ wake sources, exposed
+     * through the optional platform callback.
+     * Calling it synchronously is important: when it returns, the MCR can
+     * finish normally, so the next arm_step samples the newly asserted line
+     * at PC+4 and constructs the architected MCR+8 interrupt return link.
+     *
+     * A flat CPU harness has no clocked platform and therefore no callback.
+     * Preserve its old accepted-no-op behavior rather than blocking the host.
+     */
+    bool wfi = !load && opc1 == 0u && crn == 7u &&
+               opc2 == 4u && crm == 0u;
+    if (wfi) {
+        if (!cpu_is_priv(c)) return ARM_UNDEFINED;
+        /* DDI0333H specifies the transferred value as SBZ.  Rejecting a
+         * non-zero value is fail-closed; silently treating it as a wait could
+         * park a guest on an encoding whose behavior is not defined. */
+        if (reg_read(c, pc, rd) != 0u) return ARM_UNDEFINED;
+        if (c->bus && c->bus->wait_for_interrupt)
+            (void)c->bus->wait_for_interrupt(c->bus->ctx);
+        return ARM_OK;
+    }
 
     /*
      * CP15 is privileged. The ARM1176JZF-S (ARM DDI 0301H, table 3-3) grants
@@ -944,7 +976,7 @@ static arm_status_t exec_data_processing(arm_cpu_t *c, uint32_t pc, uint32_t ins
                 return ARM_OK;
             }
         }
-        return ARM_UNDEFINED;                                /* CLZ, saturating/DSP: later */
+        return ARM_UNDEFINED;                    /* unimplemented miscellaneous/control */
     }
 
     /* ARMv6 register-specified shifts forbid R15 in every operand field. The
@@ -1450,6 +1482,105 @@ static arm_status_t exec_multiply_long(arm_cpu_t *c, uint32_t pc, uint32_t insn)
         /* C and V are unpredictable after a long multiply on ARMv6. */
     }
     return ARM_OK;
+}
+
+/*
+ * ARMv5TE signed halfword multiplies (ARM DDI 0100I A4.1.74, A4.1.77,
+ * A4.1.79, A4.1.86, and A4.1.88).  These sit in the ARM data-processing
+ * encoding space, so they must be decoded before the generic ALU path.
+ *
+ * Keep the conversions explicit instead of relying on implementation-defined
+ * unsigned-to-signed casts or right-shifting a negative C value.  That matters
+ * here because the portable core is also built by Apple's Clang for the app.
+ */
+static int64_t dsp_signed_half(uint32_t value, bool top) {
+    uint32_t half = (value >> (top ? 16u : 0u)) & 0xffffu;
+    return (half & 0x8000u) ? (int64_t)half - INT64_C(65536)
+                            : (int64_t)half;
+}
+
+static int64_t dsp_signed_word(uint32_t value) {
+    return (value & 0x80000000u) ? (int64_t)value - INT64_C(4294967296)
+                                 : (int64_t)value;
+}
+
+static uint32_t dsp_accumulate_word(arm_cpu_t *c, int64_t product,
+                                    uint32_t accumulator) {
+    int64_t sum = product + dsp_signed_word(accumulator);
+    if (sum > INT32_MAX || sum < INT32_MIN)
+        c->cpsr |= ARM_CPSR_Q;       /* Q is sticky; these instructions never clear it */
+    return (uint32_t)sum;            /* architected modulo-2^32 result */
+}
+
+static arm_status_t exec_dsp_multiply(arm_cpu_t *c, uint32_t insn) {
+    unsigned rd = (insn >> 16) & 0xfu;
+    unsigned rn = (insn >> 12) & 0xfu;
+    unsigned rs = (insn >> 8)  & 0xfu;
+    unsigned rm = insn & 0xfu;
+    bool x = (insn & (1u << 5)) != 0u;  /* top half of Rm */
+    bool y = (insn & (1u << 6)) != 0u;  /* top half of Rs */
+
+    /* SMLAxy Rd,Rm,Rs,Rn: signed halfword product plus signed word. */
+    if ((insn & 0x0ff00090u) == 0x01000080u) {
+        if (rd == 15u || rn == 15u || rs == 15u || rm == 15u)
+            return ARM_UNDEFINED;
+        int64_t product = dsp_signed_half(c->r[rm], x)
+                        * dsp_signed_half(c->r[rs], y);
+        c->r[rd] = dsp_accumulate_word(c, product, c->r[rn]);
+        return ARM_OK;
+    }
+
+    /* SMLAWy Rd,Rm,Rs,Rn: bits[47:16] of word*halfword, then accumulate. */
+    if ((insn & 0x0ff000b0u) == 0x01200080u) {
+        if (rd == 15u || rn == 15u || rs == 15u || rm == 15u)
+            return ARM_UNDEFINED;
+        int64_t product = dsp_signed_word(c->r[rm])
+                        * dsp_signed_half(c->r[rs], y);
+        uint32_t upper = (uint32_t)((uint64_t)product >> 16);
+        c->r[rd] = dsp_accumulate_word(c, dsp_signed_word(upper), c->r[rn]);
+        return ARM_OK;
+    }
+
+    /* SMULWy Rd,Rm,Rs: the same word*halfword product, without accumulate. */
+    if ((insn & 0x0ff0f0b0u) == 0x012000a0u) {
+        if (rd == 15u || rs == 15u || rm == 15u)
+            return ARM_UNDEFINED;
+        int64_t product = dsp_signed_word(c->r[rm])
+                        * dsp_signed_half(c->r[rs], y);
+        c->r[rd] = (uint32_t)((uint64_t)product >> 16);
+        return ARM_OK;
+    }
+
+    /* SMLALxy RdLo,RdHi,Rm,Rs: signed product added modulo 2^64. */
+    if ((insn & 0x0ff00090u) == 0x01400080u) {
+        unsigned rdhi = rd, rdlo = rn;
+        if (rdhi == 15u || rdlo == 15u || rs == 15u || rm == 15u ||
+            rdhi == rdlo)
+            return ARM_UNDEFINED;
+
+        /* Read the complete accumulator and both sources before either write:
+         * ARM1176 permits a source to alias a destination. */
+        uint64_t accumulator = ((uint64_t)c->r[rdhi] << 32) | c->r[rdlo];
+        int64_t product = dsp_signed_half(c->r[rm], x)
+                        * dsp_signed_half(c->r[rs], y);
+        uint64_t result = accumulator + (uint64_t)product;
+        c->r[rdlo] = (uint32_t)result;
+        c->r[rdhi] = (uint32_t)(result >> 32);
+        return ARM_OK;
+    }
+
+    /* SMULxy Rd,Rm,Rs: exact signed 16x16 -> signed 32-bit product. */
+    if ((insn & 0x0ff0f090u) == 0x01600080u) {
+        if (rd == 15u || rs == 15u || rm == 15u)
+            return ARM_UNDEFINED;
+        int64_t product = dsp_signed_half(c->r[rm], x)
+                        * dsp_signed_half(c->r[rs], y);
+        c->r[rd] = (uint32_t)product;
+        return ARM_OK;
+    }
+
+    /* Includes SMUL/SMULW encodings whose SBZ field is non-zero. */
+    return ARM_UNDEFINED;
 }
 
 /* ------------------------------------------------------------------- step */
@@ -2085,6 +2216,8 @@ arm_status_t arm_step(arm_cpu_t *c) {
         st = exec_multiply(c, pc, insn);
     } else if ((insn & 0x0f8000f0u) == 0x00800090u) {     /* UMULL/UMLAL/SMULL/SMLAL */
         st = exec_multiply_long(c, pc, insn);
+    } else if ((insn & 0x0f900090u) == 0x01000080u) {     /* ARMv5TE DSP multiplies */
+        st = exec_dsp_multiply(c, insn);
     } else if ((insn & 0x0e000000u) == 0x06000000u &&
                (insn & 0x00000010u) != 0) {
         /* bits[27:25]==011 with bit4==1 is the ARMv6 media space. The extend
@@ -2279,12 +2412,15 @@ arm_status_t arm_step(arm_cpu_t *c) {
         }
     } else if ((insn & 0x0e000000u) == 0x00000000u &&
                (insn & 0x00000090u) == 0x00000090u) {
-        /* Remaining extension space with bits[6:5]==00: SWP/SWPB and the DSP
-         * multiplies. bits[27:25]==000, bit7==1, bit4==1. The bit25==0
+        /* Remaining multiply/synchronisation extension space after the exact
+         * MUL, long-multiply, exclusive, and SWP decoders above.
+         * bits[27:25]==000, bit7==1, bit4==1. The bit25==0
          * requirement (mask 0x0e000000, not 0x0c000000) is essential: immediate
          * data-processing sets bit25 and its imm8 may itself have bits 7 and 4
-         * set (e.g. MOV r0,#0x90), so it must NOT be trapped here. MUL/MLA are
-         * handled above; these are unimplemented — trap rather than corrupt Rd. */
+         * set (e.g. MOV r0,#0x90), so it must NOT be trapped here. The ARMv5TE
+         * DSP multiplies have bit4==0 and are decoded explicitly above. Any
+         * encoding left here is unsupported/reserved, so trap rather than
+         * corrupting architectural state. */
         st = ARM_UNDEFINED;
     } else if ((insn & 0x0f000010u) == 0x0e000010u) {     /* MCR / MRC (CP15) */
         st = exec_coprocessor(c, pc, insn);

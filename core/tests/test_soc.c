@@ -169,6 +169,288 @@ static void test_timer_ack_mask_matches_the_kernels(void) {
           s5l_timer_read(&t, TIMER_IRQLATCH));
 }
 
+/* Slow, literal form of the old timer loop.  It is intentionally test-only:
+ * compare the algebraic production implementation against it over awkward
+ * phases without making a multi-billion-tick WFI wait run in host time. */
+static void timer_tick_reference(s5l_timer_t *t, uint32_t ticks) {
+    t->ticks += ticks;
+    if (t->t4_state & TIMER4_STATE_START) {
+        while (ticks--) {
+            if (t->t4_value == 0) {
+                t->t4_value = t->t4_count;
+                if (t->t4_value == 0) break;
+            }
+            if (--t->t4_value == 0) {
+                t->irqlatch |= TIMER4_IRQ_BITS;
+                t->t4_value = t->t4_count;
+            }
+        }
+    }
+}
+
+static void test_timer_lump_matches_literal_countdown(void) {
+    /* Cover zero reloads, a live value larger than its reload, exact expiry
+     * boundaries, multiple periods, stopped timers, and a pre-existing latch. */
+    for (uint32_t period = 0; period <= 7; period++) {
+        for (uint32_t value = 0; value <= 9; value++) {
+            for (uint32_t ticks = 0; ticks <= 31; ticks++) {
+                for (unsigned started = 0; started < 2; started++) {
+                    s5l_timer_t fast, slow;
+                    s5l_timer_reset(&fast);
+                    fast.ticks = 0xfffffff0u;
+                    fast.t4_count = period;
+                    fast.t4_value = value;
+                    fast.t4_state = started ? TIMER4_STATE_START : 0u;
+                    fast.irqlatch = ((period + value + ticks) & 1u)
+                                  ? TIMER4_IRQ_BITS : 0u;
+                    slow = fast;
+                    (void)s5l_timer_tick(&fast, ticks);
+                    timer_tick_reference(&slow, ticks);
+                    CHECK(fast.ticks == slow.ticks &&
+                          fast.t4_value == slow.t4_value &&
+                          fast.irqlatch == slow.irqlatch,
+                          "p=%u v=%u ticks=%u start=%u: fast {%llu,%u,%x} "
+                          "slow {%llu,%u,%x}",
+                          period, value, ticks, started,
+                          (unsigned long long)fast.ticks, fast.t4_value,
+                          fast.irqlatch, (unsigned long long)slow.ticks,
+                          slow.t4_value, slow.irqlatch);
+                }
+            }
+        }
+    }
+
+    /* This used to require UINT32_MAX host-loop iterations.  With period 3,
+     * UINT32_MAX is an exact multiple of the period, so the reload phase is 3. */
+    s5l_timer_t huge;
+    s5l_timer_reset(&huge);
+    huge.t4_count = huge.t4_value = 3u;
+    huge.t4_state = TIMER4_STATE_START;
+    CHECK(s5l_timer_tick(&huge, UINT32_MAX),
+          "a huge running interval must cross an expiry");
+    CHECK(huge.ticks == UINT32_MAX && huge.t4_value == 3u &&
+          huge.irqlatch == TIMER4_IRQ_BITS,
+          "huge tick left ticks=%llu value=%u latch=%08x",
+          (unsigned long long)huge.ticks, huge.t4_value, huge.irqlatch);
+}
+
+static void test_wfi_fast_forwards_to_the_timer_boundary(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+
+    const uint32_t program[] = {
+        0xee070f90u,            /* MCR p15,0,r0,c7,c0,4  WFI */
+        0xe3a0102au             /* MOV r1,#42             */
+    };
+    s5l8900_load(&m, 0, program, sizeof program);
+
+    /* Three timebase ticks are eleven emulated CPU ticks away with this
+     * fractional phase: ceil((3*4 - 1)/1) == 11. */
+    m.cpu_hz = 4u;
+    m.tb_hz = 1u;
+    m.tb_accum = 1u;
+    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER4_COUNTBUF, 3u);
+    m.bus.write32(m.bus.ctx, S5L8900_TIMER_BASE + TIMER4_STATE,
+                  TIMER4_STATE_START | TIMER4_STATE_UPDATE);
+    m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE,
+                  1u << S5L8900_IRQ_TIMER);
+    m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTSELECT,
+                  1u << S5L8900_IRQ_TIMER);             /* timer -> FIQ */
+
+    /* F masks the FIQ exception, but ARM1176 WFI must still wake on the raw
+     * asserted line.  No synthetic idle instructions may enter cpu.cycles. */
+    m.cpu.r[15] = 0;
+    m.cpu.cpsr = ARM_MODE_SYS | ARM_CPSR_F;
+    arm_status_t st = ARM_OK;
+    unsigned ran = s5l8900_run(&m, 1u, &st);
+    CHECK(st == ARM_OK && ran == 1u &&
+          m.cpu.r[15] == 4u && m.cpu.cycles == 1u,
+          "WFI status=%d ran=%u pc=%08x retired=%llu",
+          (int)st, ran, m.cpu.r[15], (unsigned long long)m.cpu.cycles);
+    CHECK(m.timer.ticks == 3u && m.timer.t4_value == 3u,
+          "timer stopped at ticks=%llu value=%u, expect exact expiry 3/3",
+          (unsigned long long)m.timer.ticks, m.timer.t4_value);
+    /* The runner accounts the WFI instruction's ordinary one active tick
+     * after the synchronous wait.  At 4:1 that leaves fractional phase 1 and
+     * does not cross a fourth timebase tick. */
+    CHECK(m.tb_accum == 1u && m.cpu.fiq_line,
+          "fraction=%llu fiq=%d expect 1/1 at the edge",
+          (unsigned long long)m.tb_accum, (int)m.cpu.fiq_line);
+
+    /* A masked wake resumes after the MCR instead of entering the handler. */
+    st = arm_step(&m.cpu);
+    CHECK(st == ARM_OK && m.cpu.r[1] == 42u && m.cpu.r[15] == 8u,
+          "masked wake did not resume after WFI: status=%d r1=%u pc=%08x",
+          (int)st, m.cpu.r[1], m.cpu.r[15]);
+    s5l8900_free(&m);
+}
+
+static void test_wfi_unmasked_fiq_uses_the_post_mcr_return_link(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+    const uint32_t wfi = 0xee070f90u;
+    s5l8900_load(&m, 0, &wfi, sizeof wfi);
+    m.cpu_hz = m.tb_hz = 1u;
+    m.timer.t4_count = m.timer.t4_value = 2u;
+    m.timer.t4_state = TIMER4_STATE_START;
+    m.vic[0].enable = 1u << S5L8900_IRQ_TIMER;
+    m.vic[0].select = 1u << S5L8900_IRQ_TIMER;
+    m.cpu.cpsr = ARM_MODE_SYS;                  /* IRQ and FIQ both enabled */
+
+    arm_status_t st = arm_step(&m.cpu);         /* WFI reaches the edge */
+    CHECK(st == ARM_OK && m.cpu.r[15] == 4u && m.cpu.fiq_line,
+          "WFI did not complete at pending FIQ: status=%d pc=%08x fiq=%d",
+          (int)st, m.cpu.r[15], (int)m.cpu.fiq_line);
+    st = arm_step(&m.cpu);                      /* interrupt is sampled here */
+    CHECK(st == ARM_OK && m.cpu.r[15] == ARM_VEC_FIQ &&
+          (m.cpu.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_FIQ,
+          "FIQ entry status=%d pc=%08x mode=%02x",
+          (int)st, m.cpu.r[15], m.cpu.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK(m.cpu.r[14] == 8u && m.cpu.cycles == 2u,
+          "lr_fiq=%08x cycles=%llu expect WFI+8 and two retired operations",
+          m.cpu.r[14], (unsigned long long)m.cpu.cycles);
+    s5l8900_free(&m);
+}
+
+static void test_wfi_pending_line_completes_without_advancing_time(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+    const uint32_t wfi = 0xee070f90u;
+    s5l8900_load(&m, 0, &wfi, sizeof wfi);
+
+    /* Make a software IRQ both pending and visible before WFI.  I masks
+     * exception entry at arm_step's first sample, but not WFI wakeup. */
+    m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE, 1u << 3);
+    m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_SOFTINT, 1u << 3);
+    s5l8900_tick(&m, 0);
+    CHECK(m.cpu.irq_line, "software IRQ should already be asserted");
+    m.cpu.cpsr = ARM_MODE_SYS | ARM_CPSR_I;
+    arm_status_t st = arm_step(&m.cpu);
+    CHECK(st == ARM_OK && m.cpu.r[15] == 4u && m.cpu.cycles == 1u,
+          "pending WFI status=%d pc=%08x cycles=%llu",
+          (int)st, m.cpu.r[15], (unsigned long long)m.cpu.cycles);
+    CHECK(m.timer.ticks == 0u && m.tb_accum == 0u,
+          "already-pending wake advanced time to %llu/%llu",
+          (unsigned long long)m.timer.ticks,
+          (unsigned long long)m.tb_accum);
+    s5l8900_free(&m);
+}
+
+static void test_wfi_stops_at_earliest_deliverable_device_edge(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+    const uint32_t wfi = 0xee070f90u;
+    s5l8900_load(&m, 0, &wfi, sizeof wfi);
+    m.cpu_hz = m.tb_hz = 1u;
+
+    /* Timer would fire in ten ticks.  A scanout frame is three ticks away and
+     * is enabled through the VIC, so WFI must stop there and leave seven timer
+     * ticks outstanding rather than coalescing across the CLCD interrupt. */
+    m.timer.t4_count = m.timer.t4_value = 10u;
+    m.timer.t4_state = TIMER4_STATE_START;
+    m.clcd.scanning = true;
+    m.clcd.frame_ticks = 4u;
+    m.clcd.frame_accum = 1u;
+    m.clcd.intmask = CLCD_INT_FRAME;
+    m.vic[0].enable = (1u << S5L8900_IRQ_TIMER) | (1u << S5L8900_IRQ_CLCD);
+    m.cpu.cpsr = ARM_MODE_SYS | ARM_CPSR_I | ARM_CPSR_F;
+
+    arm_status_t st = arm_step(&m.cpu);
+    CHECK(st == ARM_OK && m.timer.ticks == 3u,
+          "earliest-edge WFI status=%d ticks=%llu expect 3",
+          (int)st, (unsigned long long)m.timer.ticks);
+    CHECK(m.timer.t4_value == 7u && m.timer.irqlatch == 0u,
+          "timer crossed later edge: value=%u latch=%08x",
+          m.timer.t4_value, m.timer.irqlatch);
+    CHECK(m.clcd.frames == 1u && m.clcd.frame_accum == 0u && m.cpu.irq_line,
+          "CLCD edge frames=%llu phase=%u irq=%d",
+          (unsigned long long)m.clcd.frames, m.clcd.frame_accum,
+          (int)m.cpu.irq_line);
+    CHECK(m.cpu.cycles == 1u, "idle elapsed time polluted retired count: %llu",
+          (unsigned long long)m.cpu.cycles);
+    s5l8900_free(&m);
+}
+
+static void test_wfi_lump_preserves_non_waking_device_side_effects(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+    const uint32_t wfi = 0xee070f90u;
+    s5l8900_load(&m, 0, &wfi, sizeof wfi);
+    m.cpu_hz = m.tb_hz = 1u;
+
+    m.timer.t4_count = m.timer.t4_value = 10u;
+    m.timer.t4_state = TIMER4_STATE_START;
+    m.vic[0].enable = 1u << S5L8900_IRQ_TIMER;
+    m.clcd.scanning = true;
+    m.clcd.frame_ticks = 3u;
+    m.clcd.frame_accum = 0u;
+    m.clcd.intmask = 0u;                       /* frames cannot wake the CPU */
+    m.cpu.cpsr = ARM_MODE_SYS | ARM_CPSR_I;
+
+    arm_status_t st = arm_step(&m.cpu);
+    CHECK(st == ARM_OK && m.timer.ticks == 10u && m.cpu.irq_line,
+          "timer wake status=%d ticks=%llu irq=%d",
+          (int)st, (unsigned long long)m.timer.ticks, (int)m.cpu.irq_line);
+    /* Three VBL boundaries occurred while the core slept.  Their level latch
+     * coalesces, but the visibility counter and residual phase must not be
+     * skipped merely because CLCD was not the selected wake source. */
+    CHECK(m.clcd.frames == 3u && m.clcd.frame_accum == 1u &&
+          (m.clcd.intstatus & CLCD_INT_FRAME) != 0u,
+          "sleep lost CLCD state: frames=%llu phase=%u status=%08x",
+          (unsigned long long)m.clcd.frames, m.clcd.frame_accum,
+          m.clcd.intstatus);
+    s5l8900_free(&m);
+}
+
+static void test_wfi_no_event_falls_back_without_time_or_host_hang(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+    const uint32_t program[] = { 0xee070f90u, 0xe3a02007u };
+    s5l8900_load(&m, 0, program, sizeof program);
+
+    /* An armed timer behind a disabled VIC cannot wake an ARM1176 in standby.
+     * Do not run it to an arbitrary boundary and do not block the host forever. */
+    m.timer.t4_count = m.timer.t4_value = 9u;
+    m.timer.t4_state = TIMER4_STATE_START;
+    m.cpu.cpsr = ARM_MODE_SYS;
+    arm_status_t st = arm_step(&m.cpu);
+    CHECK(st == ARM_OK && m.cpu.r[15] == 4u && m.cpu.cycles == 1u,
+          "no-event WFI status=%d pc=%08x cycles=%llu",
+          (int)st, m.cpu.r[15], (unsigned long long)m.cpu.cycles);
+    CHECK(m.timer.ticks == 0u && m.timer.t4_value == 9u &&
+          !m.cpu.irq_line && !m.cpu.fiq_line,
+          "no-event fallback changed devices: ticks=%llu value=%u irq=%d fiq=%d",
+          (unsigned long long)m.timer.ticks, m.timer.t4_value,
+          (int)m.cpu.irq_line, (int)m.cpu.fiq_line);
+    st = arm_step(&m.cpu);
+    CHECK(st == ARM_OK && m.cpu.r[2] == 7u,
+          "host did not make progress after fallback: status=%d r2=%u",
+          (int)st, m.cpu.r[2]);
+    s5l8900_free(&m);
+
+    /* Enabled routes are still not future events when their autonomous
+     * counters are zero/disabled.  This separate shape catches accidental
+     * division by zero and UINT32 wrap in the event-distance calculation. */
+    s5l8900_t zero;
+    CHECK(s5l8900_init(&zero, 0, 1u << 20), "zero-event machine init failed");
+    s5l8900_load(&zero, 0, &program[0], sizeof program[0]);
+    zero.timer.t4_state = TIMER4_STATE_START;
+    zero.timer.t4_count = zero.timer.t4_value = 0u;
+    zero.clcd.scanning = true;
+    zero.clcd.frame_ticks = 0u;
+    zero.clcd.intmask = CLCD_INT_FRAME;
+    zero.vic[0].enable = (1u << S5L8900_IRQ_TIMER) |
+                         (1u << S5L8900_IRQ_CLCD);
+    zero.cpu.cpsr = ARM_MODE_SYS | ARM_CPSR_I | ARM_CPSR_F;
+    st = arm_step(&zero.cpu);
+    CHECK(st == ARM_OK && zero.cpu.r[15] == 4u &&
+          zero.timer.ticks == 0u && zero.tb_accum == 0u,
+          "zero-event fallback status=%d pc=%08x ticks=%llu fraction=%llu",
+          (int)st, zero.cpu.r[15], (unsigned long long)zero.timer.ticks,
+          (unsigned long long)zero.tb_accum);
+    s5l8900_free(&zero);
+}
+
 /*
  * Guest time must advance at the guest's own CPU:timebase ratio, not once per
  * instruction. Running the timebase at instruction rate makes time pass ~68x
@@ -1252,6 +1534,13 @@ int main(void) {
     test_timebase_runs_at_the_guest_ratio();
     test_timer_period_is_exact();
     test_timer_ack_mask_matches_the_kernels();
+    test_timer_lump_matches_literal_countdown();
+    test_wfi_fast_forwards_to_the_timer_boundary();
+    test_wfi_unmasked_fiq_uses_the_post_mcr_return_link();
+    test_wfi_pending_line_completes_without_advancing_time();
+    test_wfi_stops_at_earliest_deliverable_device_edge();
+    test_wfi_lump_preserves_non_waking_device_side_effects();
+    test_wfi_no_event_falls_back_without_time_or_host_hang();
     test_timer_interrupt_reaches_handler();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
