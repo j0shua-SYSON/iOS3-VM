@@ -16,13 +16,24 @@
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "ksyms.h"
 #include "macho.h"
 #include "snapshot.h"
 #include "soc.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 static uint8_t *slurp(const char *path, size_t *len_out) {
     FILE *f = fopen(path, "rb");
@@ -33,6 +44,224 @@ static uint8_t *slurp(const char *path, size_t *len_out) {
     fclose(f);
     *len_out = (size_t)n;
     return b;
+}
+
+/* Size and stream a large input without first mirroring it in a host buffer.
+ * The root filesystem is hundreds of MiB, while the final copy already lives
+ * in guest DRAM.  Keeping both copies almost doubles boot-time memory use.
+ *
+ * Keep the same open file from sizing through the final read.  The metadata
+ * stamp cannot make a mutable file into a snapshot, but it catches ordinary
+ * replacement and concurrent writes without allocating another image-sized
+ * buffer. Size and second-resolution change times are common everywhere;
+ * POSIX also gives a stable device/inode identity for the path check. */
+#ifdef _WIN32
+typedef struct _stat64 host_file_stat_t;
+static int host_file_fstat(FILE *f, host_file_stat_t *st) {
+    int fd = _fileno(f);
+    return fd < 0 ? -1 : _fstat64(fd, st);
+}
+static int host_file_stat(const char *path, host_file_stat_t *st) {
+    return _stat64(path, st);
+}
+#else
+typedef struct stat host_file_stat_t;
+static int host_file_fstat(FILE *f, host_file_stat_t *st) {
+    int fd = fileno(f);
+    return fd < 0 ? -1 : fstat(fd, st);
+}
+static int host_file_stat(const char *path, host_file_stat_t *st) {
+    return stat(path, st);
+}
+#endif
+
+typedef struct {
+    FILE             *file;
+    const char       *path;
+    host_file_stat_t  stamp;
+    size_t            size;
+} streamed_file_t;
+
+static bool host_file_stat_equal(const host_file_stat_t *a,
+                                 const host_file_stat_t *b) {
+    bool same = a->st_mode  == b->st_mode  && a->st_size  == b->st_size &&
+                a->st_mtime == b->st_mtime && a->st_ctime == b->st_ctime;
+#ifndef _WIN32
+    same = same && a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+#endif
+    return same;
+}
+
+static bool streamed_file_verify(const streamed_file_t *source,
+                                 const char *when) {
+    host_file_stat_t opened_now, path_now;
+    if (!source || !source->file || !source->path) return false;
+    if (host_file_fstat(source->file, &opened_now) != 0 ||
+        host_file_stat(source->path, &path_now) != 0) {
+        perror("stat");
+        return false;
+    }
+    if (!host_file_stat_equal(&source->stamp, &opened_now) ||
+        !host_file_stat_equal(&source->stamp, &path_now)) {
+        fprintf(stderr, "read: input changed %s\n", when);
+        return false;
+    }
+    return true;
+}
+
+static bool streamed_file_open(const char *path, streamed_file_t *source,
+                               size_t *len_out) {
+    host_file_stat_t path_stamp;
+    if (!path || !source || !len_out) return false;
+    memset(source, 0, sizeof *source);
+    source->file = fopen(path, "rb");
+    if (!source->file) { perror("open"); return false; }
+    source->path = path;
+    if (host_file_fstat(source->file, &source->stamp) != 0 ||
+        host_file_stat(path, &path_stamp) != 0) {
+        perror("stat");
+        fclose(source->file);
+        source->file = NULL;
+        return false;
+    }
+    if (!host_file_stat_equal(&source->stamp, &path_stamp)) {
+        fprintf(stderr, "open: input changed while it was being opened\n");
+        fclose(source->file);
+        source->file = NULL;
+        return false;
+    }
+    if (source->stamp.st_size < 0 ||
+        (uintmax_t)source->stamp.st_size > (uintmax_t)SIZE_MAX) {
+        fprintf(stderr, "open: input is too large for this host\n");
+        fclose(source->file);
+        source->file = NULL;
+        return false;
+    }
+    clearerr(source->file);
+    if (fseek(source->file, 0, SEEK_SET) != 0) {
+        perror("seek");
+        fclose(source->file);
+        source->file = NULL;
+        return false;
+    }
+    source->size = (size_t)source->stamp.st_size;
+    *len_out = source->size;
+    return true;
+}
+
+static bool streamed_file_close(streamed_file_t *source) {
+    if (!source || !source->file) return true;
+    FILE *f = source->file;
+    source->file = NULL;
+    if (fclose(f) != 0) {
+        perror("close");
+        return false;
+    }
+    return true;
+}
+
+static bool stream_file(streamed_file_t *source, uint8_t *dst,
+                        size_t expected) {
+    if (!source || !source->file || expected != source->size ||
+        (!dst && expected)) return false;
+    if (!streamed_file_verify(source, "before it was loaded")) return false;
+    FILE *f = source->file;
+
+    size_t done = 0;
+    while (done < expected) {
+        size_t chunk = expected - done;
+        if (chunk > (1u << 20)) chunk = 1u << 20;
+        size_t got = fread(dst + done, 1, chunk, f);
+        if (!got) {
+            if (ferror(f)) {
+                int saved_errno = errno;
+                fprintf(stderr, "read: failed after %llu of %llu bytes: ",
+                        (unsigned long long)done,
+                        (unsigned long long)expected);
+                fprintf(stderr, "%s\n", strerror(saved_errno));
+            }
+            else fprintf(stderr, "read: unexpected EOF after %llu of %llu bytes\n",
+                         (unsigned long long)done,
+                         (unsigned long long)expected);
+            return false;
+        }
+        done += got;
+    }
+
+    int extra = fgetc(f);
+    if (extra != EOF || ferror(f)) {
+        fprintf(stderr, "read: input size changed while it was being loaded\n");
+        return false;
+    }
+    return streamed_file_verify(source, "while it was being loaded");
+}
+
+typedef struct {
+    const char *name;
+    uint64_t    begin;
+    uint64_t    end;
+    bool        active;
+} boot_range_t;
+
+static bool add_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (!out || b > UINT64_MAX - a) return false;
+    *out = a + b;
+    return true;
+}
+
+static bool align_u64(uint64_t value, uint64_t alignment, uint64_t *out) {
+    if (!alignment || (alignment & (alignment - 1)) ||
+        value > UINT64_MAX - (alignment - 1)) return false;
+    *out = (value + alignment - 1) & ~(alignment - 1);
+    return true;
+}
+
+static bool boot_range_make(boot_range_t *range, const char *name,
+                            uint64_t begin, uint64_t length, bool active) {
+    if (!range || !name || !add_u64(begin, length, &range->end)) return false;
+    range->name = name;
+    range->begin = begin;
+    range->active = active;
+    return true;
+}
+
+static bool boot_ranges_overlap(const boot_range_t *a,
+                                const boot_range_t *b) {
+    if (!a->active || !b->active || a->begin == a->end || b->begin == b->end)
+        return false;
+    return a->begin < b->end && b->begin < a->end;
+}
+
+static bool boot_layout_validate(const boot_range_t *dram,
+                                 const boot_range_t *ranges, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        if (!ranges[i].active) continue;
+        if (ranges[i].begin < dram->begin || ranges[i].end > dram->end) {
+            fprintf(stderr,
+                    "layout: %s [0x%llx,0x%llx) is outside DRAM "
+                    "[0x%llx,0x%llx)\n",
+                    ranges[i].name,
+                    (unsigned long long)ranges[i].begin,
+                    (unsigned long long)ranges[i].end,
+                    (unsigned long long)dram->begin,
+                    (unsigned long long)dram->end);
+            return false;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (!boot_ranges_overlap(&ranges[i], &ranges[j])) continue;
+            fprintf(stderr,
+                    "layout: %s [0x%llx,0x%llx) overlaps %s "
+                    "[0x%llx,0x%llx)\n",
+                    ranges[i].name,
+                    (unsigned long long)ranges[i].begin,
+                    (unsigned long long)ranges[i].end,
+                    ranges[j].name,
+                    (unsigned long long)ranges[j].begin,
+                    (unsigned long long)ranges[j].end);
+            return false;
+        }
+    }
+    return true;
 }
 
 /* ---------------------------------------------------------------------------
@@ -377,14 +606,19 @@ static uint32_t hfs_tail_first(uint32_t total_blocks, uint32_t block_size) {
 }
 
 /*
- * Grow the volume in the loaded RAM disk by `want_mb` megabytes of FREE space.
- * On success rdp/rd_np are updated to point at a larger buffer. Returns false,
- * with an explanation, on any refusal — the caller aborts the boot rather than
- * booting an image it did not fully understand.
+ * Grow the volume in a preallocated span by `want_mb` megabytes of FREE space.
+ * The caller supplies capacity, so this never reallocates the hundreds-of-MiB
+ * image or creates a second full-size host copy. On success rd_np is updated to
+ * the exposed length. Returns false, with an explanation, on any refusal — the
+ * caller aborts the boot rather than booting an image it did not understand.
  */
-static bool rd_grow_volume(uint8_t **rdp, size_t *rd_np, uint32_t want_mb) {
-    uint8_t *img = *rdp;
-    size_t   n   = *rd_np;
+static bool rd_grow_volume(uint8_t *img, size_t *rd_np, size_t capacity,
+                           uint32_t want_mb) {
+    if (!img || !rd_np || *rd_np > capacity) {
+        fprintf(stderr, "rd-grow: invalid destination span\n");
+        return false;
+    }
+    size_t n = *rd_np;
     hfsvol_t v;
 
     if (!hfs_validate(img, n, &v, "before")) return false;
@@ -429,12 +663,17 @@ static bool rd_grow_volume(uint8_t **rdp, size_t *rd_np, uint32_t want_mb) {
             return false;
         }
 
-    size_t new_n = (size_t)((uint64_t)new_total * bs);
-    uint8_t *grown = realloc(img, new_n);
-    if (!grown) { fprintf(stderr, "rd-grow: out of memory for a %llu MB image\n",
-                          (unsigned long long)(new_n >> 20)); return false; }
-    memset(grown + n, 0, new_n - n);
-    *rdp = img = grown;
+    uint64_t new_n64 = (uint64_t)new_total * bs;
+    if (new_n64 > SIZE_MAX || new_n64 > capacity) {
+        fprintf(stderr,
+                "rd-grow: %llu-byte result exceeds the %llu-byte destination "
+                "capacity\n",
+                (unsigned long long)new_n64,
+                (unsigned long long)capacity);
+        return false;
+    }
+    size_t new_n = (size_t)new_n64;
+    memset(img + n, 0, new_n - n);
 
     /* (3) the reserved tail moves. */
     for (uint32_t b = old_tail; b < v.total_blocks; b++) hfs_bit_set(img, &v, b, 0);
@@ -887,6 +1126,32 @@ static const uint8_t *guest_ptr(uint32_t va, uint32_t need) {
     uint32_t o = pa - g_mach->ram_base;
     if (o >= g_mach->ram_size || g_mach->ram_size - o < need) return NULL;
     return g_mach->ram + o;
+}
+
+/* Fetch bytes through the guest's current translation tables. guest_ptr()
+ * intentionally handles only the kernel's fixed linear window, but the most
+ * valuable undefined instructions now occur in user processes. Re-walk the
+ * exact fetch mapping after a stop so the report always includes the encoding
+ * that blocked progress. The stopped instruction already fetched once, so
+ * this diagnostic read cannot introduce a mapping the guest did not use. */
+static bool guest_fetch_bytes(uint32_t va, uint8_t *out, size_t n,
+                              uint32_t *first_pa) {
+    if (!g_mach || !out || n > UINT32_MAX ||
+        (n && (uint64_t)va + n - 1u > UINT32_MAX)) return false;
+
+    uint32_t mode = g_mach->cpu.cpsr & ARM_CPSR_MODE_MASK;
+    bool priv = mode != ARM_MODE_USR;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t pa = 0;
+        uint32_t fsr = arm_mmu_translate(&g_mach->cpu, va + (uint32_t)i,
+                                         ARM_ACCESS_FETCH, priv, &pa);
+        if (fsr || pa < g_mach->ram_base) return false;
+        uint64_t off = (uint64_t)pa - g_mach->ram_base;
+        if (off >= g_mach->ram_size) return false;
+        if (i == 0 && first_pa) *first_pa = pa;
+        out[i] = g_mach->ram[(size_t)off];
+    }
+    return true;
 }
 
 /* Print the C string at a guest address, escaped, or say why we cannot. */
@@ -1760,10 +2025,10 @@ int main(int argc, char **argv) {
             "      the kernel, instead of above it. Both are below\n"
             "      topOfKernelData and so equally protected, but below the\n"
             "      kernel the disk stops pushing that line up and the free\n"
-            "      page pool grows by its whole size — 312 MB at\n"
-            "      -V 0xa4000000 -R 768 -Y against 59 at the default, and\n"
-            "      -V 0xa0000000 -R 768 -Y --grow 100 fits a 512 MB volume\n"
-            "      (the allocation file's ceiling) with 248 MB left over.\n"
+            "      page pool grew by its whole size in historical 768 MB\n"
+            "      experiments. Those old commands are now rejected: the\n"
+            "      corrected model reserves NOR at 0x28000000, exactly after\n"
+            "      the supported 512 MB DRAM window.\n"
             "      It needs -V to open a gap under the kernel, and THAT is\n"
             "      what does not work yet: with -V below 0xc0000000 the boot\n"
             "      reaches \"BSD root: md0\" and then goes idle without ever\n"
@@ -1911,11 +2176,11 @@ int main(int argc, char **argv) {
      *   -V 0xa4000000 -R 768 -Y                445 MB disk, 312.14 MB pool
      *   -V 0xa0000000 -R 768 -Y --grow 100     512 MB disk, 248.14 MB pool
      *
-     * 768 MB is the most DRAM this machine can have: SDRAM base 0x08000000
-     * plus 768 MB is 0x38000000, the first peripheral aperture, and the DRAM
-     * window silently shadows anything it covers. 512 MB is the largest volume
-     * the allocation file can describe. So the last line is the ceiling in
-     * both directions at once.
+     * Those 768 MB rows are retained as historical measurements only. They
+     * predate the corrected modelled NOR window at 0x28000000 and the strict
+     * RAM/device overlap check. The largest accepted window is now 512 MB:
+     * [0x08000000,0x28000000). The HFS allocation file independently caps the
+     * volume at 512 MB as well.
      *
      * EXPERIMENT, NOT YET A WORKING BOOT, and the reason is -V rather than -Y:
      * both -V rows above reach "BSD root: md0" and then go idle without ever
@@ -2063,10 +2328,11 @@ int main(int argc, char **argv) {
      * The ceiling is 0xe0000000 - gVirtBase, NOT a constant 512 MB. It reads as
      * 512 only because gVirtBase is 0xc0000000, and gVirtBase is a boot_args
      * field we choose (-V), not something the kernel hardcodes the way it
-     * hardcodes virtual_avail. Writing it this way makes the one experiment
-     * that could buy real headroom a command line away rather than a rebuild:
-     * -V 0xb0000000 makes the window 768 MB, which is also exactly the physical
-     * space between SDRAM base and the first peripheral aperture.
+     * hardcodes virtual_avail. With -V 0xb0000000 the kernel-side arithmetic
+     * alone would permit 768 MB, but the SoC model correctly rejects that
+     * physical map because it reaches the NOR window at 0x28000000. Keep the
+     * cap relative to gVirtBase so lower-base experiments at or below the
+     * physical 512 MB ceiling remain testable.
      *
      * That experiment is NOT known to work and must be run before it is
      * believed — if VM_MIN_KERNEL_ADDRESS is compiled into this kernel as
@@ -2130,6 +2396,22 @@ int main(int argc, char **argv) {
     mach.trace_devices = true;
     g_mach = &mach; g_virt_base = virt_base; g_phys_base = phys_base;
 
+    boot_range_t dram_range, kernel_range;
+    uint64_t kernel_begin64, kernel_end64;
+    if (!boot_range_make(&dram_range, "DRAM", phys_base, ram_size, true) ||
+        m.vm_low < virt_base || m.vm_high < m.vm_low ||
+        !add_u64(phys_base, (uint64_t)m.vm_low - virt_base, &kernel_begin64) ||
+        !add_u64(phys_base, (uint64_t)m.vm_high - virt_base, &kernel_end64) ||
+        !boot_range_make(&kernel_range, "kernel", kernel_begin64,
+                         kernel_end64 - kernel_begin64, true) ||
+        !boot_layout_validate(&dram_range, &kernel_range, 1)) {
+        fprintf(stderr,
+                "layout: kernel virtual span [0x%08x,0x%08x) cannot be "
+                "mapped safely from virtual base 0x%08x\n",
+                m.vm_low, m.vm_high, virt_base);
+        return 1;
+    }
+
     printf("kernel     : %s (%zu bytes)\n", argv[1], len);
     printf("virt base  : 0x%08x   phys base : 0x%08x   RAM %u MB\n",
            virt_base, phys_base, ram_size >> 20);
@@ -2141,7 +2423,16 @@ int main(int argc, char **argv) {
             printf("  skip %-16s vm 0x%08x is below the virtual base\n", s->name, s->vmaddr);
             continue;
         }
-        uint32_t pa = s->vmaddr - virt_base + phys_base;
+        uint64_t pa64, file_end64;
+        if (!add_u64(phys_base, (uint64_t)s->vmaddr - virt_base, &pa64) ||
+            !add_u64(pa64, s->filesize, &file_end64) ||
+            pa64 > UINT32_MAX || pa64 < kernel_range.begin ||
+            file_end64 > kernel_range.end || file_end64 > dram_range.end) {
+            fprintf(stderr, "layout: kernel segment %s has an unsafe physical span\n",
+                    s->name);
+            return 1;
+        }
+        uint32_t pa = (uint32_t)pa64;
         s5l8900_load(&mach, pa, img + s->fileoff, s->filesize);
         printf("  load %-16s vm 0x%08x -> pa 0x%08x  %u bytes\n",
                s->name, s->vmaddr, pa, s->filesize);
@@ -2185,7 +2476,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    uint32_t entry_pa = m.entry - virt_base + phys_base;
+    uint64_t entry_pa64;
+    if (m.entry < virt_base ||
+        !add_u64(phys_base, (uint64_t)m.entry - virt_base, &entry_pa64) ||
+        entry_pa64 > UINT32_MAX || entry_pa64 < kernel_range.begin ||
+        entry_pa64 >= kernel_range.end) {
+        fprintf(stderr, "layout: kernel entry 0x%08x is outside the kernel span\n",
+                m.entry);
+        return 1;
+    }
+    uint32_t entry_pa = (uint32_t)entry_pa64;
     printf("entry      : vm 0x%08x -> pa 0x%08x\n", m.entry, entry_pa);
 
     /*
@@ -2198,8 +2498,7 @@ int main(int argc, char **argv) {
      * and Version are the values in common use; they are the fields I am least
      * sure of and the first thing to question if the kernel rejects the struct.
      */
-    uint32_t dt_pa = (m.vm_high - virt_base + phys_base + 0xfffu) & ~0xfffu;
-    uint32_t dt_len = 0;
+    uint32_t dt_pa = 0, dt_len = 0;
 
     /* The tree has to be read before the layout is fixed, because the RAMDisk
      * entry written into it names an address that depends on where everything
@@ -2210,38 +2509,23 @@ int main(int argc, char **argv) {
         fprintf(stderr, "devicetree: cannot read %s\n", dtpath);
         return 1;
     }
+    if (dt_n > UINT32_MAX) {
+        fprintf(stderr, "devicetree: %llu-byte input exceeds the 32-bit boot_args field\n",
+                (unsigned long long)dt_n);
+        free(dt);
+        return 1;
+    }
     if (dt) dt_len = (uint32_t)dt_n;
 
-    /* Likewise the RAM disk: its size decides where topOfKernelData ends up. */
+    /* Learn the RAM-disk size now, but do not allocate or read it yet. It is
+     * streamed into its final guest-DRAM address after the layout is checked. */
     size_t rd_n = 0;
-    uint8_t *rd = rdpath ? slurp(rdpath, &rd_n) : NULL;
-    if (rdpath && !rd) { fprintf(stderr, "ramdisk: cannot read %s\n", rdpath); return 1; }
-
-    /* Retarget /private/etc/fstab at the device this machine actually has.
-     * Only the in-memory copy is touched; firmware/rootfs.img stays pristine. */
-    if (rd && fstab_fixup) {
-        size_t at = rd_rewrite_fstab(rd, rd_n, fstab_line);
-        if (at == (size_t)-1) return 1;
-        printf("fstab      : /private/etc/fstab @ image+0x%08x -> \"%s\"\n"
-               "             (stock names /dev/disk0s1 + /dev/disk0s2; this VM "
-               "has no NAND-backed disk0.\n"
-               "              --keep-fstab to leave it alone — launchd then "
-               "fails fsck and halts.)\n",
-               (unsigned)at, fstab_line);
-    }
-
-    /* Give the guest somewhere to write. The stock volume is sized exactly to
-     * its contents (freeBlocks == 0) because on hardware everything writable
-     * lives on disk0s2; here "/" is all there is. Again the in-memory copy
-     * only — and it has to happen before rd_len is taken below, because the
-     * grown image is the device the guest is handed. */
-    if (rd && rd_grow_mb) {
-        if (!rd_grow_volume(&rd, &rd_n, rd_grow_mb)) {
-            fprintf(stderr, "             pass --grow 0 to boot the volume "
-                            "untouched (it has zero free blocks, so launchd "
-                            "can create nothing).\n");
-            return 1;
-        }
+    uint8_t *rd = NULL;
+    streamed_file_t rd_source;
+    memset(&rd_source, 0, sizeof rd_source);
+    if (rdpath && !streamed_file_open(rdpath, &rd_source, &rd_n)) {
+        fprintf(stderr, "ramdisk: cannot size %s\n", rdpath);
+        return 1;
     }
 
     /*
@@ -2255,7 +2539,22 @@ int main(int argc, char **argv) {
     const uint32_t FB_BPP = N82_FB_BPP;
     const uint32_t fb_bytes = want_fb ? N82_FB_BYTES : 0u;
 
-    uint32_t ba_pa = (dt_pa + dt_len + 0xfffu) & ~0xfffu;
+    uint64_t dt_pa64, ba_pa64;
+    boot_range_t dt_range, ba_range;
+    if (!align_u64(kernel_range.end, 0x1000u, &dt_pa64) ||
+        dt_pa64 > UINT32_MAX ||
+        !boot_range_make(&dt_range, "device tree", dt_pa64, dt_n, dt != NULL) ||
+        !align_u64(dt_range.end, 0x1000u, &ba_pa64) ||
+        ba_pa64 > UINT32_MAX ||
+        !boot_range_make(&ba_range, "boot_args page", ba_pa64, 0x1000u, true)) {
+        fprintf(stderr,
+                "layout: kernel, device tree, and boot_args do not fit in "
+                "32-bit space\n");
+        streamed_file_close(&rd_source);
+        return 1;
+    }
+    dt_pa = (uint32_t)dt_pa64;
+    uint32_t ba_pa = (uint32_t)ba_pa64;
 
     /*
      * The RAM disk goes immediately after boot_args and BELOW topOfKernelData.
@@ -2272,8 +2571,116 @@ int main(int argc, char **argv) {
     /* -Y moves it BELOW the kernel instead (see the flag's note): still below
      * topOfKernelData, still static, but no longer pushing that line — and
      * therefore the free page pool — up by the size of the root filesystem. */
-    uint32_t rd_pa = rd_low ? phys_base : ((ba_pa + 0x1000u + 0xfffu) & ~0xfffu);
-    uint32_t rd_len = (uint32_t)((rd_n + 0xfffu) & ~(size_t)0xfffu);
+    uint64_t rd_pa64, capacity64 = 0, rd_reserve_len64 = 0;
+    if (rdpath &&
+        (!add_u64((uint64_t)rd_n, (uint64_t)rd_grow_mb << 20,
+                  &capacity64) ||
+         capacity64 > SIZE_MAX || capacity64 > UINT32_MAX ||
+         !align_u64(capacity64, 0x1000u, &rd_reserve_len64))) {
+        fprintf(stderr, "ramdisk: source plus requested growth is too large\n");
+        streamed_file_close(&rd_source);
+        return 1;
+    }
+    if (rd_low) {
+        rd_pa64 = phys_base;
+    } else if (!align_u64(ba_range.end, 0x1000u, &rd_pa64)) {
+        fprintf(stderr, "layout: RAM-disk address overflow\n");
+        streamed_file_close(&rd_source);
+        return 1;
+    }
+
+    boot_range_t rd_range;
+    if (rd_pa64 > UINT32_MAX ||
+        !boot_range_make(&rd_range, "RAM disk reserve", rd_pa64,
+                         rd_reserve_len64, rdpath != NULL)) {
+        fprintf(stderr, "layout: RAM-disk span exceeds 32-bit physical space\n");
+        streamed_file_close(&rd_source);
+        return 1;
+    }
+    uint32_t rd_pa = (uint32_t)rd_pa64;
+    size_t capacity = (size_t)capacity64;
+
+    uint64_t fb_start64 = 0, planned_static_end64 = 0;
+    boot_range_t fb_range;
+    if (want_fb) {
+        if ((uint64_t)ram_size < fb_bytes) {
+            fprintf(stderr,
+                    "framebuffer: %u bytes do not fit in %u bytes of DRAM\n",
+                    fb_bytes, ram_size);
+            streamed_file_close(&rd_source);
+            return 1;
+        }
+        fb_start64 = (dram_range.end - fb_bytes) & ~UINT64_C(0xfff);
+    }
+    if (!boot_range_make(&fb_range, "framebuffer", fb_start64, fb_bytes,
+                         want_fb)) {
+        fprintf(stderr, "framebuffer: physical span overflow\n");
+        streamed_file_close(&rd_source);
+        return 1;
+    }
+
+    boot_range_t layout_ranges[] = {
+        kernel_range, dt_range, ba_range, rd_range, fb_range
+    };
+    if (!boot_layout_validate(&dram_range, layout_ranges,
+                              sizeof layout_ranges / sizeof layout_ranges[0])) {
+        streamed_file_close(&rd_source);
+        return 1;
+    }
+    uint64_t static_input_end64 = (rdpath && !rd_low) ? rd_range.end
+                                                       : ba_range.end;
+    if (!align_u64(static_input_end64, 0x4000u, &planned_static_end64) ||
+        planned_static_end64 > dram_range.end ||
+        (want_fb && planned_static_end64 > fb_range.begin)) {
+        fprintf(stderr,
+                "layout: static boot reserve ending at 0x%llx reaches the "
+                "framebuffer or leaves DRAM\n",
+                (unsigned long long)planned_static_end64);
+        streamed_file_close(&rd_source);
+        return 1;
+    }
+
+    /* The complete conservative layout is proved disjoint before this direct
+     * write. Keep the source handle open through the final metadata check. */
+    if (rdpath) {
+        rd = mach.ram + (size_t)(rd_range.begin - dram_range.begin);
+        bool read_ok = stream_file(&rd_source, rd, rd_n);
+        bool close_ok = streamed_file_close(&rd_source);
+        if (!read_ok || !close_ok) {
+            fprintf(stderr, "ramdisk: cannot stream %s into guest DRAM\n", rdpath);
+            return 1;
+        }
+
+        /* Retarget /private/etc/fstab at the device this machine provides.
+         * Only guest DRAM is touched; firmware/rootfs.img stays pristine. */
+        if (fstab_fixup) {
+            size_t at = rd_rewrite_fstab(rd, rd_n, fstab_line);
+            if (at == (size_t)-1) return 1;
+            printf("fstab      : /private/etc/fstab @ image+0x%08x -> \"%s\"\n"
+                   "             (stock names /dev/disk0s1 + /dev/disk0s2; "
+                   "this VM has no NAND-backed disk0.\n"
+                   "              --keep-fstab leaves it unchanged; launchd "
+                   "then fails fsck and halts.)\n",
+                   (unsigned)at, fstab_line);
+        }
+
+        if (rd_grow_mb && !rd_grow_volume(rd, &rd_n, capacity, rd_grow_mb)) {
+            fprintf(stderr, "             pass --grow 0 to boot the volume "
+                            "untouched (it has zero free blocks, so launchd "
+                            "can create nothing).\n");
+            return 1;
+        }
+    }
+
+    uint64_t rd_len64, rd_actual_end64;
+    if (!align_u64((uint64_t)rd_n, 0x1000u, &rd_len64) ||
+        rd_len64 > UINT32_MAX ||
+        !add_u64(rd_pa64, rd_len64, &rd_actual_end64) ||
+        (rdpath && rd_actual_end64 > rd_range.end)) {
+        fprintf(stderr, "layout: final padded RAM-disk span exceeds its reserve\n");
+        return 1;
+    }
+    uint32_t rd_len = (uint32_t)rd_len64;
 
     /*
      * topOfKernelData is where the kernel starts placing its own page tables,
@@ -2305,15 +2712,22 @@ int main(int argc, char **argv) {
      * this never showed up before — and why the framebuffer regression noted
      * above looked like a framebuffer problem.
      */
-    uint32_t top_of_kernel_data = (rd && !rd_low)
-                                  ? ((rd_pa + rd_len + 0x3fffu) & ~0x3fffu)
-                                  : ((ba_pa + 0x1000u + 0x3fffu) & ~0x3fffu);
+    uint64_t top_of_kernel_data64;
+    uint64_t actual_static_end64 = (rd && !rd_low) ? rd_actual_end64
+                                                    : ba_range.end;
+    if (!align_u64(actual_static_end64, 0x4000u, &top_of_kernel_data64) ||
+        top_of_kernel_data64 > planned_static_end64 ||
+        top_of_kernel_data64 > UINT32_MAX) {
+        fprintf(stderr, "layout: final topOfKernelData exceeds its checked reserve\n");
+        return 1;
+    }
+    uint32_t top_of_kernel_data = (uint32_t)top_of_kernel_data64;
     /* With -Y the disk is below the kernel, so the only thing that can go
      * wrong is running into it. Say so in those terms rather than as a
      * generic "does not fit". */
     if (rd && rd_low) {
-        uint32_t kern_pa = m.vm_low - virt_base + phys_base;
-        if (rd_pa + rd_len > kern_pa) {
+        uint32_t kern_pa = (uint32_t)kernel_range.begin;
+        if (rd_actual_end64 > kernel_range.begin) {
             fprintf(stderr,
                 "-Y: a %u MB RAM disk at 0x%08x overruns the kernel's load "
                 "address 0x%08x.\n"
@@ -2325,7 +2739,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    const uint64_t dram_end64 = (uint64_t)phys_base + ram_size;
+    const uint64_t dram_end64 = dram_range.end;
     uint32_t fb_pa = top_of_kernel_data;
 
     /* Do all placement arithmetic in 64 bits. A wrapped subtraction here used
@@ -2390,9 +2804,23 @@ int main(int argc, char **argv) {
      * plants a sentinel, and the _mdevadd watchpoint below prints what actually
      * arrived in r1.
      */
+    uint64_t rd_virt64 = 0, dt_virt64 = 0, top_virt64;
+    if ((rd &&
+         (!add_u64(virt_base, rd_pa64 - dram_range.begin, &rd_virt64) ||
+          rd_virt64 > UINT32_MAX)) ||
+        (dt &&
+         (!add_u64(virt_base, dt_pa64 - dram_range.begin, &dt_virt64) ||
+          dt_virt64 > UINT32_MAX)) ||
+        !add_u64(virt_base, top_of_kernel_data64 - dram_range.begin,
+                 &top_virt64) || top_virt64 > UINT32_MAX) {
+        fprintf(stderr, "layout: a boot-data virtual address exceeds 32 bits\n");
+        return 1;
+    }
     uint32_t rd_dt_addr = rd_form == RD_ADDR_PHYS    ? rd_pa
                         : rd_form == RD_ADDR_LITERAL ? rd_literal
-                        : rd_pa - phys_base + virt_base;
+                        : (uint32_t)rd_virt64;
+    uint32_t dt_boot_addr = dt ? (uint32_t)dt_virt64 : 0;
+    uint32_t top_virt = (uint32_t)top_virt64;
 
     if (dt) {
         printf("devicetree : %s -> pa 0x%08x (%u bytes)\n", dtpath, dt_pa, dt_len);
@@ -2463,15 +2891,13 @@ int main(int argc, char **argv) {
     }
 
     if (rd) {
-        s5l8900_load(&mach, rd_pa, rd, rd_n);
-        printf("ramdisk    : %s -> pa 0x%08x  %u bytes (%u padded)\n",
+        printf("ramdisk    : %s -> pa 0x%08x  %u bytes (%u padded, direct stream)\n",
                rdpath, rd_pa, (unsigned)rd_n, rd_len);
         printf("             DT RAMDisk = {0x%08x, 0x%08x}  (%s)\n",
                rd_dt_addr, rd_len,
                rd_form == RD_ADDR_PHYS ? "physical" :
                rd_form == RD_ADDR_LITERAL ? "literal sentinel" :
                "virtual, ml_static_ptovirt form");
-        free(rd);
     }
 
     /*
@@ -2525,7 +2951,7 @@ int main(int argc, char **argv) {
     PUT32(0x24, FB_H);                 /* v_height   */
     PUT32(0x28, FB_BPP * 8);           /* v_depth    */
     PUT32(0x2c, 0);                    /* machineType           */
-    PUT32(0x30, dt_len ? (dt_pa - phys_base + virt_base) : 0);
+    PUT32(0x30, dt_boot_addr);
     PUT32(0x34, dt_len);
     memcpy(ba + 0x38, cmdline, strlen(cmdline) < 255 ? strlen(cmdline) : 255);
 #undef PUT16
@@ -2545,7 +2971,7 @@ int main(int argc, char **argv) {
         printf("framebuffer: disabled (-F enables Boot_Video + CLCD window 0)\n");
     }
     printf("boot_args  : pa 0x%08x  topOfKernelData vm 0x%08x  cmdline \"%s\"\n\n",
-           ba_pa, top_of_kernel_data - phys_base + virt_base, cmdline);
+           ba_pa, top_virt, cmdline);
 
     /*
      * GUEST MEMORY BUDGET — the arithmetic that decides whether a root
@@ -2589,22 +3015,16 @@ int main(int argc, char **argv) {
                freepool >> 20, ((freepool & 0xfffffu) * 100u) >> 20);
         printf("  for scale, a real iPhone1,2 has 128 MB total with the system "
                "on NAND\n");
-        /*
-         * A DRAM aperture this large SHADOWS peripherals, silently: bus_read
-         * tests in_ram() first and returns before it ever looks at a device.
-         * At -R 512 the window reaches 0x28000000, which swallows both the SRAM
-         * alias at 0x22000000 and — the one that matters — the NOR at
-         * 0x24000000. Nothing complains; NOR reads just come back as whatever
-         * byte of the RAM disk happens to live there. Worth saying out loud
-         * because NOR is where an era-appropriate untether would have to
-         * persist, so "we boot fine at -R 512" and "NOR works" cannot both be
-         * assumed at the same time.
-         */
-        if (dram_end > 0x22000000u)
-            printf("  NOTE: this DRAM window shadows SRAM 0x22000000%s — bus_read\n"
-                   "        tests RAM first, so those apertures are unreachable "
-                   "at this -R\n",
-                   dram_end > 0x24000000u ? " and NOR 0x24000000" : "");
+        /* This deliberately fictional DRAM fit covers real but currently
+         * unmodelled eDRAM/VROM/SRAM regions from the device tree. It does not
+         * shadow a decoded device: s5l8900_init rejects every overlap with a
+         * modelled window, and [0x08000000,0x28000000) ends exactly where the
+         * emulator's NOR begins. */
+        if (dram_end > S5L8900_EDRAM_BASE)
+            printf("  NOTE: this enlarged DRAM window covers unmodelled SoC "
+                   "regions\n"
+                   "        (eDRAM/VROM/SRAM); no decoded device window is "
+                   "shadowed\n");
         printf("\n");
     }
 
@@ -3057,7 +3477,14 @@ int main(int argc, char **argv) {
      * only evidence is a bare PC. */
     if (st != ARM_OK) {
         uint32_t p = last_pc;
+        uint8_t fetched[4];
+        uint32_t fetch_pa = 0;
         const uint8_t *ip = guest_ptr(p, 4);
+        bool translated = false;
+        if (!ip && guest_fetch_bytes(p, fetched, sizeof fetched, &fetch_pa)) {
+            ip = fetched;
+            translated = true;
+        }
         printf("\n=== ABNORMAL STOP: %s ===\n", status_name(st));
         if (ip) {
             if (mach.cpu.cpsr & ARM_CPSR_T)
@@ -3066,6 +3493,10 @@ int main(int argc, char **argv) {
                        (unsigned)(ip[2] | (ip[3] << 8)));
             else
                 printf("  encoding at pc: 0x%08x (ARM)\n", ld32(ip));
+            if (translated)
+                printf("  fetch mapping : va 0x%08x -> pa 0x%08x\n", p, fetch_pa);
+        } else {
+            printf("  encoding at pc: unavailable (fetch translation failed)\n");
         }
         printf("  lr 0x%08x (%s)\n", mach.cpu.r[14], ksym_at(mach.cpu.r[14]));
         for (int i = 0; i < 16; i += 4)
