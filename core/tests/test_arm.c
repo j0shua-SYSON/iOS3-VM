@@ -1217,6 +1217,229 @@ static void test_mmu_ttbcr_n3_table_geometry(void) {
           "pa=%08x expect 004f000c (TTBR1 is a full 16 KB table for every N)", pa);
 }
 
+/* ------------------------------------------------- DFSR / IFSR completeness -
+ * The fault status registers are the whole conversation between this CPU and
+ * XNU's abort handlers, and a single missing bit in them cost a full diagnosis
+ * cycle (DFSR.WnR, commit 85c4653). These tests pin down every field the
+ * kernel is known to read.
+ *
+ * What xnu-1357.5.30 actually reads, from the shipped kernel:
+ *   _fleh_dataabt (0xc0068338)  SUB lr,lr,#8 ; MRC p15,0,r5,c5,c0,0 (DFSR)
+ *                                            ; MRC p15,0,r6,c6,c0,0 (DFAR)
+ *   _fleh_prefabt (0xc006828c)  SUB lr,lr,#4 ; MRC p15,0,r1,c6,c0,2 (IFAR)
+ *                                            ; MRC p15,0,r5,c5,c0,1 (IFSR)
+ *   _sleh_abort   (0xc006c538)  status = fsr & 0x40f, and for a data abort
+ *                               TST fsr,#0x800 — DFSR.WnR — selecting
+ *                               fault_type 3 (read|write) instead of 1 (read).
+ */
+
+/* Two 1 MB sections through one L1 table at 0x4000: an identity map for the
+ * low megabyte (so the instruction fetch itself always succeeds) and a test
+ * mapping at 0x80000000 with the caller's AP. 0x80100000 is deliberately left
+ * without a descriptor. `mode` is the mode to execute in. */
+static void fsr_setup(arm_cpu_t *c, const uint32_t *prog, size_t words,
+                      unsigned ap, uint32_t mode) {
+    memset(g_ram, 0, sizeof g_ram);
+    for (size_t i = 0; i < words; i++) m_w32(NULL, (uint32_t)(i * 4), prog[i]);
+    m_w32(NULL, 0x4000 + (0x000u << 2), 0x00000000u | (3u << 10) | 2u);
+    m_w32(NULL, 0x4000 + (0x800u << 2), 0x00000000u | (ap  << 10) | 2u);
+    arm_reset(c, &g_bus);
+    c->cp15.ttbr0 = 0x4000; c->cp15.dacr = 1u; c->cp15.sctlr |= ARM_SCTLR_M;
+    arm_set_mode(c, mode);
+    /* Reset leaves CPSR.A set. Clear it so the assertions below prove that
+     * *exception entry* sets it, rather than passing on a leftover. */
+    c->cpsr &= ~ARM_CPSR_A;
+    c->r[15] = 0;
+}
+
+static void test_dfsr_wnr_write_vs_read(void) {
+    /* At the translator itself: the SAME fault, reached by a read and by a
+     * write, must differ in exactly one bit. AP=00 is "no access", so both
+     * directions fault with the same status and the only difference is WnR. */
+    arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 0, 0);
+    uint32_t pa = 0;
+    uint32_t rd = arm_mmu_translate(&c, 0x80000abcu, false, true, &pa);
+    uint32_t wr = arm_mmu_translate(&c, 0x80000abcu, true,  true, &pa);
+    CHECK((rd & 0xfu) == ARM_FSR_SECTION_PERMISSION,
+          "fsr=%08x expect a section permission fault on read", rd);
+    CHECK((wr & 0xfu) == ARM_FSR_SECTION_PERMISSION,
+          "fsr=%08x expect a section permission fault on write", wr);
+    CHECK((rd & (1u << 11)) == 0, "fsr=%08x: WnR must be CLEAR for a read", rd);
+    CHECK((wr & (1u << 11)) != 0, "fsr=%08x: WnR must be SET for a write", wr);
+    CHECK((rd ^ wr) == (1u << 11),
+          "read fsr %08x and write fsr %08x must differ in bit 11 alone", rd, wr);
+
+    /* WnR is orthogonal to the status code: a translation fault carries it too,
+     * and so does an unprivileged access. */
+    uint32_t tw = arm_mmu_translate(&c, 0x90000000u, true, false, &pa);
+    CHECK((tw & 0xfu) == ARM_FSR_SECTION_TRANSLATION,
+          "fsr=%08x expect a translation fault", tw);
+    CHECK((tw & (1u << 11)) != 0,
+          "fsr=%08x: WnR must be SET on a write translation fault too", tw);
+
+    /* And no field above bit 11 is ever invented: ExT (bit 12) and the
+     * extended status bit (bit 10) have no source in this machine. */
+    CHECK((wr & ~0x8ffu) == 0,
+          "fsr=%08x has bits set outside status/domain/WnR", wr);
+}
+
+static void test_data_abort_write_sets_dfsr_wnr(void) {
+    /* End to end, the way XNU sees it: an unprivileged store to a
+     * privileged-only page. This is the exact shape of the copyout that
+     * livelocked ~2.8 million times with WnR missing. */
+    uint32_t p[] = { 0xe3a01102 /*MOV r1,#0x80000000*/,
+                     0xe5812000 /*STR r2,[r1]        */ };
+    arm_cpu_t c; fsr_setup(&c, p, 2, 1 /*AP=01: privileged RW only*/, ARM_MODE_USR);
+    arm_step(&c);
+    uint32_t before = c.cpsr;
+    arm_step(&c);
+
+    CHECK(c.r[15] == ARM_VEC_DATA_ABORT, "pc=%08x expect 10 (data abort)", c.r[15]);
+    CHECK((c.cp15.dfsr & 0xfu) == ARM_FSR_SECTION_PERMISSION,
+          "dfsr=%08x expect a section permission fault", c.cp15.dfsr);
+    CHECK((c.cp15.dfsr & (1u << 11)) != 0,
+          "dfsr=%08x: bit 11 (WnR) must be SET for a store", c.cp15.dfsr);
+    CHECK(c.cp15.dfar == 0x80000000u, "dfar=%08x expect 80000000", c.cp15.dfar);
+
+    /* Abort-mode entry state, checked against what fleh_dataabt assumes:
+     * it does SUB lr,lr,#8 to recover the faulting instruction's address, and
+     * then LDRs the instruction word from it to classify the access. */
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_ABT,
+          "mode=%02x expect ABT", c.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK(c.r[14] == 4u + 8u, "lr=%08x expect 0c (faulting insn 0x04 + 8)", c.r[14]);
+    CHECK(c.spsr[ARM_BANK_ABT] == before,
+          "spsr=%08x expect the pre-fault cpsr %08x", c.spsr[ARM_BANK_ABT], before);
+    CHECK((c.cpsr & ARM_CPSR_I) != 0, "IRQs must be masked on abort entry");
+    CHECK((c.cpsr & ARM_CPSR_A) != 0,
+          "cpsr=%08x: ARMv6 sets CPSR.A on data-abort entry", c.cpsr);
+    CHECK((c.cpsr & ARM_CPSR_T) == 0, "exceptions must enter in ARM state");
+
+    /* The same page, same instruction shape, read instead of write. */
+    uint32_t q[] = { 0xe3a01102 /*MOV r1,#0x80000000*/,
+                     0xe5912000 /*LDR r2,[r1]        */ };
+    arm_cpu_t d; fsr_setup(&d, q, 2, 1, ARM_MODE_USR);
+    arm_step(&d); arm_step(&d);
+    CHECK(d.r[15] == ARM_VEC_DATA_ABORT, "pc=%08x expect 10 (data abort)", d.r[15]);
+    CHECK((d.cp15.dfsr & 0xfu) == ARM_FSR_SECTION_PERMISSION,
+          "dfsr=%08x expect a section permission fault", d.cp15.dfsr);
+    CHECK((d.cp15.dfsr & (1u << 11)) == 0,
+          "dfsr=%08x: bit 11 (WnR) must be CLEAR for a load", d.cp15.dfsr);
+}
+
+static void test_prefetch_abort_never_sets_wnr(void) {
+    /* IFSR has no WnR field. The fetch path must translate as a read, and it
+     * must leave DFSR/DFAR — which belong to the data side — untouched, because
+     * a prefetch abort taken while a data fault is still recorded would
+     * otherwise rewrite the kernel's view of the earlier fault. */
+    uint32_t p[] = { 0xe3a00102 /*MOV r0,#0x80000000*/,
+                     0xe1a0f000 /*MOV pc,r0         */ };
+    arm_cpu_t c; fsr_setup(&c, p, 2, 3, ARM_MODE_SYS);
+    c.cp15.dfsr = 0xdeadbeefu; c.cp15.dfar = 0xcafebabeu;   /* sentinels */
+    arm_step(&c);
+    /* 0x80100000 is not an encodable ARM immediate, so aim the branch there by
+     * hand: it is the megabyte just past the mapping, with no descriptor. */
+    c.r[0] = 0x80100000u;
+    arm_step(&c);                            /* MOV pc,r0 */
+    CHECK(c.r[15] == 0x80100000u, "pc=%08x expect 80100000 before the fetch", c.r[15]);
+    uint32_t before = c.cpsr;
+    arm_step(&c);                            /* the fetch aborts */
+
+    CHECK(c.r[15] == ARM_VEC_PREFETCH, "pc=%08x expect 0c (prefetch abort)", c.r[15]);
+    CHECK((c.cp15.ifsr & 0xfu) == ARM_FSR_SECTION_TRANSLATION,
+          "ifsr=%08x expect a section translation fault", c.cp15.ifsr);
+    CHECK((c.cp15.ifsr & (1u << 11)) == 0,
+          "ifsr=%08x: the instruction-fetch path must never set bit 11 — "
+          "IFSR has no WnR field", c.cp15.ifsr);
+    CHECK(c.cp15.ifar == 0x80100000u, "ifar=%08x expect 80100000", c.cp15.ifar);
+    CHECK(c.cp15.dfsr == 0xdeadbeefu,
+          "dfsr=%08x: a prefetch abort must not touch the data-side FSR", c.cp15.dfsr);
+    CHECK(c.cp15.dfar == 0xcafebabeu,
+          "dfar=%08x: a prefetch abort must not touch the data-side FAR", c.cp15.dfar);
+    /* fleh_prefabt does SUB lr,lr,#4 to recover the faulting address. */
+    CHECK(c.r[14] == 0x80100000u + 4u, "lr=%08x expect 80100004", c.r[14]);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_ABT,
+          "mode=%02x expect ABT", c.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK(c.spsr[ARM_BANK_ABT] == before,
+          "spsr=%08x expect the pre-fault cpsr %08x", c.spsr[ARM_BANK_ABT], before);
+    CHECK((c.cpsr & ARM_CPSR_A) != 0,
+          "cpsr=%08x: ARMv6 sets CPSR.A on prefetch-abort entry", c.cpsr);
+}
+
+static void test_dfar_is_the_faulting_word_of_a_block_transfer(void) {
+    /* An LDM that runs off the end of a mapped page must report the address of
+     * the word that actually faulted, not the base of the transfer. sleh_abort
+     * page-aligns DFAR (fp & 0xfffff000) and hands it to arm_fast_fault, so
+     * reporting the base would map in the page the transfer already had and
+     * re-execute the same instruction forever. */
+    uint32_t p[] = { 0xe59f1008 /*LDR  r1,[pc,#8] -> the literal at 0x10 */,
+                     0xe8910007 /*LDMIA r1,{r0,r1,r2}                    */,
+                     0xeafffffe /*B .                                    */,
+                     0x00000000 /*(pad)                                  */,
+                     0x800ffff8 /*literal: 8 bytes before the page end   */ };
+    arm_cpu_t c; fsr_setup(&c, p, 5, 3, ARM_MODE_SYS);
+    c.r[0] = 0x11111111u; c.r[2] = 0x33333333u;
+    arm_step(&c);
+    CHECK(c.r[1] == 0x800ffff8u, "r1=%08x expect 800ffff8", c.r[1]);
+    arm_step(&c);
+
+    CHECK(c.r[15] == ARM_VEC_DATA_ABORT, "pc=%08x expect 10 (data abort)", c.r[15]);
+    CHECK(c.cp15.dfar == 0x80100000u,
+          "dfar=%08x expect 80100000 — the third word of the LDM, not the base "
+          "0x800ffff8", c.cp15.dfar);
+    CHECK((c.cp15.dfsr & (1u << 11)) == 0,
+          "dfsr=%08x: an LDM is a read, WnR must be clear", c.cp15.dfsr);
+    /* Base Restored Abort Model: nothing in the register file moved. */
+    CHECK(c.r[0] == 0x11111111u, "r0=%08x expect 11111111 (base-restored)", c.r[0]);
+    CHECK(c.r[1] == 0x800ffff8u, "r1=%08x expect 800ffff8 (base-restored)", c.r[1]);
+    CHECK(c.r[2] == 0x33333333u, "r2=%08x expect 33333333 (base-restored)", c.r[2]);
+
+    /* The mirror-image STM must set WnR and report the same address. */
+    uint32_t q[] = { 0xe59f1008, 0xe8810007 /*STMIA r1,{r0,r1,r2}*/,
+                     0xeafffffe, 0x00000000, 0x800ffff8 };
+    arm_cpu_t d; fsr_setup(&d, q, 5, 3, ARM_MODE_SYS);
+    arm_step(&d); arm_step(&d);
+    CHECK(d.cp15.dfar == 0x80100000u,
+          "dfar=%08x expect 80100000 for the storing form too", d.cp15.dfar);
+    CHECK((d.cp15.dfsr & (1u << 11)) != 0,
+          "dfsr=%08x: an STM is a write, WnR must be set", d.cp15.dfsr);
+}
+
+static void test_cps_is_a_nop_in_user_mode(void) {
+    /* "CPS is a no-op if executed in User mode" (ARM ARM A4.1.16). Executing it
+     * anyway lets a user program run "CPS #0x13" and continue in SVC with its
+     * own registers. Nothing in a kernel-only boot can expose this, because XNU
+     * only ever reaches CPS from a privileged mode. */
+    uint32_t p[] = { 0xf1020013 /*CPS #0x13 (to SVC)*/,
+                     0xf1080080 /*CPSIE i           */,
+                     0xe3a00007 /*MOV r0,#7         */ };
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    memset(g_ram, 0, sizeof g_ram);
+    for (unsigned i = 0; i < 3; i++) m_w32(NULL, i * 4, p[i]);
+    arm_set_mode(&c, ARM_MODE_USR);
+    c.cpsr |= ARM_CPSR_I;
+    c.r[15] = 0;
+    for (int i = 0; i < 3; i++) arm_step(&c);
+
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR,
+          "mode=%02x expect USR — CPS must not change mode from User mode",
+          c.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK((c.cpsr & ARM_CPSR_I) != 0,
+          "cpsr=%08x: CPSIE from User mode must not unmask interrupts", c.cpsr);
+    CHECK(c.r[0] == 7, "r0=%u expect 7 — CPS is a no-op, not a trap", c.r[0]);
+
+    /* From a privileged mode it must still work, or the kernel cannot mask
+     * interrupts at all. */
+    arm_cpu_t d; arm_reset(&d, &g_bus);
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, 0xf1020013u);
+    arm_set_mode(&d, ARM_MODE_SYS);
+    d.r[15] = 0;
+    arm_step(&d);
+    CHECK((d.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC,
+          "mode=%02x expect SVC — privileged CPS must still change mode",
+          d.cpsr & ARM_CPSR_MODE_MASK);
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -1297,6 +1520,11 @@ int main(void) {
     test_mmu_kernel_mapping_survives_ttbr0_pmap_switch();
     test_mmu_ttbcr_n1_table_geometry();
     test_mmu_ttbcr_n3_table_geometry();
+    test_dfsr_wnr_write_vs_read();
+    test_data_abort_write_sets_dfsr_wnr();
+    test_prefetch_abort_never_sets_wnr();
+    test_dfar_is_the_faulting_word_of_a_block_transfer();
+    test_cps_is_a_nop_in_user_mode();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

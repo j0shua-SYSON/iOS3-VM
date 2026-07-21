@@ -137,6 +137,17 @@ static void take_exception(arm_cpu_t *c, uint32_t vector, uint32_t mode,
     c->r[14] = ret_addr;
     c->cpsr |= ARM_CPSR_I;                 /* IRQs off on entry */
     if (mask_fiq) c->cpsr |= ARM_CPSR_F;
+    /*
+     * ARM ARM (ARMv6, DDI0100I) A2.6: entry to Prefetch Abort, Data Abort, IRQ
+     * and FIQ additionally sets CPSR.A, masking imprecise aborts; Undefined and
+     * SWI leave it alone. Nothing in this machine raises an imprecise abort, so
+     * the bit masks nothing — but the guest reads it. Every SPSR XNU saves and
+     * every CPSR it prints on a panic carries it, and a nested exception taken
+     * inside an abort handler must see A already set in the SPSR it stacks.
+     */
+    if (vector == ARM_VEC_PREFETCH || vector == ARM_VEC_DATA_ABORT ||
+        vector == ARM_VEC_IRQ      || vector == ARM_VEC_FIQ)
+        c->cpsr |= ARM_CPSR_A;
     c->cpsr &= ~ARM_CPSR_T;                /* exceptions enter in ARM state */
     /*
      * Taking an exception clears the exclusive monitor. Without this, an
@@ -303,10 +314,11 @@ void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
     cpu->excl_addr = 0;
     cpu->vfp_fpexc = 0;
     cpu->vfp_fpscr = 0;
-    /* On reset the ARM1176 enters SVC mode with IRQ+FIQ disabled and begins
-     * execution from the reset vector (0x0, or 0xffff0000 with high vectors).
-     * We start at 0x0; the machine layer relocates PC as needed. */
-    cpu->cpsr   = ARM_MODE_SVC | (1u << 7) | (1u << 6); /* I and F masked */
+    /* On reset the ARM1176 enters SVC mode with IRQ, FIQ and imprecise aborts
+     * disabled and begins execution from the reset vector (0x0, or 0xffff0000
+     * with high vectors). We start at 0x0; the machine layer relocates PC as
+     * needed. */
+    cpu->cpsr   = ARM_MODE_SVC | ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_A;
     cpu->cycles = 0;
     cpu->bus    = bus;
 }
@@ -1210,8 +1222,12 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
             }
             return ARM_OK;
         }
-        if ((insn & 0xffe0u) == 0xb660u) {            /* CPS (interrupt masks) */
+        /* CPS: 1011 0110 011 im 0 A I F. Like the ARM form it is a no-op in
+         * User mode — see the ARM encoding for why that matters. */
+        if ((insn & 0xffe0u) == 0xb660u) {
             bool disable = (insn >> 4) & 1u;
+            if (!cpu_is_priv(c)) return ARM_OK;
+            if (insn & (1u << 2)) set_flag(c, ARM_CPSR_A, disable);
             if (insn & (1u << 1)) set_flag(c, ARM_CPSR_I, disable);
             if (insn & (1u << 0)) set_flag(c, ARM_CPSR_F, disable);
             return ARM_OK;
@@ -1391,13 +1407,24 @@ arm_status_t arm_step(arm_cpu_t *c) {
          * M selects whether the mode field is applied.
          */
         if ((insn & 0xfff1fe20u) == 0xf1000000u) {
+            /*
+             * "CPS is a no-op if executed in User mode" (ARM ARM A4.1.16).
+             * Unprivileged code can neither unmask an interrupt nor change
+             * mode. Executing it regardless is a privilege escalation: a user
+             * program running "CPS #0x13" would continue in SVC with its own
+             * registers and its own PC, and "CPSIE i" would let it run with
+             * interrupts it is not allowed to touch. The kernel-only boot can
+             * never expose this — XNU only ever reaches CPS from a privileged
+             * mode — so it stays invisible until launchd and dyld run.
+             */
+            if (!cpu_is_priv(c)) { c->r[15] = next; return ARM_OK; }
             unsigned imod = (insn >> 18) & 3u;
             bool     chg_mode = (insn >> 17) & 1u;
             if (imod & 2u) {
                 bool disable = (imod & 1u) != 0;
-                if (insn & (1u << 8)) set_flag(c, (1u << 8), disable);  /* A: aborts */
-                if (insn & (1u << 7)) set_flag(c, ARM_CPSR_I, disable);
-                if (insn & (1u << 6)) set_flag(c, ARM_CPSR_F, disable);
+                if (insn & ARM_CPSR_A) set_flag(c, ARM_CPSR_A, disable);
+                if (insn & ARM_CPSR_I) set_flag(c, ARM_CPSR_I, disable);
+                if (insn & ARM_CPSR_F) set_flag(c, ARM_CPSR_F, disable);
             }
             if (chg_mode) arm_set_mode(c, insn & ARM_CPSR_MODE_MASK);
             c->r[15] = next;

@@ -18,6 +18,26 @@
  * Pack an ARMv6 fault status register value: status in [3:0], domain in [7:4],
  * and WnR in [11].
  *
+ * The rest of the DFSR is deliberately zero, and each zero was checked against
+ * what xnu-1357.5.30 actually reads. sleh_abort masks the saved DFSR with
+ * 0x40f and tests bit 11 separately, so only three fields reach the kernel:
+ *
+ *   [3:0]  status  — we generate 5/7/9/b/d/f (section+page translation, domain
+ *                    and permission). sleh_abort branches on every one of them.
+ *   [10]   status[4], the extended fault codes (TLB conflict, lock abort).
+ *                    Nothing in this machine can raise one, so it stays clear.
+ *   [11]   WnR     — see below.
+ *   [7:4]  domain  — read by nothing in the kernel, but cheap and correct.
+ *   [12]   ExT     — external abort qualifier. We have no external abort source:
+ *                    an unmapped bus read returns zero rather than signalling,
+ *                    so status 0x8/0xc/0xe are unreachable and ExT stays clear.
+ *   [1]/status 0b0001 — alignment. XNU clears SCTLR.A and sets SCTLR.U at
+ *                    __start+0x16c, so the only alignment faults an ARM1176
+ *                    could still raise are unaligned LDM/STM/LDRD/LDREX/SWP,
+ *                    which this core does not detect. sleh_abort does route
+ *                    (fsr & 0x40d) == 1 to sleh_alignment, so the kernel is
+ *                    ready for one; we simply never produce it.
+ *
  * DFSR[11] ("W: the abort was caused by a write access", DDI0100I) is not
  * optional bookkeeping. XNU's sleh_abort tests it to build the fault_type it
  * hands to arm_fast_fault; with the bit clear, every write fault is repaired as
@@ -31,6 +51,10 @@
  * copyout of "/sbin/launchd" into the pid-1 address space.
  *
  * IFSR has no WnR field, so the instruction-fetch path must pass write=false.
+ * (It is fed from this same helper, so a domain also lands in IFSR[7:4]. The
+ * ARM1176 documents that field as not meaningful for instruction faults;
+ * fleh_prefabt hands the raw IFSR to sleh_abort, which masks it away with
+ * 0x40f, so the kernel never sees it either way.)
  */
 static inline uint32_t fsr_make(uint32_t status, unsigned domain, bool write) {
     return (status & 0xfu) | ((domain & 0xfu) << 4) | (write ? (1u << 11) : 0u);
@@ -144,6 +168,8 @@ uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, bool write, bool priv,
         return 0;
     }
 
-    /* Supersections and reserved encodings: not modelled yet — fault loudly. */
+    /* type == 3 is the reserved first-level encoding; the ARM ARM defines it to
+     * generate a section translation fault, which is what we return. (Sections
+     * and supersections are both handled above, under type == 2.) */
     return fsr_make(ARM_FSR_SECTION_TRANSLATION, domain, write);
 }

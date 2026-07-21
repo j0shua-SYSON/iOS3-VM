@@ -25,6 +25,12 @@
 #define ARM_CPSR_Q (1u << 27)
 
 /* CPSR control bits. */
+/* A: imprecise (asynchronous) data-abort disable, new in ARMv6. Set on entry
+ * to Reset, Prefetch Abort, Data Abort, IRQ and FIQ — see take_exception. We
+ * model no asynchronous abort source, so nothing is actually masked by it; it
+ * exists so the CPSR and every SPSR the guest saves hold the value hardware
+ * would have put there. */
+#define ARM_CPSR_A (1u << 8)  /* async abort disable */
 #define ARM_CPSR_I (1u << 7)  /* IRQ disable  */
 #define ARM_CPSR_F (1u << 6)  /* FIQ disable  */
 #define ARM_CPSR_T (1u << 5)  /* Thumb state  */
