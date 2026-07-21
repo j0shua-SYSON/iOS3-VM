@@ -49,19 +49,44 @@ default build and the boot path are untouched):
 | | State |
 |---|---|
 | `core/src/jit/a64_emit.c` — AArch64 emitter | **works**, 172 byte-exact assertions in `core/tests/test_a64_emit.c`, including an exhaustive check of the bitmask-immediate encoder against an independent `DecodeBitMasks` |
-| `core/src/jit/jit_translate.c` — block translator | **works** for a small ARM subset; 125 assertions in `core/tests/test_jit.c` on block shape and emitted words |
+| `core/src/jit/jit_translate.c` — block translator | **works** for a small ARM subset **and a measured-useful Thumb-1 subset**; 286 assertions in `core/tests/test_jit.c` on block shape and emitted words |
 | `core/src/jit/jit_mem.c` — code-buffer shim | plain RWX and `MAP_JIT` + `pthread_jit_write_protect_np`; dual mapping is not implemented (§8.2 explains why it would not help on iOS anyway) |
 | §3.4 dispatch, §3.5 chaining, §3.6 invalidation | **not built.** There is no code cache, so nothing calls the translator yet |
 | §6.1 software TLB (J1) | **not built.** Loads and stores go through a helper that calls `arm_mmu_translate` directly |
-| Thumb (J4) | **not started**; every Thumb block is declined |
+| Thumb (J4) | **translation done**, 93.54% of retired Thumb instructions (see below) |
 
-Native instruction coverage is deliberately narrow: ARM data-processing with a
-rotated immediate or an immediate-shifted register, `LDR`/`STR` word and byte
-with an immediate offset and no writeback, and `B`/`BL` — all with condition
-codes. **Everything else, including every form listed as DEFERRED in
+ARM coverage is deliberately narrow: data-processing with a rotated immediate
+or an immediate-shifted register, `LDR`/`STR` word and byte with an immediate
+offset and no writeback, and `B`/`BL` — all with condition codes.
+
+Thumb coverage is broad, because §1.3 says it has to be. Everything in the
+16-bit space is translated except the block transfers (`PUSH`/`POP`/`LDMIA`/
+`STMIA`), the four shift-by-register ALU forms, the hi-register forms that
+write PC, and the mode-changing and undefined space.
+
+**Everything else, including every form listed as DECLINED or DEFERRED in
 `jit_translate.c`, ends the block and is executed by `arm_step()`**, which is
 §2's rule and is verified by a test that denies every class and checks the
 translator then declines everything.
+
+**Measured coverage** (method as §1.1: first 20,000,000 retired instructions of
+the real `iPhone1,2_3.1.3_7E18` kernelcache; each retired instruction probed by
+translating a one-instruction block at its PC), **CONFIRMED**:
+
+| | before J4 | after J4 |
+|---|---|---|
+| share of retired instructions translated natively | **23.96%** | **88.46%** |
+| …of the ARM 31.05% | 77.17% | 77.17% |
+| …of the Thumb 68.95% | 0.00% | **93.54%** |
+
+The 11.54% still handed to `arm_step()` is 7.09% ARM (LDM/STM, exclusives,
+multiplies, MCR/MRC, PC-writing forms, the unconditional space) and 4.45%
+Thumb, itemised in the DECLINED table at the head of the Thumb section of
+`jit_translate.c`. The single largest remaining item in either instruction set
+is now the block-transfer family — 5.18% ARM plus 4.38% Thumb — which §7.3
+says must be a state helper wrapping the interpreter's own
+`exec_block_transfer`, and which therefore needs the full-sync helper ABI of
+§4.4 rather than more decoding.
 
 Not yet demonstrated: that emitted code executes correctly. The dev box is x86.
 `core/tests/test_jit_exec.c` runs the emitted code and lockstep-compares a
@@ -1244,7 +1269,7 @@ stage.
 | **J1** | **Software TLB + batched device ticks + `arm_run(cpu, budget)`.** Interpreter only; no JIT, no new semantics. | Identical instruction trace and UART output to J0 (§9.5), at ~2x the speed. Real-kernel throughput on the dev box ~7–8 M insn/s. | **1.8–2.2x** | measured components (§1.2) |
 | **J2** | **JIT skeleton.** RWX allocator + on-device execution probe, code arena, block cache, dispatcher, and a translator that handles *only* ARM data-processing and direct branches; everything else calls `arm_step`. Lockstep harness (§9.2) built here. | The CPU suite passes with the JIT engine; the boot reaches the same instruction with a bit-identical trace; the first native block executes on the phone. | **0.9–1.2x** — probably no faster, possibly slower | INFERRED |
 | **J3** | **ARM completeness + memory fast path + block chaining.** All ARM encodings the interpreter implements, the §6.2 inline sequence, direct chaining, budget checks on back-edges only. | Boot to the current M4 stopping point, bit-identical, several times faster. | **3–5x** over J1 | GUESS, bounded by the mix in §1.3 |
-| **J4** | **Thumb.** The 16-bit encodings, interworking, PUSH/POP. | The same boot again, now with 69% of instructions natively translated. | **2–3x** over J3 | INFERRED from the measured 68.95% Thumb share |
+| **J4** | **Thumb.** The 16-bit encodings and interworking. *Translation landed early, ahead of J3; PUSH/POP did not — see §0.* | The same boot again, now with 88.46% of retired instructions natively translated (measured, §0). | **2–3x** over J3 | INFERRED from the measured 68.95% Thumb share |
 | **J5** | **Polish.** Dead-flag elimination (§5.3), indirect-branch target cache (§3.5), inline LDM fast path (§7.3), r8–r12 block-local caching, PC-store elision. | Profile-driven; each item gated behind a switch and validated by §9.2 with the switch on and off. | **1.3–1.7x** | GUESS |
 
 ### 10.1 What this compounds to
