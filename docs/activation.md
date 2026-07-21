@@ -31,11 +31,48 @@ The headline, up front, because it changes how M5 should be planned:
 >
 > **The one honest gap:** the activation mechanism below is confirmed against the
 > open-source `lockdownd` *protocol* and the historical jailbreak record, **not**
-> yet against the 3.1.3 `lockdownd` *binary*, because that binary lives on the
-> encrypted root filesystem and the RootFS key was not present in the repo during
-> this investigation. §B.6 gives the turnkey recipe to close that gap in one sitting
-> once the key is dropped in — nothing in it is hard, and none of it changes the
-> verdict.
+> yet against the 3.1.3 `lockdownd` *binary*. §B.6 gives the turnkey recipe to
+> close that gap — nothing in it is hard, and none of it changes the verdict.
+
+---
+
+## Status update — what has changed since this was written
+
+Two things, and neither overturns a verdict.
+
+**1. The root filesystem is no longer encrypted or hypothetical.** This document
+was written when `lockdownd` "lives on the encrypted root filesystem and the
+RootFS key was not present in the repo". It is present now: a decrypted **HFSX**
+volume (`H X` at offset 1024, version `10.0`, 433,274,880 bytes) sits in
+`firmware/`, and the kernel **mounts it** — `BSD root: md0, major 2, minor 0`.
+Steps 1–3 of §B.6's recipe are therefore done; only step 4 (read the strings out
+of `lockdownd`) remains, and it no longer needs a key.
+
+**2. The code-signing path is now being executed, not merely read.** §A.3
+predicted a "second, page-granularity layer (`cs_enforcement_disable` in
+`vm_fault_enter`) [that] governs the mid-execution kill of invalid pages", and
+noted that it was not on the critical path. The current M5 frontier lands exactly
+there: pid 1's exec reaches `cs_validate_page`, the SHA-1 over launchd's first
+text page mismatches, and `vm_fault_enter` → `cs_invalid_page` → `psignal` fires
+12,542 times while `_unix_syscall` is never reached.
+
+Three consequences, stated plainly:
+
+- **The document's structural reading of the enforcement layers is corroborated**
+  by a running kernel, which is more than it claimed for itself.
+- **The verdict "KILLED" is still a reading of the kernel's code, not a
+  demonstration.** Neither `/chosen/debug-enabled = 1` nor
+  `cs_enforcement_disable=1` / `amfi_get_out_of_my_way=1` has yet been set in an
+  actual boot; the standard recipe is `debug=0x8 serial=1 nand-enable-adm=0`.
+  Until one of those runs, §A remains CONFIRMED-by-disassembly and untested.
+- **And it would not clear the current blocker anyway.** `cs_validate_page` exits
+  through `bad_hash`, never through `no_hash_exit`. A bad hash means the page we
+  hand the kernel is not the page Apple signed — a defect in *our* data path (the
+  RAM-disk read, the HFS+ extent mapping, or the offset the page is hashed at) —
+  and no signing policy switch changes what bytes are in the page. Option 2 in
+  §A.3 ("ad-hoc sign our own binaries so their page hashes are valid") is about
+  binaries *we* inject; launchd is Apple's, already signed, and the hash it fails
+  is over bytes we supplied.
 
 ---
 
@@ -344,9 +381,10 @@ screen.** That is the definition of MANAGEABLE, not a killer.
 ## B.6 The one thing left to verify, and exactly how
 
 Everything in §B.2 and the byte-level specifics of Routes 1–2 is INFERRED because
-`lockdownd` sits on the **encrypted** root filesystem and no RootFS key was in the
-repo this session. That verification is turnkey the moment the (published) key is
-present — here is the recipe, grounded in what was confirmed about the container:
+`lockdownd` had not been read. **Steps 1–3 below are now done** — a decrypted
+HFSX volume is in `firmware/` and the kernel mounts it as `md0` — so only step 4
+is outstanding, and it needs no key. The recipe is kept in full because it
+records how the container was established:
 
 1. **Extract** the rootfs DMG: it is member `018-6482-014.dmg` in the IPSW
    (CONFIRMED 208,195,584 bytes). `tools/ipsw_explore.py <ipsw> -x 018-6482-014.dmg`.
@@ -375,13 +413,20 @@ Nothing in that recipe is research; it is an afternoon of plumbing that upgrades
 §B.2 and Routes 1–2 from INFERRED to CONFIRMED. It does not change the verdict — it
 pins the exact filenames.
 
+**And there is now a second reason to do step 4 sooner rather than later.** An
+HFS+ catalog/extent reader that can pull one file out of `rootfs.img` on the host
+is exactly the instrument needed to diagnose the current M5 blocker: fetch
+`/sbin/launchd`'s first text page from the image directly and compare it, byte
+for byte, against the page the guest kernel hashed. The same tool answers "what
+does lockdownd check" and "which layer of our data path corrupted a page".
+
 ---
 
 # Verdicts
 
 | Risk | Verdict | Basis |
 |---|---|---|
-| **Guest code signing** | **KILLED** | CONFIRMED to the instruction against the 7E18 kernelcache: AMFI is a separate kext whose exec-time signature check is switched off by boot-args it reads only when `/chosen/debug-enabled` is set — and we are iBoot. |
+| **Guest code signing** | **KILLED** *(on paper — not yet exercised in a boot)* | CONFIRMED to the instruction against the 7E18 kernelcache: AMFI is a separate kext whose exec-time signature check is switched off by boot-args it reads only when `/chosen/debug-enabled` is set — and we are iBoot. No boot has yet set them; see the status update at the top. |
 | **Activation** | **MANAGEABLE** | Unactivated still renders SpringBoard (the activation lock screen), so M5's "renders" goal is independent of it (INFERRED-strong). The home screen needs only a data-ark file we write, or a lockdownd patch (signing is off) — never a physical-device record. Protocol CONFIRMED from open source; the exact on-device filenames INFERRED pending §B.6. |
 
 **What would change the activation verdict to STILL-A-KILLER:** only if 3.1.3's

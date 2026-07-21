@@ -49,31 +49,33 @@ can see.** No months in the dark.
 | | Milestone | State |
 |---|---|---|
 | **M0** | Toolchain online: core builds + tests in CI, iOS `.ipa` builds on a macOS runner, on-device self-test runs ARM code | ✅ **done** |
-| **M1** | Complete ARMv6 (ARM1176) interpreter, unit-tested | ✅ **done** — ARM + Thumb, *152 CPU tests* |
-| **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, NOR/NAND · *119 SoC tests* |
+| **M1** | Complete ARMv6 (ARM1176) interpreter, unit-tested | ✅ **done** — ARM + Thumb, *229 CPU assertions* |
+| **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, CLCD, NOR/NAND · *125 SoC assertions* |
 | **M3** | IMG3 + NAND/NOR: Apple's real **iBoot** runs | ✅ **done** — decrypts real firmware; LLB runs, kernel extracted |
-| **M4** | The real **XNU kernel** boots and logs | 🔵 **the kernel talks, and Apple's own drivers start** — reaches `bsd_init`, zero panics, zero aborts |
-| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | ⚪ next — needs a root filesystem and the display path |
+| **M4** | The real **XNU kernel** boots and logs | ✅ **done** — the whole IOKit driver tree starts, the real 413 MB root filesystem **mounts**, `_panic` is never reached |
+| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress — and launchd has not run yet.** pid 1 gets all the way through `execve`, and then the kernel's SHA-1 over launchd's first text page does not match its signature |
 
 ### What it actually does today
 
 Apple's real `xnu-1357.5.30`, decrypted from a stock 3.1.3 IPSW, running on
-hardware that exists only as C in this repo — and introducing itself over an
-emulated Samsung UART:
+hardware that exists only as C in this repo — mounting a real root filesystem
+and introducing itself over an emulated Samsung UART:
 
 ```
-Darwin Kernel Version 10.0.0d3: Fri Dec 18 01:26:55 PST 2009;
-  root:xnu-1357.5.30~6/RELEASE_ARM_S5L8900X
-secure boot?: YES
-
+iBoot version:
 Seatbelt MACF policy initialized
+BSD root: md0, major 2, minor 0
 AppleS5L8900XIO::start: chip-revision: EVT0
-AppleARMPL192VIC::start: _vicBaseAddress = 0xe397c000
-AppleS5L8900XGPIOIC::start: gpioBaseAddress: 0xe3985000
+AppleARMPL192VIC::start: _vicBaseAddress = 0xe3141000
 AppleS5L8900XClockController: Dynamic Performance State Management Enabled
+AppleARMPL080DMAC::start: dmac0 / dmac1
 AppleS5L8900XSDIO::start(): SDIO Revision 8900X
-AppleS5L8900XSPIController::start: spi0 ...
-AppleS5L8900XI2CController::start: i2c0 ... i2c1 ...
+virtual bool AppleMobileFileIntegrity::start(IOService*): built Dec 21 2009
+AppleS5L8900XSerial: Identified Serial Port on ARM Device=uart0 at 0x3cc00000
+AppleSerialMultiplexer: mux::start: created new mux (18) for spi-baseband
+AppleMultitouchZ2SPI: successfully started
+IOSDIOController::enumerateSlot(): Searching for SDIO device in slot: 0
+IOSDIOController::enumerateSlot(): CMD5 failed ... (no card is modelled)
 ```
 
 Those are **Apple's own kernel extensions**, unmodified, matching against our
@@ -81,7 +83,40 @@ emulated device tree and programming our emulated peripherals. Nothing is
 stubbed out to make that log appear — the kernel found the hardware it expected,
 or it would have panicked instead.
 
-Full detail in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+### And here is exactly where it stops
+
+Being precise about this matters more than the log above. In a 400,000,000-instruction
+boot with the real root filesystem, `bootkernel`'s milestone probes report:
+
+```
+_load_init_program        first @ 231,867,529
+_execve                   first @ 231,898,676
+_grade_binary             hits 3
+_load_machfile            first @ 232,036,463
+_ubc_cs_blob_add          hits 2
+_cs_validate_page         first @ 233,211,312
+cs_validate:hashing       hits 1        SHA1Init — a hash slot was found
+cs_validate:bad_hash      hits 1        the bcmp failed
+_cs_invalid_page          hits 12,542
+_psignal                  hits 12,542
+_fleh_prefabt             hits 12,542
+_unix_syscall             NEVER REACHED
+_panic                    NEVER REACHED
+```
+
+Read down that list: launchd is mapped, its signature blobs are registered, the
+kernel finds the code-directory hash slot for the first text page, computes
+SHA-1 over the page — and the comparison fails. The thread returns to the same
+faulting instruction and spins. **`launchd` has not retired a single user-mode
+instruction**, so M5 is *started*, not achieved, and nothing here is "running
+userspace". A bad hash means the page we hand the kernel is not the page Apple
+signed, which makes this our data-path bug (the RAM-disk read, the HFS+ extent
+mapping, or the offset the page is hashed at) rather than a signing policy to
+argue with.
+
+Full detail in [`docs/ROADMAP.md`](docs/ROADMAP.md), the boot narrative in
+[`docs/BOOTLOG.md`](docs/BOOTLOG.md), and the diagnosis procedure in
+[`docs/debugging.md`](docs/debugging.md).
 
 ## How it works
 
@@ -103,7 +138,24 @@ Apple-specific code is the UIKit/Metal shell. See
 APRR JIT hardening (A11) and PAC/PPL (A12), so once the jailbreak relaxes
 code-signing we get plain **RWX** pages from a bare `mmap` — the cleanest
 possible home for a dynamic recompiler. The guests ran on a 412 MHz single core with 128 MB of RAM;
-the host is a dual ~1.85 GHz `arm64` with 2 GB. Realtime is a real goal.
+the host is a dual ~1.85 GHz `arm64` with 2 GB.
+
+**Realtime is not promised.** The design work in
+[`docs/dynarec.md`](docs/dynarec.md) §10.3 puts an honest, well-built block JIT
+on this host at **0.15–0.45x** of the guest's nominal 412 MHz — "SpringBoard
+responds to your finger and animates at roughly quarter speed", which is the
+difference between a screenshot and a demo, and is not the same as
+indistinguishable from a real iPhone.
+
+**The dynarec's honest state:** an AArch64 emitter and an ARM block translator
+exist behind `-DIOS3VM_JIT=ON`, with 297 assertions, and that is roughly **15% of
+a JIT that could carry a boot**. There is no code cache, no dispatcher, no
+chaining and no invalidation — so nothing calls the translator yet, and a
+translated block currently costs *more* than interpreting it (mean run 8.1
+instructions against a ~37-instruction prologue/epilogue). Thumb is declined
+entirely, which matters because Thumb is 68.95% of retired instructions in kernel
+init. It is merged so it stops rotting against a fast-moving core, not because it
+is nearly done. [`docs/dynarec.md`](docs/dynarec.md) §0 keeps the score.
 
 ## Build & run
 
@@ -114,6 +166,46 @@ You need **nothing Apple** on your own machine — CI does the Apple build.
 cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure
 ```
 
+That is 10 suites and **974 assertions** with no firmware present; drop a real
+kernelcache in `firmware/` and the symbol/kext resolver runs 258 more against it,
+for 1,232. The build defaults to `Release` — the interpreter is the hot loop of
+everything here, and `-O3` is a measured ~3x.
+
+**Optionally build the dynarec** (off by default, and it must stay that way —
+see the status note below):
+```sh
+cmake -S . -B build-jit -DIOS3VM_JIT=ON && ctest --test-dir build-jit
+```
+
+**Boot the kernel** once you have supplied firmware (see below):
+```sh
+build/core/bootkernel firmware/kernel.macho \
+    -d firmware/devicetree.bin \
+    -c "debug=0x8 serial=1 nand-enable-adm=0" \
+    -r firmware/rootfs.img -R 512 \
+    -n 400000000
+```
+
+`-R 512` is load-bearing rather than a preference: `arm_vm_init` hardcodes
+`virtual_avail = 0xe0000000`, so advertising more than 512 MB of guest RAM makes
+the kernel's zone bootstrap fault. `nand-enable-adm=0` keeps
+`AppleS5L8900XADMFMC` from panicking on a NAND controller we do not model. Two
+further workarounds (the IORTC wait, un-matching the MBX GPU driver) are applied
+automatically and printed in the run header, so they are never invisible.
+
+### The tools
+
+| | |
+|---|---|
+| `bootkernel` | boots the kernelcache and reports where it stopped: milestone probes, a sampled profile, every non-RAM page touched with the PC that touched it, abort sites, and the guest's console output |
+| `bootkernel -L` | print the prelinked kext load map and exit without booting |
+| `bootkernel --snapshot-at <insn> <file>` / `--restore <file>` | save and resume the whole machine. Cold boot to 900 M instructions is 140 s; restore-at-200 M and continue is 34 s |
+| `snapboot` | the snapshot acceptance harness — also prints a machine-derived report, because comparing two snapshot files alone lets a field the format never stores cancel out on both sides |
+| `machoinfo <kernel> -k` / `-r <addr>` | dump the kext load map, or resolve one address to a kernel symbol or `<bundle-id>+0xNNNN` |
+| `img3dump`, `unlzss`, `runfw` | firmware container, compression, and bare-payload tools |
+
+`docs/debugging.md` is the procedure these add up to.
+
 **Get the app:** push to GitHub → the `ios-build` workflow produces an unsigned,
 fake-signed `iOS3VM.ipa` artifact. Install it on your jailbroken device running
 **AppSync Unified** (which lets `installd` accept the `ldid` ad-hoc-signed IPA)
@@ -123,7 +215,10 @@ AppSync needed). Either way, no Apple Developer account is required.
 
 **Boot an OS** (from M3 on): drop your **own** iPhone OS 3.1.3 IPSW and its
 (publicly documented) decryption keys into the app's firmware folder — see
-[`docs/BOOT_CHAIN.md`](docs/BOOT_CHAIN.md).
+[`docs/BOOT_CHAIN.md`](docs/BOOT_CHAIN.md). Reaching the root mount additionally
+needs the IPSW's root DMG decrypted with the published RootFS key; the result is
+an HFSX volume the emulator loads as a RAM disk (`-r`). Nothing in `firmware/` is
+ever committed — the whole directory is git-ignored.
 
 ## Requirements
 

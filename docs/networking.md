@@ -2,7 +2,7 @@
 
 How iPhone OS 3.1.3, running inside iOS3-VM, gets to the internet.
 
-This document is a **design**, not a report on working code. Nothing here is
+This document is a **design**, not a report on working code. Nothing in §4–§6 is
 implemented yet. Every factual claim is labelled:
 
 - **CONFIRMED** — read directly out of the user's own `iPhone1,2_3.1.3_7E18`
@@ -67,6 +67,45 @@ IOUserEthernet         IOProviderClass   = IOResources
 `AppleS5L8900XSDIO`'s `IONameMatch` on `AppleARMIODevice` is the pattern our own
 driver will copy, so it is worth noting that this is not invention — it is how
 every S5L8900 driver in this kernelcache binds.
+
+**Update: those kexts now have addresses, and the SDIO stack now runs.** The kext
+symbolizer (`f105360`) resolves each prelinked bundle's `__PRELINK_TEXT` range,
+so the Wi-Fi chain is no longer just a list of strings — it is a load map you can
+set a probe in. Reproduce with `machoinfo firmware/kernel.macho -k`:
+
+```
+com.apple.iokit.IONetworkingFamily   0xc04a1000 .. 0xc04b1000    65,536
+com.apple.iokit.IO80211Family        0xc04b1000 .. 0xc04cb000   106,496
+com.apple.iokit.IOSDIOFamily         0xc0515000 .. 0xc0522000    53,248
+com.apple.driver.AppleMRVL868x       0xc05b8000 .. 0xc05f1000   233,472
+com.apple.driver.AppleS5L8900XSDIO   0xc06f3000 .. 0xc06f9000    24,576
+```
+
+And since the TTBR1 fix started the whole driver tree, a normal boot now gets all
+the way to the point where a card *would* answer:
+
+```
+IOSDIOController::init(): IOSDIOFamily-24.7 Dec 18 2009 01:49:48
+AppleS5L8900XSDIO::init(): AppleS5L8900XSDIO-26.0 Dec 18 2009 01:49:39
+AppleS5L8900XSDIO::start(): SDIO Revision 8900X
+AppleS5L8900XSDIO: registers @ vaddr 0xe9fea000, paddr 0x38d00000
+IOSDIOController::enumerateSlot(): Searching for SDIO device in slot: 0
+AppleS5L8900XSDIO::sendCommand(): Timeout waiting for CMDRDY indication
+IOSDIOController::enumerateSlot(): CMD5 failed with SDIO device on slot 0
+AppleS5L8900XSDIO::enumerateCards(): Unable to enumerate SDIO device
+```
+
+10,003 reads land on physical page 0x38D00000 during that poll, all attributed to
+`com.apple.driver.AppleS5L8900XSDIO+0x118c`, and the driver then **times out
+gracefully** rather than hanging. That is the concrete hook for Route A: the host
+controller is being programmed by Apple's own driver, against a register window
+nothing answers for yet, and the exact register offsets it touches are already in
+the boot report. Step 1 of Route A — "reverse-engineer an undocumented register
+map by tracing what the driver touches" — has a running experiment attached to it
+now rather than only a method.
+
+None of that is Wi-Fi. It is one CMD5 that correctly fails. But it moves Route A's
+riskiest step from "unknown" to "instrumented".
 
 ### 1.2 The device tree already describes the Wi-Fi hardware
 
@@ -171,6 +210,16 @@ boot-args:    cs_enforcement_disable=1 amfi_get_out_of_my_way=1
 We are iBoot. We write both. This is not a patch to Apple's kernel — it is the
 configuration Apple's kernel already reads, which is why development devices
 existed.
+
+**Status note, so this does not quietly become an assumption:** as of the current
+frontier this recipe has **not been exercised in a boot**. The standard command
+line is `debug=0x8 serial=1 nand-enable-adm=0`, and `/chosen/debug-enabled` is
+left at zero. `AppleMobileFileIntegrity` starts cleanly in every boot, and the
+kernel's code-signing path *is* now being reached — pid 1's `execve` gets to
+`cs_validate_page` — but it fails on a **hash mismatch**, not on policy, so the
+switch above has never yet been the thing standing in the way. It remains
+INFERRED, and `docs/activation.md` §A is where the instruction-level reading
+lives.
 
 > **This is the answer to "will code signing kill it?" — and the answer is no,
 > twice over.** For the recommended route the question does not even arise,

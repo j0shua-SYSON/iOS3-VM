@@ -8,7 +8,10 @@ much, and the rest of the document is still ahead of the code.
 Every factual claim is labelled:
 
 - **CONFIRMED** — measured or read directly out of this repository at
-  `65c9240`, by the commands shown. Reproduce it before trusting it.
+  `65c9240`, by the commands shown. Reproduce it before trusting it. Where a
+  CONFIRMED claim has since been *acted on* — the missing `-O` flags in §1.1/§1.5,
+  the snapshot proposal in §11.2 — it is struck through or marked, rather than
+  deleted, so the measurement that motivated the change is still readable.
 - **INFERRED** — follows from something confirmed plus how ARMv8 / iOS / this
   class of emulator works. Strong, but not verified on this hardware.
 - **GUESS** — plausible, unverified, and flagged so it does not quietly become
@@ -17,19 +20,18 @@ Every factual claim is labelled:
 The headline conclusions, up front, because two of them are not what you would
 expect:
 
-> **1. There is a measured 5–6x sitting on the floor that is not a JIT.** The
-> committed build compiles the core with *no optimiser at all*
-> (`-std=gnu11 -Wall -Wextra`, CONFIRMED from `build/build.ninja`). Turning that
-> on is worth **3.0x on a real kernel boot, measured**. A software TLB is worth
-> another **~2x**, and it is the JIT's memory fast path anyway — it is not
-> throwaway work.
+> **1. There is a measured 5–6x sitting on the floor that is not a JIT.** ~~The
+> committed build compiles the core with *no optimiser at all*.~~ **Taken:** the
+> top-level `CMakeLists.txt` has defaulted to `Release` since `b3940fa`, worth a
+> measured **3.0x on a real kernel boot**. The software TLB — another **~2x**, and
+> the JIT's memory fast path anyway — is still on the floor.
 >
 > **2. The JIT should start after the first SpringBoard frame renders, not
 > before — but the thing that makes M5's iteration loop bearable is
 > snapshot/restore, not the JIT.** A boot to SpringBoard is billions of
 > instructions; no realistic interpreter speed makes that a fast edit-run loop,
 > and no realistic *JIT* speed does either. Save the machine after the kernel is
-> up and resume from there.
+> up and resume from there. **Done, and it worked** — see §11.2.
 >
 > **3. Do not promise realtime.** An honest, well-built block JIT on this host
 > lands at **0.15–0.45x** of the guest's nominal 412 MHz (§10.3). That is
@@ -65,7 +67,32 @@ Not yet demonstrated: that emitted code executes correctly. The dev box is x86.
 `core/tests/test_jit_exec.c` runs the emitted code and lockstep-compares a
 translated block against the interpreter, but it only does so on an arm64 host
 and skips itself elsewhere; the `jit` job in `.github/workflows/core-tests.yml`
-is what puts it on Apple Silicon runners.
+is what puts it on Apple Silicon runners. A `SKIP` on a macOS runner would mean
+that coverage silently vanished, so read the log rather than the badge.
+
+### 0.1 How much of a JIT this is: about 15%
+
+Stated as a number because "foundation merged" is the kind of phrase that quietly
+becomes "we have a JIT".
+
+| | |
+|---|---|
+| Emitted-code coverage of retired instructions | **~31% ceiling** — ARM only. Thumb is 68.95% (§1.3) and is declined outright |
+| Actual coverage today | far below that ceiling: only the narrow ARM subset listed above translates natively |
+| Speed of a translated block **today** | **worse than interpreting it.** Mean run is 8.1 instructions (§1.3) against a ~37-instruction prologue/epilogue, and with no chaining every block pays it |
+| Blocks executed in a boot | **zero.** There is no code cache and no dispatcher, so nothing calls the translator from the run loop |
+
+Everything that turns those rows around is §3 (cache, dispatch, chaining,
+invalidation), §6.1 (the software TLB), and J4 (Thumb) — which is to say, most of
+this document. The merge exists so the emitter and translator stop rotting
+against a core that is moving fast, and so their tests run in CI on every push.
+It is not a step towards shipping the JIT sooner than §11 says.
+
+**What it does already prove** is worth keeping separate from what it does not:
+the AArch64 encodings are byte-exact against an independent decoder, the
+translator declines everything it does not handle (verified by a test that denies
+every class and checks it then declines the lot), and the "JIT is a layer over the
+interpreter" rule of §2 holds in code rather than only in prose.
 
 ---
 
@@ -106,11 +133,14 @@ sits exactly where it should between these: real code is branchier and more
 Thumb-heavy than a four-instruction loop, and it is presumably from an optimised
 build.
 
-The first conclusion is uncomfortable and should be acted on today: **the
-committed CMake configuration leaves a 3x on the table.** `CMAKE_BUILD_TYPE` is
-empty in `build/CMakeCache.txt` and the compile line in `build/build.ninja` is
-`-std=gnu11 -Wall -Wextra` with no `-O` flag (CONFIRMED). Whatever else this
-document recommends, that is an hour of work for a measured 3x.
+The first conclusion was uncomfortable and has since been acted on: **the
+committed CMake configuration was leaving a 3x on the table.** `CMAKE_BUILD_TYPE`
+was empty and the compile line carried no `-O` flag. Since `b3940fa` the
+top-level `CMakeLists.txt` defaults to `Release`, so the "as committed" rows
+above are now **historical** — they record what the un-optimised build cost, not
+what a fresh clone does. CI builds both `Release` and a sanitizer `Debug`, which
+also earns its keep as a correctness check: if `-O2` and `-O0` ever disagree,
+that is a real bug worth catching.
 
 ### 1.2 Where the interpreter's time goes
 
@@ -226,7 +256,7 @@ So:
 
 | Win | Measured / expected | Risk | Is it wasted if the JIT happens? |
 |---|---|---|---|
-| Build with `-O2`/`-O3` | **3.0x, measured** (§1.1) | none | no |
+| ~~Build with `-O2`/`-O3`~~ **TAKEN** (`b3940fa`) | **3.0x, measured** (§1.1) | none | no |
 | Software TLB in front of `arm_mmu_translate` | **~1.7–2.0x** (from §1.2's 5.91 → ~12 M/s ceiling) | *real* — see §6.1 | **no**: it *is* the JIT's memory fast path |
 | Tick devices once per batch instead of per instruction | **~1.2x** (§1.2) | low | **no**: it is required for the JIT to be differentially testable (§9.3) |
 
@@ -1316,18 +1346,50 @@ insn/s) a full boot is still 30–200 seconds**, and at the pessimistic end it i
 minutes. The JIT does not fix the M5 iteration loop; it only makes it less
 awful.
 
-**Snapshot/restore does fix it.** Serialise `arm_cpu_t`, guest RAM, and every
-device's state to a file, and restore it. The machine is already a single
-`s5l8900_t` with `memset`-initialised, POD device structs (CONFIRMED,
-`machine.c:188`), so this is on the order of 200 lines plus a version tag, and
-the differential harness gives it a free correctness test (restore a snapshot
-into both engines and compare). It turns "boot to SpringBoard, then test the
-touch driver" from 30 minutes into 2 seconds, it helps every M5 task, and it is
-maybe two days of work.
+**Snapshot/restore does fix it. This is no longer a proposal — it shipped in
+`95eaf8b`**, and the prediction held.
 
-**That is the recommendation's load-bearing claim: the thing that unblocks M5 is
-snapshotting, and the thing that unblocks *interactivity* is the JIT. They solve
-different problems and should not be confused for one another.**
+`core/src/snapshot.c` serialises the whole machine: the CPU including all banked
+registers and SPSRs, the full CP15, the exclusive monitor, VFP, RAM, NOR, both
+VICs, the timer, power, CLCD, and every stub window. The format is
+`magic|version|len|flags → GEOM CPU MACH RAM NOR STUB END → FNV-1a-64`.
+
+**Measured:** cold to 900 M instructions is **140 s**; restore-at-200 M and run to
+900 M is **34 s**. Continue-to-400 M and restore-at-200 M-then-run-to-400 M produce
+snapshots identical across all 432,618,045 bytes.
+
+Three design notes, because the interesting problem was not serialisation but
+*making field-omission hard* — a snapshot that silently drops one register
+produces a divergent boot that costs days:
+
+- Every field is named exactly once, in a visitor whose macros dispatch on
+  COUNT/SAVE/LOAD, so save and load are the same list in the same order and
+  cannot drift.
+- A `_Static_assert` on `sizeof()` of every snapshotted struct names the visitor
+  to extend, so adding a field to `arm_cpu_t` breaks the build instead of
+  silently escaping the format.
+- RAM is classified per 4 KB page (zero / uniform / raw) rather than
+  dirty-tracked, because a write barrier would have to catch every bus write,
+  loader path and future DMA model — and one missed path is exactly the silent
+  divergence this exists to prevent.
+
+It passed first try, which is when a test deserves suspicion, so it was
+negative-controlled: dropping `timer.ticks` from a visitor gives 58252 vs 29126,
+dropping `tb_accum` gives 176000000 vs 88000000 — both caught. That control also
+exposed a trap now baked into the harness: **comparing only the two snapshot
+files is insufficient, because a field the format never stores is absent from
+both sides and cancels out.** `tools/snapboot` therefore diffs a machine-derived
+report as well.
+
+One caveat that matters when using it to debug: the host-side diagnostics — trace
+ring, milestone hit counts, sampled profile, hot-page log — are **not** machine
+state and are not restored. They start fresh and cover only the window since the
+restore. Instruction indices are absolute either way.
+
+**That is the recommendation's load-bearing claim, and it survived contact: the
+thing that unblocks M5 is snapshotting, and the thing that unblocks
+*interactivity* is the JIT. They solve different problems and should not be
+confused for one another.**
 
 ### 11.3 The trigger to start early anyway
 
@@ -1340,6 +1402,15 @@ Start J2 before SpringBoard renders **only if** both of these become true:
    so the double-implementation cost has fallen.
 
 Absent both, the sequencing above stands.
+
+**Where that stands now.** Condition 1's first half is satisfied — snapshot/restore
+exists — but its second half is not: the M5 loop is currently dominated by a
+34-second restore-and-continue, not by emulation throughput, and the frontier is
+a single mis-hashed page rather than billions of instructions of userland.
+Condition 2 is plainly false; the last session alone added the CPUID registers,
+`CPSR.A` on abort entry, and the User-mode `CPS` fix, and named four more
+interpreter gaps it deliberately did not close. So the trigger has **not** fired,
+and the J2 foundation being merged does not mean it has. J2 is parked on purpose.
 
 ---
 
