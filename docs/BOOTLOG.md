@@ -710,7 +710,16 @@ What is *not* there yet: `AppleH1CLCD`, the display controller at
 `/device-tree/arm-io/clcd` (physical 0x38900000, interrupt 13), and
 `AppleMerlotLCD`, which needs a non-zero `lcd-panel-id` at
 `/device-tree/arm-io/spi0/lcd0`. The kernel is drawing into a buffer, not
-driving a panel. Wiring that buffer to the app's Metal view — and giving the
+driving a panel.
+
+To be precise about *why*, since an earlier draft of this section got it
+wrong: the CLCD is modelled — `core/src/soc/clcd.c` is 384 lines with tests.
+`AppleH1CLCD` executes zero instructions, so it never reads those registers.
+It is also not a driver that programs the display: it reads `CLCD_CTRL`,
+adopts the first enabled window, and wraps that window's pitch, base and
+geometry in the IOSurface that becomes the screen. With `CLCD_CTRL == 0` the
+loads are predicated off and it builds the surface out of uninitialised
+callee-saved registers — so something must seed a window first. Wiring that buffer to the app's Metal view — and giving the
 LCD kexts something to bind to — is M5 work.
 
 ---

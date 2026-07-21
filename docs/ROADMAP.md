@@ -412,9 +412,12 @@ later.
   correctly times out because no card is modelled. Every one is counted and
   attributed to a PC *and now to a kext*, which is the point; but each is a
   driver talking to a device that is not listening.
-- **`AppleH1CLCD` does not start.** The display controller is
+- **`AppleH1CLCD` does not start** — but NOT because the CLCD is unmodelled.
+  That earlier claim was wrong on both halves: `core/src/soc/clcd.c` is a real
+  384-line model, and the nub's registers are simply never read, because the
+  kext executes zero instructions. The display controller is
   `/device-tree/arm-io/clcd`, `compatible = "clcd,s5l8900x"`, physical
-  0x38900000, interrupt 13. Nothing models it, so the kext never comes up — and
+  0x38900000, interrupt 13. The kext never comes up — and
   it is the piece that turns a framebuffer into a display.
 - **`AppleMerlotLCD` needs a panel ID.** `/device-tree/arm-io/spi0/lcd0` is
   `compatible = "lcd,merlot"` with `lcd-panel-id = 0x00000000`. Real iBoot reads
