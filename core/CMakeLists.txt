@@ -27,6 +27,41 @@ if(NOT MSVC)
     target_compile_options(emucore PRIVATE -Wall -Wextra)
 endif()
 
+# --- dynamic recompiler (optional, off by default) --------------------------
+# See docs/dynarec.md. The translator is a layer over the interpreter: anything
+# it does not handle is left to arm_step(), so enabling this cannot change what
+# the guest computes, only how fast. It is still off by default because nothing
+# in the machine's run loop calls it yet.
+if(IOS3VM_JIT)
+    target_sources(emucore PRIVATE
+        src/jit/a64_emit.c
+        src/jit/jit_translate.c
+        src/jit/jit_mem.c
+    )
+    target_compile_definitions(emucore PUBLIC IOS3VM_JIT)
+
+    # Byte-exact encoder tests. Pure computation, so these run everywhere —
+    # including the x86 dev box, which is the point.
+    add_executable(test_a64_emit tests/test_a64_emit.c)
+    target_link_libraries(test_a64_emit PRIVATE emucore)
+    add_test(NAME a64_emitter COMMAND test_a64_emit)
+
+    # Block-shape and emitted-code tests. Also host-independent.
+    add_executable(test_jit tests/test_jit.c)
+    target_link_libraries(test_jit PRIVATE emucore)
+    add_test(NAME jit_translator COMMAND test_jit)
+
+    # The only test that executes emitted code. Skips itself (exit 0) unless
+    # the host is arm64 AND executable memory can be obtained, so it is safe to
+    # register unconditionally: on x86 it reports SKIP, on the GitHub Actions
+    # macos-14/macos-15 Apple Silicon runners it really runs.
+    add_executable(test_jit_exec tests/test_jit_exec.c)
+    target_link_libraries(test_jit_exec PRIVATE emucore)
+    add_test(NAME jit_execution COMMAND test_jit_exec)
+    set_tests_properties(jit_execution PROPERTIES
+        PASS_REGULAR_EXPRESSION "SKIP:|0 failed")
+endif()
+
 # --- unit tests -------------------------------------------------------------
 add_executable(test_arm tests/test_arm.c)
 target_link_libraries(test_arm PRIVATE emucore)

@@ -20,6 +20,13 @@ targets:
       # Compile the platform-independent emulator core straight into the app.
       - path: ../core/src
         name: core
+        # The dynamic recompiler (docs/dynarec.md) is deliberately NOT in the
+        # app yet. It is gated by the CMake option IOS3VM_JIT for host builds
+        # and nothing in the machine's run loop calls it, so compiling it in
+        # would add code to the shipping binary that cannot run. Delete this
+        # exclusion at stage J3, when the app enables the JIT for real.
+        excludes:
+          - "jit/**"
     # Linked explicitly rather than relying on module auto-linking: the display
     # path calls into CoreGraphics (CGImageCreate) and QuartzCore (CALayer
     # filters) directly, and "it happened to link via UIKit" is not something to

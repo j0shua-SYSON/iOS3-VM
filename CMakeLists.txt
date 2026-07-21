@@ -17,5 +17,14 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# The ARMv6 -> arm64 dynamic recompiler (docs/dynarec.md). OFF by default and
+# it must stay that way: the interpreter is the specification and the shipping
+# engine, and nothing about the default build or the boot path changes when
+# this is off. Turning it on adds three source files to emucore and three test
+# executables; the emitter and translator are portable C and are fully tested
+# on any host, while core/tests/test_jit_exec.c — the only test that *runs*
+# emitted code — skips itself at runtime unless the host is arm64.
+option(IOS3VM_JIT "Build the ARMv6 -> arm64 dynamic recompiler" OFF)
+
 enable_testing()
 add_subdirectory(core)

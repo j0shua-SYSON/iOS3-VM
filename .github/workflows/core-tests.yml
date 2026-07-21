@@ -31,6 +31,60 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  jit:
+    # The dynamic recompiler (docs/dynarec.md). It is off in the default build,
+    # so it needs a job of its own or it would never be compiled at all.
+    #
+    # Two different things are being checked here, and the matrix reflects
+    # that:
+    #
+    #   ubuntu-latest (x86_64) — the emitter and the block translator are pure
+    #     computation, so their byte-exact tests run anywhere. The execution
+    #     test detects a non-arm64 host and reports SKIP.
+    #
+    #   macos-14 / macos-15 (Apple Silicon, arm64) — the ONLY place emitted
+    #     code is actually executed, which is the only way to show the
+    #     encodings compute the right answers rather than merely being
+    #     well-formed. The gate is at runtime, not in CMake: test_jit_exec
+    #     asks jit_host_can_execute() and then whether executable memory can
+    #     be obtained, and exits 0 with "SKIP:" if either answer is no. So a
+    #     runner without MAP_JIT cannot turn this job red for an environmental
+    #     reason — only a wrong encoding can.
+    #
+    # Read the log rather than just the status: "SKIP" on a macos runner would
+    # mean the execution coverage silently disappeared.
+    name: jit (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report host architecture
+        run: uname -m
+
+      - name: Configure (JIT on)
+        run: cmake -S . -B build-jit -DCMAKE_BUILD_TYPE=Release -DIOS3VM_JIT=ON
+
+      - name: Build
+        run: cmake --build build-jit --config Release
+
+      - name: Test
+        run: ctest --test-dir build-jit --output-on-failure
+
+      - name: Show the execution-test verdict
+        run: ./build-jit/core/test_jit_exec
+
+      - name: Configure and build with the JIT off
+        # The default build must stay green and unchanged; this is the guard
+        # against the option leaking into it.
+        run: |
+          cmake -S . -B build-off -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-off --config Release
+          ctest --test-dir build-off --output-on-failure
+
   sanitize:
     # The emulator parses untrusted, user-supplied firmware and executes guest
     # code that can address anything, so run the whole suite under the address
