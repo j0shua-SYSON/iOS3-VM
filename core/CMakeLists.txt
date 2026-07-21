@@ -6,6 +6,7 @@ add_library(emucore STATIC
     src/mmu.c
     src/snapshot.c
     src/vm_source.c
+    src/vm_block.c
     src/soc/uart.c
     src/soc/vic.c
     src/soc/timer.c
@@ -136,6 +137,10 @@ add_test(NAME nand_device COMMAND test_nand)
 add_executable(test_vm_source tests/test_vm_source.c)
 target_link_libraries(test_vm_source PRIVATE emucore)
 add_test(NAME vm_source COMMAND test_vm_source)
+
+add_executable(test_vm_block tests/test_vm_block.c)
+target_link_libraries(test_vm_block PRIVATE emucore)
+add_test(NAME vm_block COMMAND test_vm_block)
 
 # VMGuest is the portable-C seam between the iOS shell and emucore.  Building
 # it only with Xcode left its physical-address and scanout bounds checks outside
