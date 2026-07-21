@@ -493,9 +493,14 @@ static ksyms_status_t prelink_load(ksyms_t *ks, const macho_t *m) {
     for (unsigned i = 1; i < ks->nkext_exec; i++) {
         const kext_t *a = &ks->kext[i - 1], *b = &ks->kext[i];
         if ((uint64_t)a->addr + a->size > (uint64_t)b->addr) {
+            /* Both identifiers are bounded in the parsed representation, but
+             * two maximum-size names plus the explanatory prose exceed this
+             * diagnostic buffer. Bound their presentation explicitly so the
+             * warning remains NUL-terminated and warning-free under GCC's
+             * -Wformat-truncation without weakening the parser's own limit. */
             snprintf(ks->detail, sizeof ks->detail,
-                     "WARNING: %s 0x%08x+0x%x overlaps %s 0x%08x — addresses in "
-                     "the overlap are attributed to the first",
+                     "WARNING: %.63s@0x%08x+0x%x overlaps %.63s@0x%08x; "
+                     "addresses in the overlap are attributed to the first",
                      a->bundle, a->addr, a->size, b->bundle, b->addr);
             break;
         }
