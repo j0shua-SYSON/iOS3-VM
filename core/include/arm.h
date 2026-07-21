@@ -31,6 +31,15 @@
  * exists so the CPSR and every SPSR the guest saves hold the value hardware
  * would have put there. */
 #define ARM_CPSR_A (1u << 8)  /* async abort disable */
+/*
+ * E: the data endianness of loads and stores, new in ARMv6 (SETEND writes it).
+ * This machine is little-endian throughout and SETEND BE traps, so E is never
+ * set by anything we execute — but MSR CPSR_x can set it, and the architecture
+ * makes exception entry OVERWRITE it from SCTLR.EE rather than leave it alone.
+ * take_exception does that, so a guest that set E cannot carry a big-endian
+ * data path into a handler, and the SPSR it stacks records the truth.
+ */
+#define ARM_CPSR_E (1u << 9)  /* data endianness: 0 little, 1 big */
 #define ARM_CPSR_I (1u << 7)  /* IRQ disable  */
 #define ARM_CPSR_F (1u << 6)  /* FIQ disable  */
 #define ARM_CPSR_T (1u << 5)  /* Thumb state  */
@@ -42,6 +51,7 @@
 #define ARM_SCTLR_C (1u << 2)   /* data cache enable   */
 #define ARM_SCTLR_I (1u << 12)  /* instruction cache   */
 #define ARM_SCTLR_V (1u << 13)  /* high exception vectors @ 0xFFFF0000 */
+#define ARM_SCTLR_EE (1u << 25) /* CPSR.E value taken on exception entry */
 
 /* Main ID register value reported for the ARM1176JZF-S in the S5L8900. */
 #define ARM1176_MIDR       0x410fb767u

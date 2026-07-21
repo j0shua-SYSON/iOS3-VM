@@ -150,6 +150,16 @@ static void take_exception(arm_cpu_t *c, uint32_t vector, uint32_t mode,
         c->cpsr |= ARM_CPSR_A;
     c->cpsr &= ~ARM_CPSR_T;                /* exceptions enter in ARM state */
     /*
+     * CPSR.E <- SCTLR.EE (ARM ARM, ARMv6, B4.1.1 and the exception-entry
+     * pseudocode in A2.6). Not "leave E alone": the handler must start in the
+     * endianness the system control register names, whatever the interrupted
+     * code had selected with SETEND. We never set SCTLR.EE and SETEND BE traps,
+     * so in practice this always clears E — but writing it as an assignment
+     * from EE rather than an unconditional clear keeps the rule intact if a
+     * guest ever sets E through MSR CPSR_x, which our MSR mask does permit.
+     */
+    set_flag(c, ARM_CPSR_E, (c->cp15.sctlr & ARM_SCTLR_EE) != 0);
+    /*
      * Taking an exception clears the exclusive monitor. Without this, an
      * interrupt landing between a thread's LDREX and its STREX leaves the tag
      * intact, so the preempted thread's STREX still succeeds after the
@@ -311,6 +321,11 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
      * proceed; trapping it would stop a boot over a feature query.
      */
     if (cp == 14) {
+        /* Every CP14 register on this part is privileged-access-only, and with
+         * the debug unit absent there is nothing here for a user process at
+         * all. Answering zeros to unprivileged code would be inventing a
+         * permission the hardware does not grant. */
+        if (!cpu_is_priv(c)) return ARM_UNDEFINED;
         if ((insn >> 20) & 1u) c->r[(insn >> 12) & 0xfu] = 0;  /* MRC reads 0 */
         return ARM_OK;                                          /* MCR ignored */
     }
@@ -376,6 +391,33 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     unsigned opc2 = (insn >> 5)  & 7u;
     unsigned crm  = insn & 0xfu;
     arm_cp15_t *p = &c->cp15;
+
+    /*
+     * CP15 is privileged. The ARM1176JZF-S (ARM DDI 0301H, table 3-3) grants
+     * User mode exactly three things:
+     *
+     *   c7   the memory barriers and the cache-maintenance-by-MVA operations —
+     *        harmless, and no-ops here because there are no caches to manage;
+     *   c13,c0,2  TPIDRURW, read/write — the user-mode thread-ID scratch word;
+     *   c13,c0,3  TPIDRURO, READ only — where XNU parks cthread_self. This is
+     *        not hypothetical: _thread_set_cthread_self (0xc0061da0) writes it
+     *        with "MCR p15,0,r0,c13,c0,3", and libSystem's pthread_self reads
+     *        it back from User mode on every lock.
+     *
+     * Everything else — SCTLR, TTBR0/TTBR1, TTBCR, DACR, the fault registers,
+     * FCSEIDR, CONTEXTIDR, TPIDRPRW — is UNDEFINED from User mode. That is not
+     * pedantry: without this check a user process can point TTBR0 at a page
+     * table it wrote itself, clear SCTLR.M outright, or make DACR name every
+     * domain a manager, and our translation layer would obey. This is the same
+     * shape of hole as CPS-in-User-mode: unreachable for the whole kernel-only
+     * boot, live from the first instruction launchd executes.
+     */
+    if (!cpu_is_priv(c)) {
+        bool allowed = (crn == 7)
+                    || (crn == 13 && crm == 0 && opc2 == 2)
+                    || (crn == 13 && crm == 0 && opc2 == 3 && load);
+        if (!allowed) return ARM_UNDEFINED;
+    }
 
     if (load) {
         uint32_t v = 0;
@@ -939,6 +981,22 @@ static arm_status_t exec_block_transfer(arm_cpu_t *c, uint32_t pc, uint32_t insn
         if (L && (list & (1u << 15))) restore_cpsr = true;
         else                          user_bank = true;
     }
+
+    /*
+     * The user-bank forms are LDM(2)/STM(2), and the architecture states their
+     * operand restriction flatly: "the W bit must not be set" (ARM ARM, ARMv6,
+     * A4.1.21 / A4.1.42) — W == 1 here is UNPREDICTABLE. There is no defensible
+     * answer to give: writeback would have to land in EITHER the current mode's
+     * Rn or the user bank's, and the two choices differ precisely when Rn is
+     * r13, which is the only base XNU ever uses with this form. Guessing one
+     * would corrupt a stack pointer silently. Trap instead, and name it.
+     *
+     * Nothing in the shipped kernel needs this: every `^` transfer in xnu-1357's
+     * ARM code — _fleh_swi+0x8, _fleh_undef+0x20, _fleh_prefabt+0x18,
+     * _fleh_dataabt+0x18, _fleh_irq+0x18 and _thread_exception_return+0x58 —
+     * encodes W == 0 (0xe8cd7fff / 0xe8dd7fff).
+     */
+    if (user_bank && W) return ARM_UNDEFINED;
 
     unsigned n = 0;
     for (unsigned i = 0; i < 16; i++) if (list & (1u << i)) n++;

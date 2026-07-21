@@ -1716,6 +1716,460 @@ static void test_vfp_lazy_trap_cannot_loop(void) {
           "vector a second time", (int)st);
 }
 
+/* ================= the user <-> kernel transition =========================
+ *
+ * Everything below is checked against xnu-1357.5.30's own code, not only
+ * against the ARM ARM, because the kernel's assembly is the other half of the
+ * contract. The encodings used here are the literal words in firmware/
+ * kernel.macho:
+ *
+ *   _fleh_swi              0xc00680a0  STM sp,{r0-r14}^   0xe8cd7fff
+ *                          0xc00680b8  SRSIA sp,#0x13     0xf8cd0513
+ *   _thread_exception_return
+ *                          0xc0068774  LDM sp,{r0-r14}^   0xe8dd7fff
+ *                          0xc006877c  MOVS pc,lr         0xe1b0f00e
+ *   _fleh_fiq_generic      0xc00685e4  SUBSPL pc,lr,#4    0x525ef004
+ *   _copyin                0xc0069cb0  LDRT r3,[r0],#4    0xe4b03004
+ *   _copyout               0xc0069d38  STRT r3,[r1],#4    0xe4a13004
+ *   _thread_set_cthread_self
+ *                          0xc0061da0  MCR p15,0,r0,c13,c0,3
+ *
+ * Note what _fleh_swi does NOT do: it never looks at the SWI immediate. The
+ * syscall number arrives in r12 ("CMN ip,#3" is its first instruction) and
+ * _unix_syscall re-reads it from the saved frame at +0x30, which is r12's slot
+ * in the STM^ above. The arguments come from the saved r0-r6 (it computes
+ * "&regs->r[0]" or "&regs->r[1]" and rejects anything with more than 7 args) —
+ * never from the user stack. So the whole syscall ABI rests on the `^` block
+ * transfers below reading and writing the USER bank.
+ */
+
+/* Put the core in User mode at `pc` with the MMU off and a program loaded at 0. */
+static void user_mode_at(arm_cpu_t *c, const uint32_t *prog, size_t words,
+                         uint32_t pc) {
+    memset(g_ram, 0, sizeof g_ram);
+    for (size_t i = 0; i < words; i++) m_w32(NULL, (uint32_t)(i * 4), prog[i]);
+    arm_reset(c, &g_bus);
+    arm_set_mode(c, ARM_MODE_USR);
+    c->cpsr &= ~(ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_A);
+    c->r[15] = pc;
+}
+
+static void test_swi_entry_state_from_user_mode(void) {
+    /* The full ARM ARM (ARMv6, A2.6.4) entry contract for SWI, taken from User
+     * mode — the only mode it will ever be taken from once launchd runs. */
+    uint32_t p[0x44] = {0};
+    p[0x40] = 0xef000080u;                    /* 0x100: SWI #0x80 */
+    arm_cpu_t c; user_mode_at(&c, p, 0x44, 0x100);
+    arm_set_mode(&c, ARM_MODE_SVC);
+    c.r[13] = 0x900; c.r[14] = 0xdeadbeefu;   /* SVC bank, must be overwritten */
+    arm_set_mode(&c, ARM_MODE_USR);
+    c.r[13] = 0xaaaa0000u; c.r[14] = 0xbbbb0000u;
+    c.r[12] = 4;                              /* the syscall number XNU reads */
+    arm_step(&c);
+
+    CHECK(c.r[15] == ARM_VEC_SWI, "pc=%08x expect 08", c.r[15]);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC,
+          "mode=%02x expect SVC", c.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK(c.r[14] == 0x104, "lr_svc=%08x expect 104 (the instruction AFTER the "
+          "SWI; _unix_syscall rewinds this by 4 for ERESTART)", c.r[14]);
+    CHECK(c.r[13] == 0x900, "sp_svc=%08x expect the SVC bank, not the user's", c.r[13]);
+    CHECK(c.spsr[ARM_BANK_SVC] == (ARM_MODE_USR),
+          "spsr_svc=%08x expect the pre-switch User CPSR", c.spsr[ARM_BANK_SVC]);
+    CHECK((c.cpsr & ARM_CPSR_I) != 0, "I must be set on entry");
+    CHECK((c.cpsr & ARM_CPSR_A) == 0,
+          "A must NOT be set: SWI and Undefined are the two vectors that leave "
+          "it alone (A2.6). Setting it here would put a bit in every SPSR XNU "
+          "saves that hardware would not have put there");
+    CHECK((c.cpsr & ARM_CPSR_T) == 0, "T must be cleared: handlers run in ARM state");
+    CHECK((c.cpsr & ARM_CPSR_E) == 0, "E must come from SCTLR.EE, which is clear");
+    CHECK(c.r[12] == 4, "r12 is not banked and must survive the switch to SVC");
+}
+
+static void test_thumb_swi_lr_is_the_next_halfword(void) {
+    /* In Thumb state the SWI is two bytes, so the return address is PC+2, not
+     * PC+4. Getting this wrong resumes the process one instruction early. */
+    uint32_t p[0x44] = {0};
+    m_w32(NULL, 0, 0);
+    arm_cpu_t c; user_mode_at(&c, p, 0x44, 0x100);
+    m_w16(NULL, 0x100, 0xdf80u);              /* SWI #0x80, Thumb */
+    c.cpsr |= ARM_CPSR_T;
+    arm_step(&c);
+
+    CHECK(c.r[15] == ARM_VEC_SWI, "pc=%08x expect 08", c.r[15]);
+    CHECK(c.r[14] == 0x102, "lr_svc=%08x expect 102 (PC+2 in Thumb)", c.r[14]);
+    CHECK((c.cpsr & ARM_CPSR_T) == 0, "the handler runs in ARM state");
+    CHECK((c.spsr[ARM_BANK_SVC] & ARM_CPSR_T) != 0,
+          "SPSR.T must record that the caller was Thumb — _fleh_undef and "
+          "_sleh_undef key off exactly this bit");
+    CHECK((c.spsr[ARM_BANK_SVC] & ARM_CPSR_MODE_MASK) == ARM_MODE_USR,
+          "SPSR mode must be User; _fleh_* branch on \"TST spsr,#0xf\"");
+}
+
+static void test_irq_sets_a_but_swi_does_not(void) {
+    /* The distinction take_exception draws, pinned from both sides so neither
+     * half can regress alone. */
+    uint32_t p[] = { 0xef000000u };           /* SWI #0 */
+    arm_cpu_t c; user_mode_at(&c, p, 1, 0);
+    arm_step(&c);
+    CHECK((c.cpsr & ARM_CPSR_A) == 0, "SWI must leave A alone");
+
+    arm_cpu_t d; user_mode_at(&d, p, 1, 0);
+    d.irq_line = true;
+    arm_step(&d);
+    CHECK(d.r[15] == ARM_VEC_IRQ, "pc=%08x expect 18 (IRQ)", d.r[15]);
+    CHECK((d.cpsr & ARM_CPSR_A) != 0, "IRQ entry must set A");
+    CHECK((d.cpsr & ARM_CPSR_F) == 0, "IRQ entry must NOT mask FIQ");
+}
+
+static void test_exception_entry_takes_cpsr_e_from_sctlr_ee(void) {
+    /* CPSR.E <- SCTLR.EE, not "E is preserved". We never set EE, so the bit
+     * must come back clear even when the interrupted code had set it. */
+    uint32_t p[] = { 0xe3a00c02u,   /* MOV r0,#0x200  (the E bit)  */
+                     0xe122f000u,   /* MSR CPSR_x, r0 -> sets E    */
+                     0xef000000u }; /* SWI #0                      */
+    arm_cpu_t c; load_and_run(&c, p, 3, 2);
+    CHECK((c.cpsr & ARM_CPSR_E) != 0, "MSR should have set E for this test");
+    arm_step(&c);
+    CHECK((c.cpsr & ARM_CPSR_E) == 0, "exception entry must clear E from SCTLR.EE");
+    CHECK((c.spsr[ARM_BANK_SVC] & ARM_CPSR_E) != 0,
+          "the SPSR must still record that the caller had E set");
+}
+
+static void test_xnu_syscall_frame_round_trip(void) {
+    /*
+     * The real thing: SWI from User mode, _fleh_swi's "STM sp,{r0-r14}^",
+     * the handler scribbling on the registers, _thread_exception_return's
+     * "LDM sp,{r0-r14}^" and "MOVS pc,lr". Every user register must come back,
+     * the SVC bank must be untouched throughout, and the frame in memory must
+     * hold the USER r13/r14 rather than the handler's.
+     */
+    uint32_t p[0x44] = {0};
+    p[0x02] = 0xe8cd7fffu;   /* 0x08: STM sp,{r0-r14}^   (the SWI vector) */
+    p[0x03] = 0xe1a00000u;   /* 0x0c: NOP (the mandatory gap after ^)     */
+    p[0x04] = 0xe3a00000u;   /* 0x10: MOV r0,#0   — clobber               */
+    p[0x05] = 0xe3a0c000u;   /* 0x14: MOV r12,#0  — clobber               */
+    p[0x06] = 0xe8dd7fffu;   /* 0x18: LDM sp,{r0-r14}^                    */
+    p[0x07] = 0xe1a00000u;   /* 0x1c: NOP                                 */
+    p[0x08] = 0xe1b0f00eu;   /* 0x20: MOVS pc,lr                          */
+    p[0x40] = 0xef000000u;   /* 0x100: SWI #0                             */
+
+    arm_cpu_t c; user_mode_at(&c, p, 0x44, 0x100);
+    arm_set_mode(&c, ARM_MODE_SVC);
+    c.r[13] = 0x900;                       /* the per-thread save area   */
+    c.r[14] = 0xcccc0000u;                 /* SVC LR, must not leak out  */
+    arm_set_mode(&c, ARM_MODE_USR);
+    for (unsigned i = 0; i < 13; i++) c.r[i] = 0x1000u + i;
+    c.r[13] = 0xaaaa0000u; c.r[14] = 0xbbbb0000u;
+
+    for (int i = 0; i < 8; i++) arm_step(&c);
+
+    /* The frame the kernel reads: r12 at +0x30, user sp at +0x34, user lr +0x38. */
+    CHECK(m_r32(NULL, 0x900 + 0x00) == 0x1000u, "frame r0=%08x", m_r32(NULL, 0x900));
+    CHECK(m_r32(NULL, 0x900 + 0x30) == 0x100cu,
+          "frame+0x30=%08x expect r12 — this is the slot _unix_syscall reads the "
+          "syscall number from", m_r32(NULL, 0x900 + 0x30));
+    CHECK(m_r32(NULL, 0x900 + 0x34) == 0xaaaa0000u,
+          "frame+0x34=%08x expect the USER sp, not sp_svc", m_r32(NULL, 0x900 + 0x34));
+    CHECK(m_r32(NULL, 0x900 + 0x38) == 0xbbbb0000u,
+          "frame+0x38=%08x expect the USER lr", m_r32(NULL, 0x900 + 0x38));
+
+    /* And the return. */
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR,
+          "mode=%02x expect back in User", c.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK(c.r[15] == 0x104, "pc=%08x expect 104", c.r[15]);
+    CHECK(c.r[0] == 0x1000u && c.r[12] == 0x100cu,
+          "r0=%08x r12=%08x: the clobbered registers must be restored",
+          c.r[0], c.r[12]);
+    CHECK(c.r[13] == 0xaaaa0000u && c.r[14] == 0xbbbb0000u,
+          "sp=%08x lr=%08x expect the user bank back", c.r[13], c.r[14]);
+    arm_set_mode(&c, ARM_MODE_SVC);
+    CHECK(c.r[13] == 0x900 && c.r[14] == 0x104,
+          "sp_svc=%08x lr_svc=%08x: the LDM^ must write the USER bank ONLY. "
+          "lr_svc still has to hold the resume address the SWI put there — "
+          "_thread_exception_return reloads it from the frame BEFORE the LDM^ "
+          "and then feeds it straight to MOVS pc,lr, so a LDM^ that wrote the "
+          "current bank would return to the user's r14 instead", c.r[13], c.r[14]);
+}
+
+static void test_syscall_error_flag_reaches_user_through_the_spsr(void) {
+    /*
+     * How a failed syscall tells the process. _unix_syscall does
+     * "LDR r3,[r6,#0x40]; ORR r3,r3,#0x20000000; STR r3,[r6,#0x40]" — it sets
+     * the C flag in the SAVED CPSR — and _thread_exception_return reloads that
+     * word into SPSR_svc with "MSR spsr_fsxc,r4" before "MOVS pc,lr". So the
+     * flags a user process sees after a syscall travel entirely through the
+     * SPSR: an exception return that recomputed NZCV from its own arithmetic,
+     * or that restored only the control byte, would make every syscall look
+     * successful to libSystem's "bcs cerror".
+     */
+    uint32_t p[] = { 0xe16ff000u,   /* 0x00: MSR spsr_fsxc, r0 */
+                     0xe1b0f00eu }; /* 0x04: MOVS pc, lr       */
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, p[0]); m_w32(NULL, 4, p[1]);
+    arm_set_mode(&c, ARM_MODE_SVC);
+    c.r[0]  = ARM_MODE_USR | ARM_CPSR_C;   /* the frame's cpsr word, C set */
+    c.r[14] = 0x00001020u;
+    c.cpsr |= ARM_CPSR_Z;                  /* handler flags, must not survive */
+    c.cpsr &= ~ARM_CPSR_C;
+    c.r[15] = 0;
+    arm_step(&c); arm_step(&c);
+
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR,
+          "mode=%02x expect User", c.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK((c.cpsr & ARM_CPSR_C) != 0,
+          "cpsr=%08x: C must arrive from the SPSR — this is the syscall error "
+          "indication", c.cpsr);
+    CHECK((c.cpsr & ARM_CPSR_Z) == 0,
+          "cpsr=%08x: the handler's own flags must not leak into user mode", c.cpsr);
+    CHECK(c.r[15] == 0x00001020u, "pc=%08x expect 1020", c.r[15]);
+}
+
+static void test_user_bank_ldm_writes_the_user_bank(void) {
+    /* The load direction of the same rule, isolated. */
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    memset(g_ram, 0, sizeof g_ram);
+    arm_set_mode(&c, ARM_MODE_USR);
+    c.r[13] = 0x1111; c.r[14] = 0x2222;
+    arm_set_mode(&c, ARM_MODE_SVC);
+    c.r[13] = 0x800; c.r[14] = 0xcccc0000u;
+    m_w32(NULL, 0x800, 0x33330000u);      /* -> user r13 */
+    m_w32(NULL, 0x804, 0x44440000u);      /* -> user r14 */
+    m_w32(NULL, 0, 0xe8dd6000u);          /* LDM sp,{r13,r14}^ */
+    c.r[15] = 0;
+    arm_step(&c);
+
+    CHECK(c.r[13] == 0x800 && c.r[14] == 0xcccc0000u,
+          "sp_svc=%08x lr_svc=%08x must be untouched", c.r[13], c.r[14]);
+    arm_set_mode(&c, ARM_MODE_USR);
+    CHECK(c.r[13] == 0x33330000u && c.r[14] == 0x44440000u,
+          "user sp=%08x lr=%08x expect the loaded values", c.r[13], c.r[14]);
+}
+
+static void test_user_bank_stm_from_fiq_uses_the_user_r8_r12(void) {
+    /* FIQ is the mode where the `^` form has the most to get wrong: it banks
+     * r8-r12 as well as r13/r14, so a save that reads the live registers would
+     * write FIQ's private copies into the interrupted thread's frame and hand
+     * them back to it on resume. */
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    memset(g_ram, 0, sizeof g_ram);
+    arm_set_mode(&c, ARM_MODE_USR);
+    for (unsigned i = 8; i <= 12; i++) c.r[i] = 0xd0000000u + i;
+    c.r[13] = 0xaaaa0000u; c.r[14] = 0xbbbb0000u;
+    arm_set_mode(&c, ARM_MODE_FIQ);
+    for (unsigned i = 8; i <= 12; i++) c.r[i] = 0xf0000000u + i;
+    c.r[13] = 0x800; c.r[14] = 0xcccc0000u;
+    m_w32(NULL, 0, 0xe8cd7f00u);          /* STMIA sp,{r8-r14}^ */
+    c.r[15] = 0;
+    arm_step(&c);
+
+    for (unsigned i = 0; i < 5; i++)
+        CHECK(m_r32(NULL, 0x800 + i * 4) == 0xd0000000u + 8 + i,
+              "frame r%u=%08x expect the USER bank, not FIQ's", 8 + i,
+              m_r32(NULL, 0x800 + i * 4));
+    CHECK(m_r32(NULL, 0x814) == 0xaaaa0000u, "frame sp=%08x expect user sp",
+          m_r32(NULL, 0x814));
+    CHECK(m_r32(NULL, 0x818) == 0xbbbb0000u, "frame lr=%08x expect user lr",
+          m_r32(NULL, 0x818));
+    CHECK(c.r[8] == 0xf0000008u && c.r[14] == 0xcccc0000u,
+          "the FIQ bank must be untouched");
+}
+
+static void test_user_bank_transfer_with_writeback_traps(void) {
+    /* LDM(2)/STM(2) forbid writeback (ARM ARM A4.1.21/A4.1.42): W==1 is
+     * UNPREDICTABLE, and the two plausible answers differ exactly when Rn is
+     * r13 — the only base XNU uses with this form. Trap rather than pick one. */
+    uint32_t st[] = { 0xe8ed7fffu };      /* STMIA sp!,{r0-r14}^ */
+    uint32_t ld[] = { 0xe8fd7fffu };      /* LDMIA sp!,{r0-r14}^ */
+    arm_cpu_t c;
+    CHECK(run_status(&c, st, 1, 1) == ARM_UNDEFINED, "STM^ with writeback must trap");
+    CHECK(run_status(&c, ld, 1, 1) == ARM_UNDEFINED, "LDM^ with writeback must trap");
+    /* ...but the exception-return LDM, which legitimately writes back, must not. */
+    arm_cpu_t d;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, 0xe8fd8000u);          /* LDMIA sp!,{pc}^ */
+    m_w32(NULL, 0x800, 0x00001020u);
+    arm_reset(&d, &g_bus);
+    arm_set_mode(&d, ARM_MODE_SVC);
+    d.spsr[ARM_BANK_SVC] = ARM_MODE_USR;
+    d.r[13] = 0x800;
+    d.r[15] = 0;
+    CHECK(arm_step(&d) == ARM_OK,
+          "LDM {pc}^ with writeback is LDM(3), where writeback IS allowed");
+    CHECK(d.r[15] == 0x00001020u, "pc=%08x expect the return address", d.r[15]);
+    CHECK((d.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR,
+          "mode=%02x expect User restored from SPSR", d.cpsr & ARM_CPSR_MODE_MASK);
+    CHECK(d.bank_r13[ARM_BANK_SVC] == 0x804,
+          "sp_svc=%08x expect 804: the writeback lands in the HANDLER's banked "
+          "Rn, and only then does CPSR<-SPSR rebank us", d.bank_r13[ARM_BANK_SVC]);
+}
+
+static void test_srs_stores_lr_and_spsr_of_the_current_mode(void) {
+    /* _fleh_swi+0x18 is "SRSIA sp,#0x13" (0xf8cd0513): it appends the user PC
+     * (in lr_svc) and the user CPSR (in spsr_svc) to the frame at +0x3c/+0x40,
+     * which is exactly where _thread_exception_return reads them back from. */
+    uint32_t p[] = { 0xf8cd0513u };
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, p[0]);
+    arm_set_mode(&c, ARM_MODE_SVC);
+    c.r[13] = 0x93c; c.r[14] = 0x00000104u;
+    c.spsr[ARM_BANK_SVC] = ARM_MODE_USR | ARM_CPSR_T;
+    c.r[15] = 0;
+    arm_step(&c);
+
+    CHECK(m_r32(NULL, 0x93c) == 0x00000104u, "[sp]=%08x expect lr_svc", m_r32(NULL, 0x93c));
+    CHECK(m_r32(NULL, 0x940) == (ARM_MODE_USR | ARM_CPSR_T),
+          "[sp+4]=%08x expect spsr_svc", m_r32(NULL, 0x940));
+    CHECK(c.r[13] == 0x93c, "W==0 in this encoding: sp must not move");
+}
+
+static void test_subs_pc_lr_4_returns_from_fiq(void) {
+    /* _fleh_fiq_generic ends with "SUBSPL pc,lr,#4" — the third exception-return
+     * form, and the only one that arrives at the resume address by arithmetic. */
+    uint32_t p[] = { 0xe25ef004u };       /* SUBS pc,lr,#4 */
+    arm_cpu_t c; arm_reset(&c, &g_bus);
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, p[0]);
+    arm_set_mode(&c, ARM_MODE_FIQ);
+    c.spsr[ARM_BANK_FIQ] = ARM_MODE_USR;
+    c.r[14] = 0x00001020u;
+    c.r[15] = 0;
+    arm_step(&c);
+    CHECK(c.r[15] == 0x0000101cu, "pc=%08x expect 101c (lr-4)", c.r[15]);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR,
+          "mode=%02x expect User restored from SPSR", c.cpsr & ARM_CPSR_MODE_MASK);
+}
+
+/* --- copyin / copyout: the T forms under real user-pmap conditions -------- */
+
+/* Identity-map section 0 as AP=11 (so the fetch works from any mode) and map
+ * VA 0x80000000 -> PA 0 as AP=01: privileged RW, user NO ACCESS. That is what
+ * a kernel-only page looks like to copyin. */
+static void kernel_only_page_setup(arm_cpu_t *c, const uint32_t *prog, size_t words) {
+    const uint32_t l1 = 0x4000;
+    memset(g_ram, 0, sizeof g_ram);
+    for (size_t i = 0; i < words; i++) m_w32(NULL, (uint32_t)(i * 4), prog[i]);
+    m_w32(NULL, l1 + 0,           0x00000000u | (3u << 10) | 2u);  /* AP=11 */
+    m_w32(NULL, l1 + (0x800 << 2), 0x00000000u | (1u << 10) | 2u); /* AP=01 */
+    arm_reset(c, &g_bus);
+    c->cp15.ttbr0 = l1;
+    c->cp15.dacr  = 1u;                       /* domain 0 client: check AP */
+    c->cp15.sctlr |= ARM_SCTLR_M;
+    arm_set_mode(c, ARM_MODE_SVC);
+    c->r[15] = 0;
+}
+
+static void test_ldrt_from_svc_translates_as_unprivileged(void) {
+    /* copyin's inner loop is "LDRT r3,[r0],#4" issued from SVC with the user
+     * pmap in TTBR0. A plain LDR of the same address succeeds; the T form must
+     * fault, because that is the whole mechanism protecting the kernel from
+     * dereferencing a pointer the process could not have followed itself. */
+    uint32_t p[] = { 0xe3a01102u,   /* MOV r1,#0x80000000 */
+                     0xe3811c03u,   /* ORR r1,r1,#0x300   */
+                     0xe5910000u,   /* LDR  r0,[r1]       (privileged: ok)   */
+                     0xe4b12000u }; /* LDRT r2,[r1]       (unprivileged: fault) */
+    arm_cpu_t c; kernel_only_page_setup(&c, p, 4);
+    m_w32(NULL, 0x300, 0x5a5aa5a5u);
+    arm_step(&c); arm_step(&c); arm_step(&c);
+    CHECK(c.r[0] == 0x5a5aa5a5u,
+          "r0=%08x: a plain LDR from SVC must read the kernel-only page", c.r[0]);
+    arm_step(&c);
+    CHECK(c.r[15] == ARM_VEC_DATA_ABORT,
+          "pc=%08x expect 10: LDRT from a privileged mode translates as "
+          "unprivileged and must abort here", c.r[15]);
+    CHECK((c.cp15.dfsr & 0xfu) == ARM_FSR_SECTION_PERMISSION,
+          "dfsr=%08x expect a section permission fault", c.cp15.dfsr);
+    CHECK((c.cp15.dfsr & (1u << 11)) == 0, "WnR must be clear for a read");
+    CHECK(c.cp15.dfar == 0x80000300u, "dfar=%08x expect 80000300", c.cp15.dfar);
+}
+
+static void test_strt_from_svc_translates_as_unprivileged(void) {
+    /* copyout's mirror image, and the one that also has to get DFSR.WnR right. */
+    uint32_t p[] = { 0xe3a01102u,   /* MOV r1,#0x80000000 */
+                     0xe3811c03u,   /* ORR r1,r1,#0x300   */
+                     0xe5810000u,   /* STR  r0,[r1]       (privileged: ok)   */
+                     0xe4a12000u }; /* STRT r2,[r1]       (unprivileged: fault) */
+    arm_cpu_t c; kernel_only_page_setup(&c, p, 4);
+    c.r[0] = 0x11223344u;
+    arm_step(&c); arm_step(&c); arm_step(&c);
+    CHECK(m_r32(NULL, 0x300) == 0x11223344u, "a plain STR from SVC must land");
+    arm_step(&c);
+    CHECK(c.r[15] == ARM_VEC_DATA_ABORT, "pc=%08x expect 10 (STRT must abort)", c.r[15]);
+    CHECK((c.cp15.dfsr & (1u << 11)) != 0, "dfsr=%08x: WnR must be set for a write",
+          c.cp15.dfsr);
+}
+
+static void test_user_mode_load_uses_user_permissions(void) {
+    /* And the same page reached from genuine User mode, so `priv` is confirmed
+     * to come from the CURRENT mode and not only from the instruction form. */
+    uint32_t p[] = { 0xe3a01102u,   /* MOV r1,#0x80000000 */
+                     0xe5910000u }; /* LDR r0,[r1]        */
+    arm_cpu_t c; kernel_only_page_setup(&c, p, 2);
+    arm_set_mode(&c, ARM_MODE_USR);
+    arm_step(&c); arm_step(&c);
+    CHECK(c.r[15] == ARM_VEC_DATA_ABORT,
+          "pc=%08x expect 10: a plain LDR in User mode must fault on a "
+          "kernel-only page", c.r[15]);
+}
+
+/* --- CP15 is privileged ---------------------------------------------------- */
+
+static arm_status_t run_one_in_user(arm_cpu_t *c, uint32_t insn) {
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, insn);
+    arm_reset(c, &g_bus);
+    arm_set_mode(c, ARM_MODE_USR);
+    c->r[15] = 0;
+    return arm_step(c);
+}
+
+static void test_cp15_is_privileged_from_user_mode(void) {
+    /*
+     * CP15 is not a free-for-all. Without this check a user process can write
+     * TTBR0 and point translation at a page table it owns, or clear SCTLR.M,
+     * or make DACR call every domain a manager — and our MMU would obey. Same
+     * shape as the CPS-in-User-mode hole: invisible for the entire kernel-only
+     * boot, live from launchd's first instruction.
+     */
+    arm_cpu_t c;
+    CHECK(run_one_in_user(&c, 0xee110f10u) == ARM_UNDEFINED, "MRC SCTLR must trap");
+    CHECK(run_one_in_user(&c, 0xee010f10u) == ARM_UNDEFINED, "MCR SCTLR must trap");
+    CHECK(run_one_in_user(&c, 0xee020f10u) == ARM_UNDEFINED, "MCR TTBR0 must trap");
+    CHECK(run_one_in_user(&c, 0xee030f10u) == ARM_UNDEFINED, "MCR DACR must trap");
+    CHECK(run_one_in_user(&c, 0xee1d0f90u) == ARM_UNDEFINED, "MRC TPIDRPRW must trap");
+    CHECK(run_one_in_user(&c, 0xee110f30u) == ARM_UNDEFINED, "MRC CP14 must trap");
+    /* The same accesses from a privileged mode must still work. */
+    uint32_t p[] = { 0xee110f10u };
+    arm_cpu_t d; load_and_run(&d, p, 1, 1);
+    CHECK(d.r[0] == d.cp15.sctlr, "SCTLR must still be readable from SYS mode");
+}
+
+static void test_cp15_thread_id_registers_stay_user_accessible(void) {
+    /* The three CP15 accesses the ARM1176 does grant User mode. TPIDRURO is the
+     * load-bearing one: _thread_set_cthread_self (0xc0061da0) writes it with
+     * "MCR p15,0,r0,c13,c0,3" and libSystem reads it back from User mode. */
+    arm_cpu_t c;
+    CHECK(run_one_in_user(&c, 0xee1d0f70u) == ARM_OK, "MRC TPIDRURO must be allowed");
+    CHECK(run_one_in_user(&c, 0xee0d0f70u) == ARM_UNDEFINED,
+          "MCR TPIDRURO is READ-only from User mode");
+    CHECK(run_one_in_user(&c, 0xee1d0f50u) == ARM_OK, "MRC TPIDRURW must be allowed");
+    CHECK(run_one_in_user(&c, 0xee0d0f50u) == ARM_OK, "MCR TPIDRURW must be allowed");
+    CHECK(run_one_in_user(&c, 0xee071f9au) == ARM_OK,
+          "the c7 barrier/cache operations stay accessible from User mode");
+
+    /* And the value really round-trips through the kernel-side write. */
+    arm_cpu_t d;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0, 0xee1d0f70u);            /* MRC p15,0,r0,c13,c0,3 */
+    arm_reset(&d, &g_bus);
+    d.cp15.tpidruro = 0xfeedface;
+    arm_set_mode(&d, ARM_MODE_USR);
+    d.r[15] = 0;
+    arm_step(&d);
+    CHECK(d.r[0] == 0xfeedfaceu, "r0=%08x expect the cthread_self value", d.r[0]);
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -1811,6 +2265,22 @@ int main(void) {
     test_vfp_sysreg_access_follows_fpexc();
     test_vfp_cpacr_denial_vectors();
     test_vfp_lazy_trap_cannot_loop();
+    test_swi_entry_state_from_user_mode();
+    test_thumb_swi_lr_is_the_next_halfword();
+    test_irq_sets_a_but_swi_does_not();
+    test_exception_entry_takes_cpsr_e_from_sctlr_ee();
+    test_xnu_syscall_frame_round_trip();
+    test_syscall_error_flag_reaches_user_through_the_spsr();
+    test_user_bank_ldm_writes_the_user_bank();
+    test_user_bank_stm_from_fiq_uses_the_user_r8_r12();
+    test_user_bank_transfer_with_writeback_traps();
+    test_srs_stores_lr_and_spsr_of_the_current_mode();
+    test_subs_pc_lr_4_returns_from_fiq();
+    test_ldrt_from_svc_translates_as_unprivileged();
+    test_strt_from_svc_translates_as_unprivileged();
+    test_user_mode_load_uses_user_permissions();
+    test_cp15_is_privileged_from_user_mode();
+    test_cp15_thread_id_registers_stay_user_accessible();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
