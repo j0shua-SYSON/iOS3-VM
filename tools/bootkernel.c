@@ -777,7 +777,8 @@ int main(int argc, char **argv) {
             "      the default), or a literal address to use as a sentinel\n"
             "  -b  boot_args Revision field (default 1)\n"
             "  -M  do not synthesise /memory reg from the RAM layout\n"
-            "  -K  how many trace lines to print at the first data abort\n"
+            "  -T  how many trace lines to print at the first data abort\n"
+            "  -K  disable the post-load kernel patches (see the kpatch table)\n"
             "  -A  DIAGNOSTIC SHIM, not a fix: after an exception return that\n"
             "      resumes in Thumb state, undo the word alignment the core\n"
             "      applies to the resume address. Use it to confirm that a\n"
@@ -837,7 +838,7 @@ int main(int argc, char **argv) {
     unsigned ndtov = 0;
     char dtbuf[32][96];
     bool patch_memnode = true;
-    unsigned ktail = 512;              /* -K n: trace lines to print on abort */
+    unsigned ktail = 512;              /* -T n: trace lines to print on abort */
 
     /* Walk the arguments one at a time: pair-stepping breaks as soon as a
      * single-argument flag like -a appears. */
@@ -868,7 +869,7 @@ int main(int argc, char **argv) {
         if      (!strcmp(argv[i], "-p")) phys_base = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-V")) virt_base = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-n")) steps     = (unsigned)strtoul(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "-K")) ktail     = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-T")) ktail     = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-d")) dtpath    = argv[++i];
         else if (!strcmp(argv[i], "-c")) cmdline   = argv[++i];
         else if (!strcmp(argv[i], "-b")) ba_rev    = (unsigned)strtoul(argv[++i], NULL, 0);
