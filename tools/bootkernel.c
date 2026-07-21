@@ -445,6 +445,128 @@ static void print_guest_str(const char *label, uint32_t va) {
     printf("\"\n");
 }
 
+/* ---------------------------------------------------------------------------
+ * The guest's OWN view of memory.
+ *
+ * The budget printed in the header is the host's arithmetic. This is the
+ * kernel's answer to the same question, read straight out of its globals, and
+ * the two disagreeing is itself information (it would mean the kernel is not
+ * seeing the DRAM we think we gave it).
+ *
+ * vm_page_free_count is a PAGE count, sampled rather than watched: the number
+ * that matters for "does a 92 MB shared cache fit" is not the value at the end
+ * of the run but the LOW-WATER MARK across it, because a boot that survives on
+ * average and runs out once still dies. Sampling is on the same phase as the
+ * profiler, so it costs four guest reads per 64K instructions.
+ *
+ * All of these are plain kernel-window globals, so guest_ptr's linear
+ * translation reaches them without an MMU walk. A symbol that does not resolve
+ * reads as 0 and prints as "-", never as a plausible wrong number.
+ * ------------------------------------------------------------------------- */
+static uint32_t guest_u32(uint32_t va) {
+    const uint8_t *p = va ? guest_ptr(va, 4) : NULL;
+    return p ? ld32(p) : 0u;
+}
+
+static struct {
+    uint32_t free_va, wire_va, active_va, inactive_va, target_va;
+    uint32_t sane_va, maxmem_va, memsize_va;
+    uint32_t availstart_va, availend_va, firstavail_va;
+    uint32_t free_peak;         /* most free pages ever seen = end of bootstrap */
+    unsigned free_peak_at;
+    uint32_t free_min;          /* low-water mark AFTER the peak, in pages */
+    unsigned free_min_at;       /* instruction index of that minimum */
+    uint32_t free_first;        /* first non-zero sample */
+    unsigned free_first_at;
+    unsigned samples;
+    uint32_t hist[40];          /* free pages over the run, 40 buckets */
+    unsigned hist_n[40];
+} VM;
+
+static void vm_resolve(void) {
+    VM.free_va       = ksym_value("_vm_page_free_count");
+    VM.wire_va       = ksym_value("_vm_page_wire_count");
+    VM.active_va     = ksym_value("_vm_page_active_count");
+    VM.inactive_va   = ksym_value("_vm_page_inactive_count");
+    VM.target_va     = ksym_value("_vm_page_free_target");
+    VM.sane_va       = ksym_value("_sane_size");
+    VM.maxmem_va     = ksym_value("_max_mem");
+    VM.memsize_va    = ksym_value("_mem_size");
+    VM.availstart_va = ksym_value("_avail_start");
+    VM.availend_va   = ksym_value("_avail_end");
+    VM.firstavail_va = ksym_value("_first_avail");
+    VM.free_min = 0xffffffffu;
+}
+
+static void vm_sample(unsigned n, unsigned steps) {
+    if (!VM.free_va) return;
+    uint32_t f = guest_u32(VM.free_va);
+    /* Zero means vm_page_bootstrap has not run yet, not "out of memory". */
+    if (!f) return;
+    VM.samples++;
+    if (!VM.free_first) { VM.free_first = f; VM.free_first_at = n; }
+    /*
+     * The low-water mark is only meaningful AFTER the pool is full.
+     * vm_page_bootstrap fills the free list one page at a time, so the first
+     * samples catch it mid-fill and a naive minimum reports "0.38 MB free",
+     * which reads as catastrophic memory pressure and is nothing of the kind.
+     * Track the peak, and only start looking for a minimum once past it.
+     */
+    if (f >= VM.free_peak) { VM.free_peak = f; VM.free_peak_at = n; VM.free_min = f; }
+    else if (f < VM.free_min) { VM.free_min = f; VM.free_min_at = n; }
+    unsigned b = steps ? (unsigned)((uint64_t)n * 40u / steps) : 0;
+    if (b > 39) b = 39;
+    VM.hist[b] += f;
+    VM.hist_n[b]++;
+}
+
+#define VM_MB(pages) ((double)(pages) * 4096.0 / 1048576.0)
+
+static void vm_report(void) {
+    printf("\n=== GUEST VM COUNTERS (the kernel's own view) ===\n");
+    if (!VM.free_va) {
+        printf("    _vm_page_free_count did not resolve — no report\n");
+        return;
+    }
+    struct { const char *nm; uint32_t va; bool pages; } row[] = {
+        { "mem_size",              VM.memsize_va,    false },
+        { "max_mem",               VM.maxmem_va,     false },
+        { "sane_size",             VM.sane_va,       false },
+        { "avail_start",           VM.availstart_va, false },
+        { "avail_end",             VM.availend_va,   false },
+        { "first_avail",           VM.firstavail_va, false },
+        { "vm_page_free_count",    VM.free_va,       true  },
+        { "vm_page_free_target",   VM.target_va,     true  },
+        { "vm_page_wire_count",    VM.wire_va,       true  },
+        { "vm_page_active_count",  VM.active_va,     true  },
+        { "vm_page_inactive_count",VM.inactive_va,   true  },
+    };
+    for (unsigned i = 0; i < sizeof row / sizeof row[0]; i++) {
+        if (!row[i].va) { printf("    %-24s -\n", row[i].nm); continue; }
+        uint32_t v = guest_u32(row[i].va);
+        if (row[i].pages)
+            printf("    %-24s %10u pages  %8.2f MB\n", row[i].nm, v, VM_MB(v));
+        else
+            printf("    %-24s 0x%08x       %8.2f MB\n", row[i].nm, v, v / 1048576.0);
+    }
+    if (VM.samples) {
+        printf("    ---- free pages over the run (%u samples) ----\n", VM.samples);
+        printf("    first  %8u pages %7.2f MB  @instr %u  (mid-bootstrap)\n",
+               VM.free_first, VM_MB(VM.free_first), VM.free_first_at);
+        printf("    peak   %8u pages %7.2f MB  @instr %u  (pool fully built)\n",
+               VM.free_peak, VM_MB(VM.free_peak), VM.free_peak_at);
+        printf("    LOWEST %8u pages %7.2f MB  @instr %u   <-- the headroom "
+               "that actually has to hold everything\n",
+               VM.free_min, VM_MB(VM.free_min), VM.free_min_at);
+        for (unsigned i = 0; i < 40; i++)
+            if (VM.hist_n[i])
+                printf("      bucket %2u  mean free %8.2f MB\n",
+                       i, VM_MB((double)VM.hist[i] / VM.hist_n[i]));
+    } else {
+        printf("    (never sampled non-zero — vm_page_bootstrap not reached)\n");
+    }
+}
+
 /* ------------------------------------------------------------------------
  * DIAGNOSTIC INSTRUMENTATION (temporary; for finding the serial console).
  *
@@ -548,6 +670,38 @@ static const milestone_t MILESTONES[] = {
 };
 #define NMILE ((unsigned)(sizeof MILESTONES / sizeof MILESTONES[0]))
 
+/*
+ * Milestones resolved BY NAME out of the kernel's own symbol table instead of
+ * being hand-transcribed. Everything here answers one question — "is the
+ * machine still doing work, or has every thread parked?" — so the list is the
+ * scheduler, the sleep primitives, the Mach IPC receive path, and the two
+ * dyld-facing syscalls that a launchd which cannot map the shared cache would
+ * be stuck at. A name that does not resolve is dropped silently at startup and
+ * reported in the milestone table by its absence, never by a wrong address.
+ */
+static const char *MILE_BYNAME[] = {
+    /* scheduler / idle: if these are the whole late window, nothing is runnable */
+    "_machine_idle", "_idle_thread", "_thread_block_reason", "_thread_invoke",
+    "_thread_continue", "_thread_go", "_swtch", "_thread_switch",
+    "_wait_queue_assert_wait", "_clock_delay_until", "_delay",
+    /* BSD sleep */
+    "_msleep", "_tsleep", "_tsleep0", "_msleep0",
+    /* Mach IPC receive — a launchd blocked on a port sits here */
+    "_mach_msg_trap", "_ipc_mqueue_receive", "_ipc_mqueue_receive_continue",
+    "_semaphore_wait_continue",
+    /* the dyld shared cache path */
+    "_shared_region_map_np", "_shared_region_check_np",
+    /* VM / exec paths worth seeing counts for */
+    "_mmap", "_vm_map_enter", "_kernel_thread_start",
+};
+#define NMILE_BYNAME ((unsigned)(sizeof MILE_BYNAME / sizeof MILE_BYNAME[0]))
+#define NMILE_MAX (NMILE + NMILE_BYNAME)
+
+/* The runtime table actually scanned by the step loop: the hand-written list
+ * above followed by whichever of MILE_BYNAME the symbol table could resolve. */
+static milestone_t MILE[NMILE_MAX];
+static unsigned    NM;
+
 static struct {
     /* bus interposition */
     arm_bus_t   inner;              /* the machine's original callbacks */
@@ -561,9 +715,41 @@ static struct {
     struct { uint32_t page, first_pc; uint64_t reads, writes; } dev_page[64];
 
     /* milestones */
-    uint32_t    mile_pa[NMILE];
-    uint64_t    mile_hits[NMILE];
-    unsigned    mile_first[NMILE];
+    uint32_t    mile_pa[NMILE_MAX];
+    uint64_t    mile_hits[NMILE_MAX];
+    unsigned    mile_first[NMILE_MAX];
+
+    /* --- WHAT MODE THE GUEST IS ACTUALLY IN ------------------------------
+     * Indexed by CPSR[4:0]. The single most decisive number for a stall is the
+     * USER-mode count inside a late window: zero user instructions after the
+     * exec means pid 1 never runs, so it is blocked in the kernel and the
+     * question is "on what", not "where in launchd".  */
+    uint64_t    mode_all[32], mode_win[32];
+    uint64_t    thumb_all, thumb_win;
+    uint64_t    win_instrs;
+
+    /* --- USER-MODE PC HISTOGRAM ------------------------------------------
+     * Sampled on EVERY user-mode instruction, not every 1024: user mode is
+     * rare enough here that a 1-in-1024 sample of it rounds to nothing. */
+#define UPCHASH 4096u
+    unsigned    upc_n, upc_dropped;
+    struct { uint32_t va; uint64_t hits; } upc_hist[UPCHASH];
+
+    /* --- SYSTEM CALLS ----------------------------------------------------
+     * Captured at _fleh_swi, whose FIRST instruction is `cmn ip,#3` — so the
+     * ABI is settled by the handler itself: r12 carries the trap number, and
+     * r0..r3 the first four arguments, in the caller's (user) registers, which
+     * are not banked in SVC and are therefore still live at handler entry.
+     *   r12 <  0   Mach trap, index -r12
+     *   r12 == 0   BSD indirect syscall, real number in r0
+     *   r12 >  0   BSD syscall r12
+     * (_unix_syscall corroborates: it reloads the number from savedstate+0x30,
+     * i.e. regs->r12, and takes r0 as the number when it is zero.) */
+    unsigned    sc_n, sc_dropped;
+    struct { unsigned at; uint32_t r12, r[4], lr, spsr; } sc[512];
+
+    /* IRQ entries, for the same reason FIQ entries are counted. */
+    uint64_t    irq_n;
 
     /* distinct MMU faults */
     unsigned    fault_n;
@@ -657,6 +843,21 @@ static void pc_sample(uint32_t va) {
         return;
     }
     G.pc_dropped++;                             /* never silently: reported */
+}
+
+/* The same, for user-mode PCs, in their own table so a handful of user
+ * instructions is not buried under a hundred million kernel samples. */
+static void upc_sample(uint32_t va) {
+    va &= ~1u;
+    uint32_t h = va * 2654435761u;
+    for (unsigned probe = 0; probe < 64; probe++) {
+        unsigned i = ((h >> 13) + probe) & (UPCHASH - 1u);
+        if (G.upc_hist[i].hits && G.upc_hist[i].va != va) continue;
+        if (!G.upc_hist[i].hits) { G.upc_hist[i].va = va; G.upc_n++; }
+        G.upc_hist[i].hits++;
+        return;
+    }
+    G.upc_dropped++;
 }
 
 /* Attribute one sample to a function, keeping the table small and exact. */
@@ -779,8 +980,25 @@ static void spy_install(s5l8900_t *m, uint32_t virt_base, uint32_t phys_base) {
     G.inner = m->bus;
     m->bus.read32 = sr32; m->bus.read16 = sr16; m->bus.read8 = sr8;
     m->bus.write32 = sw32; m->bus.write16 = sw16; m->bus.write8 = sw8;
-    for (unsigned i = 0; i < NMILE; i++)
-        G.mile_pa[i] = MILESTONES[i].va - virt_base + phys_base;
+    for (unsigned i = 0; i < NM; i++)
+        G.mile_pa[i] = MILE[i].va - virt_base + phys_base;
+}
+
+/*
+ * Build the runtime milestone table: the hand-transcribed list verbatim, then
+ * whichever of MILE_BYNAME the kernel's symbol table can resolve. Called after
+ * ksyms_load and before spy_install, which reads NM.
+ */
+static void milestones_build(void) {
+    for (unsigned i = 0; i < NMILE; i++) MILE[NM++] = MILESTONES[i];
+    for (unsigned i = 0; i < NMILE_BYNAME; i++) {
+        uint32_t va = ksym_value(MILE_BYNAME[i]);
+        if (!va) { printf("  milestone %-28s UNRESOLVED — dropped\n",
+                          MILE_BYNAME[i]); continue; }
+        MILE[NM].name = MILE_BYNAME[i];
+        MILE[NM].va   = va & ~1u;
+        NM++;
+    }
 }
 
 static void note_fault(uint32_t far_, uint32_t fsr, uint32_t pc, bool pref, unsigned at) {
@@ -800,6 +1018,219 @@ static void note_fault(uint32_t far_, uint32_t fsr, uint32_t pc, bool pref, unsi
          * while diagnosing a wedge. The profile and hot-PC lists already report
          * their drops; this one did not. */
         G.fault_dropped++;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Naming the traps.
+ *
+ * Sparse tables rather than dense arrays: the point is that an unknown number
+ * prints as a number, not as whatever entry happened to be at that index in a
+ * table copied from the wrong kernel. Numbers are xnu-1357's
+ * bsd/kern/syscalls.master and osfmk/kern/syscall_sw.c.
+ * ------------------------------------------------------------------------- */
+typedef struct { unsigned n; const char *name; } trapname_t;
+
+static const trapname_t BSD_SYSCALL[] = {
+    {0,"syscall(indirect)"},{1,"exit"},{2,"fork"},{3,"read"},{4,"write"},
+    {5,"open"},{6,"close"},{7,"wait4"},{9,"link"},{10,"unlink"},{12,"chdir"},
+    {13,"fchdir"},{14,"mknod"},{15,"chmod"},{16,"chown"},{18,"getfsstat"},
+    {20,"getpid"},{23,"setuid"},{24,"getuid"},{25,"geteuid"},{26,"ptrace"},
+    {27,"recvmsg"},{28,"sendmsg"},{29,"recvfrom"},{30,"accept"},
+    {31,"getpeername"},{32,"getsockname"},{33,"access"},{34,"chflags"},
+    {35,"fchflags"},{36,"sync"},{37,"kill"},{39,"getppid"},{41,"dup"},
+    {42,"pipe"},{43,"getegid"},{46,"sigaction"},{47,"getgid"},
+    {48,"sigprocmask"},{49,"getlogin"},{50,"setlogin"},{51,"acct"},
+    {52,"sigpending"},{53,"sigaltstack"},{54,"ioctl"},{55,"reboot"},
+    {56,"revoke"},{57,"symlink"},{58,"readlink"},{59,"execve"},{60,"umask"},
+    {61,"chroot"},{65,"msync"},{66,"vfork"},{73,"munmap"},{74,"mprotect"},
+    {75,"madvise"},{78,"mincore"},{79,"getgroups"},{80,"setgroups"},
+    {81,"getpgrp"},{82,"setpgid"},{83,"setitimer"},{85,"swapon"},
+    {86,"getitimer"},{89,"getdtablesize"},{90,"dup2"},{92,"fcntl"},
+    {93,"select"},{95,"fsync"},{96,"setpriority"},{97,"socket"},
+    {98,"connect"},{100,"getpriority"},{104,"bind"},{105,"setsockopt"},
+    {106,"listen"},{111,"sigsuspend"},{116,"gettimeofday"},{117,"getrusage"},
+    {118,"getsockopt"},{120,"readv"},{121,"writev"},{122,"settimeofday"},
+    {123,"fchown"},{124,"fchmod"},{128,"rename"},{131,"flock"},{132,"mkfifo"},
+    {133,"sendto"},{134,"shutdown"},{135,"socketpair"},{136,"mkdir"},
+    {137,"rmdir"},{138,"utimes"},{139,"futimes"},{140,"adjtime"},
+    {142,"gethostuuid"},{147,"setsid"},{151,"getpgid"},{152,"setprivexec"},
+    {153,"pread"},{154,"pwrite"},{157,"statfs"},{158,"fstatfs"},
+    {159,"unmount"},{161,"getfh"},{165,"quotactl"},{167,"mount"},
+    {169,"csops"},{173,"waitid"},{176,"add_profil"},{180,"kdebug_trace"},
+    {181,"setgid"},{182,"setegid"},{183,"seteuid"},{184,"sigreturn"},
+    {185,"chud"},{188,"stat"},{189,"fstat"},{190,"lstat"},{191,"pathconf"},
+    {192,"fpathconf"},{194,"getrlimit"},{195,"setrlimit"},
+    {196,"getdirentries"},{197,"mmap"},{199,"lseek"},{200,"truncate"},
+    {201,"ftruncate"},{202,"__sysctl"},{203,"mlock"},{204,"munlock"},
+    {205,"undelete"},{216,"open_dprotected_np"},{220,"getattrlist"},
+    {221,"setattrlist"},{222,"getdirentriesattr"},{223,"exchangedata"},
+    {225,"searchfs"},{226,"delete"},{227,"copyfile"},{228,"fgetattrlist"},
+    {229,"fsetattrlist"},{230,"poll"},{231,"watchevent"},{232,"waitevent"},
+    {233,"modwatch"},{234,"getxattr"},{235,"fgetxattr"},{236,"setxattr"},
+    {237,"fsetxattr"},{238,"removexattr"},{239,"fremovexattr"},
+    {240,"listxattr"},{241,"flistxattr"},{242,"fsctl"},{243,"initgroups"},
+    {244,"posix_spawn"},{245,"ffsctl"},{247,"nfsclnt"},{248,"fhopen"},
+    {250,"minherit"},{266,"shm_open"},{267,"shm_unlink"},{268,"sem_open"},
+    {269,"sem_close"},{270,"sem_unlink"},{271,"sem_wait"},{272,"sem_trywait"},
+    {273,"sem_post"},{274,"sem_getvalue"},{275,"sem_init"},{276,"sem_destroy"},
+    {277,"open_extended"},{278,"umask_extended"},{279,"stat_extended"},
+    {280,"lstat_extended"},{281,"fstat_extended"},{282,"chmod_extended"},
+    {283,"fchmod_extended"},{284,"access_extended"},{285,"settid"},
+    {286,"gettid"},{293,"identitysvc"},{294,"shared_region_check_np"},
+    {295,"shared_region_map_np"},{296,"vm_pressure_monitor"},
+    {301,"__psynch_mutexwait"},{302,"__psynch_mutexdrop"},
+    {327,"issetugid"},{328,"__pthread_kill"},{329,"__pthread_sigmask"},
+    {330,"__sigwait"},{331,"__disable_threadsignal"},
+    {332,"__pthread_markcancel"},{333,"__pthread_canceled"},
+    {334,"__semwait_signal"},{336,"proc_info"},{337,"sendfile"},
+    {338,"stat64"},{339,"fstat64"},{340,"lstat64"},{341,"stat64_extended"},
+    {342,"lstat64_extended"},{343,"fstat64_extended"},
+    {344,"getdirentries64"},{345,"statfs64"},{346,"fstatfs64"},
+    {347,"getfsstat64"},{348,"__pthread_chdir"},{349,"__pthread_fchdir"},
+    {350,"audit"},{351,"auditon"},{353,"getauid"},{354,"setauid"},
+    {357,"getaudit_addr"},{358,"setaudit_addr"},{359,"auditctl"},
+    {360,"bsdthread_create"},{361,"bsdthread_terminate"},{362,"kqueue"},
+    {363,"kevent"},{364,"lchown"},{365,"stack_snapshot"},
+    {366,"bsdthread_register"},{367,"workq_open"},{368,"workq_ops"},
+    {371,"__mac_execve"},{372,"__mac_syscall"},{380,"__mac_execve"},
+    {396,"read_nocancel"},{397,"write_nocancel"},{398,"open_nocancel"},
+    {399,"close_nocancel"},{407,"fcntl_nocancel"},{408,"select_nocancel"},
+    {409,"fsync_nocancel"},{412,"sigsuspend_nocancel"},
+    {416,"__semwait_signal_nocancel"},{423,"__mac_mount"},
+};
+
+/* Mach traps live at NEGATIVE r12; the index is -r12. */
+static const trapname_t MACH_TRAP[] = {
+    {3,"ml_get_timebase (ARM fast trap)"},
+    {26,"mach_reply_port"},{27,"thread_self_trap"},{28,"task_self_trap"},
+    {29,"host_self_trap"},{31,"mach_msg_trap"},{32,"mach_msg_overwrite_trap"},
+    {33,"semaphore_signal_trap"},{34,"semaphore_signal_all_trap"},
+    {35,"semaphore_signal_thread_trap"},{36,"semaphore_wait_trap"},
+    {37,"semaphore_wait_signal_trap"},{38,"semaphore_timedwait_trap"},
+    {39,"semaphore_timedwait_signal_trap"},{43,"map_fd"},
+    {44,"task_name_for_pid"},{45,"task_for_pid"},{46,"pid_for_task"},
+    {48,"macx_swapon"},{49,"macx_swapoff"},{51,"macx_triggers"},
+    {52,"macx_backing_store_suspend"},{53,"macx_backing_store_recovery"},
+    {58,"pfz_exit"},{59,"swtch_pri"},{60,"swtch"},{61,"thread_switch"},
+    {62,"clock_sleep_trap"},{89,"mach_timebase_info"},{90,"mach_wait_until"},
+    {91,"mk_timer_create"},{92,"mk_timer_destroy"},{93,"mk_timer_arm"},
+    {94,"mk_timer_cancel"},
+};
+
+static const char *trapname(const trapname_t *t, unsigned nt, unsigned num) {
+    for (unsigned i = 0; i < nt; i++) if (t[i].n == num) return t[i].name;
+    return NULL;
+}
+
+/*
+ * The system calls the guest actually made.
+ *
+ * This is the report that says what to implement next: a boot that stops
+ * making progress after five calls is not a mystery once the fifth call has a
+ * name and arguments. Indirect calls (r12 == 0) are decoded through r0, which
+ * is what _unix_syscall itself does.
+ */
+static void syscall_report(uint32_t virt_base, uint32_t phys_base) {
+    (void)virt_base; (void)phys_base;
+    printf("\n=== SYSTEM CALLS (caught at _fleh_swi; r12 = trap number) ===\n");
+    printf("    %u captured%s\n", G.sc_n,
+           G.sc_dropped ? " (table full, more dropped)" : "");
+    if (!G.sc_n) {
+        printf("    NONE — no SWI ever executed. Nothing in user mode asked the\n"
+               "    kernel for anything, so pid 1 either never ran or never got\n"
+               "    as far as its first call.\n");
+        return;
+    }
+    for (unsigned i = 0; i < G.sc_n; i++) {
+        int32_t num = (int32_t)G.sc[i].r12;
+        const char *nm; char buf[64];
+        bool thumb = (G.sc[i].spsr & ARM_CPSR_T) != 0;
+        uint32_t upc = G.sc[i].lr - (thumb ? 2u : 4u);
+        if (num < 0) {
+            nm = trapname(MACH_TRAP, (unsigned)(sizeof MACH_TRAP / sizeof MACH_TRAP[0]),
+                          (unsigned)(-num));
+            if (!nm) { snprintf(buf, sizeof buf, "mach_trap #%d", -num); nm = buf; }
+        } else {
+            /* r12 == 0 is SYS_syscall: the real number is the first argument. */
+            unsigned bn = num ? (unsigned)num : G.sc[i].r[0];
+            nm = trapname(BSD_SYSCALL, (unsigned)(sizeof BSD_SYSCALL / sizeof BSD_SYSCALL[0]), bn);
+            if (!nm) { snprintf(buf, sizeof buf, "bsd_syscall #%u", bn); nm = buf; }
+        }
+        printf("    #%-3u @%-11u r12 %-11d %-32s\n"
+               "         args %08x %08x %08x %08x   from user pc %08x (%s, spsr %08x)\n",
+               i, G.sc[i].at, num, nm,
+               G.sc[i].r[0], G.sc[i].r[1], G.sc[i].r[2], G.sc[i].r[3],
+               upc, thumb ? "Thumb" : "ARM", G.sc[i].spsr);
+        /* An argument that points at a readable string is almost always the
+         * path/name the call is about, and is the single most useful field. */
+        for (unsigned a = 0; a < 4; a++) {
+            const uint8_t *p = guest_ptr(G.sc[i].r[a], 4);
+            if (!p) continue;
+            unsigned printable = 0;
+            for (unsigned q = 0; q < 8 && p[q]; q++)
+                printable += (p[q] >= 0x20 && p[q] < 0x7f);
+            if (printable >= 4) {
+                char lbl[24]; snprintf(lbl, sizeof lbl, "       arg%u", a);
+                print_guest_str(lbl, G.sc[i].r[a]);
+            }
+        }
+    }
+}
+
+/*
+ * Which privilege mode the guest spent its instructions in.
+ *
+ * The windowed half is the decisive one. If a late window contains ZERO
+ * user-mode instructions, launchd is not running: it is parked inside the
+ * kernel, and the thing to find is what it is parked on — not a user PC.
+ */
+static void mode_report(unsigned n, unsigned win_lo, unsigned win_hi) {
+    static const struct { unsigned m; const char *nm; } MODES[] = {
+        {ARM_MODE_USR,"USR (user)"},{ARM_MODE_FIQ,"FIQ"},{ARM_MODE_IRQ,"IRQ"},
+        {ARM_MODE_SVC,"SVC (kernel)"},{ARM_MODE_ABT,"ABT (abort)"},
+        {ARM_MODE_UND,"UND (undefined)"},{ARM_MODE_SYS,"SYS"},
+    };
+    bool windowed = (win_lo || win_hi != 0xffffffffu);
+    printf("\n=== CPU MODE HISTOGRAM ===\n");
+    printf("    %-18s %-22s %s\n", "mode", "whole run",
+           windowed ? "WINDOW (-W)" : "");
+    for (unsigned i = 0; i < sizeof MODES / sizeof MODES[0]; i++) {
+        unsigned m = MODES[i].m;
+        if (!G.mode_all[m] && !G.mode_win[m]) continue;
+        printf("    %-18s %-12llu %5.1f%%    ", MODES[i].nm,
+               (unsigned long long)G.mode_all[m],
+               n ? 100.0 * (double)G.mode_all[m] / (double)n : 0.0);
+        if (windowed)
+            printf("%-12llu %5.1f%%", (unsigned long long)G.mode_win[m],
+                   G.win_instrs ? 100.0 * (double)G.mode_win[m] / (double)G.win_instrs : 0.0);
+        printf("\n");
+    }
+    printf("    %-18s %-12llu           ", "Thumb state",
+           (unsigned long long)G.thumb_all);
+    if (windowed) printf("%-12llu", (unsigned long long)G.thumb_win);
+    printf("\n");
+    if (windowed)
+        printf("    window covered %llu instructions [%u,%u)\n",
+               (unsigned long long)G.win_instrs, win_lo, win_hi);
+    printf("    IRQ entries %llu\n", (unsigned long long)G.irq_n);
+    if (!G.mode_all[ARM_MODE_USR])
+        printf("    NO USER-MODE INSTRUCTION EVER RETIRED.\n");
+    else if (windowed && !G.mode_win[ARM_MODE_USR])
+        printf("    NO USER-MODE INSTRUCTION IN THE WINDOW — whatever is\n"
+               "    spinning or sleeping, it is inside the kernel.\n");
+
+    printf("\n=== HOTTEST USER-MODE PCs (every user instruction sampled) ===\n");
+    if (!G.upc_n) { printf("    (none)\n"); return; }
+    printf("    %u distinct user PCs%s\n", G.upc_n,
+           G.upc_dropped ? " (hash full, incomplete)" : "");
+    for (unsigned rank = 0; rank < 24; rank++) {
+        uint64_t best = 0; unsigned bi = UPCHASH;
+        for (unsigned i = 0; i < UPCHASH; i++)
+            if (G.upc_hist[i].hits > best) { best = G.upc_hist[i].hits; bi = i; }
+        if (bi == UPCHASH || !best) break;
+        printf("    0x%08x  %llu\n", G.upc_hist[bi].va, (unsigned long long)best);
+        G.upc_hist[bi].hits = 0;
     }
 }
 
@@ -856,6 +1287,12 @@ int main(int argc, char **argv) {
             "      the default), or a literal address to use as a sentinel\n"
             "  -b  boot_args Revision field (default 1)\n"
             "  -M  do not synthesise /memory reg from the RAM layout\n"
+            "  -W  <lo>[:<hi>] restrict the sampled profile / hot-PC table /\n"
+            "      per-kext attribution to instructions in [lo,hi). A whole-run\n"
+            "      profile of a boot that STALLS describes the boot, not the\n"
+            "      stall; a window that starts after the last milestone\n"
+            "      characterises what is actually spinning.\n"
+            "  -Z  <n> print pc/mode/symbol every n instructions\n"
             "  -T  how many trace lines to print at the first data abort\n"
             "  -K  disable the post-load kernel patches (see the kpatch table)\n"
             "  -A  DIAGNOSTIC SHIM, not a fix: after an exception return that\n"
@@ -911,6 +1348,12 @@ int main(int argc, char **argv) {
      */
     enum { RD_ADDR_VIRT, RD_ADDR_PHYS, RD_ADDR_LITERAL } rd_form = RD_ADDR_VIRT;
     uint32_t rd_literal = 0;
+
+    /* -W <lo>[:<hi>] profile window, -Z <n> heartbeat. Defaults are "the whole
+     * run" and "silent", so neither changes an existing invocation. */
+    unsigned win_lo = 0, win_hi = 0xffffffffu, heartbeat = 0;
+    /* Filled once the symbol table is loaded; 0 disables syscall capture. */
+    uint32_t fleh_swi_va = 0, fleh_swi_pa = 0;
 
     /* -D <path>:<prop>=<value> overrides / adds a device-tree patch, so the
      * frequencies can be probed from the shell instead of by rebuilding. */
@@ -975,7 +1418,16 @@ int main(int argc, char **argv) {
             ndtov++;
             continue;
         }
-        if      (!strcmp(argv[i], "-p")) phys_base = (uint32_t)strtoul(argv[++i], NULL, 0);
+        if (!strcmp(argv[i], "-W")) {
+            const char *v = argv[++i];
+            char *colon = NULL;
+            win_lo = (unsigned)strtoul(v, &colon, 0);
+            win_hi = (colon && *colon == ':') ? (unsigned)strtoul(colon + 1, NULL, 0)
+                                              : 0xffffffffu;
+            continue;
+        }
+        if      (!strcmp(argv[i], "-Z")) heartbeat = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-p")) phys_base = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--restore")) restore_path = argv[++i];
         else if (!strcmp(argv[i], "-V")) virt_base = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-n")) steps     = (unsigned)strtoul(argv[++i], NULL, 0);
@@ -1024,15 +1476,31 @@ int main(int argc, char **argv) {
      * RAM disk sits: virtual_avail is 0xe0000000 for a 12 MB or a 413 MB disk
      * alike — placement does not change it, MEASURED.)
      */
-    const uint32_t KERN_MEMSIZE_MAX = 0x20000000u;   /* 512 MB: gVirtBase..0xe0000000 */
+    /*
+     * The ceiling is 0xe0000000 - gVirtBase, NOT a constant 512 MB. It reads as
+     * 512 only because gVirtBase is 0xc0000000, and gVirtBase is a boot_args
+     * field we choose (-V), not something the kernel hardcodes the way it
+     * hardcodes virtual_avail. Writing it this way makes the one experiment
+     * that could buy real headroom a command line away rather than a rebuild:
+     * -V 0xb0000000 makes the window 768 MB, which is also exactly the physical
+     * space between SDRAM base and the first peripheral aperture.
+     *
+     * That experiment is NOT known to work and must be run before it is
+     * believed — if VM_MIN_KERNEL_ADDRESS is compiled into this kernel as
+     * 0xc0000000 then addresses below it are user addresses and the boot will
+     * fail in a confusing way rather than an obvious one. -V is how you find
+     * out; this cap is just no longer the thing preventing you from asking.
+     */
+    const uint32_t KERN_VIRTUAL_AVAIL = 0xe0000000u;  /* MEASURED, arm_vm_init+0x18c */
+    const uint32_t KERN_MEMSIZE_MAX   = KERN_VIRTUAL_AVAIL - virt_base;
     if (ram_size > KERN_MEMSIZE_MAX) {
         fprintf(stderr,
                 "note: capping guest RAM %u MB -> %u MB — xnu-1357 arm_vm_init fixes\n"
-                "      virtual_avail at 0xe0000000, so mem_size above 512 MB makes\n"
-                "      zone_bootstrap's early zone_virtual_addr() fault on an\n"
+                "      virtual_avail at 0x%08x, so mem_size above (that - gVirtBase)\n"
+                "      makes zone_bootstrap's early zone_virtual_addr() fault on an\n"
                 "      uninitialised pv_head_table (panic: sleh_abort at interrupt\n"
-                "      context). The kernel cannot use DRAM past 0xe0000000 anyway.\n",
-                ram_size >> 20, KERN_MEMSIZE_MAX >> 20);
+                "      context). The kernel cannot use DRAM past that line anyway.\n",
+                ram_size >> 20, KERN_MEMSIZE_MAX >> 20, KERN_VIRTUAL_AVAIL);
         ram_size = KERN_MEMSIZE_MAX;
     }
 
@@ -1057,6 +1525,12 @@ int main(int argc, char **argv) {
      */
     ksyms_load(&KS, img, len);
     report_symbol_sources();
+    milestones_build();
+    /* _fleh_swi is the one address the syscall capture needs; take it from the
+     * symbol table rather than the transcribed milestone so a different kernel
+     * build cannot silently point the probe at the wrong code. */
+    fleh_swi_va = ksym_value("_fleh_swi") & ~1u;
+    fleh_swi_pa = fleh_swi_va - virt_base + phys_base;
     if (want_kextmap) {
         printf("\n");
         dump_kext_map();
@@ -1383,6 +1857,58 @@ int main(int argc, char **argv) {
     printf("boot_args  : pa 0x%08x  topOfKernelData vm 0x%08x  cmdline \"%s\"\n\n",
            ba_pa, top_of_kernel_data - phys_base + virt_base, cmdline);
 
+    /*
+     * GUEST MEMORY BUDGET — the arithmetic that decides whether a root
+     * filesystem this large can be a RAM disk at all.
+     *
+     * topOfKernelData is not decoration: everything below it is memory the
+     * kernel treats as its own pre-loaded static data and NEVER hands to the
+     * VM. So the free page pool the whole system runs out of — every process,
+     * every page table, the entire buffer cache and every page of any mapped
+     * file — is exactly [topOfKernelData, end of DRAM). A RAM disk does not
+     * "use up half of RAM"; it moves this line, and what is left is the real
+     * budget. Printed unconditionally because it is the number that answers
+     * "will it fit", and answering it by hand from three other lines of this
+     * header is how the wrong answer gets believed.
+     */
+    {
+        uint32_t dram_end = phys_base + ram_size;
+        uint32_t kern_static = top_of_kernel_data - phys_base;
+        uint32_t freepool = dram_end - top_of_kernel_data;
+        printf("=== GUEST MEMORY BUDGET ===\n");
+        printf("  DRAM                 : 0x%08x..0x%08x  %u MB\n",
+               phys_base, dram_end, ram_size >> 20);
+        printf("  kernel image+DT+args : %u.%02u MB\n",
+               (rd_pa - phys_base) >> 20,
+               (((rd_pa - phys_base) & 0xfffffu) * 100u) >> 20);
+        printf("  RAM disk             : %u.%02u MB%s\n",
+               rd_len >> 20, ((rd_len & 0xfffffu) * 100u) >> 20,
+               rd ? "" : "  (none)");
+        printf("  static (below TOKD)  : %u.%02u MB   [never given to the VM]\n",
+               kern_static >> 20, ((kern_static & 0xfffffu) * 100u) >> 20);
+        printf("  FREE PAGE POOL       : %u.%02u MB   [everything else lives here]\n",
+               freepool >> 20, ((freepool & 0xfffffu) * 100u) >> 20);
+        printf("  for scale, a real iPhone1,2 has 128 MB total with the system "
+               "on NAND\n");
+        /*
+         * A DRAM aperture this large SHADOWS peripherals, silently: bus_read
+         * tests in_ram() first and returns before it ever looks at a device.
+         * At -R 512 the window reaches 0x28000000, which swallows both the SRAM
+         * alias at 0x22000000 and — the one that matters — the NOR at
+         * 0x24000000. Nothing complains; NOR reads just come back as whatever
+         * byte of the RAM disk happens to live there. Worth saying out loud
+         * because NOR is where an era-appropriate untether would have to
+         * persist, so "we boot fine at -R 512" and "NOR works" cannot both be
+         * assumed at the same time.
+         */
+        if (dram_end > 0x22000000u)
+            printf("  NOTE: this DRAM window shadows SRAM 0x22000000%s — bus_read\n"
+                   "        tests RAM first, so those apertures are unreachable "
+                   "at this -R\n",
+                   dram_end > 0x24000000u ? " and NOR 0x24000000" : "");
+        printf("\n");
+    }
+
     mach.cpu.r[15] = entry_pa;
     mach.cpu.r[0]  = ba_pa;            /* XNU takes boot_args in r0 */
 
@@ -1455,6 +1981,7 @@ int main(int argc, char **argv) {
     const unsigned nwps = (unsigned)(sizeof wps / sizeof wps[0]);
     for (unsigned i = 0; i < nwps; i++)
         printf("watch      : %-12s vm 0x%08x\n", wps[i].name, wps[i].va);
+    vm_resolve();
     printf("\n");
 
     arm_status_t st = ARM_OK;
@@ -1487,12 +2014,63 @@ int main(int argc, char **argv) {
          * matched at its virtual address and at its pre-MMU physical alias. */
         {
             uint32_t p = last_pc & ~1u;
-            for (unsigned i = 0; i < NMILE; i++) {
-                if (p != (MILESTONES[i].va & ~1u) && p != (G.mile_pa[i] & ~1u)) continue;
+            for (unsigned i = 0; i < NM; i++) {
+                if (p != (MILE[i].va & ~1u) && p != (G.mile_pa[i] & ~1u)) continue;
                 if (!G.mile_hits[i]) G.mile_first[i] = n;
                 G.mile_hits[i]++;
                 break;
             }
+        }
+
+        /*
+         * What mode is the guest in, and — when it is user mode — where.
+         *
+         * Cheap enough to do on every instruction, and it has to be: the whole
+         * question "is launchd running at all" is a count of instructions whose
+         * CPSR mode is 0x10, and a sampled version of that answers "probably
+         * none" when the truthful answer is "exactly none".
+         */
+        {
+            unsigned md = mach.cpu.cpsr & ARM_CPSR_MODE_MASK;
+            bool thumb = (mach.cpu.cpsr & ARM_CPSR_T) != 0;
+            G.mode_all[md]++;
+            if (thumb) G.thumb_all++;
+            if (n >= win_lo && n < win_hi) {
+                G.win_instrs++;
+                G.mode_win[md]++;
+                if (thumb) G.thumb_win++;
+            }
+            if (md == ARM_MODE_USR) upc_sample(last_pc);
+        }
+
+        /*
+         * SYSTEM CALLS. Caught at _fleh_swi, before it has touched anything:
+         * r12 is the trap number and r0..r3 the arguments, still the user's
+         * because neither is banked in SVC. lr_svc is the return address, so
+         * the user PC that issued the SWI is lr-4 (ARM) or lr-2 (Thumb), and
+         * SPSR.T says which.
+         */
+        if (fleh_swi_va &&
+            ((last_pc & ~1u) == fleh_swi_va || (last_pc & ~1u) == fleh_swi_pa)) {
+            if (G.sc_n < 512) {
+                unsigned k = G.sc_n++;
+                G.sc[k].at   = n;
+                G.sc[k].r12  = mach.cpu.r[12];
+                for (unsigned q = 0; q < 4; q++) G.sc[k].r[q] = mach.cpu.r[q];
+                G.sc[k].lr   = mach.cpu.r[14];
+                G.sc[k].spsr = mach.cpu.spsr[ARM_BANK_SVC];
+            } else G.sc_dropped++;
+        }
+
+        /* -Z: a heartbeat, so a run that wedges says where without waiting for
+         * the final report. */
+        if (heartbeat && n && (n % heartbeat) == 0) {
+            uint32_t va = last_pc >= phys_base && last_pc < virt_base
+                        ? last_pc - phys_base + virt_base : last_pc;
+            printf("  [@%-11u] pc %08x m%02x%s  %s\n", n, last_pc,
+                   mach.cpu.cpsr & ARM_CPSR_MODE_MASK,
+                   (mach.cpu.cpsr & ARM_CPSR_T) ? "T" : " ", ksym_at(va));
+            fflush(stdout);
         }
 
         /* Did we just land on one of the failure entry points? */
@@ -1571,7 +2149,16 @@ int main(int argc, char **argv) {
         if ((n & 0x3ffu) == 0) {
             uint32_t va = last_pc >= phys_base && last_pc < virt_base
                         ? last_pc - phys_base + virt_base : last_pc;
-            prof_sample(va);
+            /*
+             * -W gates the PROFILE ONLY, and that is the whole point of it. A
+             * whole-run profile of a boot that stalls is dominated by the work
+             * that DID happen — here, ~230M instructions of IOKit driver
+             * matching — and so describes the boot rather than the stall. Ask
+             * for a window that starts well after the last milestone and the
+             * same machinery characterises what is actually spinning.
+             */
+            if (n >= win_lo && n < win_hi) prof_sample(va);
+            if ((n & 0xffffu) == 0) vm_sample(n, steps);
         }
 
         st = arm_step(&mach.cpu);
@@ -1660,6 +2247,8 @@ int main(int argc, char **argv) {
             /* Record every distinct abort site. With the MMU on, an access to
              * an unmapped VIRTUAL address faults here and never reaches the
              * bus, so these are invisible in the unmapped-physical counters. */
+            if (mode_after == ARM_MODE_IRQ && mode_before != ARM_MODE_IRQ)
+                G.irq_n++;
             if (mode_after == ARM_MODE_ABT && mode_before != ARM_MODE_ABT) {
                 bool pref = (mach.cpu.r[15] & 0xfffu) == 0x00cu;
                 note_fault(pref ? mach.cpu.cp15.ifar : mach.cpu.cp15.dfar,
@@ -1715,7 +2304,21 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (first_abort_at) {
+    /*
+     * The trace ring holds the LAST tcount instructions of the run, not the
+     * ones around the first abort — unless -a stopped the run there. Printing
+     * it under the heading "instructions leading up to it" and numbering the
+     * lines from first_abort_at therefore invented an instruction index for
+     * every line: a tail from ~234 M was labelled ~118 M and read as a much
+     * earlier fault. Say so instead, and point at the (correctly numbered)
+     * end-of-run tail above.
+     */
+    if (first_abort_at && !stop_on_abort) {
+        printf("FIRST data abort at instruction %u: DFSR 0x%08x  DFAR 0x%08x\n",
+               first_abort_at, abort_dfsr, abort_dfar);
+        printf("  (no trace: the ring holds the END of the run, not this point."
+               " Re-run with -a to stop here.)\n\n");
+    } else if (first_abort_at) {
         printf("FIRST data abort at instruction %u: DFSR 0x%08x  DFAR 0x%08x\n\n",
                first_abort_at, abort_dfsr, abort_dfar);
         printf("  instructions leading up to it (newest last):\n");
@@ -1890,18 +2493,75 @@ int main(int argc, char **argv) {
                    (unsigned long long)(steps / 40 * (i + 1)),
                    (unsigned long long)G.hot_bucket[i]);
 
+    /*
+     * WHERE THE RUN ENDED, instruction by instruction.
+     *
+     * The abort dump below already prints this ring, but only when there was
+     * an abort. A run that simply hits its step limit while spinning printed
+     * nothing at all — and the last few hundred instructions of a spin ARE the
+     * spin. Two views: the distinct functions on the way in (the call path),
+     * and the raw tail (the loop body).
+     */
+    {
+        unsigned ntail = ktail < 200 ? ktail : 200;
+        printf("\n=== LAST %u INSTRUCTIONS BEFORE THE RUN ENDED ===\n", ntail);
+        unsigned start = (tw + KTRACE - tcount) % KTRACE;
+        printf("  distinct functions over the last %u instructions:\n",
+               tcount > 65536 ? 65536 : tcount);
+        {
+            char seen[160]; seen[0] = '\0';
+            unsigned from = tcount > 65536 ? tcount - 65536 : 0;
+            for (unsigned i = from; i < tcount; i++) {
+                unsigned k = (start + i) % KTRACE;
+                uint32_t va = tr[k].pc >= phys_base && tr[k].pc < virt_base
+                            ? tr[k].pc - phys_base + virt_base : tr[k].pc;
+                const char *nm = ksym_at(va);
+                char base[160];
+                const char *bar = strchr(nm, '+');
+                snprintf(base, sizeof base, "%.*s",
+                         bar ? (int)(bar - nm) : (int)strlen(nm), nm);
+                if (strcmp(base, seen)) {
+                    printf("    %-9u %08x m%02x  %s\n",
+                           n - (tcount - 1 - i), tr[k].pc,
+                           tr[k].cpsr & ARM_CPSR_MODE_MASK, nm);
+                    snprintf(seen, sizeof seen, "%s", base);
+                }
+            }
+        }
+        printf("  raw tail:\n");
+        unsigned skip = tcount > ntail ? tcount - ntail : 0;
+        for (unsigned i = skip; i < tcount; i++) {
+            unsigned k = (start + i) % KTRACE;
+            uint32_t va = tr[k].pc >= phys_base && tr[k].pc < virt_base
+                        ? tr[k].pc - phys_base + virt_base : tr[k].pc;
+            printf("    %-9u %08x %c m%02x r0=%08x r1=%08x r2=%08x r3=%08x "
+                   "sp=%08x lr=%08x  %s\n",
+                   n - (tcount - 1 - i), tr[k].pc,
+                   (tr[k].cpsr & ARM_CPSR_T) ? 'T' : 'A',
+                   tr[k].cpsr & ARM_CPSR_MODE_MASK,
+                   tr[k].r[0], tr[k].r[1], tr[k].r[2], tr[k].r[3],
+                   tr[k].r[13], tr[k].r[14], ksym_at(va));
+        }
+    }
+
     printf("\n=== CONSOLE-INIT MILESTONES (xnu-1357.5.30 symbols) ===\n");
     printf("    --- NEVER REACHED ---\n");
-    for (unsigned i = 0; i < NMILE; i++)
+    for (unsigned i = 0; i < NM; i++)
         if (!G.mile_hits[i])
-            printf("    %-28s vm 0x%08x\n", MILESTONES[i].name, MILESTONES[i].va);
+            printf("    %-28s vm 0x%08x\n", MILE[i].name, MILE[i].va);
     printf("    --- reached, with call counts and first instruction index ---\n");
-    for (unsigned i = 0; i < NMILE; i++)
+    for (unsigned i = 0; i < NM; i++)
         if (G.mile_hits[i])
-            printf("    %-28s hits %-10llu first @ instr %u\n", MILESTONES[i].name,
+            printf("    %-28s hits %-10llu first @ instr %u\n", MILE[i].name,
                    (unsigned long long)G.mile_hits[i], G.mile_first[i]);
 
-    printf("\n=== WHERE THE TIME WENT (sampled every 1024 instructions) ===\n");
+    mode_report(n, win_lo, win_hi);
+    syscall_report(virt_base, phys_base);
+
+    printf("\n=== WHERE THE TIME WENT (sampled every 1024 instructions%s) ===\n",
+           (win_lo || win_hi != 0xffffffffu) ? ", WINDOWED" : "");
+    if (win_lo || win_hi != 0xffffffffu)
+        printf("    window: instructions %u .. %u  (-W)\n", win_lo, win_hi);
     {
         unsigned total = 0;
         for (unsigned i = 0; i < G.prof_n; i++) total += G.prof[i].hits;
@@ -2021,6 +2681,8 @@ int main(int argc, char **argv) {
                ksym_at(G.fault[i].pc >= phys_base && G.fault[i].pc < virt_base
                        ? G.fault[i].pc - phys_base + virt_base : G.fault[i].pc),
                (unsigned long long)G.fault[i].n, G.fault[i].first_at);
+
+    vm_report();
 
     if (mach.uart0.tx_len)
         printf("\n=== KERNEL UART OUTPUT (%zu bytes) ===\n%s\n",
