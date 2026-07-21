@@ -38,10 +38,10 @@ sanitizer jobs, and executes emitted JIT blocks on the arm64 macOS runners. The
 iOS workflow proves compile, link, fake-sign and packaging only; it is not an
 on-device runtime or real-firmware boot test. Exact assertion totals change with
 the suite and optional private firmware, so the workflow log is authoritative.
-At `b669543`, `ios-build` run
-[`29836528667`](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29836528667)
+At `9c20483`, `ios-build` run
+[`29840841480`](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29840841480)
 and `core-tests` run
-[`29836528681`](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29836528681)
+[`29840840205`](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29840840205)
 both completed successfully.
 
 ---
