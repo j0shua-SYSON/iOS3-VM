@@ -109,14 +109,39 @@
  *     MEANING is inferred from the surrounding code; their BEHAVIOUR (plain
  *     storage) is what the driver actually requires, and that much is certain.
  *
- *   INFERRED: the layout of the RGB window registers at 0x058 + k*0x18. The
- *     driver writes all six from a helper we did not fully decompile; the
- *     field assignment (pitch, control, framebuffer address, geometry, line
- *     length, position) and the pixel-format encoding in control bits[10:8]
- *     with component order in bits[17:16] come from the disassembly summary
- *     this work was handed. Nothing in the emulator depends on it being right:
- *     the registers are plain storage either way, and s5l_clcd_window() exists
- *     so a wrong reading shows up as a wrong picture rather than as silence.
+ *   CONFIRMED (was INFERRED): the layout of the RGB window registers at
+ *     0x058 + k*0x18, now read out of 0xc0705f00 — the vtable slot
+ *     IOMobileFramebuffer::start invokes immediately after start_hardware, and
+ *     the most important function in this whole driver:
+ *
+ *       r2 = regs;
+ *       if      (read32(r2+0x08) & 0x40) { pitch=[r2+0x58]; ctl=[r2+0x5c]; fb=[r2+0x60]; geom=[r2+0x64]; }
+ *       else if (                & 0x20) { ...0x70 0x74 0x78 0x7c }
+ *       else if (                & 0x10) { ...0x88 0x8c 0x90 0x94 }
+ *       else if (                & 0x08) { ...0xa0 0xa4 0xa8 0xac }
+ *       fourcc = ((ctl >> 8) & 7) >= 6 ? 'ARGB' : '565L';      // 0xc0705ff8
+ *       width  = (geom << 5) >> 21;                            // bits[26:16]
+ *       height = uxth(geom &~ 0xfc00);                         // bits[9:0]
+ *       size   = round_up(pitch * height, 0x1000);
+ *       md     = IOMemoryDescriptor::withPhysicalAddress(fb, size, kIODirectionOutIn);
+ *       surface = IOCoreSurfaceRoot->createSurface(md, {IOSurfaceIsGlobal:true});
+ *
+ *     So the window base offsets, the CLCD_CTRL enable bits and their priority
+ *     order, the field order, the geometry bit positions, and the fact that
+ *     FBADDR is PHYSICAL are all facts now, not readings.
+ *
+ *     THE CONSEQUENCE IS THE POINT: AppleH1CLCD does not program the display.
+ *     It reads whatever iBoot left in these registers and wraps it in the
+ *     IOSurface that becomes the screen. If CLCD_CTRL enables no window, the
+ *     four `ldrne`s above simply do not execute and the driver builds that
+ *     IOSurface out of four uninitialised callee-saved registers. A boot stub
+ *     standing in for iBoot MUST call s5l_clcd_seed_window0() — an unseeded
+ *     controller is not a blank screen, it is a garbage surface.
+ *
+ *   STILL INFERRED, and deliberately not acted on: component order in control
+ *     bits[17:16]. The driver publishes 'ARGB' whatever those bits hold, so we
+ *     have no evidence for what they select. s5l_clcd_window() reports the
+ *     field; s5l_clcd_scanout() ignores it rather than inventing a swizzle.
  *
  *   DECIDED, and stated: 0x204 reads as 0. Bits [7:6] are the only bits the
  *     driver looks at and it defers the swap when they are both set, so any
@@ -124,11 +149,18 @@
  *     which is the only answer that cannot deadlock, and it is what we return
  *     unconditionally. We do NOT model whatever real state those bits carry.
  *
- *   NOT MODELLED, deliberately: scanout does not read the framebuffer, gamma is
- *     not applied, the video overlay does nothing, and 0x004 stops the frame
- *     interrupt but nothing else. None of that is invented behaviour — it is
- *     absent behaviour, and s5l_clcd_window() is the seam where a renderer
- *     picks up the real programming when there is one to draw with.
+ *   NOT MODELLED, deliberately: the hardware scanout does not read the
+ *     framebuffer on its own, gamma is not applied, the video overlay does
+ *     nothing, and 0x004 stops the frame interrupt but nothing else. None of
+ *     that is invented behaviour — it is absent behaviour.
+ *
+ *     s5l_clcd_scanout() is the seam the header used to promise: it takes the
+ *     window the DRIVER would take (s5l_clcd_active_window(), in the driver's
+ *     own 0x40/0x20/0x10/0x08 order) and turns it into RGB. It is a host-side
+ *     observation of guest memory, not a device behaviour: nothing the guest
+ *     can see changes when it is called, and every byte it returns came out of
+ *     guest DRAM. A window it cannot decode is an error return, never a
+ *     plausible-looking rectangle.
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
@@ -364,12 +396,14 @@ void s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
     c->scanning = true;
 }
 
+/* The driver's own enable-bit order: window 0 first, then 1, 2, 3. */
+static const uint32_t ENABLE_BIT[CLCD_WIN_COUNT] = {
+    CLCD_CTRL_WIN0, CLCD_CTRL_WIN1, CLCD_CTRL_WIN2, CLCD_CTRL_WIN3
+};
+
 bool s5l_clcd_window(const s5l_clcd_t *c, unsigned k,
                      uint32_t *fb_phys, uint32_t *width, uint32_t *height,
                      uint32_t *stride, uint32_t *format, uint32_t *order) {
-    static const uint32_t ENABLE_BIT[CLCD_WIN_COUNT] = {
-        CLCD_CTRL_WIN0, CLCD_CTRL_WIN1, CLCD_CTRL_WIN2, CLCD_CTRL_WIN3
-    };
     if (k >= CLCD_WIN_COUNT) return false;
     if (!(c->ctrl & ENABLE_BIT[k])) return false;
 
@@ -380,5 +414,85 @@ bool s5l_clcd_window(const s5l_clcd_t *c, unsigned k,
     if (stride)  *stride  = w->stride;
     if (format)  *format  = (w->control >> CLCD_FMT_SHIFT)   & CLCD_FMT_MASK;
     if (order)   *order   = (w->control >> CLCD_ORDER_SHIFT) & CLCD_ORDER_MASK;
+    return true;
+}
+
+/*
+ * Exactly the selection AppleH1CLCD makes at 0xc0705f10: read CLCD_CTRL, take
+ * the first of 0x40/0x20/0x10/0x08 that is set. This is a real decision, not a
+ * convenience — the driver reads the chosen window's four registers and builds
+ * the IOSurface that becomes the screen out of them, so whichever window this
+ * function names is the one that has to hold the picture.
+ */
+uint32_t s5l_clcd_active_window(const s5l_clcd_t *c) {
+    for (unsigned k = 0; k < CLCD_WIN_COUNT; k++)
+        if (c->ctrl & ENABLE_BIT[k]) return k;
+    return CLCD_WIN_NONE;
+}
+
+bool s5l_clcd_scanout(const s5l_clcd_t *c, unsigned k,
+                      const uint8_t *ram, uint32_t ram_base, size_t ram_len,
+                      uint8_t *rgb, size_t rgb_len,
+                      uint32_t *out_w, uint32_t *out_h) {
+    uint32_t fb, w, h, stride, fmt, order;
+    if (!ram || !rgb) return false;
+    if (!s5l_clcd_window(c, k, &fb, &w, &h, &stride, &fmt, &order)) return false;
+    if (!w || !h) return false;
+
+    /*
+     * The driver classifies depth and nothing finer (see CLCD_FMT_IS_32BPP in
+     * soc.h and the jump table it cites), so this decodes on depth and nothing
+     * finer either. A 16-bit window is 5-6-5 because that is the FourCC the
+     * driver publishes for it; a 32-bit window is the driver's 'ARGB', which in
+     * a little-endian word is 0xAARRGGBB and therefore B,G,R,A in memory.
+     *
+     * `order` is deliberately NOT acted on. The driver publishes 'ARGB' whatever
+     * bits [17:16] hold, so we have no evidence for what they change; acting on
+     * them would be inventing a swizzle. It is reported through
+     * s5l_clcd_window() so a caller can see it, and that is all.
+     */
+    const uint32_t bpp = CLCD_FMT_IS_32BPP(fmt) ? 4u : 2u;
+
+    /* A stride that cannot hold one row means the programming is wrong, and a
+     * wrong picture drawn confidently is worse than no picture. */
+    if (stride < (uint64_t)w * bpp) return false;
+    if ((uint64_t)w * h * 3u > rgb_len) return false;
+
+    /*
+     * The window's framebuffer address is PHYSICAL (the driver hands it to
+     * IOMemoryDescriptor::withPhysicalAddress). Resolve it against guest DRAM
+     * and require the WHOLE source rectangle to be inside: a window pointing at
+     * MMIO, or one row past the end of RAM, is a fault to report, not a black
+     * band to paint. The last row only needs w*bpp bytes, not a whole stride.
+     */
+    if (fb < ram_base) return false;
+    uint64_t off  = (uint64_t)fb - ram_base;
+    uint64_t need = (uint64_t)(h - 1u) * stride + (uint64_t)w * bpp;
+    if (off + need > ram_len) return false;
+
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *src = ram + off + (uint64_t)y * stride;
+        uint8_t       *dst = rgb + (size_t)y * w * 3u;
+        for (uint32_t x = 0; x < w; x++) {
+            if (bpp == 4u) {
+                /* 0xAARRGGBB little-endian: B,G,R,A. */
+                dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0];
+            } else {
+                uint32_t p = (uint32_t)src[0] | ((uint32_t)src[1] << 8);
+                uint32_t r5 = (p >> 11) & 0x1fu;
+                uint32_t g6 = (p >> 5)  & 0x3fu;
+                uint32_t b5 =  p        & 0x1fu;
+                /* Replicate the high bits into the low ones so full-scale in
+                 * stays full-scale out; a plain shift would cap white at 0xf8. */
+                dst[0] = (uint8_t)((r5 << 3) | (r5 >> 2));
+                dst[1] = (uint8_t)((g6 << 2) | (g6 >> 4));
+                dst[2] = (uint8_t)((b5 << 3) | (b5 >> 2));
+            }
+            src += bpp;
+            dst += 3;
+        }
+    }
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
     return true;
 }

@@ -336,7 +336,30 @@ void     s5l_power_write(s5l_power_t *p, uint32_t off, uint32_t val);
 #define CLCD_GAMMA0      0x400u  /* three 256-entry u32 LUTs, 0x400/0x800/0xc00 */
 #define CLCD_GAMMA_SIZE  0x400u
 
-/* Window register sub-offsets, from CLCD_WIN_FIRST + k*CLCD_WIN_STRIDE. */
+/*
+ * Window register sub-offsets, from CLCD_WIN_FIRST + k*CLCD_WIN_STRIDE.
+ *
+ * CONFIRMED, not inferred, since 0xc0705f00 — AppleH1CLCD's "adopt whatever
+ * iBoot left running" routine, the vtable slot IOMobileFramebuffer::start calls
+ * immediately after start_hardware:
+ *
+ *     r2 = mapped register base
+ *     if      (read32(r2+8) & 0x40) { sl=[r2+0x58] fp=[r2+0x5c] fb=[r2+0x60] r8=[r2+0x64] }
+ *     else if (              & 0x20) { sl=[r2+0x70] fp=[r2+0x74] fb=[r2+0x78] r8=[r2+0x7c] }
+ *     else if (              & 0x10) { sl=[r2+0x88] fp=[r2+0x8c] fb=[r2+0x90] r8=[r2+0x94] }
+ *     else if (              & 0x08) { sl=[r2+0xa0] fp=[r2+0xa4] fb=[r2+0xa8] r8=[r2+0xac] }
+ *
+ * which pins the four window bases at 0x58/0x70/0x88/0xa0 (stride 0x18), pins
+ * the CLCD_CTRL enable bits to 0x40/0x20/0x10/0x08 in that priority order, and
+ * pins the field order. The driver then (0xc0706040..0xc0706068) does
+ *
+ *     width  = (r8 << 5) >> 21;      // geometry bits[26:16]
+ *     height = uxth(r8 &~ 0xfc00);   // geometry bits[9:0]
+ *     size   = round_up(sl * height, 0x1000);   // sl is bytes per row
+ *
+ * and wraps `fb` with IOMemoryDescriptor::withPhysicalAddress, so FBADDR is a
+ * PHYSICAL address. Nothing here is a guess any more.
+ */
 #define CLCD_WIN_PITCH     0x00u  /* stride in BYTES                          */
 #define CLCD_WIN_CONTROL   0x04u  /* bits[10:8] pixel format, [17:16] order   */
 #define CLCD_WIN_FBADDR    0x08u  /* framebuffer PHYSICAL base                */
@@ -344,7 +367,7 @@ void     s5l_power_write(s5l_power_t *p, uint32_t off, uint32_t val);
 #define CLCD_WIN_LINEWORDS 0x10u  /* line length in 32-bit words              */
 #define CLCD_WIN_POSITION  0x14u  /* (dstX << 16) | dstY                      */
 
-/* CLCD_CTRL window-enable bits. */
+/* CLCD_CTRL window-enable bits, and the order the driver tests them in. */
 #define CLCD_CTRL_WIN0   0x40u
 #define CLCD_CTRL_WIN1   0x20u
 #define CLCD_CTRL_WIN2   0x10u
@@ -356,13 +379,29 @@ void     s5l_power_write(s5l_power_t *p, uint32_t off, uint32_t val);
 #define CLCD_INT_FRAME    0x0001u /* frame (VBL) done — the swap completion   */
 #define CLCD_INT_UNDERRUN 0x3f00u /* per-window FIFO underrun; we never set it */
 
-/* Pixel formats, from window control bits[10:8]. */
+/*
+ * Pixel formats, from window control bits[10:8].
+ *
+ * The DEPTH is confirmed; the fine-grained names are not, and the difference
+ * matters. At 0xc0705ff8 the driver switches on exactly this field to pick the
+ * IOSurface pixel format it will publish, through a six-entry jump table:
+ *
+ *     f = (control >> 8) & 7;
+ *     switch (f - 2) { case 0..3: fourcc = '565L'; case 4,5: fourcc = 'ARGB'; }
+ *     default (f == 0 or 1):      fourcc = '565L';
+ *
+ * so the driver itself declares 6 and 7 to be 32 bits per pixel and everything
+ * else to be 16-bit 5-6-5. It never distinguishes 2 from 3 from 4 from 5, so
+ * neither do we: CLCD_FMT_IS_32BPP() is the only classification the binary
+ * supports, and s5l_clcd_scanout() decodes on that and nothing finer.
+ */
 #define CLCD_FMT_SHIFT     8u
 #define CLCD_FMT_MASK      0x7u
 #define CLCD_FMT_32BPP     7u
 #define CLCD_FMT_RGB565    3u
 #define CLCD_FMT_RGB555    2u
 #define CLCD_FMT_ARGB4444  5u
+#define CLCD_FMT_IS_32BPP(f) ((f) == 6u || (f) == 7u)
 /* Component order, from window control bits[17:16]; only meaningful at 32bpp. */
 #define CLCD_ORDER_SHIFT   16u
 #define CLCD_ORDER_MASK    0x3u
@@ -419,6 +458,37 @@ void     s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
 bool     s5l_clcd_window(const s5l_clcd_t *c, unsigned k,
                          uint32_t *fb_phys, uint32_t *width, uint32_t *height,
                          uint32_t *stride, uint32_t *format, uint32_t *order);
+
+/*
+ * Which window the DRIVER would scan out, tested in the driver's own priority
+ * order (window 0, then 1, then 2, then 3 — 0xc0705f10..0xc0705f94). Returns
+ * CLCD_WIN_NONE when CLCD_CTRL enables no window at all, which is not a
+ * cosmetic state: with no bit set the driver leaves its four locals holding
+ * whatever the caller's frame did and builds an IOSurface out of that garbage,
+ * so "no window enabled" is a bug in whatever stood in for iBoot, not a blank
+ * screen. Callers must treat CLCD_WIN_NONE as an error.
+ */
+#define CLCD_WIN_NONE 0xffffffffu
+uint32_t s5l_clcd_active_window(const s5l_clcd_t *c);
+
+/*
+ * Scan out an enabled window into 24-bit RGB, one byte per channel, top row
+ * first — the seam clcd.c's header has always named, now that the window layout
+ * is confirmed rather than inferred.
+ *
+ * `ram`/`ram_base`/`ram_len` describe the guest DRAM the window's PHYSICAL
+ * framebuffer address is resolved against; a window pointing outside it is an
+ * error, not a black rectangle. `rgb` must hold at least width*height*3 bytes.
+ *
+ * Returns false — and writes NOTHING — if the window is disabled, the geometry
+ * is empty, the stride cannot hold a row, the source does not lie wholly inside
+ * guest DRAM, or `rgb` is too small. It never invents a pixel: every returned
+ * byte comes from guest memory.
+ */
+bool     s5l_clcd_scanout(const s5l_clcd_t *c, unsigned k,
+                          const uint8_t *ram, uint32_t ram_base, size_t ram_len,
+                          uint8_t *rgb, size_t rgb_len,
+                          uint32_t *out_w, uint32_t *out_h);
 
 #define S5L_STUB_MAX      16
 

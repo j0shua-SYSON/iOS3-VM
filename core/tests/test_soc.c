@@ -590,6 +590,130 @@ static void test_clcd_seed_is_visible_to_the_guest(void) {
 }
 
 /*
+ * The window the DRIVER would pick, in the driver's own order. AppleH1CLCD
+ * tests 0x40, then 0x20, then 0x10, then 0x08 (0xc0705f10..0xc0705f94) and
+ * scans out the FIRST match; it does not merge windows and it does not prefer
+ * the largest. Getting the order wrong here would put the picture in the wrong
+ * place with no error anywhere.
+ */
+static void test_clcd_active_window_follows_the_drivers_order(void) {
+    s5l_clcd_t c; s5l_clcd_reset(&c);
+    CHECK(s5l_clcd_active_window(&c) == CLCD_WIN_NONE,
+          "a controller with no window enabled must say so, not name window 0");
+
+    s5l_clcd_write(&c, CLCD_CTRL, CLCD_CTRL_WIN2 | CLCD_CTRL_WIN3);
+    CHECK(s5l_clcd_active_window(&c) == 2,
+          "with windows 2 and 3 enabled the driver takes 2, got %u",
+          s5l_clcd_active_window(&c));
+
+    s5l_clcd_write(&c, CLCD_CTRL, CLCD_CTRL_WIN1 | CLCD_CTRL_WIN2 | CLCD_CTRL_WIN3);
+    CHECK(s5l_clcd_active_window(&c) == 1, "window 1 outranks 2 and 3");
+
+    s5l_clcd_write(&c, CLCD_CTRL, 0xffu);
+    CHECK(s5l_clcd_active_window(&c) == 0, "window 0 outranks everything");
+
+    /* CLCD_CTRL_VIDEO is not an RGB window and must not be mistaken for one. */
+    s5l_clcd_write(&c, CLCD_CTRL, CLCD_CTRL_VIDEO | CLCD_CTRL_ENABLE);
+    CHECK(s5l_clcd_active_window(&c) == CLCD_WIN_NONE,
+          "the video overlay bit is not an RGB window");
+}
+
+/*
+ * Scanout: the pixels the guest wrote are the pixels that come out, and a
+ * window that is programmed wrong produces an ERROR rather than a picture.
+ */
+static void test_clcd_scanout_reads_guest_memory(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0x08000000u, 1u << 20), "machine init failed");
+
+    const uint32_t W = 4, H = 3, STRIDE = 64;       /* stride > W*bpp on purpose */
+    const uint32_t FB = 0x08000000u + 0x1000u;
+    s5l_clcd_seed_window0(&m.clcd, FB, W, H, STRIDE,
+                          CLCD_FMT_32BPP, CLCD_ORDER_BGRA);
+
+    /* Paint a known pattern through the bus, as the guest would. Stored as
+     * 0xAARRGGBB, so byte 0 is blue and byte 2 is red. */
+    for (uint32_t y = 0; y < H; y++)
+        for (uint32_t x = 0; x < W; x++)
+            m.bus.write32(m.bus.ctx, FB + y * STRIDE + x * 4u,
+                          0xff000000u | ((x * 16u) << 16) | ((y * 32u) << 8) | 7u);
+
+    uint8_t rgb[4 * 3 * 3];
+    uint32_t ow = 0, oh = 0;
+    CHECK(s5l_clcd_scanout(&m.clcd, 0, m.ram, m.ram_base, m.ram_size,
+                           rgb, sizeof rgb, &ow, &oh),
+          "scanout of a correctly programmed window must succeed");
+    CHECK(ow == W && oh == H, "scanout geometry %ux%u, expected %ux%u", ow, oh, W, H);
+    for (uint32_t y = 0; y < H; y++)
+        for (uint32_t x = 0; x < W; x++) {
+            const uint8_t *p = &rgb[(y * W + x) * 3];
+            CHECK(p[0] == (uint8_t)(x * 16u) && p[1] == (uint8_t)(y * 32u) && p[2] == 7,
+                  "pixel (%u,%u) = %02x%02x%02x", x, y, p[0], p[1], p[2]);
+        }
+
+    /* A buffer one byte short must be refused, not overrun. */
+    CHECK(!s5l_clcd_scanout(&m.clcd, 0, m.ram, m.ram_base, m.ram_size,
+                            rgb, sizeof rgb - 1u, NULL, NULL),
+          "a short destination must be an error");
+
+    /* A window whose last row runs past the end of DRAM must be refused. Placing
+     * the base so that h-1 strides plus one row overshoots by a single byte is
+     * the case an off-by-one would wave through. */
+    uint32_t last = (uint32_t)(m.ram_base + m.ram_size);
+    uint32_t need = (H - 1u) * STRIDE + W * 4u;
+    s5l_clcd_seed_window0(&m.clcd, last - need + 1u, W, H, STRIDE,
+                          CLCD_FMT_32BPP, CLCD_ORDER_BGRA);
+    CHECK(!s5l_clcd_scanout(&m.clcd, 0, m.ram, m.ram_base, m.ram_size,
+                            rgb, sizeof rgb, NULL, NULL),
+          "a window running one byte past DRAM must be an error, not a picture");
+
+    /* A stride too small to hold a row is a programming fault, not a squeeze. */
+    s5l_clcd_seed_window0(&m.clcd, FB, W, H, W * 4u - 1u,
+                          CLCD_FMT_32BPP, CLCD_ORDER_BGRA);
+    CHECK(!s5l_clcd_scanout(&m.clcd, 0, m.ram, m.ram_base, m.ram_size,
+                            rgb, sizeof rgb, NULL, NULL),
+          "a stride shorter than one row must be an error");
+
+    /* A disabled window has nothing to scan out. */
+    s5l_clcd_seed_window0(&m.clcd, FB, W, H, STRIDE,
+                          CLCD_FMT_32BPP, CLCD_ORDER_BGRA);
+    s5l_clcd_write(&m.clcd, CLCD_CTRL, 0);
+    CHECK(!s5l_clcd_scanout(&m.clcd, 0, m.ram, m.ram_base, m.ram_size,
+                            rgb, sizeof rgb, NULL, NULL),
+          "a disabled window must not scan out");
+
+    s5l8900_free(&m);
+}
+
+/*
+ * 16-bit windows. The driver publishes '565L' for every format below 6, so a
+ * 16-bit window is 5-6-5 — and full-scale in has to be full-scale out, which a
+ * plain left-shift does not give you (0x1f << 3 is 0xf8, not 0xff).
+ */
+static void test_clcd_scanout_565_reaches_full_white(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0x08000000u, 1u << 20), "machine init failed");
+
+    const uint32_t W = 2, H = 1, STRIDE = 8, FB = 0x08000000u + 0x2000u;
+    s5l_clcd_seed_window0(&m.clcd, FB, W, H, STRIDE,
+                          CLCD_FMT_RGB565, CLCD_ORDER_BGRA);
+    /* pixel 0 = white (all bits set), pixel 1 = pure green at full scale. */
+    m.bus.write32(m.bus.ctx, FB, 0x07e0ffffu);
+
+    uint8_t rgb[2 * 3];
+    CHECK(s5l_clcd_scanout(&m.clcd, 0, m.ram, m.ram_base, m.ram_size,
+                           rgb, sizeof rgb, NULL, NULL), "565 scanout");
+    CHECK(rgb[0] == 0xff && rgb[1] == 0xff && rgb[2] == 0xff,
+          "0xffff must decode to full white, got %02x%02x%02x",
+          rgb[0], rgb[1], rgb[2]);
+    CHECK(rgb[3] == 0 && rgb[4] == 0xff && rgb[5] == 0,
+          "0x07e0 must decode to full green, got %02x%02x%02x",
+          rgb[3], rgb[4], rgb[5]);
+
+    s5l8900_free(&m);
+}
+
+/*
  * The whole path, end to end: the guest arms the frame interrupt exactly the
  * way AppleH1CLCD's swap_submit does, and the CPU's IRQ line comes up through
  * VIC line 13 — the line the device tree gives /arm-io/clcd.
@@ -783,6 +907,9 @@ int main(void) {
     test_clcd_status_never_defers_the_swap();
     test_clcd_saved_registers_read_back();
     test_clcd_seed_is_visible_to_the_guest();
+    test_clcd_active_window_follows_the_drivers_order();
+    test_clcd_scanout_reads_guest_memory();
+    test_clcd_scanout_565_reaches_full_white();
     test_clcd_interrupt_reaches_the_cpu_on_line_13();
     test_timebase_runs_without_a_timer();
     test_timebase_runs_at_the_guest_ratio();
