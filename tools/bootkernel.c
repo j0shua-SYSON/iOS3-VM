@@ -567,6 +567,7 @@ static struct {
 
     /* distinct MMU faults */
     unsigned    fault_n;
+    unsigned    fault_dropped;
     struct { uint32_t far_, fsr, pc; bool prefetch; unsigned first_at; uint64_t n; } fault[48];
 
     /* --- DIAGNOSTIC: exception returns that resume in Thumb state ---------
@@ -792,6 +793,13 @@ static void note_fault(uint32_t far_, uint32_t fsr, uint32_t pc, bool pref, unsi
         G.fault[G.fault_n].pc = pc; G.fault[G.fault_n].prefetch = pref;
         G.fault[G.fault_n].first_at = at; G.fault[G.fault_n].n = 1;
         G.fault_n++;
+    } else {
+        /* The table saturates early on a real boot — around instruction 116M.
+         * Count what falls off: a silently truncated table reads as "these are
+         * all the abort sites", which is exactly the wrong thing to believe
+         * while diagnosing a wedge. The profile and hot-PC lists already report
+         * their drops; this one did not. */
+        G.fault_dropped++;
     }
 }
 
@@ -874,6 +882,7 @@ int main(int argc, char **argv) {
     bool want_fb = false;
     uint32_t v_display = 0;   /* 0 = kernel text console draws; 1 = defer to IOMFB */
     bool want_mbx = false;    /* -g keeps the (unmodelled, hang-prone) MBX GPU driver */
+    bool want_sha1hw = false; /* -S keeps the (unmodelled) SHA-1 engine matched */
     bool no_kpatch = false;   /* -K disables the post-load kernel patches */
     bool want_kextmap = false;/* -L prints the kext load map and exits */
     /* -A: from outside the core, undo the word-alignment the interpreter
@@ -935,6 +944,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-a")) { stop_on_abort = true; continue; }
         if (!strcmp(argv[i], "-F")) { want_fb = true; continue; }
         if (!strcmp(argv[i], "-g")) { v_display = 1; want_mbx = true; continue; }  /* defer to IOMFB, keep MBX */
+        if (!strcmp(argv[i], "-S")) { want_sha1hw = true; continue; }  /* keep the SHA-1 nub matched */
         if (!strcmp(argv[i], "-K")) { no_kpatch = true; continue; }  /* no kernel patches */
         if (!strcmp(argv[i], "-M")) { patch_memnode = false; continue; }
         if (!strcmp(argv[i], "-L")) { want_kextmap = true; continue; }
@@ -1273,6 +1283,26 @@ int main(int argc, char **argv) {
          * the boot. Disabled by default so the boot can reach the root device. */
         if (!want_mbx)
             dt_unmatch(dt, dt_n, "arm-io/mbx");
+        /* Keep IOCryptoAcceleratorFamily off the SHA-1 nub at 0x38000000.
+         *
+         * That kext calls sha1_hardware_hook() to install a function pointer in
+         * the kernel's _performSHA1WithinKernelOnly. Once it is non-NULL,
+         * SHA1UpdateUsePhysicalAddress routes any exactly-4096-byte buffer to
+         * the hardware engine instead of running SHA1Transform — and
+         * cs_validate_page hashes exactly 4096 bytes. We do not model that
+         * register file, so the digest came back fabricated and launchd's first
+         * text page failed its signature, spinning on cs_invalid_page forever.
+         *
+         * The bytes were never wrong: 155 signed Mach-Os and 6731 code pages on
+         * the volume all hash correctly, and the timing proves software SHA-1
+         * never ran (14,329 instructions observed against ~145,000 needed for
+         * 2262 Thumb instructions per 64-byte block).
+         *
+         * Un-matching is preferable to patching the kernel, and leaves the AES
+         * block alone. Model the engine properly if anything ever needs
+         * /dev/sha1 or FairPlay. */
+        if (!want_sha1hw)
+            dt_unmatch(dt, dt_n, "arm-io/sha1");
         for (unsigned i = 0; i < ndtov; i++)
             dt_set_u32(dt, dt_n, dtov[i].path, dtov[i].prop, dtov[i].val);
         printf("  ---------------------------------------------------------\n");
@@ -1981,6 +2011,9 @@ int main(int argc, char **argv) {
                ksym_at(G.strex_log[i].pc));
 
     printf("\n=== DISTINCT ABORT SITES (%u) ===\n", G.fault_n);
+    if (G.fault_dropped)
+        printf("    WARNING: %u aborts at NEW sites were dropped (table full)"
+               " — this list is NOT complete\n", G.fault_dropped);
     for (unsigned i = 0; i < G.fault_n; i++)
         printf("    %s FAR 0x%08x FSR 0x%02x  pc 0x%08x %s  n=%llu first@%u\n",
                G.fault[i].prefetch ? "IFETCH" : "DATA  ",
