@@ -26,7 +26,7 @@ been done publicly; M5 is new ground.
 | **M2** | SoC bring-up | A bare-metal payload prints over the emulated UART; a timer IRQ is taken and returned from | ✅ done — *125 machine assertions* |
 | **M3** | Apple's firmware chain | Real IMG3s parse and decrypt; real Apple LLB executes; the kernelcache is extracted | ✅ done |
 | **M4** | XNU boots and logs | The kernel reaches `bsd_init`, prints, and Apple's own kexts match and start | ✅ **done** — plus the real root filesystem mounts |
-| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress — pid 1 execs launchd and then fails its first page's signature.** No user-mode instruction has executed |
+| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress — `launchd` executes user-mode code and issues 5 system calls**, then the boot stops on a VFP encoding the interpreter does not implement |
 | **D** | Dynarec (parallel) | SpringBoard at interactive frame rates on the phone | 🔵 emitter + block translator exist (J2, off by default); no code cache, no dispatcher — nothing calls it yet |
 | **N** | Guest networking (parallel) | The guest resolves a name and fetches a URL | ⚪ designed, not built |
 
@@ -147,7 +147,9 @@ program our emulated peripherals — with no panic.
 **That criterion is met, and the milestone is complete.** A
 400,000,000-instruction boot of `xnu-1357.5.30~6/RELEASE_ARM_S5L8900X`,
 decrypted from a stock IPSW, with the real 413 MB root filesystem attached as a
-RAM disk:
+RAM disk. (Measured at `9363283`. At HEAD the same command no longer *reaches*
+400 M: pid 1 now makes progress instead of spinning, and the run halts at
+234,731,493 on an unimplemented VFP encoding — see M5.)
 
 | Measurement | Value |
 |---|---|
@@ -367,6 +369,27 @@ entry is a wall that stopped the boot dead, and how it was found.
    where the real part says 0x33, because we have no CP14 debug unit and
    `do_debugid()` would take a non-zero value as licence to publish a breakpoint
    count; a test pins the two together. (`30a95d3`)
+9. **A hardware SHA-1 engine we do not model, silently fabricating digests.**
+   With the exec path open, launchd's first text page failed its code-signature
+   hash and the thread spun `cs_invalid_page` → `psignal` without retiring a
+   single user instruction. **The bytes were never wrong.** Two independent
+   from-scratch verifications exonerated the image first — a UDIF verifier that
+   decompressed all 7 `blkx` tables and checked every per-`blkx` CRC32 (zero bad
+   entries, and the reconstruction is byte-identical to `rootfs_apm.img`), and an
+   HFSX reader that walked the catalog and verified code-directory page hashes
+   for every signed Mach-O on the volume (155 files, 6,731 code pages, 27.6 MB,
+   zero mismatches, launchd 46/46 and dyld 56/56). The real cause:
+   `SHA1UpdateUsePhysicalAddress` branches to a hardware engine for buffers of
+   exactly 4096 bytes whenever `_performSHA1WithinKernelOnly` is non-NULL — a
+   function pointer installed by `IOCryptoAcceleratorFamily`, which matched in
+   our boot. `cs_validate_page` hashes exactly 4096 bytes, so it took the
+   hardware path every time, read six words out of an unmodelled register file at
+   0x38000000, and `SHA1Final` emitted that. **The clinching evidence was
+   timing**: `SHA1Transform` costs ~2,262 Thumb instructions per 64-byte block, so
+   4 KB should cost ~145,000 instructions; the observed `SHA1Init` → verdict
+   interval was 14,329, an order of magnitude too few. Software SHA-1 provably
+   never ran. Un-matching the `sha1` nub keeps the hook NULL; `-S` restores it.
+   (`f01a9a4`)
 
 ### What M4 leaves behind, still unexplained
 
@@ -374,11 +397,14 @@ M4's criterion is met and then some, but two things are survivable rather than
 understood, and that is the category that becomes a mystery three milestones
 later.
 
-- **48 distinct abort sites**, all data aborts with FSR 0x07 (page translation
-  fault) on a marching sequence of kernel virtual addresses, in
+- **The abort-site table saturates**, all data aborts with FSR 0x07 (page
+  translation fault) on a marching sequence of kernel virtual addresses, in
   `IOBufferMemoryDescriptor::initWithPhysicalMask` and the kernel's own
-  `_fleh_dataabt`. First at instruction 116,573,687, DFAR 0xea110000. The kernel
-  takes them and carries on; `_panic` is never reached.
+  `_fleh_dataabt`. First at instruction ~116.6 M, DFAR 0xea110000. The kernel
+  takes them and carries on; `_panic` is never reached. The table holds 48 entries
+  and now **reports how many it dropped** rather than truncating silently — a
+  silently truncated list reads as "these are all the abort sites", which is
+  exactly the wrong thing to believe while diagnosing a wedge (`f01a9a4`).
 - **22 distinct non-RAM physical pages** are now touched, up from 13, because far
   more drivers run. The unmodelled ones are the edge interrupt controller, the
   second VIC, GPIO, the clock/reset generator, i2c0/i2c1, spi0/spi1, the crypto
@@ -418,55 +444,59 @@ later.
 3. SpringBoard renders the home screen into the framebuffer.
 4. A touch delivered from the host's screen moves something on the guest's.
 
-**Where we actually are: half of criterion 1.** The root filesystem mounts — the
-real 413 MB HFSX volume from the IPSW, as `md0`. `launchd` has **not** executed a
-single instruction in user mode.
+**Where we actually are: criterion 1 is met, and criterion 2 has not started.**
+The root filesystem mounts — the real 413 MB HFSX volume from the IPSW, as `md0` —
+and `launchd` executes user-mode code and issues system calls. It then stops,
+and it stops on *us*.
 
-Measured at 400,000,000 instructions with the real rootfs, from `bootkernel`'s
-milestone probes:
+Measured with the real rootfs, from `bootkernel`'s milestone probes:
 
 ```
-_load_init_program        first @ 231,867,529
-_execve                   first @ 231,898,676
-_mac_vnode_check_exec     first @ 231,993,982
+_load_init_program        first @ 230,864,582
+_execve                   first @ 230,895,729
+_mac_vnode_check_exec     first @ 230,968,564
 _grade_binary             hits 3
-_load_machfile            first @ 232,036,463
+_load_machfile            first @ 231,011,045
 _ubc_cs_blob_add          hits 2
-_cs_validate_page         first @ 233,211,312
-cs_validate:hashing       hits 1          SHA1Init — a hash slot was found
-cs_validate:bad_hash      hits 1          the bcmp failed
+_cs_validate_page         hits 15         first @ 232,201,298
+cs_validate:hashing       hits 15
+cs_validate:bad_hash      NEVER REACHED
 cs_validate:no_hash_exit  NEVER REACHED
-_cs_invalid_page          hits 12,542
-_psignal                  hits 12,542
-_fleh_prefabt             hits 12,542
-_fleh_swi                 NEVER REACHED
-_unix_syscall             NEVER REACHED
-_mach_msg_overwrite_trap  NEVER REACHED
+_cs_invalid_page          NEVER REACHED
+_psignal                  NEVER REACHED
+_fleh_swi                 hits 24         first @ 233,031,366
+_mach_msg_overwrite_trap  hits 12         first @ 233,347,392
+_unix_syscall             hits  5         first @ 234,013,919
+_fleh_undef               hits  1         first @ 234,731,379
 _panic                    NEVER REACHED
+
+stopped after 234,731,493 instructions: UNDEFINED INSTRUCTION
+  encoding at pc: 0xecb10a20 (ARM)
+  lr 0xc006ae0d (_vfp_trap+0x38)
 ```
 
-launchd is mapped, its signature blobs are registered, the kernel finds the
-code-directory hash slot for its first text page, computes SHA-1 over the page,
-and the comparison fails. `vm_fault_enter` calls `cs_invalid_page`, posts a
-signal, the thread returns to the same faulting instruction, and it spins — a
-prefetch-abort count that climbs while no SWI is ever issued.
+Fifteen pages validate cleanly, no page is ever invalidated, twenty-four SWIs are
+taken, twelve Mach traps and five BSD system calls are serviced. Then the kernel
+takes an undefined-instruction trap into `_vfp_trap` — the handler whose job is to
+emulate or execute the VFP instruction that faulted — and the encoding it reaches
+is one **our interpreter does not implement**, so the machine halts at the
+instruction rather than computing something plausible. That is M1's rule doing its
+job: the emulator named the gap instead of corrupting state that would fail
+somewhere else.
 
-**The distinction those three `cs_validate` probes draw is the whole point.** "No
-hash" would be a signing *policy*, and `docs/activation.md` argues at length that
-we can switch that off. "Bad hash" means the page we hand the kernel is not the
-page Apple signed — so it is our data path, and ours to fix. The candidates, in
-order of suspicion: the RAM-disk read, the HFS+ extent mapping, and the offset the
-page is hashed at.
+**This is progress, and it is not M5.** Five system calls is not a userland. No
+daemon has started, nothing has been logged by userspace, and SpringBoard needs a
+display controller and a panel that do not exist yet.
 
 ### The M5 work item list, as it now stands
 
-- **Find the bad page.** Compare the bytes the kernel hashes against the same
-  offset in `firmware/rootfs.img` read directly on the host. This is a
-  well-posed, bounded bug, not an open question.
-- **Then: nothing symbolizes userspace.** Every diagnostic in this project
-  resolves against the kernelcache. The instant launchd retires an instruction,
-  the milestone table, the profiler and the kext symbolizer all go quiet. This
-  is a known gap in front of M5, not a solved one.
+- **VFP arithmetic in the interpreter.** This is the current wall, and it was
+  predicted: `e2d6c44` listed the VFP undefined trap as a known gap left
+  deliberately unfixed. It is now reachable, which is this project's usual shape.
+- **Nothing symbolizes userspace.** Every diagnostic here resolves against the
+  kernelcache. The instant launchd retires an instruction, the milestone table,
+  the profiler and the kext symbolizer all go quiet — which is exactly the
+  regime we have now entered. This is a known gap, not a solved one.
 - **The display path** — `AppleH1CLCD` plus the Merlot panel ID, then the guest
   framebuffer surfaced through the app's Metal view.
 - **Multitouch**, mapped from the host touchscreen to the guest's controller.
@@ -482,12 +512,15 @@ by boot-args the kernel reads when `/chosen/debug-enabled` is set, and we are
 iBoot), and activation is **MANAGEABLE** (an unactivated device still renders
 SpringBoard, as its activation lock screen).
 
-**Two honest caveats on that.** First, neither switch has yet been *exercised* in
-a boot — the current recipe does not set `debug-enabled` or
-`cs_enforcement_disable`, so the "KILLED" verdict remains a reading of the
-kernel's code rather than a demonstration. Second, it would not fix the current
-blocker anyway: `cs_validate_page` reached `bad_hash`, and a bad hash is our data
-bug regardless of what policy we could have opted out of.
+**One honest caveat, and one piece of corroboration.** The caveat: neither switch
+has yet been *exercised* in a boot — the current recipe does not set
+`debug-enabled` or `cs_enforcement_disable` — so "KILLED" remains a reading of the
+kernel's code rather than a demonstration. The corroboration: code signing has
+since been *survived without either switch*. `cs_validate_page` now runs fifteen
+times over launchd's pages and validates every one, `cs_invalid_page` is never
+reached, and pid 1 reaches user mode. Apple's own signatures verify against
+Apple's own bytes on our emulated hardware, which is a stronger result than
+switching the check off would have been.
 
 **Performance is a quantified limitation rather than a risk.** The interpreter
 runs a tight synthetic loop at roughly 14 million instructions per second on the

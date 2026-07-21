@@ -30,10 +30,13 @@ Three parts of that command line are not preferences:
   from the IPSW, published through `/chosen/memory-map` as `RAMDisk` with `rd=md0`
   appended to the command line.
 
-Two more workarounds are applied automatically and echoed in the run header —
-the IORTC 30-second wait patched to zero, and the `mbx` node's `compatible`
-string broken so the PowerVR driver does not match. They are printed rather than
-silent on purpose.
+Three more workarounds are applied automatically and echoed in the run header —
+the IORTC 30-second wait patched to zero, the `mbx` node's `compatible` string
+broken so the PowerVR driver does not match, and the `sha1` nub un-matched so
+`IOCryptoAcceleratorFamily` never installs its hardware-SHA-1 hook (`-S` keeps it,
+`-g` keeps MBX, `-K` disables the kernel patch). They are printed rather than
+silent on purpose: every one of them is a lie we are telling the guest, and a lie
+you cannot see is a lie you will spend a day rediscovering.
 
 Instruction indices are counts of retired guest instructions since reset. They
 are deterministic for a given build and inputs, and they move as the emulator
@@ -442,47 +445,34 @@ just mounted, and `execve` gets remarkably far.
 
 | instr | what |
 |---|---|
-| 231,815,712 | `_bsdinit_task` |
-| 231,867,529 | `_load_init_program` |
-| 231,898,676 | `_execve` |
-| 231,993,982 | `_mac_vnode_check_exec` — the MAC policy is consulted and allows it |
-| 232,035,949 | `_grade_binary` (3 calls) — the armv6 Mach-O is now graded, not rejected |
-| 232,036,463 | `_load_machfile` — launchd is mapped |
-| 232,074,496 | `_ubc_cs_blob_add` (2 calls) — its signature blobs are registered |
-| 233,211,312 | `_cs_validate_page` — the verdict on its first text page |
-| 233,211,804 | `cs_validate:hashing` — SHA1Init: a code-directory hash slot exists |
-| 233,226,133 | `cs_validate:bad_hash` — **the bcmp fails** |
-| 233,226,627 | `_cs_invalid_page` (12,542 times) |
-| 233,226,736 | `_psignal` (12,542 times) |
-| 233,054,337 | `_fleh_prefabt` (12,542 times) |
-| — | `_fleh_swi`, `_unix_syscall`, `_mach_msg_overwrite_trap`: **NEVER REACHED** |
+| 230,812,220 | `_bsdinit_task` |
+| 230,864,582 | `_load_init_program` |
+| 230,895,729 | `_execve` |
+| 230,968,564 | `_mac_vnode_check_exec` — the MAC policy is consulted and allows it |
+| 231,010,531 | `_grade_binary` (3 calls) — the armv6 Mach-O is graded, not rejected |
+| 231,011,045 | `_load_machfile` — launchd is mapped |
+| 231,049,078 | `_ubc_cs_blob_add` (2 calls) — its signature blobs are registered |
+| 232,201,298 | `_cs_validate_page` (15 calls), `cs_validate:hashing` (15) — and `bad_hash` / `no_hash_exit` **never reached**: every page validates |
+| 233,031,366 | **`_fleh_swi`** (24) — the first system call instruction pid 1 ever executes |
+| 233,347,392 | `_mach_msg_overwrite_trap` (12) |
+| 234,013,919 | **`_unix_syscall`** (5) |
+| 234,731,379 | `_fleh_undef` (1) → `_sleh_undef` → `_vfp_trap` |
+| **234,731,493** | **the emulator stops: UNDEFINED INSTRUCTION, `0xecb10a20`, lr `_vfp_trap+0x38`** |
 
-Read that as a chain and it says something precise: launchd is mapped, its
-signature is registered, the kernel finds the hash slot for the first text page,
-hashes the page, and the hash does not match. `vm_fault_enter` calls
-`cs_invalid_page`, posts a signal, the thread returns to the same faulting
-instruction, and it spins.
+**pid 1 executes user-mode code and makes system calls.** `_panic` is never
+reached. The run does not end on a guest failure at all — it ends because *we*
+stopped. The kernel took an undefined-instruction trap into `_vfp_trap`, whose job
+is to deal with the VFP instruction that faulted, and the encoding it reached is
+one the interpreter does not implement. Per M1's rule, an unimplemented encoding
+returns `ARM_UNDEFINED` and halts the machine *at* the instruction rather than
+executing something plausible. The emulator named its own gap.
 
-**`launchd` has not retired a single user-mode instruction.** No system call has
-been issued. This is not "userspace is coming up slowly"; nothing in user mode
-has run at all.
+Keep the scale honest: five BSD system calls and twelve Mach traps is not a
+userland. Nothing has been logged by userspace, no daemon has started, and
+SpringBoard needs a display controller and a panel that do not exist yet.
 
-The reason there are three probes inside `cs_validate_page` rather than one is
-that its three exits mean completely different things:
-
-| probe | meaning |
-|---|---|
-| `no_hash_exit` | no blob covers this page, or the code directory has no slot for it — a **policy** we could argue with |
-| `hashing` | a hash slot was found and SHA-1 is being computed |
-| `bad_hash` | the comparison failed — the page we handed the kernel **is not the page Apple signed** |
-
-We hit `bad_hash`, and `no_hash_exit` is never reached. That makes this a bug in
-our data path — the RAM-disk read, the HFS+ extent mapping, or the offset the
-page is hashed at — and not a code-signing policy question. It is a well-posed
-bug, which is the most useful thing a wall can be.
-
-Two earlier walls on this exact path are worth recording because each one looked
-like a completely different problem:
+Three walls on this exact path are worth recording, because each looked like a
+completely different problem from its symptom:
 
 - The kernel first reached this code and **livelocked on ~2.8 million identical
   data aborts** at `_copyout+0x40`, one every ~395 instructions, because we never
@@ -494,6 +484,26 @@ like a completely different problem:
   zero for `ID_ISAR1`, so the kernel's Jazelle probe failed, its architecture
   field stayed 0xF, and `cpu_subtype` fell through to `CPU_SUBTYPE_ARM_ALL` —
   which `grade_binary`'s jump table does not cover.
+- Then **launchd's first text page failed its signature**, and it spun
+  `cs_invalid_page` → `psignal` ~95,000 times. This looked exactly like a corrupt
+  disk image, and it was not. `cs_validate_page` hashes exactly 4096 bytes, and
+  `SHA1UpdateUsePhysicalAddress` routes exactly-4096-byte buffers to a **hardware**
+  SHA-1 engine whenever `_performSHA1WithinKernelOnly` is non-NULL — a hook
+  installed by `IOCryptoAcceleratorFamily`, which matched in our boot. The engine
+  at 0x38000000 is not modelled, so six reads came back as whatever the stub
+  returned and `SHA1Final` emitted that.
+
+  Two independent from-scratch verifications exonerated the image *before* anything
+  was changed — a UDIF verifier over all 7 `blkx` tables and every per-`blkx`
+  CRC32, and an HFSX reader that checked code-directory page hashes for all 155
+  signed Mach-Os and 6,731 code pages on the volume. Zero mismatches, launchd
+  46/46, dyld 56/56.
+
+  **The clinching evidence was timing.** `SHA1Transform` costs ~2,262 Thumb
+  instructions per 64-byte block, so hashing 4 KB in software must cost ~145,000
+  instructions. The observed `SHA1Init` → verdict interval was **14,329** — 10.1x
+  too few. Software SHA-1 provably never ran, which located the bug without
+  disassembling anything further.
 
 ---
 

@@ -53,7 +53,7 @@ can see.** No months in the dark.
 | **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, CLCD, NOR/NAND · *125 SoC assertions* |
 | **M3** | IMG3 + NAND/NOR: Apple's real **iBoot** runs | ✅ **done** — decrypts real firmware; LLB runs, kernel extracted |
 | **M4** | The real **XNU kernel** boots and logs | ✅ **done** — the whole IOKit driver tree starts, the real 413 MB root filesystem **mounts**, `_panic` is never reached |
-| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress — and launchd has not run yet.** pid 1 gets all the way through `execve`, and then the kernel's SHA-1 over launchd's first text page does not match its signature |
+| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** `launchd` executes user-mode code and issues its first system calls — then the boot stops on a VFP instruction our interpreter does not implement. Five syscalls is not a userland |
 
 ### What it actually does today
 
@@ -85,34 +85,51 @@ or it would have panicked instead.
 
 ### And here is exactly where it stops
 
-Being precise about this matters more than the log above. In a 400,000,000-instruction
-boot with the real root filesystem, `bootkernel`'s milestone probes report:
+Being precise about this matters more than the log above. `bootkernel`'s
+milestone probes, from a boot with the real root filesystem:
 
 ```
-_load_init_program        first @ 231,867,529
-_execve                   first @ 231,898,676
+_load_init_program        first @ 230,864,582
+_execve                   first @ 230,895,729
 _grade_binary             hits 3
-_load_machfile            first @ 232,036,463
+_load_machfile            first @ 231,011,045
 _ubc_cs_blob_add          hits 2
-_cs_validate_page         first @ 233,211,312
-cs_validate:hashing       hits 1        SHA1Init — a hash slot was found
-cs_validate:bad_hash      hits 1        the bcmp failed
-_cs_invalid_page          hits 12,542
-_psignal                  hits 12,542
-_fleh_prefabt             hits 12,542
-_unix_syscall             NEVER REACHED
+_cs_validate_page         hits 15
+cs_validate:hashing       hits 15
+cs_validate:bad_hash      NEVER REACHED
+_cs_invalid_page          NEVER REACHED
+_fleh_swi                 hits 24    first @ 233,031,366
+_mach_msg_overwrite_trap  hits 12
+_unix_syscall             hits  5    first @ 234,013,919
 _panic                    NEVER REACHED
+
+stopped after 234,731,493 instructions: UNDEFINED INSTRUCTION
+  encoding at pc: 0xecb10a20 (ARM)
+  lr 0xc006ae0d (_vfp_trap+0x38)
 ```
 
-Read down that list: launchd is mapped, its signature blobs are registered, the
-kernel finds the code-directory hash slot for the first text page, computes
-SHA-1 over the page — and the comparison fails. The thread returns to the same
-faulting instruction and spins. **`launchd` has not retired a single user-mode
-instruction**, so M5 is *started*, not achieved, and nothing here is "running
-userspace". A bad hash means the page we hand the kernel is not the page Apple
-signed, which makes this our data-path bug (the RAM-disk read, the HFS+ extent
-mapping, or the offset the page is hashed at) rather than a signing policy to
-argue with.
+**pid 1 is executing user-mode code and making system calls.** That is the first
+half of M5's first criterion. Then the run ends — not on a guest panic, but
+because *we* stopped: the kernel took an undefined-instruction trap into
+`_vfp_trap`, and the VFP encoding it went to emulate is one the interpreter does
+not implement, so the machine halts at the instruction instead of guessing. That
+is the M1 rule working exactly as designed, and it is the next thing to build.
+
+Keep the scale honest: **five system calls is not a userland.** SpringBoard needs
+daemons, a display controller (`AppleH1CLCD`), a panel ID, and a multitouch
+device, none of which exist yet.
+
+Getting this far needed one more emulator-shaped bug worth naming, because it
+looked exactly like a corrupt disk. launchd's first text page was failing its
+code-signature hash. The bytes were fine — every one of the 155 signed Mach-Os
+and 6,731 code pages on the volume hashes correctly. `cs_validate_page` hashes
+exactly 4096 bytes, and `SHA1UpdateUsePhysicalAddress` routes exactly-4096-byte
+buffers to a *hardware* SHA-1 engine whenever `IOCryptoAcceleratorFamily` has
+registered its hook — an engine at 0x38000000 that we do not model, so the digest
+came back fabricated. Un-matching that nub keeps the hook NULL and the kernel
+hashes in software. The clinching evidence was timing: `SHA1Init` → verdict took
+14,329 instructions where software SHA-1 over 4 KB needs ~145,000, so the
+software path demonstrably never ran.
 
 Full detail in [`docs/ROADMAP.md`](docs/ROADMAP.md), the boot narrative in
 [`docs/BOOTLOG.md`](docs/BOOTLOG.md), and the diagnosis procedure in

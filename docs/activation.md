@@ -48,13 +48,25 @@ volume (`H X` at offset 1024, version `10.0`, 433,274,880 bytes) sits in
 Steps 1–3 of §B.6's recipe are therefore done; only step 4 (read the strings out
 of `lockdownd`) remains, and it no longer needs a key.
 
-**2. The code-signing path is now being executed, not merely read.** §A.3
-predicted a "second, page-granularity layer (`cs_enforcement_disable` in
-`vm_fault_enter`) [that] governs the mid-execution kill of invalid pages", and
-noted that it was not on the critical path. The current M5 frontier lands exactly
-there: pid 1's exec reaches `cs_validate_page`, the SHA-1 over launchd's first
-text page mismatches, and `vm_fault_enter` → `cs_invalid_page` → `psignal` fires
-12,542 times while `_unix_syscall` is never reached.
+**2. The code-signing path has now been executed, and survived — without either
+switch.** §A.3 predicted a "second, page-granularity layer
+(`cs_enforcement_disable` in `vm_fault_enter`) [that] governs the mid-execution
+kill of invalid pages", and judged it off the critical path. It turned out to be
+squarely on it, and the story went through two stages:
+
+*First*, pid 1's exec reached `cs_validate_page` and the hash of launchd's first
+text page **mismatched**, so `vm_fault_enter` → `cs_invalid_page` → `psignal`
+spun ~95,000 times with `_unix_syscall` never reached. §A.3's page-granularity
+layer, exactly as described, actively killing an image.
+
+*Then* it was found not to be a signing problem at all. The bytes were never
+wrong: two from-scratch verifications (a UDIF `blkx`/CRC32 verifier, and an HFSX
+reader checking code-directory page hashes for all 155 signed Mach-Os and 6,731
+code pages on the volume) found zero mismatches. `cs_validate_page` hashes exactly
+4096 bytes, and `SHA1UpdateUsePhysicalAddress` routes exactly-4096-byte buffers to
+a **hardware** SHA-1 engine whenever `IOCryptoAcceleratorFamily` has installed its
+hook — an engine at 0x38000000 that we do not model, so the digest was fabricated.
+Keeping that kext off the nub restores software SHA-1.
 
 Three consequences, stated plainly:
 
@@ -65,14 +77,14 @@ Three consequences, stated plainly:
   `cs_enforcement_disable=1` / `amfi_get_out_of_my_way=1` has yet been set in an
   actual boot; the standard recipe is `debug=0x8 serial=1 nand-enable-adm=0`.
   Until one of those runs, §A remains CONFIRMED-by-disassembly and untested.
-- **And it would not clear the current blocker anyway.** `cs_validate_page` exits
-  through `bad_hash`, never through `no_hash_exit`. A bad hash means the page we
-  hand the kernel is not the page Apple signed — a defect in *our* data path (the
-  RAM-disk read, the HFS+ extent mapping, or the offset the page is hashed at) —
-  and no signing policy switch changes what bytes are in the page. Option 2 in
-  §A.3 ("ad-hoc sign our own binaries so their page hashes are valid") is about
-  binaries *we* inject; launchd is Apple's, already signed, and the hash it fails
-  is over bytes we supplied.
+- **But the practical question is answered better than the switch would have
+  answered it.** `cs_validate_page` now runs 15 times over launchd's pages and
+  validates every one; `cs_invalid_page` and `psignal` are never reached; pid 1
+  executes user-mode code and issues system calls. Apple's own signatures verify
+  against Apple's own bytes on our emulated hardware, with enforcement *on*. That
+  makes the switches in §A a contingency rather than a dependency — and it is a
+  reminder that a signature failure in this emulator is far more likely to be a
+  device we have not modelled than a policy we need to defeat.
 
 ---
 
@@ -413,12 +425,11 @@ Nothing in that recipe is research; it is an afternoon of plumbing that upgrades
 §B.2 and Routes 1–2 from INFERRED to CONFIRMED. It does not change the verdict — it
 pins the exact filenames.
 
-**And there is now a second reason to do step 4 sooner rather than later.** An
-HFS+ catalog/extent reader that can pull one file out of `rootfs.img` on the host
-is exactly the instrument needed to diagnose the current M5 blocker: fetch
-`/sbin/launchd`'s first text page from the image directly and compare it, byte
-for byte, against the page the guest kernel hashed. The same tool answers "what
-does lockdownd check" and "which layer of our data path corrupted a page".
+**And a host-side HFSX reader now exists**, built to exonerate the disk image
+during the launchd signature investigation: it walks the catalog and verified
+code-directory page hashes for all 155 signed Mach-Os on the volume. Step 4 is
+therefore no longer "write a tool and then read `lockdownd`" — it is just reading
+`lockdownd`.
 
 ---
 

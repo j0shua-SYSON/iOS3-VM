@@ -1,9 +1,9 @@
 # Diagnosing a wedge
 
-The same procedure has now been run five times, and each time it found the bug:
-ADMFMC, the MBX GPU driver, the IORTC wait, the TTBR abort storm, and the
-post-SDIO silence. It was rediscovered from scratch every time. This document is
-that procedure, written down.
+The same procedure has now been run six times, and each time it found the bug:
+ADMFMC, the MBX GPU driver, the IORTC wait, the TTBR abort storm, the post-SDIO
+silence, and launchd's failing page hash. It was rediscovered from scratch every
+time. This document is that procedure, written down.
 
 The shape of the problem is always the same. The boot stops making progress, and
 it does so **without panicking** — a panic would tell you where you are. What you
@@ -63,13 +63,15 @@ Two patterns are worth naming because they recur:
 
 - **A first-level handler count that climbs while `_unix_syscall` stays
   `NEVER REACHED`** means the new image is spinning on a fault rather than
-  running. That is exactly what the current M5 frontier looks like.
+  running. That is precisely what the launchd signature bug looked like: 12,542
+  prefetch aborts, and not one SWI.
 - **Probes inside one function, not just at its entry.** `cs_validate_page` can
-  say no three ways, and only one of them is our bug — so there are three
-  milestones inside it (`no_hash_exit`, `hashing`, `bad_hash`). Adding a probe at
-  a *branch* rather than at a symbol is usually the difference between "code
-  signing rejected it" and "the page we handed the kernel is not the page Apple
-  signed".
+  say no three ways, and they mean completely different things — so there are
+  three milestones inside it (`no_hash_exit`, `hashing`, `bad_hash`). That
+  distinction is what turned "code signing rejected launchd" into "the page we
+  handed the kernel is not the page Apple signed", which is a bug on our side of
+  the line. Adding a probe at a *branch* rather than at a symbol is routinely the
+  difference between a policy argument and a located defect.
 
 Adding a milestone costs one line in the `MILESTONES[]` table in
 `tools/bootkernel.c` and a symbol lookup:
@@ -179,6 +181,41 @@ spin rather than progress.
 
 ---
 
+## 4a. "Which code path did it take?" — count the instructions
+
+This one is new, and it is the cheapest oracle in the toolbox: **an instruction
+count between two milestones tells you which implementation ran.**
+
+The launchd signature bug is the worked example. `cs_validate_page` was reaching
+`bad_hash`, which by definition means our bytes were wrong — except two
+independent from-scratch verifications said the disk image was perfect (a UDIF
+verifier over every `blkx` CRC32, and an HFSX reader that checked code-directory
+page hashes for all 155 signed Mach-Os and 6,731 code pages on the volume; zero
+mismatches).
+
+The resolution came from arithmetic, not disassembly. `SHA1Transform` is ~2,262
+Thumb instructions per 64-byte block, so hashing a 4096-byte page in software must
+cost about **145,000** instructions. The observed `SHA1Init` → verdict interval was
+**14,329** — an order of magnitude too few. Software SHA-1 had provably never run,
+which meant something else computed that digest: `SHA1UpdateUsePhysicalAddress`
+routes exactly-4096-byte buffers to a hardware engine whenever
+`_performSHA1WithinKernelOnly` is non-NULL, and `IOCryptoAcceleratorFamily` had
+matched and installed the hook. The engine at 0x38000000 is not modelled, so the
+digest was fabricated from stub reads.
+
+The general form is worth internalising:
+
+> Estimate what the code you *think* is running should cost, then compare it with
+> the interval the milestone table already gives you for free. An order-of-magnitude
+> mismatch means a different code path ran — usually a hardware accelerator, a
+> fast path, or a hook you did not know existed.
+
+It costs one multiplication and no new tooling, and it distinguishes "our data is
+wrong" from "our data never got there", which is a distinction that can otherwise
+burn days.
+
+---
+
 ## 5. The three lessons this procedure encodes
 
 **Systemic beats device-specific — and the two feel identical from the log.**
@@ -219,6 +256,14 @@ Stated so it is not rediscovered as a surprise:
 - The trace ring is a fixed depth (`-T`), so a fault whose cause is a million
   instructions upstream will not be in it. Snapshot before the interval and
   re-run with a milestone instead.
-- Nothing here symbolizes *userspace*. The moment launchd retires its first
-  instruction, every tool above goes quiet, because all of them resolve against
-  the kernelcache. That is a known gap in front of M5, not a solved one.
+- Nothing here symbolizes *userspace*. Every tool above resolves against the
+  kernelcache, so from the moment launchd retires its first instruction they go
+  quiet — and that regime has now begun. It is a known gap, not a solved one.
+- The abort-site table holds 48 entries. It now reports how many it dropped, but
+  it still drops them; a table that silently truncated read as "these are all the
+  abort sites", which is exactly the wrong thing to believe.
+- The profiler's function table holds 1,024 entries and its hot-PC hash 8,192.
+  Both print a `WARNING` when they overflow. **Read that warning before reading
+  the percentages** — an earlier version of this profiler silently dropped
+  everything past 64 entries and printed identical output at 200 M and 400 M
+  instructions, which looked exactly like coverage.
