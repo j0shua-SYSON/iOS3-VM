@@ -50,7 +50,7 @@
  * or real user mode — can expose it, and the first one the kernel makes is the
  * copyout of "/sbin/launchd" into the pid-1 address space.
  *
- * IFSR has no WnR field, so the instruction-fetch path must pass write=false.
+ * IFSR has no WnR field, so ARM_ACCESS_FETCH never sets it.
  * (It is fed from this same helper, so a domain also lands in IFSR[7:4]. The
  * ARM1176 documents that field as not meaningful for instruction faults;
  * fleh_prefabt hands the raw IFSR to sleh_abort, which masks it away with
@@ -90,8 +90,60 @@ static bool ap_permits(unsigned ap, bool apx, bool write, bool priv) {
     }
 }
 
-uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, bool write, bool priv,
-                           uint32_t *pa) {
+/*
+ * XN — execute never. ARMv6 puts it in bit 4 of a section or supersection, bit
+ * 15 of a large page and bit 0 of a small page, and it exists only when
+ * SCTLR.XP selects the extended descriptor format (with XP clear those bits
+ * mean something else entirely, so reading them as XN would invent faults).
+ *
+ * This is not theoretical for xnu-1357.5.30. The kernel really does set it:
+ *
+ *   _nx_enabled   0xc020e1b8  a __DATA global holding 1 in the image on disk.
+ *                             Only four things reference it: _pmap_enter,
+ *                             _pmap_protect and _pmap_page_protect, which all
+ *                             just read it, and a name/pointer table entry at
+ *                             0xc02434d0 that exposes it as a tunable. No code
+ *                             writes it, and no boot-arg parse feeds it, so for
+ *                             this boot it is 1.
+ *   _pmap_enter   0xc006056c  Thumb. At +0x18 it tests prot & VM_PROT_EXECUTE;
+ *                             if the mapping is NOT executable it falls through
+ *                             to +0x1f8, which loads _nx_enabled and then
+ *                             pmap->nx_enabled (the word at pmap+0x420) and,
+ *                             when both are non-zero, sets r10 = 1. The PTE
+ *                             template is built at +0x92 as "pa | 2" — a small
+ *                             page with XN clear. +0x1f4 is reached only when
+ *                             r10 == 1 and does "ORRS r2,r1" with r1 == r10:
+ *                             "pa | 3", the small-page descriptor WITH XN set.
+ *   _pmap_disable_NX 0xc005fe44  Thumb, five instructions: it stores 0 to
+ *                             pmap+0x420, i.e. the per-pmap flag above. That is
+ *                             the only opt-out, and it is per address space.
+ *
+ * So this kernel really does mark non-executable mappings XN for any address
+ * space that has not opted out: the check below is live, not a rule invented
+ * from the ARM ARM and never exercised. Enforcing it turns "branched into the
+ * heap" from silently executing garbage into a prefetch abort at a known PC,
+ * which is what the kernel's own SIGSEGV path expects to see.
+ *
+ * It is still correct if a configuration turns NX off — nothing then sets the
+ * bit and nothing here fires — so the check costs nothing where it does not
+ * apply.
+ *
+ * A manager domain (DACR == 0b11) skips the check, exactly as it skips the AP
+ * check: the ARM ARM defines a manager domain as one where no permission fault
+ * can be generated, and XN violations are reported as permission faults.
+ */
+static bool xn_forbids_fetch(const arm_cpu_t *c, arm_access_t acc, unsigned dac,
+                             bool xn) {
+    return acc == ARM_ACCESS_FETCH && xn && dac != 3u
+        && (c->cp15.sctlr & ARM_SCTLR_XP) != 0u;
+}
+
+uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, arm_access_t acc,
+                           bool priv, uint32_t *pa) {
+    /* Only a store sets WnR. A fetch is checked against XN, never against WnR:
+     * IFSR has no such field. */
+    bool write = (acc == ARM_ACCESS_WRITE);
+
     /* MMU disabled: physical == virtual. This is how every boot ROM starts. */
     if (!(c->cp15.sctlr & ARM_SCTLR_M)) { *pa = va; return 0; }
 
@@ -136,6 +188,9 @@ uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, bool write, bool priv,
         bool     apx = (l1 >> 15) & 1u;
         if (dac != 3u && !ap_permits(ap, apx, write, priv))
             return fsr_make(ARM_FSR_SECTION_PERMISSION, domain, write);
+        /* Sections and supersections both carry XN in bit 4. */
+        if (xn_forbids_fetch(c, acc, dac, (l1 >> 4) & 1u))
+            return fsr_make(ARM_FSR_SECTION_PERMISSION, domain, false);
 
         /*
          * Bit 18 selects a 16 MB supersection, which takes its base from
@@ -162,6 +217,10 @@ uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, bool write, bool priv,
         bool     apx = (l2 >> 9) & 1u;
         if (dac != 3u && !ap_permits(ap, apx, write, priv))
             return fsr_make(ARM_FSR_PAGE_PERMISSION, domain, write);
+        /* A large page keeps XN in bit 15; a small page has it in bit 0, which
+         * is why t2 == 3 and t2 == 2 are the same descriptor type. */
+        if (xn_forbids_fetch(c, acc, dac, (t2 == 1u) ? ((l2 >> 15) & 1u) : (l2 & 1u)))
+            return fsr_make(ARM_FSR_PAGE_PERMISSION, domain, false);
 
         if (t2 == 1u) *pa = (l2 & 0xffff0000u) | (va & 0x0000ffffu); /* 64 KB */
         else          *pa = (l2 & 0xfffff000u) | (va & 0x00000fffu); /* 4 KB  */

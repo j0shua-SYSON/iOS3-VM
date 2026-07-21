@@ -711,7 +711,7 @@ static void mmu_setup_section(arm_cpu_t *c, uint32_t va, uint32_t pa,
 static void test_mmu_disabled_is_identity(void) {
     arm_cpu_t c; arm_reset(&c, &g_bus);
     uint32_t pa = 0;
-    uint32_t f = arm_mmu_translate(&c, 0xdeadb000u, false, true, &pa);
+    uint32_t f = arm_mmu_translate(&c, 0xdeadb000u, ARM_ACCESS_READ, true, &pa);
     CHECK(f == 0, "fsr=%u expect 0 with MMU off", f);
     CHECK(pa == 0xdeadb000u, "pa=%08x expect identity", pa);
 }
@@ -719,7 +719,7 @@ static void test_mmu_disabled_is_identity(void) {
 static void test_mmu_section_translation(void) {
     arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 3, 0);
     uint32_t pa = 0;
-    uint32_t f = arm_mmu_translate(&c, 0x80001234u, false, true, &pa);
+    uint32_t f = arm_mmu_translate(&c, 0x80001234u, ARM_ACCESS_READ, true, &pa);
     CHECK(f == 0, "fsr=%u expect 0", f);
     CHECK(pa == 0x00201234u, "pa=%08x expect 00201234", pa);
 }
@@ -727,7 +727,8 @@ static void test_mmu_section_translation(void) {
 static void test_mmu_unmapped_faults(void) {
     arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 3, 0);
     uint32_t pa = 0;
-    uint32_t f = arm_mmu_translate(&c, 0x90000000u, false, true, &pa); /* no entry */
+    /* 0x90000000 has no descriptor at all. */
+    uint32_t f = arm_mmu_translate(&c, 0x90000000u, ARM_ACCESS_READ, true, &pa);
     CHECK((f & 0xf) == ARM_FSR_SECTION_TRANSLATION,
           "fsr=%x expect section translation fault", f);
 }
@@ -736,9 +737,9 @@ static void test_mmu_user_write_permission(void) {
     /* AP=10: privileged RW, user read-only. A user write must fault. */
     arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 2, 0);
     uint32_t pa = 0;
-    CHECK(arm_mmu_translate(&c, 0x80000000u, false, false, &pa) == 0,
+    CHECK(arm_mmu_translate(&c, 0x80000000u, ARM_ACCESS_READ, false, &pa) == 0,
           "user read should be permitted with AP=10");
-    uint32_t f = arm_mmu_translate(&c, 0x80000000u, true, false, &pa);
+    uint32_t f = arm_mmu_translate(&c, 0x80000000u, ARM_ACCESS_WRITE, false, &pa);
     CHECK((f & 0xf) == ARM_FSR_SECTION_PERMISSION,
           "fsr=%x expect permission fault on user write", f);
 }
@@ -754,7 +755,7 @@ static void test_mmu_small_page_translation(void) {
     arm_reset(&c, &g_bus);
     c.cp15.ttbr0 = l1; c.cp15.dacr = 1u; c.cp15.sctlr |= ARM_SCTLR_M;
     uint32_t pa = 0;
-    uint32_t f = arm_mmu_translate(&c, 0x80000abcu, false, true, &pa);
+    uint32_t f = arm_mmu_translate(&c, 0x80000abcu, ARM_ACCESS_READ, true, &pa);
     CHECK(f == 0, "fsr=%u expect 0 for small page", f);
     CHECK(pa == 0x00300abcu, "pa=%08x expect 00300abc", pa);
 }
@@ -863,9 +864,9 @@ static void test_apx_makes_mapping_read_only(void) {
     c.cp15.ttbr0 = 0x4000; c.cp15.dacr = 1u; c.cp15.sctlr |= ARM_SCTLR_M;
 
     uint32_t pa = 0;
-    CHECK(arm_mmu_translate(&c, 0x80000000u, false, true, &pa) == 0,
+    CHECK(arm_mmu_translate(&c, 0x80000000u, ARM_ACCESS_READ, true, &pa) == 0,
           "privileged read should be allowed with APX=1,AP=01");
-    uint32_t f = arm_mmu_translate(&c, 0x80000000u, true, true, &pa);
+    uint32_t f = arm_mmu_translate(&c, 0x80000000u, ARM_ACCESS_WRITE, true, &pa);
     CHECK((f & 0xf) == ARM_FSR_SECTION_PERMISSION,
           "fsr=%x expect permission fault on write to a read-only section", f);
 }
@@ -1017,7 +1018,7 @@ static void test_mmu_supersection(void) {
     c.cp15.ttbr0 = 0x4000; c.cp15.dacr = 1u; c.cp15.sctlr |= ARM_SCTLR_M;
 
     uint32_t pa = 0;
-    CHECK(arm_mmu_translate(&c, 0xc020e220u, false, true, &pa) == 0,
+    CHECK(arm_mmu_translate(&c, 0xc020e220u, ARM_ACCESS_READ, true, &pa) == 0,
           "supersection translation faulted");
     CHECK(pa == 0x0820e220u,
           "pa=%08x expect 0820e220 (supersection uses va[23:0])", pa);
@@ -1025,7 +1026,8 @@ static void test_mmu_supersection(void) {
     /* A plain section must still use the 1 MB split. */
     uint32_t sect = 0x08000000u | (3u << 10) | 2u;
     m_w32(NULL, 0x4000 + ((0xc0000000u >> 20) << 2), sect);
-    CHECK(arm_mmu_translate(&c, 0xc0001234u, false, true, &pa) == 0, "section faulted");
+    CHECK(arm_mmu_translate(&c, 0xc0001234u, ARM_ACCESS_READ, true, &pa) == 0,
+          "section faulted");
     CHECK(pa == 0x08001234u, "pa=%08x expect 08001234 (plain section)", pa);
 }
 
@@ -1107,7 +1109,7 @@ static void mmu_put_section(uint32_t table, unsigned index, uint32_t pa) {
 /* Privileged read translation; returns the PA, or 0xffffffff if it faulted. */
 static uint32_t mmu_xlate(arm_cpu_t *c, uint32_t va) {
     uint32_t pa = 0;
-    return arm_mmu_translate(c, va, false, true, &pa) ? 0xffffffffu : pa;
+    return arm_mmu_translate(c, va, ARM_ACCESS_READ, true, &pa) ? 0xffffffffu : pa;
 }
 
 static void test_mmu_ttbcr_n0_ignores_ttbr1(void) {
@@ -1166,7 +1168,7 @@ static void test_mmu_ttbcr_n2_kernel_va_uses_ttbr1(void) {
     CHECK(pa == 0x003f000cu, "pa=%08x expect 003f000c (vector page via TTBR1)", pa);
 
     uint32_t p = 0;
-    uint32_t f = arm_mmu_translate(&c, 0xd0000000u, false, true, &p);
+    uint32_t f = arm_mmu_translate(&c, 0xd0000000u, ARM_ACCESS_READ, true, &p);
     CHECK((f & 0xf) == ARM_FSR_SECTION_TRANSLATION,
           "fsr=%x expect a translation fault: a TTBR1 miss must not fall back "
           "to TTBR0 (got pa=%08x)", f, p);
@@ -1316,8 +1318,8 @@ static void test_dfsr_wnr_write_vs_read(void) {
      * directions fault with the same status and the only difference is WnR. */
     arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 0, 0);
     uint32_t pa = 0;
-    uint32_t rd = arm_mmu_translate(&c, 0x80000abcu, false, true, &pa);
-    uint32_t wr = arm_mmu_translate(&c, 0x80000abcu, true,  true, &pa);
+    uint32_t rd = arm_mmu_translate(&c, 0x80000abcu, ARM_ACCESS_READ, true, &pa);
+    uint32_t wr = arm_mmu_translate(&c, 0x80000abcu, ARM_ACCESS_WRITE, true, &pa);
     CHECK((rd & 0xfu) == ARM_FSR_SECTION_PERMISSION,
           "fsr=%08x expect a section permission fault on read", rd);
     CHECK((wr & 0xfu) == ARM_FSR_SECTION_PERMISSION,
@@ -1329,7 +1331,7 @@ static void test_dfsr_wnr_write_vs_read(void) {
 
     /* WnR is orthogonal to the status code: a translation fault carries it too,
      * and so does an unprivileged access. */
-    uint32_t tw = arm_mmu_translate(&c, 0x90000000u, true, false, &pa);
+    uint32_t tw = arm_mmu_translate(&c, 0x90000000u, ARM_ACCESS_WRITE, false, &pa);
     CHECK((tw & 0xfu) == ARM_FSR_SECTION_TRANSLATION,
           "fsr=%08x expect a translation fault", tw);
     CHECK((tw & (1u << 11)) != 0,
@@ -1498,6 +1500,259 @@ static void test_cps_is_a_nop_in_user_mode(void) {
           d.cpsr & ARM_CPSR_MODE_MASK);
 }
 
+/* --- page-crossing unaligned accesses, and XN --------------------------- */
+
+/*
+ * Two 4 KB small pages behind one coarse table, at VA 0x80000000 and
+ * 0x80001000, whose physical frames the caller chooses — and chooses to be far
+ * apart, because that is the whole point: a walker that translates only the
+ * base of a straddling access reads or writes across the *physical* boundary,
+ * which is silently the wrong memory whenever the frames are not adjacent.
+ * A frame of 0 leaves that page with no second-level descriptor at all.
+ * `xn1` sets execute-never (bit 0 of a small-page descriptor) on the second.
+ *
+ * The low megabyte is identity-mapped by a section so the instruction fetch
+ * always succeeds, and SCTLR.XP is set because that is the configuration XNU
+ * runs in and the only one in which XN exists.
+ */
+static void split_setup(arm_cpu_t *c, const uint32_t *prog, size_t words,
+                        uint32_t pa0, uint32_t pa1, bool xn1) {
+    const uint32_t l1 = 0x4000, l2 = 0x5000;
+    memset(g_ram, 0, sizeof g_ram);
+    for (size_t i = 0; i < words; i++) m_w32(NULL, (uint32_t)(i * 4), prog[i]);
+    m_w32(NULL, l1 + (0x000u << 2), 0x00000000u | (3u << 10) | 2u);   /* identity */
+    m_w32(NULL, l1 + (0x800u << 2), (l2 & 0xfffffc00u) | 1u);         /* coarse   */
+    if (pa0) m_w32(NULL, l2 + (0u << 2), (pa0 & 0xfffff000u) | (3u << 4) | 2u);
+    if (pa1) m_w32(NULL, l2 + (1u << 2),
+                   (pa1 & 0xfffff000u) | (3u << 4) | 2u | (xn1 ? 1u : 0u));
+    arm_reset(c, &g_bus);
+    c->cp15.ttbr0  = l1;
+    c->cp15.dacr   = 1u;                       /* domain 0: client */
+    c->cp15.sctlr |= ARM_SCTLR_M | ARM_SCTLR_XP;
+    c->cpsr = (c->cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS;
+    c->r[15] = 0;
+}
+
+static void test_unaligned_access_spanning_two_pages(void) {
+    /* VA 0x80000ffe..0x80001001: two bytes in the frame at PA 0x30000 and two
+     * in the frame at PA 0x60000. Translating the base once and doing a single
+     * 32-bit bus read at 0x30ffe picks up 0x31000/0x31001 for the top half —
+     * memory belonging to whatever else happens to sit after that frame, which
+     * is why a decoy is planted there: it returned 0x8899bbaa before the fix. */
+    uint32_t p[] = { 0xe59f1008 /*LDR r1,[pc,#8] -> literal at 0x10*/,
+                     0xe5910000 /*LDR r0,[r1]                      */,
+                     0xeafffffe /*B .                              */,
+                     0x00000000,
+                     0x80000ffeu };
+    arm_cpu_t c; split_setup(&c, p, 5, 0x30000u, 0x60000u, false);
+    m_w8(NULL, 0x30ffeu, 0xaa); m_w8(NULL, 0x30fffu, 0xbb);
+    m_w8(NULL, 0x60000u, 0xcc); m_w8(NULL, 0x60001u, 0xdd);
+    m_w8(NULL, 0x31000u, 0x99); m_w8(NULL, 0x31001u, 0x88);  /* the decoy */
+    arm_step(&c); arm_step(&c);
+    CHECK(c.r[0] == 0xddccbbaau,
+          "r0=%08x expect ddccbbaa — the two halves come from PA 0x30ffe and "
+          "PA 0x60000, not from one run of bytes at 0x30ffe", c.r[0]);
+
+    /* The storing mirror: each half must land in its own frame, and nothing may
+     * be written past the end of the first one. */
+    uint32_t q[] = { 0xe59f1008, 0xe5810000 /*STR r0,[r1]*/, 0xeafffffe,
+                     0x00000000, 0x80000ffeu };
+    arm_cpu_t d; split_setup(&d, q, 5, 0x30000u, 0x60000u, false);
+    arm_step(&d);
+    d.r[0] = 0x11223344u;
+    arm_step(&d);
+    CHECK(m_r8(NULL, 0x30ffeu) == 0x44 && m_r8(NULL, 0x30fffu) == 0x33,
+          "%02x %02x expect 44 33 in the first frame",
+          m_r8(NULL, 0x30ffeu), m_r8(NULL, 0x30fffu));
+    CHECK(m_r8(NULL, 0x60000u) == 0x22 && m_r8(NULL, 0x60001u) == 0x11,
+          "%02x %02x expect 22 11 in the SECOND frame",
+          m_r8(NULL, 0x60000u), m_r8(NULL, 0x60001u));
+    CHECK(m_r8(NULL, 0x31000u) == 0 && m_r8(NULL, 0x31001u) == 0,
+          "the store must not run past the end of the first physical frame");
+
+    /* A halfword straddling the same boundary, and — the other side of the
+     * test — a word ending exactly ON the boundary, which does NOT cross and
+     * must still be served by a single whole-word bus access. */
+    uint32_t h[] = { 0xe59f1008, 0xe1d100b0 /*LDRH r0,[r1]*/, 0xeafffffe,
+                     0x00000000, 0x80000fffu };
+    arm_cpu_t e; split_setup(&e, h, 5, 0x30000u, 0x60000u, false);
+    m_w8(NULL, 0x30fffu, 0xbb); m_w8(NULL, 0x60000u, 0xcc);
+    arm_step(&e); arm_step(&e);
+    CHECK(e.r[0] == 0xccbbu, "r0=%08x expect ccbb for a straddling LDRH", e.r[0]);
+
+    uint32_t w[] = { 0xe59f1008, 0xe5910000, 0xeafffffe, 0x00000000, 0x80000ffcu };
+    arm_cpu_t g; split_setup(&g, w, 5, 0x30000u, 0x60000u, false);
+    m_w32(NULL, 0x30ffcu, 0x12345678u);
+    arm_step(&g); arm_step(&g);
+    CHECK(g.r[0] == 0x12345678u,
+          "r0=%08x expect 12345678 — 0xffc..0xfff is the last word wholly inside "
+          "the page and must not be split", g.r[0]);
+}
+
+static void test_unaligned_access_faulting_on_the_second_page(void) {
+    /* The half that faults is the one that must be reported. sleh_abort page-
+     * aligns DFAR and repairs that page, so a fault on the second page reported
+     * against the base address maps in the page the access already had and
+     * re-executes the same instruction forever. */
+    uint32_t p[] = { 0xe59f1008, 0xe5910000 /*LDR r0,[r1]*/, 0xeafffffe,
+                     0x00000000, 0x80000ffeu };
+    arm_cpu_t c; split_setup(&c, p, 5, 0x30000u, 0u /*second page absent*/, false);
+    arm_step(&c);
+    c.r[0] = 0xdeadbeefu;
+    arm_step(&c);
+    CHECK(c.r[15] == ARM_VEC_DATA_ABORT, "pc=%08x expect 10 (data abort)", c.r[15]);
+    CHECK((c.cp15.dfsr & 0xfu) == ARM_FSR_PAGE_TRANSLATION,
+          "dfsr=%08x expect a page translation fault", c.cp15.dfsr);
+    CHECK((c.cp15.dfsr & (1u << 11)) == 0, "dfsr=%08x: a load must not set WnR",
+          c.cp15.dfsr);
+    CHECK(c.cp15.dfar == 0x80001000u,
+          "dfar=%08x expect 80001000 — the first byte that lies in the SECOND "
+          "page, not the base 0x80000ffe", c.cp15.dfar);
+    CHECK(c.r[0] == 0xdeadbeefu,
+          "r0=%08x: base-restored abort model — the destination must not move",
+          c.r[0]);
+    CHECK(c.r[1] == 0x80000ffeu, "r1=%08x expect the base unchanged", c.r[1]);
+
+    /* A store that faults on its second page. DFAR and WnR as above — and the
+     * bytes that landed in the first page STAY there. Hardware issues the two
+     * halves as separate bus transactions and cannot retract one that has
+     * completed; the architecture restores the base *register*, not memory.
+     * Re-execution after the handler maps the page rewrites the same bytes. */
+    uint32_t q[] = { 0xe59f1008, 0xe5810000 /*STR r0,[r1]*/, 0xeafffffe,
+                     0x00000000, 0x80000ffeu };
+    arm_cpu_t d; split_setup(&d, q, 5, 0x30000u, 0u, false);
+    arm_step(&d);
+    d.r[0] = 0x11223344u;
+    arm_step(&d);
+    CHECK(d.r[15] == ARM_VEC_DATA_ABORT, "pc=%08x expect 10 (data abort)", d.r[15]);
+    CHECK(d.cp15.dfar == 0x80001000u,
+          "dfar=%08x expect 80001000 for the storing form too", d.cp15.dfar);
+    CHECK((d.cp15.dfsr & (1u << 11)) != 0,
+          "dfsr=%08x: a store must set WnR", d.cp15.dfsr);
+    CHECK(m_r8(NULL, 0x30ffeu) == 0x44 && m_r8(NULL, 0x30fffu) == 0x33,
+          "%02x %02x expect 44 33: the first page's bytes are already committed "
+          "when the second page aborts", m_r8(NULL, 0x30ffeu), m_r8(NULL, 0x30fffu));
+    CHECK(d.r[1] == 0x80000ffeu, "r1=%08x expect the base unchanged", d.r[1]);
+
+    /* And when it is the FIRST page that is missing, the base is the right
+     * answer and nothing is written anywhere. */
+    arm_cpu_t e; split_setup(&e, q, 5, 0u, 0x60000u, false);
+    arm_step(&e);
+    e.r[0] = 0x11223344u;
+    arm_step(&e);
+    CHECK(e.cp15.dfar == 0x80000ffeu,
+          "dfar=%08x expect 80000ffe when the first page is the bad one",
+          e.cp15.dfar);
+    CHECK(m_r8(NULL, 0x60000u) == 0 && m_r8(NULL, 0x60001u) == 0,
+          "a fault on the first half must not let the second half through");
+}
+
+/*
+ * XN — execute never.
+ *
+ * Confirmed live in xnu-1357.5.30 before being implemented: _nx_enabled
+ * (0xc020e1b8) is a __DATA global initialised to 1 that nothing in the image
+ * writes, and Thumb _pmap_enter (0xc006056c) builds its small-page template as
+ * "pa | 2" but reaches an ORR that makes it "pa | 3" — XN set — whenever the
+ * mapping is not VM_PROT_EXECUTE and both _nx_enabled and the per-pmap flag at
+ * pmap+0x420 are non-zero. _pmap_disable_NX (0xc005fe44) is five instructions
+ * that store 0 to that flag, and it is the only opt-out.
+ */
+static void test_xn_blocks_fetch_from_a_small_page(void) {
+    uint32_t p[] = { 0xe59f0008 /*LDR r0,[pc,#8] -> literal at 0x10*/,
+                     0xe1a0f000 /*MOV pc,r0                        */,
+                     0xeafffffe /*B .                              */,
+                     0x00000000,
+                     0x80001000u };
+
+    /* The permitted case first, so the fault below is known to be the XN bit
+     * and not the mapping being broken: same page, XN clear, executes. */
+    arm_cpu_t c; split_setup(&c, p, 5, 0x30000u, 0x60000u, false);
+    m_w32(NULL, 0x60000u, 0xe3a02007u);             /* MOV r2,#7 at the target */
+    arm_step(&c); arm_step(&c); arm_step(&c);
+    CHECK(c.r[2] == 7, "r2=%u expect 7 — a page without XN must execute", c.r[2]);
+
+    /* The same mapping with XN set. */
+    arm_cpu_t d; split_setup(&d, p, 5, 0x30000u, 0x60000u, true);
+    m_w32(NULL, 0x60000u, 0xe3a02007u);
+    d.cp15.dfsr = 0xdeadbeefu; d.cp15.dfar = 0xcafebabeu;
+    arm_step(&d);
+    d.r[2] = 0x5a5a5a5au;
+    arm_step(&d);
+    CHECK(d.r[15] == 0x80001000u, "pc=%08x expect 80001000 before the fetch", d.r[15]);
+    arm_step(&d);
+    CHECK(d.r[15] == ARM_VEC_PREFETCH, "pc=%08x expect 0c (prefetch abort)", d.r[15]);
+    CHECK((d.cp15.ifsr & 0xfu) == ARM_FSR_PAGE_PERMISSION,
+          "ifsr=%08x expect a page permission fault — XN is reported as a "
+          "permission fault", d.cp15.ifsr);
+    CHECK((d.cp15.ifsr & (1u << 11)) == 0,
+          "ifsr=%08x: IFSR has no WnR field", d.cp15.ifsr);
+    CHECK(d.cp15.ifar == 0x80001000u, "ifar=%08x expect 80001000", d.cp15.ifar);
+    CHECK(d.cp15.dfsr == 0xdeadbeefu && d.cp15.dfar == 0xcafebabeu,
+          "an XN fault is a prefetch abort and must not touch the data side");
+    CHECK(d.r[2] == 0x5a5a5a5au,
+          "r2=%08x: the execute-never page must not have executed", d.r[2]);
+
+    /* XN is a fetch-only attribute: the same page stays readable and writable.
+     * If it did not, marking the heap non-executable would make it unusable. */
+    uint32_t pa = 0;
+    CHECK(arm_mmu_translate(&d, 0x80001000u, ARM_ACCESS_READ, true, &pa) == 0
+          && pa == 0x60000u,
+          "pa=%08x: an XN page must still translate for a read", pa);
+    CHECK(arm_mmu_translate(&d, 0x80001000u, ARM_ACCESS_WRITE, true, &pa) == 0,
+          "an XN page must still translate for a write");
+    CHECK((arm_mmu_translate(&d, 0x80001000u, ARM_ACCESS_FETCH, true, &pa) & 0xfu)
+          == ARM_FSR_PAGE_PERMISSION,
+          "only ARM_ACCESS_FETCH may see the XN bit");
+
+    /* A manager domain cannot generate a permission fault at all, and an XN
+     * violation is a permission fault, so it is not checked there either. */
+    d.cp15.dacr = 3u;
+    CHECK(arm_mmu_translate(&d, 0x80001000u, ARM_ACCESS_FETCH, true, &pa) == 0,
+          "a manager domain must not raise an XN fault");
+}
+
+static void test_xn_on_a_section_and_the_xp_gate(void) {
+    /* Sections carry XN in bit 4. The section planted at index 0x800 maps
+     * 0x80000000 onto physical 0, so 0x80000008 is the MOV r2,#7 below. */
+    uint32_t p[] = { 0xe59f0008 /*LDR r0,[pc,#8]*/, 0xe1a0f000 /*MOV pc,r0*/,
+                     0xe3a02007 /*MOV r2,#7     */, 0xeafffffe /*B .      */,
+                     0x80000008u };
+    struct { bool xn, xp; } cases[] = { {false, true}, {true, true}, {true, false} };
+    for (unsigned k = 0; k < 3; k++) {
+        arm_cpu_t c;
+        memset(g_ram, 0, sizeof g_ram);
+        for (unsigned i = 0; i < 5; i++) m_w32(NULL, i * 4, p[i]);
+        m_w32(NULL, 0x4000 + (0x000u << 2), (3u << 10) | 2u);
+        m_w32(NULL, 0x4000 + (0x800u << 2),
+              (3u << 10) | 2u | (cases[k].xn ? (1u << 4) : 0u));
+        arm_reset(&c, &g_bus);
+        c.cp15.ttbr0  = 0x4000;
+        c.cp15.dacr   = 1u;
+        c.cp15.sctlr |= ARM_SCTLR_M | (cases[k].xp ? ARM_SCTLR_XP : 0u);
+        c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS;
+        c.r[15] = 0;
+        c.r[2] = 0x5a5a5a5au;
+        arm_step(&c); arm_step(&c); arm_step(&c);
+
+        if (cases[k].xn && cases[k].xp) {
+            CHECK(c.r[15] == ARM_VEC_PREFETCH,
+                  "pc=%08x expect 0c: an XN section must abort on fetch", c.r[15]);
+            CHECK((c.cp15.ifsr & 0xfu) == ARM_FSR_SECTION_PERMISSION,
+                  "ifsr=%08x expect a SECTION permission fault", c.cp15.ifsr);
+            CHECK(c.cp15.ifar == 0x80000008u, "ifar=%08x expect 80000008",
+                  c.cp15.ifar);
+        } else {
+            /* xn && !xp is the inert case: with SCTLR.XP clear the descriptors
+             * are the ARMv5-compatible layout, where bit 4 is not XN at all, so
+             * reading it as XN would invent a fault the hardware never takes. */
+            CHECK(c.r[2] == 7,
+                  "r2=%08x expect 7 (xn=%d xp=%d): the fetch must be permitted",
+                  c.r[2], (int)cases[k].xn, (int)cases[k].xp);
+        }
+    }
+}
+
 int main(void) {
     printf("iOS3-VM ARMv6 interpreter tests\n");
     test_mov_imm();
@@ -1586,6 +1841,10 @@ int main(void) {
     test_prefetch_abort_never_sets_wnr();
     test_dfar_is_the_faulting_word_of_a_block_transfer();
     test_cps_is_a_nop_in_user_mode();
+    test_unaligned_access_spanning_two_pages();
+    test_unaligned_access_faulting_on_the_second_page();
+    test_xn_blocks_fetch_from_a_small_page();
+    test_xn_on_a_section_and_the_xp_gate();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

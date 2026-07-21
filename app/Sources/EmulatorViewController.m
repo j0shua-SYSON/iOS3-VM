@@ -337,7 +337,7 @@ static const NSUInteger kConsoleScrollback = 12000;
     m.cpu.cp15.sctlr |= ARM_SCTLR_M;
 
     uint32_t pa = 0;
-    uint32_t fsr = arm_mmu_translate(&m.cpu, 0x80001234u, false, true, &pa);
+    uint32_t fsr = arm_mmu_translate(&m.cpu, 0x80001234u, ARM_ACCESS_READ, true, &pa);
     [self append:[NSString stringWithFormat:@"[mmu]  0x80001234 -> 0x%08x (fsr %u)  %@",
                   pa, fsr, (fsr == 0 && pa == 0x00201234u) ? @"OK" : @"FAIL"]];
     s5l8900_free(&m);
