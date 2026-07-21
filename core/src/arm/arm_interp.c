@@ -16,6 +16,8 @@
 #include "arm.h"
 #include "vfp.h"
 
+#include <stddef.h>
+
 /* ------------------------------------------------------------------ helpers */
 
 static inline void set_flag(arm_cpu_t *c, uint32_t bit, bool on) {
