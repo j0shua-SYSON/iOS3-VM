@@ -14,6 +14,7 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "arm.h"
+#include "vfp.h"
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -163,6 +164,11 @@ static void mem_write_crossing(arm_cpu_t *c, uint32_t va, unsigned n, uint32_t v
  * there is dead. */
 MEM_READ(32)  MEM_READ(16)  MEM_READ(8)
 MEM_WRITE(32) MEM_WRITE(16) MEM_WRITE(8)
+
+/* The VFP unit reaches memory through the interpreter's own translating
+ * accessors, so a VLDM that crosses into an unmapped page latches the fault
+ * exactly like an LDM would and arm_step converts it to a data abort. */
+static const vfp_bus_t g_vfp_bus = { mem_r32, mem_w32 };
 
 arm_bank_t arm_bank_of_mode(uint32_t mode) {
     switch (mode & ARM_CPSR_MODE_MASK) {
@@ -342,28 +348,11 @@ static bool insn_is_vfp_space(uint32_t insn) {
         || (insn & 0x0fe00e00u) == 0x0c400a00u;
 }
 
-/*
- * CPACR gates CP10/CP11 before FPEXC does. The ARM1176 requires the two fields
- * to be programmed identically (ARM DDI 0301H 3.2.7) and XNU's _init_vfp does
- * exactly that — "CPACR |= 0xf << 20" from _arm_init+0x2cc, the only CPACR
- * write anywhere in the kernel — so in practice they always agree. Where they
- * do not, take the more restrictive: a VFP instruction needs both halves, and
- * over-permitting would silently execute something the hardware would refuse.
- */
-static bool vfp_cpacr_permits(const arm_cpu_t *c) {
-    unsigned cp10 = (c->cp15.cpacr >> ARM_CPACR_CP10_SHIFT) & 3u;
-    unsigned cp11 = (c->cp15.cpacr >> ARM_CPACR_CP11_SHIFT) & 3u;
-    unsigned acc  = cp10 < cp11 ? cp10 : cp11;
-    if (acc == 3u) return true;                  /* full access             */
-    if (acc == 1u) return cpu_is_priv(c);        /* privileged only         */
-    return false;                                /* 0 denied, 2 reserved    */
-}
-
-static bool vfp_enabled(const arm_cpu_t *c) {
-    return (c->vfp_fpexc & ARM_FPEXC_EN) != 0;
-}
-
-/* True only for the lazy-enable case described above. */
+/* vfp_cpacr_permits() and vfp_enabled() live in vfp.c (declared in vfp.h):
+ * they are half of the availability gate the VFP unit itself applies, and one
+ * copy of that rule is the only safe number of copies.
+ *
+ * True only for the lazy-enable case described above. */
 static bool vfp_lazy_enable_trap(const arm_cpu_t *c, uint32_t insn) {
     if (!insn_is_vfp_space(insn)) return false;
     return !vfp_cpacr_permits(c) || !vfp_enabled(c);
@@ -425,58 +414,15 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
         return ARM_OK;                                          /* MCR ignored */
     }
     /*
-     * CP10/CP11 are the VFP11 coprocessor. XNU disables VFP and enables it
-     * lazily per thread, so machine_switch_context reads and writes FPEXC on
-     * every context switch — these are reached within the first ten million
-     * instructions of boot.
-     *
-     * Only the SYSTEM registers are modelled (VMRS/VMSR, encoded as MRC/MCR on
-     * p10 with opc1 == 7). Floating-point arithmetic is not implemented; if the
-     * guest executes a real VFP data-processing instruction it will still trap,
-     * which is the honest outcome — it names what is missing rather than
-     * silently computing nonsense.
+     * CP10/CP11 are the VFP11 coprocessor; this is its MCR/MRC form (VMOV to
+     * and from a core register, and VMRS/VMSR). The whole unit — availability,
+     * the register file and every instruction — is core/src/arm/vfp.c.
      *
      * Note that ARM_UNDEFINED is not necessarily fatal on this path: arm_step
      * routes it through undefined_instruction(), which vectors the guest when
      * — and only when — the access is one VFP itself is currently refusing.
      */
-    if (cp == 10 || cp == 11) {
-        unsigned opc1 = (insn >> 21) & 7u;
-        unsigned rd_  = (insn >> 12) & 0xfu;
-        if (opc1 != 7) return ARM_UNDEFINED;      /* FP data-processing */
-
-        unsigned reg = (insn >> 16) & 0xfu;       /* CRn selects the sysreg */
-
-        /*
-         * The availability rules, which are the lazy-enable mechanism itself:
-         * CPACR can withhold CP10/CP11 outright, and with FPEXC.EN clear the
-         * only VFP system registers that remain accessible are FPEXC (8) and
-         * FPSID (0). Everything else is UNDEFINED. XNU depends on exactly this
-         * asymmetry — _get_vfp_enabled reads FPEXC precisely when VFP is off —
-         * and never touches FPSCR before setting EN (see _vfp_switch, which
-         * writes FPEXC first and only then VMRS/VMSR FPSCR).
-         */
-        if (!vfp_cpacr_permits(c)) return ARM_UNDEFINED;
-        if (reg != 0 && reg != 8 && !vfp_enabled(c)) return ARM_UNDEFINED;
-
-        if ((insn >> 20) & 1u) {                  /* VMRS: read */
-            uint32_t v;
-            switch (reg) {
-                case 0:  v = ARM1176_FPSID;  break;   /* VFP11 identity   */
-                case 1:  v = c->vfp_fpscr;   break;
-                case 8:  v = c->vfp_fpexc;   break;
-                default: v = 0;              break;   /* MVFR etc: absent */
-            }
-            /* Rt == 15 means "write the flags", used by VMRS APSR_nzcv. */
-            if (rd_ == 15) c->cpsr = (c->cpsr & 0x0fffffffu) | (v & 0xf0000000u);
-            else           c->r[rd_] = v;
-        } else {                                  /* VMSR: write */
-            uint32_t v = reg_read(c, pc, rd_);
-            if (reg == 1)      c->vfp_fpscr = v;
-            else if (reg == 8) c->vfp_fpexc = v;
-        }
-        return ARM_OK;
-    }
+    if (cp == 10 || cp == 11) return vfp_execute(c, pc, insn, &g_vfp_bus);
 
     if (cp != 15) return ARM_UNDEFINED;         /* CP10/11/14/15 only */
 
@@ -617,6 +563,7 @@ void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
     cpu->excl_addr = 0;
     cpu->vfp_fpexc = 0;
     cpu->vfp_fpscr = 0;
+    for (int i = 0; i < 32; i++) cpu->vfp_s[i] = 0;
     /* On reset the ARM1176 enters SVC mode with IRQ, FIQ and imprecise aborts
      * disabled and begins execution from the reset vector (0x0, or 0xffff0000
      * with high vectors). We start at 0x0; the machine layer relocates PC as
@@ -1984,6 +1931,12 @@ arm_status_t arm_step(arm_cpu_t *c) {
         st = ARM_UNDEFINED;
     } else if ((insn & 0x0f000010u) == 0x0e000010u) {     /* MCR / MRC (CP15) */
         st = exec_coprocessor(c, pc, insn);
+    } else if ((insn & 0x0f000e10u) == 0x0e000a00u ||     /* VFP CDP          */
+               (insn & 0x0e000e00u) == 0x0c000a00u) {     /* VFP LDC/STC/MCRR */
+        /* The rest of the VFP11 encoding space. The MCR/MRC form came back
+         * from exec_coprocessor above; these three groups have no CP15
+         * counterpart and so reach the unit directly. */
+        st = vfp_execute(c, pc, insn, &g_vfp_bus);
     } else if ((insn & 0x0f000000u) == 0x0f000000u) {     /* SWI / SVC */
         take_exception(c, ARM_VEC_SWI, ARM_MODE_SVC, pc + 4, false, &next);
     } else if ((insn & 0x0c000000u) == 0x00000000u) {     /* data processing / PSR */

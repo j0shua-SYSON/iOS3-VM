@@ -1547,11 +1547,17 @@ static void test_vfp_enabled_still_halts(void) {
     /* The other half of the rule, and the half that keeps us honest: once the
      * kernel has enabled VFP, an encoding we cannot execute has to stop the
      * machine and name itself. _sleh_undef would deliver EXC_BAD_INSTRUCTION
-     * here, so vectoring would destroy the diagnostic AND kill the process. */
+     * here, so vectoring would destroy the diagnostic AND kill the process.
+     *
+     * VFPv2 itself is now implemented (core/src/arm/vfp.c), so the examples
+     * here are the encodings that remain genuinely absent from this part: NEON
+     * — which the ARM1176 does not have at all — and VFPv3 additions. The VFP
+     * unit's own coverage is tested in core/tests/test_vfp.c. */
     struct { uint32_t insn; const char *what; } v[] = {
-        { 0xee300a00u, "VADD.F32 s0,s0,s0" },
-        { 0xecb10a20u, "VLDMIA r1!,{s0-s31}" },
-        { 0xf2000d40u, "VADD.F32 (SIMD)" },
+        { 0xf2000d40u, "VADD.F32 (Advanced SIMD; no NEON on the ARM1176)" },
+        { 0xf4200a0fu, "VLD1.8 (Advanced SIMD element/structure load)"    },
+        { 0xeeb00b00u, "VMOV.F64 d0,#imm (VFPv3)"                        },
+        { 0xee000b10u, "VMOV.32 d0[0],r0 (Advanced SIMD scalar transfer)" },
     };
     for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) {
         arm_cpu_t c;
@@ -1705,8 +1711,13 @@ static void test_vfp_lazy_trap_cannot_loop(void) {
      * the way _vfp_switch does and the SAME instruction now halts loudly
      * instead of vectoring again, so a kernel that enables VFP and retries
      * gets a diagnostic rather than an infinite exception loop. */
+    /* 0xeeb00b00 is VMOV.F64 d0,#imm — in the VFP encoding space (so the
+     * disabled case vectors) but a VFPv3 addition the VFP11 does not have (so
+     * the enabled case halts). It has to be an encoding we do not implement:
+     * one we DO implement simply executes on the retry, which is the whole
+     * point of the milestone and is covered by test_vfp.c. */
     arm_cpu_t c;
-    arm_status_t st = run_vfp(&c, 0xee300a00u, false);
+    arm_status_t st = run_vfp(&c, 0xeeb00b00u, false);
     CHECK(st == ARM_OK && c.r[15] == ARM_VEC_UNDEFINED, "first pass must vector");
 
     c.vfp_fpexc |= ARM_FPEXC_EN;                  /* what _vfp_switch does */

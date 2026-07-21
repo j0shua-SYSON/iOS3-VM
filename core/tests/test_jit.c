@@ -627,6 +627,41 @@ static void test_deny_all_translates_nothing(void) {
     CHECK(jit_get_deny() == 0, "deny mask cleared");
 }
 
+/*
+ * VFP stays in the interpreter, deliberately and permanently.
+ *
+ * core/src/arm/vfp.c implements VFPv2 with a host floating-point unit whose
+ * rounding, exception flags and flush-to-zero behaviour it controls carefully.
+ * Emitting arm64 FP instructions for those encodings would put a SECOND
+ * floating-point implementation in the machine, with its own FPCR, and the two
+ * would have to agree bit for bit on every result and every sticky flag. They
+ * would not, and the divergence would be silent. So the translator must
+ * decline the whole VFP encoding space and let arm_step run it — which is the
+ * general rule of docs/dynarec.md (anything not translated is interpreted)
+ * applied to the one family where "not yet" is really "not ever".
+ */
+static void test_vfp_is_never_translated(void) {
+    static const struct { uint32_t insn; const char *what; } CASES[] = {
+        { 0xecb10a20u, "VLDMIA r1!,{s0-s31}  (VFP load/store multiple)" },
+        { 0xed910a00u, "VLDR s0,[r1]         (VFP load/store)"          },
+        { 0xee302a20u, "VADD.F32 s4,s0,s1    (VFP data processing)"     },
+        { 0xee304b01u, "VADD.F64 d4,d0,d1    (VFP data processing)"     },
+        { 0xeeb40a60u, "VCMP.F32 s0,s1       (VFP data processing)"     },
+        { 0xee100a10u, "VMOV r0,s0           (VFP 32-bit transfer)"     },
+        { 0xeef10a10u, "VMRS r0,FPSCR        (VFP 32-bit transfer)"     },
+        { 0xec510b10u, "VMOV r0,r1,d0        (VFP 64-bit transfer)"     },
+        { 0xf2000d40u, "VADD.F32             (Advanced SIMD)"           },
+    };
+    arm_cpu_t c; jit_block_t b;
+    unsigned i;
+    for (i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
+        CHECK(!xlate(&c, 0, &CASES[i].insn, 1, &b, CODE_WORDS),
+              "%s must fall back", CASES[i].what);
+        CHECK(b.insn_count == 0, "%s translated %u instructions",
+              CASES[i].what, b.insn_count);
+    }
+}
+
 static void test_deny_one_class(void) {
     uint32_t p[] = { 0xe3a00001, 0xe5901000, 0xe3a02003, 0xeafffffe };
     arm_cpu_t c; jit_block_t b;
@@ -907,6 +942,7 @@ int main(void) {
     test_thumb_memory();
     test_thumb_decode_agrees_with_the_interpreter();
     test_thumb_deny();
+    test_vfp_is_never_translated();
     test_deny_all_translates_nothing();
     test_deny_one_class();
     test_refused_encodings();

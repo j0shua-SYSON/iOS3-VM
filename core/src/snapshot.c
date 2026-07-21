@@ -103,7 +103,7 @@
         "update this number, and bump SNAPSHOT_VERSION in snapshot.h.")
 
 SNAP_SIZE_GUARD(arm_cp15_t,        64,    "snap_cpu");
-SNAP_SIZE_GUARD(arm_cpu_t,         296,   "snap_cpu");
+SNAP_SIZE_GUARD(arm_cpu_t,         424,   "snap_cpu");
 SNAP_SIZE_GUARD(s5l_uart_t,        8224,  "snap_uart");
 SNAP_SIZE_GUARD(s5l_vic_t,         16,    "snap_vic");
 SNAP_SIZE_GUARD(s5l_timer_t,       40,    "snap_timer");
@@ -113,7 +113,7 @@ SNAP_SIZE_GUARD(s5l_clcd_t,        3360,  "snap_clcd");
 SNAP_SIZE_GUARD(s5l_nor_entry_t,   12,    "snap_nor");
 SNAP_SIZE_GUARD(s5l_nor_t,         208,   "snap_nor");
 SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
-SNAP_SIZE_GUARD(s5l8900_t,         15640, "snap_mach");
+SNAP_SIZE_GUARD(s5l8900_t,         15768, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
@@ -283,6 +283,9 @@ static void snap_cpu(sn_io_t *io, arm_cpu_t *c) {
     F32(c->excl_addr);
     F32(c->vfp_fpexc);
     F32(c->vfp_fpscr);
+    /* s0-s31. d0-d15 alias these and so need no separate entry — that is the
+     * point of storing the file once (see arm_cpu_t.vfp_s). */
+    FA32(c->vfp_s, 32);
 }
 
 /* The UART's whole transmit capture is saved, not just its used prefix: the

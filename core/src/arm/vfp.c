@@ -1,0 +1,1029 @@
+/*
+ * iOS3-VM — VFPv2 (the ARM1176JZF-S's VFP11 unit).
+ *
+ * WHY THIS EXISTS, AND WHY NOW
+ * ----------------------------
+ * The boot reaches launchd, which issues five syscalls and then executes a VFP
+ * instruction. Our lazy-VFP Undefined trap vectors the guest to 0x04; XNU's
+ * _sleh_undef (0xc006c184) recognises the encoding and calls _vfp_trap ->
+ * _vfp_switch (0xc0069384), which sets FPEXC.EN and then UNCONDITIONALLY
+ * executes
+ *
+ *     VLDMIA r1!, {s0-s31}          ; 0xecb10a20
+ *
+ * to restore the thread's VFP register file. There is no way past that
+ * instruction without a real register file, so real VFP is a requirement the
+ * kernel's own code established, not an assumption.
+ *
+ *
+ * WHAT THE HARDWARE IS
+ * --------------------
+ * VFPv2. 32 single-precision registers s0-s31, aliased onto 16 double-precision
+ * registers d0-d15; dN is the pair (s[2N] low word, s[2N+1] high word). There
+ * is NO d16-d31 and NO Advanced SIMD/NEON on this part, so every encoding that
+ * would name one is refused rather than silently folded onto a register that
+ * does exist. Three system registers matter: FPSID (read-only identity),
+ * FPSCR (status and control) and FPEXC (the enable, which is the whole lazy
+ * per-thread enable mechanism — see the discrimination comment in
+ * arm_interp.c).
+ *
+ *
+ * =====================  FLOATING-POINT SEMANTICS  ==========================
+ *
+ * Arithmetic is the host's C `float` and `double`. That is IEEE-754 binary32
+ * and binary64, which is the same format VFPv2 uses, so for round-to-nearest-
+ * even every operation implemented here is bit-exact against hardware.
+ *
+ * MODELLED EXACTLY
+ *   - the s/d register file and its aliasing
+ *   - +, -, *, /, sqrt, and the four multiply-accumulate forms, each with its
+ *     own rounding step (VFPv2's VMLA is NOT fused; see the note at f32_do)
+ *   - comparisons, including the unordered case, writing FPSCR.NZCV
+ *   - the integer and double/single conversions, with ARM's saturation rules
+ *   - the cumulative exception flags IOC / DZC / OFC / UFC / IXC / IDC
+ *   - FPSCR.FZ, flush-to-zero, on both the input and the output side; and
+ *     FPSCR.DN, default-NaN. These are not optional decoration: dyld runs in
+ *     ARM's "RunFast" configuration with FZ set, so the very first
+ *     floating-point instruction launchd's dynamic linker executes is already
+ *     in a non-default mode.
+ *
+ * REFUSED, NOT APPROXIMATED. Before any instruction that could be changed by
+ * one of these, FPSCR is checked and the instruction TRAPS (ARM_UNDEFINED,
+ * with a printed reason) rather than computing a plausible wrong number:
+ *
+ *   FPSCR.Len   != 0   short vectors. VFP11 really implements them; we do not.
+ *                      A vector operation executed as a scalar one would write
+ *                      one register instead of up to eight, silently. This
+ *                      gates every data-processing instruction, VMOV included,
+ *                      because Len changes which registers they write.
+ *   FPSCR.RMode != 0   directed rounding (RP/RM/RZ). Host arithmetic rounds to
+ *                      nearest-even. Honouring the other three would mean
+ *                      driving the host's rounding mode through <fenv.h>
+ *                      fesetround, which without a working #pragma STDC
+ *                      FENV_ACCESS the optimiser is entitled to schedule
+ *                      around — a wrong float that looks plausible. Only
+ *                      instructions that actually round are gated on this;
+ *                      VMOV, VABS, VNEG, VCMP, the exact widening conversions
+ *                      and VCVT's explicit round-toward-zero form all run in
+ *                      any rounding mode, because none of them consult it.
+ *   FPSCR trap enables (IOE/DZE/OFE/UFE/IXE/IDE)
+ *                      ask the unit to BOUNCE the instruction to support code
+ *                      through FPEXC.EX/FPINST. We never enter exceptional
+ *                      state, so honouring the request is not possible and
+ *                      ignoring it would turn a signalled exception into a
+ *                      silently-completed operation. Gated only where an
+ *                      exception can actually arise.
+ *   the flush-to-zero boundary
+ *                      one case inside FZ that the host cannot answer; it is
+ *                      detected and refused rather than guessed. See fz_out32.
+ *
+ * KNOWN DEVIATIONS (all of them, deliberately listed)
+ *   1. NaN PAYLOAD PROPAGATION ORDER. With DN clear, VFP propagates an input
+ *      NaN: a signalling NaN wins over a quiet one regardless of operand order,
+ *      and is quieted by setting its top fraction bit. The host (x86 SSE, and
+ *      arm64) instead prefers the FIRST operand. So an operation with a quiet
+ *      NaN in operand 1 and a signalling NaN in operand 2 yields the same
+ *      CLASS of result (a quiet NaN) and the same IOC flag, but possibly a
+ *      different payload. Nothing in a boot depends on a NaN payload; code
+ *      that did would be relying on behaviour ARM itself documents as
+ *      implementation-specific across its own cores. With DN set — which is
+ *      how dyld runs — this deviation cannot be observed at all.
+ *   2. FPINST / FPINST2 (the bounce registers) and MVFR0 / MVFR1 are not
+ *      implemented and reading them traps. We never bounce, so FPINST has no
+ *      truthful value; and we have no verified MVFR reading for VFP11, so
+ *      answering would be inventing a feature advertisement. XNU 1357 reads
+ *      neither.
+ *   3. x87 hosts would double-round single-precision arithmetic. Every host
+ *      this builds for (x86-64 with SSE, arm64) computes binary32 natively.
+ *   4. FPSID reports ARM1176_FPSID (0x410120b4), inherited from the CP15
+ *      identity block in arm.h. The implementer, "VFPv2 subarchitecture" and
+ *      part fields are certain; the variant/revision nibbles are not
+ *      independently verified against an ARM1176JZF-S TRM here, and nothing in
+ *      XNU 1357 branches on them.
+ *
+ * HOW THE EXCEPTION FLAGS ARE SAMPLED
+ *   From the host, via <fenv.h>: feclearexcept before the operation and
+ *   fetestexcept after. That is the only way to get UFC and IXC right without
+ *   reimplementing rounding. Because GCC does not enable #pragma STDC
+ *   FENV_ACCESS, the arithmetic is anchored between the two library calls with
+ *   `volatile` staging variables: a volatile access is an observable side
+ *   effect and cannot be reordered across a call to an opaque external
+ *   function, so the operands are read after the clear and the result is
+ *   written before the test. The same anchoring is what forces each rounding
+ *   step of VMLA to be materialised, which stops -ffp-contract from fusing the
+ *   multiply and the add into an FMA that VFPv2 does not have.
+ *
+ * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
+ */
+#include "vfp.h"
+
+#include <fenv.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ===================================================================== trap */
+
+static const char *g_reason;
+
+const char *vfp_trap_reason(void) { return g_reason; }
+
+/*
+ * Refuse an encoding, loudly. Everything this unit cannot execute comes
+ * through here, so a halt always names the encoding, the PC and the reason —
+ * which is the whole point of this core's "trap what you don't implement"
+ * rule. The default case of every switch below is a call to this, never a
+ * fallthrough that computes something.
+ */
+static arm_status_t vfp_trap(uint32_t pc, uint32_t insn, const char *why) {
+    g_reason = why;
+    fprintf(stderr, "vfp: refusing 0x%08x at pc 0x%08x: %s\n", insn, pc, why);
+    return ARM_UNDEFINED;
+}
+
+/* ======================================================== availability ==== *
+ *
+ * CPACR gates CP10/CP11 before FPEXC does. The ARM1176 requires the two fields
+ * to be programmed identically (ARM DDI 0301H 3.2.7) and XNU's _init_vfp does
+ * exactly that — "CPACR |= 0xf << 20" from _arm_init+0x2cc, the only CPACR
+ * write anywhere in the kernel — so in practice they always agree. Where they
+ * do not, take the more restrictive: a VFP instruction needs both halves, and
+ * over-permitting would silently execute something the hardware would refuse.
+ */
+bool vfp_cpacr_permits(const arm_cpu_t *c) {
+    unsigned cp10 = (c->cp15.cpacr >> ARM_CPACR_CP10_SHIFT) & 3u;
+    unsigned cp11 = (c->cp15.cpacr >> ARM_CPACR_CP11_SHIFT) & 3u;
+    unsigned acc  = cp10 < cp11 ? cp10 : cp11;
+    if (acc == 3u) return true;                                /* full access */
+    if (acc == 1u) return (c->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
+    return false;                                     /* 0 denied, 2 reserved */
+}
+
+bool vfp_enabled(const arm_cpu_t *c) {
+    return (c->vfp_fpexc & ARM_FPEXC_EN) != 0;
+}
+
+/* ============================================== FPSCR mode admissibility ==
+ *
+ * Three tiers, from the semantics note at the top of this file. Each returns
+ * the offending FPSCR bits, or 0 when the current mode is one we model
+ * exactly. Splitting them matters: VMOV and VABS must keep working in RZ mode
+ * because hardware does not consult the rounding mode for them, and refusing
+ * would invent a fault the guest cannot possibly be expecting.
+ */
+/*
+ * Four tiers, from the least to the most that an instruction can depend on.
+ *
+ * Short vectors change which REGISTERS any data-processing instruction writes,
+ * VMOV and VABS included, so Len gates everything. The trap enables gate every
+ * instruction that can raise an exception, which VMOV, VABS and VNEG cannot.
+ * The rounding mode gates only instructions that round; VMOV, VABS, VNEG,
+ * VCMP, the exact widening conversions and VCVT's explicit round-toward-zero
+ * form never consult it, and refusing them in RZ mode would invent a fault the
+ * guest cannot be expecting.
+ *
+ * FZ and DN are not here because they are implemented (see fz_in32 and
+ * f32_do); they change results rather than making them unrepresentable.
+ */
+#define MODE_EXACT    (ARM_FPSCR_LEN)
+#define MODE_VALUES   (MODE_EXACT | ARM_FPSCR_ENABLES)
+#define MODE_ROUNDING (MODE_VALUES | ARM_FPSCR_RMODE)
+
+static const char *mode_complaint(uint32_t bad) {
+    if (bad & ARM_FPSCR_LEN)     return "FPSCR.Len selects short vectors";
+    if (bad & ARM_FPSCR_ENABLES) return "FPSCR enables a trapped FP exception";
+    if (bad & ARM_FPSCR_RMODE)   return "FPSCR.RMode selects directed rounding";
+    return "FPSCR selects an unmodelled mode";
+}
+
+/* ===================================================== bit-exact casts ==== */
+
+static inline float    u2f(uint32_t u) { float  f; memcpy(&f, &u, 4); return f; }
+static inline uint32_t f2u(float    f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static inline double   u2d(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }
+static inline uint64_t d2u(double   d) { uint64_t u; memcpy(&u, &d, 8); return u; }
+
+/* ARM's unary negations are sign-bit flips, not arithmetic: they neither
+ * signal on a NaN nor change its payload. Doing them in the integer domain
+ * makes that explicit. */
+static inline float  fneg32(float  f) { return u2f(f2u(f) ^ 0x80000000u); }
+static inline double fneg64(double d) { return u2d(d2u(d) ^ 0x8000000000000000ull); }
+static inline float  fabs32(float  f) { return u2f(f2u(f) & 0x7fffffffu); }
+static inline double fabs64(double d) { return u2d(d2u(d) & 0x7fffffffffffffffull); }
+
+static inline bool snan32(uint32_t u) {
+    return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0
+        && (u & 0x00400000u) == 0;
+}
+static inline bool snan64(uint64_t u) {
+    return (u & 0x7ff0000000000000ull) == 0x7ff0000000000000ull
+        && (u & 0x000fffffffffffffull) != 0
+        && (u & 0x0008000000000000ull) == 0;
+}
+
+/* ============================================ host arithmetic + flags ==== */
+
+typedef enum { OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_SQRT } fop_t;
+
+/*
+ * A private marker carried alongside the FPSCR exception bits. It is NOT an
+ * FPSCR bit (6 is reserved on VFPv2) and never reaches FPSCR: seeing it means
+ * flush-to-zero cannot be decided from the host's rounded result and the
+ * instruction must trap. See fz_out32.
+ */
+#define VFP_FZ_AMBIGUOUS (1u << 6)
+
+#define F32_MIN_NORMAL 0x00800000u
+#define F64_MIN_NORMAL 0x0010000000000000ull
+#define F32_DEFAULT_NAN 0x7fc00000u
+#define F64_DEFAULT_NAN 0x7ff8000000000000ull
+
+/* ------------------------------------------------- flush-to-zero, FPSCR.FZ --
+ *
+ * INPUT side (ARM ARM FPUnpack): a denormal operand is replaced by a zero of
+ * the same sign and IDC is set. The sign is preserved because FPUnpack reads
+ * it before it decides the operand is a zero, which is what makes
+ * denormal * -1 come out negative.
+ *
+ * OUTPUT side (ARM ARM FPRound): a result whose magnitude is below the
+ * smallest normal is replaced by a zero of the result's sign and UFC is set —
+ * and the inexact report is NOT also made, because the flush replaces the
+ * rounding rather than following it.
+ *
+ * THE ONE CASE THIS CANNOT DECIDE. The architecture tests the result BEFORE
+ * rounding; the host hands us the result AFTER. Every disagreement is
+ * therefore confined to one situation: the host returned exactly the smallest
+ * normal AND the operation was inexact, meaning the exact result sat in the
+ * half-ulp sliver on one side or the other of that boundary. Below it, the
+ * architecture flushes to zero; above it, it does not; and the host's answer
+ * looks identical either way. Rather than pick, that case traps and names
+ * itself. It is detected, not hoped about.
+ */
+static float fz_in32(float f, uint32_t *exc) {
+    uint32_t u = f2u(f);
+    if ((u & 0x7f800000u) == 0u && (u & 0x007fffffu) != 0u) {
+        *exc |= ARM_FPSCR_IDC;
+        return u2f(u & 0x80000000u);
+    }
+    return f;
+}
+static double fz_in64(double d, uint32_t *exc) {
+    uint64_t u = d2u(d);
+    if ((u & 0x7ff0000000000000ull) == 0ull &&
+        (u & 0x000fffffffffffffull) != 0ull) {
+        *exc |= ARM_FPSCR_IDC;
+        return u2d(u & 0x8000000000000000ull);
+    }
+    return d;
+}
+static float fz_out32(float f, uint32_t *exc) {
+    uint32_t u = f2u(f), mag = u & 0x7fffffffu;
+    if (mag != 0u && mag < F32_MIN_NORMAL) {
+        *exc = (*exc & ~ARM_FPSCR_IXC) | ARM_FPSCR_UFC;
+        return u2f(u & 0x80000000u);
+    }
+    if (mag == F32_MIN_NORMAL && (*exc & ARM_FPSCR_IXC)) *exc |= VFP_FZ_AMBIGUOUS;
+    return f;
+}
+static double fz_out64(double d, uint32_t *exc) {
+    uint64_t u = d2u(d), mag = u & 0x7fffffffffffffffull;
+    if (mag != 0ull && mag < F64_MIN_NORMAL) {
+        *exc = (*exc & ~ARM_FPSCR_IXC) | ARM_FPSCR_UFC;
+        return u2d(u & 0x8000000000000000ull);
+    }
+    if (mag == F64_MIN_NORMAL && (*exc & ARM_FPSCR_IXC)) *exc |= VFP_FZ_AMBIGUOUS;
+    return d;
+}
+
+/* Default-NaN mode, FPSCR.DN: every NaN result becomes the one default quiet
+ * NaN instead of a propagated input. Exact, and it happens to make the NaN
+ * payload deviation noted at the top of this file unobservable. */
+static float dn_out32(float f, uint32_t fpscr) {
+    if ((fpscr & ARM_FPSCR_DN) && (f2u(f) & 0x7fffffffu) > 0x7f800000u)
+        return u2f(F32_DEFAULT_NAN);
+    return f;
+}
+static double dn_out64(double d, uint32_t fpscr) {
+    if ((fpscr & ARM_FPSCR_DN) &&
+        (d2u(d) & 0x7fffffffffffffffull) > 0x7ff0000000000000ull)
+        return u2d(F64_DEFAULT_NAN);
+    return d;
+}
+
+static uint32_t host_exceptions(void) {
+    int raised = fetestexcept(FE_ALL_EXCEPT);
+    uint32_t f = 0;
+    if (raised & FE_INVALID)   f |= ARM_FPSCR_IOC;
+    if (raised & FE_DIVBYZERO) f |= ARM_FPSCR_DZC;
+    if (raised & FE_OVERFLOW)  f |= ARM_FPSCR_OFC;
+    if (raised & FE_UNDERFLOW) f |= ARM_FPSCR_UFC;
+    if (raised & FE_INEXACT)   f |= ARM_FPSCR_IXC;
+    return f;
+}
+
+/*
+ * One rounding step, with its exception flags captured.
+ *
+ * The volatile staging is load-bearing, twice over. It anchors the arithmetic
+ * between feclearexcept and fetestexcept (see the header comment), and it
+ * forces the result of each call to be materialised at binary32/binary64
+ * width, which is what makes a sequence of two calls round twice. VFPv2 has no
+ * fused multiply-add: VMLA is a multiply, rounded, then an add, rounded, and
+ * an optimiser that contracted the two would give an answer that differs from
+ * hardware in the last bit — the exact class of silent wrongness this core
+ * exists to avoid.
+ */
+static float f32_do(fop_t op, float a, float b, uint32_t fpscr, uint32_t *exc) {
+    volatile float va, vb, vr;
+    float x, y, r;
+    uint32_t e = 0;
+
+    if (fpscr & ARM_FPSCR_FZ) { a = fz_in32(a, &e); b = fz_in32(b, &e); }
+    va = a; vb = b;
+    feclearexcept(FE_ALL_EXCEPT);
+    x = va; y = vb;
+    switch (op) {
+        case OP_ADD: r = x + y;    break;
+        case OP_SUB: r = x - y;    break;
+        case OP_MUL: r = x * y;    break;
+        case OP_DIV: r = x / y;    break;
+        default:     r = sqrtf(x); break;
+    }
+    vr = r;
+    e |= host_exceptions();
+    r  = vr;
+    if (fpscr & ARM_FPSCR_FZ) r = fz_out32(r, &e);
+    *exc |= e;
+    return dn_out32(r, fpscr);
+}
+
+static double f64_do(fop_t op, double a, double b, uint32_t fpscr, uint32_t *exc) {
+    volatile double va, vb, vr;
+    double x, y, r;
+    uint32_t e = 0;
+
+    if (fpscr & ARM_FPSCR_FZ) { a = fz_in64(a, &e); b = fz_in64(b, &e); }
+    va = a; vb = b;
+    feclearexcept(FE_ALL_EXCEPT);
+    x = va; y = vb;
+    switch (op) {
+        case OP_ADD: r = x + y;   break;
+        case OP_SUB: r = x - y;   break;
+        case OP_MUL: r = x * y;   break;
+        case OP_DIV: r = x / y;   break;
+        default:     r = sqrt(x); break;
+    }
+    vr = r;
+    e |= host_exceptions();
+    r  = vr;
+    if (fpscr & ARM_FPSCR_FZ) r = fz_out64(r, &e);
+    *exc |= e;
+    return dn_out64(r, fpscr);
+}
+
+/*
+ * ARM ARM FPToFixed with fbits == 0. NaN converts to zero and sets IOC; an
+ * out-of-range value saturates to the extreme of the destination type and sets
+ * IOC (and NOT IXC — saturation replaces the inexact report, it does not
+ * accompany it). Rounding is explicit here rather than delegated to the host's
+ * mode: round_to_zero is VCVT's architectural truncation, and the other case
+ * is VCVTR, which uses FPSCR.RMode — gated to round-to-nearest above, which is
+ * what rint() does in the host's default mode.
+ */
+static uint32_t fp_to_int(double v, bool is_signed, bool round_to_zero,
+                          uint32_t *exc) {
+    double r;
+    if (v != v) { *exc |= ARM_FPSCR_IOC; return 0; }      /* NaN -> 0 + IOC */
+    r = round_to_zero ? trunc(v) : rint(v);
+    if (is_signed) {
+        if (r >=  2147483648.0) { *exc |= ARM_FPSCR_IOC; return 0x7fffffffu; }
+        if (r <  -2147483648.0) { *exc |= ARM_FPSCR_IOC; return 0x80000000u; }
+        if (r != v) *exc |= ARM_FPSCR_IXC;
+        return (uint32_t)(int32_t)r;
+    }
+    if (r >= 4294967296.0) { *exc |= ARM_FPSCR_IOC; return 0xffffffffu; }
+    if (r <  0.0)          { *exc |= ARM_FPSCR_IOC; return 0u; }
+    if (r != v) *exc |= ARM_FPSCR_IXC;
+    return (uint32_t)r;
+}
+
+/* The four comparison flags, ARM ARM FPCompare. Note these land in FPSCR, not
+ * CPSR: the guest moves them across with "VMRS APSR_nzcv, FPSCR". */
+static uint32_t cmp_flags_ordered(int order) {
+    switch (order) {
+        case -1: return ARM_FPSCR_N;                        /* less than     */
+        case  0: return ARM_FPSCR_Z | ARM_FPSCR_C;          /* equal         */
+        case  1: return ARM_FPSCR_C;                        /* greater than  */
+        default: return ARM_FPSCR_C | ARM_FPSCR_V;          /* unordered     */
+    }
+}
+
+/* ================================================== register numbering ==== */
+
+/*
+ * The D/N/M bits (23:22 is D, 7 is N, 5 is M) are the LOW bit of a
+ * single-precision register number and the HIGH bit of a double-precision one.
+ * VFPv2 has only d0-d15, so a set high bit names a register the ARM1176 does
+ * not have; refusing is the only truthful answer, and it is also the one that
+ * catches a decode mistake of ours instead of aliasing it onto d0-d15.
+ */
+#define BIT(i)   ((insn >> (i)) & 1u)
+#define FIELD(hi) ((insn >> (hi)) & 0xfu)
+#define SREG(f4, lo) (((f4) << 1) | (lo))
+
+/* ================================================= load / store group ==== *
+ *
+ * cond 110 P U D W L Rn Vd 101 sz imm8   (ARM ARM A7.6, "Extension register
+ * load/store"). The five bits P:U:D:W:L select the form:
+ *
+ *   0b0000x  UNDEFINED            0b10x0x  VLDR/VSTR, negative offset
+ *   0b0010x  64-bit core transfer 0b10x1x  VLDM/VSTM decrement-before, wb
+ *   0b01x0x  VLDM/VSTM IA, no wb  0b11x0x  VLDR/VSTR, positive offset
+ *   0b01x1x  VLDM/VSTM IA, wb     0b11x1x  UNDEFINED
+ *
+ * VPUSH and VPOP are not separate instructions: they are the decrement-before
+ * and increment-after writeback forms with Rn == sp, and fall out of this
+ * decode for free. _vfp_switch's VLDMIA r1!, {s0-s31} is the 0b01x11 row.
+ */
+static arm_status_t vfp_ldst(arm_cpu_t *c, uint32_t pc, uint32_t insn,
+                             const vfp_bus_t *bus) {
+    bool     P = BIT(24), U = BIT(23), D = BIT(22), W = BIT(21), L = BIT(20);
+    unsigned rn = FIELD(16), vd = FIELD(12);
+    bool     dbl = BIT(8);
+    unsigned imm8 = insn & 0xffu;
+    uint32_t base, addr;
+    unsigned first, count, i;
+
+    if (!P && !U && !W) return vfp_trap(pc, insn, "UNDEFINED extension load/store form");
+    if (P && U && W)    return vfp_trap(pc, insn, "UNDEFINED extension load/store form");
+
+    /* Rn == 15 is the PC-relative literal form of VLDR/VSTR only; with
+     * writeback, or as a VLDM/VSTM base, the architecture calls it
+     * UNPREDICTABLE and we will not guess which of the two plausible
+     * behaviours a given core picked. */
+    if (rn == 15u) {
+        if (W || !P) return vfp_trap(pc, insn, "PC as a writeback/VLDM base is UNPREDICTABLE");
+        base = pc + 8u;                                    /* Align(PC,4)    */
+    } else {
+        base = c->r[rn];
+    }
+
+    /* ---- VLDR / VSTR: a single register at an immediate word offset. ---- */
+    if (P && !W) {
+        addr = U ? base + imm8 * 4u : base - imm8 * 4u;
+        if (dbl) {
+            if (D) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+            if (L) {
+                uint32_t lo = bus->read32(c, addr);
+                uint32_t hi = bus->read32(c, addr + 4u);
+                if (!c->abort_pending)
+                    vfp_set_d(c, vd, (uint64_t)lo | ((uint64_t)hi << 32));
+            } else {
+                uint64_t v = vfp_get_d(c, vd);
+                bus->write32(c, addr,      (uint32_t)v);
+                bus->write32(c, addr + 4u, (uint32_t)(v >> 32));
+            }
+        } else {
+            unsigned sd = SREG(vd, D);
+            if (L) {
+                uint32_t v = bus->read32(c, addr);
+                if (!c->abort_pending) vfp_set_s(c, sd, v);
+            } else {
+                bus->write32(c, addr, vfp_get_s(c, sd));
+            }
+        }
+        return ARM_OK;
+    }
+
+    /* ---- VLDM / VSTM (and therefore VPUSH / VPOP). ---------------------- */
+    if (imm8 == 0u) return vfp_trap(pc, insn, "VLDM/VSTM with an empty register list");
+
+    if (dbl) {
+        if (D) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+        first = vd;
+        count = imm8 / 2u;
+        /*
+         * An ODD imm8 is the deprecated VFPv2 FLDMX/FSTMX format: it moves
+         * imm8/2 doublewords and reserves one extra word whose contents are
+         * unspecified. The reservation is honoured (the transfer occupies
+         * imm8*4 bytes either way, so writeback lands in the right place); the
+         * extra word reads as ignored and writes as zero, which is within what
+         * the architecture leaves UNKNOWN.
+         */
+        if (first + count > 16u)
+            return vfp_trap(pc, insn, "register list runs past d15");
+    } else {
+        first = SREG(vd, D);
+        count = imm8;
+        if (first + count > 32u)
+            return vfp_trap(pc, insn, "register list runs past s31");
+    }
+
+    addr = U ? base : base - imm8 * 4u;
+
+    for (i = 0; i < count; i++) {
+        if (dbl) {
+            if (L) {
+                uint32_t lo = bus->read32(c, addr + i * 8u);
+                uint32_t hi = bus->read32(c, addr + i * 8u + 4u);
+                if (c->abort_pending) return ARM_OK;
+                vfp_set_d(c, first + i, (uint64_t)lo | ((uint64_t)hi << 32));
+            } else {
+                uint64_t v = vfp_get_d(c, first + i);
+                bus->write32(c, addr + i * 8u,      (uint32_t)v);
+                bus->write32(c, addr + i * 8u + 4u, (uint32_t)(v >> 32));
+                if (c->abort_pending) return ARM_OK;
+            }
+        } else {
+            if (L) {
+                uint32_t v = bus->read32(c, addr + i * 4u);
+                if (c->abort_pending) return ARM_OK;
+                vfp_set_s(c, first + i, v);
+            } else {
+                bus->write32(c, addr + i * 4u, vfp_get_s(c, first + i));
+                if (c->abort_pending) return ARM_OK;
+            }
+        }
+    }
+    /*
+     * FLDMX/FSTMX's reserved trailing word. It is still touched — the transfer
+     * really does span imm8*4 bytes, so a list that straddles a page boundary
+     * must fault the same way hardware would — but its value is architecturally
+     * UNKNOWN, so it is discarded on load and written as zero on store.
+     */
+    if (dbl && (imm8 & 1u)) {
+        if (L) (void)bus->read32(c, addr + count * 8u);
+        else   bus->write32(c, addr + count * 8u, 0u);
+        if (c->abort_pending) return ARM_OK;
+    }
+
+    if (W) c->r[rn] = U ? base + imm8 * 4u : base - imm8 * 4u;
+    return ARM_OK;
+}
+
+/* ======================================== 32-bit core-register transfer ==
+ *
+ * cond 1110 opc1 L Vn Rt 101 sz N 0 0 1 0000 — the MCR/MRC form.
+ *   opc1 == 000 : VMOV between Sn and Rt
+ *   opc1 == 111 : VMSR / VMRS
+ * Everything else in this space is an Advanced SIMD scalar transfer, which
+ * this part does not have.
+ */
+static arm_status_t vfp_xfer32(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    unsigned opc1 = (insn >> 21) & 7u;
+    bool     L    = BIT(20);
+    unsigned vn   = FIELD(16), rt = FIELD(12);
+
+    if (opc1 == 0u) {                               /* VMOV Sn <-> Rt        */
+        unsigned sn = SREG(vn, BIT(7));
+        if (BIT(8)) return vfp_trap(pc, insn, "Advanced SIMD scalar transfer (no NEON on VFP11)");
+        if ((insn & 0x0000006fu) != 0u)
+            return vfp_trap(pc, insn, "reserved bits set in VMOV (core register)");
+        if (rt == 15u) return vfp_trap(pc, insn, "PC as VMOV core register is UNPREDICTABLE");
+        if (L) c->r[rt] = vfp_get_s(c, sn);
+        else   vfp_set_s(c, sn, c->r[rt]);
+        return ARM_OK;
+    }
+
+    if (opc1 != 7u)
+        return vfp_trap(pc, insn, "Advanced SIMD scalar transfer (no NEON on VFP11)");
+
+    /*
+     * VMRS / VMSR. The availability asymmetry here IS the lazy-enable
+     * mechanism: with FPEXC.EN clear the only accessible system registers are
+     * FPEXC (8) and FPSID (0), which is exactly what _get_vfp_enabled relies
+     * on when it reads FPEXC precisely while VFP is off. The caller has
+     * already applied that rule.
+     */
+    if (L) {
+        uint32_t v;
+        switch (vn) {
+            case 0: v = ARM1176_FPSID;  break;
+            case 1: v = c->vfp_fpscr;   break;
+            case 8: v = c->vfp_fpexc;   break;
+            default:
+                return vfp_trap(pc, insn,
+                    "VMRS of a VFP system register this unit does not implement "
+                    "(MVFR0/MVFR1/FPINST/FPINST2)");
+        }
+        /* Rt == 15 is "VMRS APSR_nzcv, FPSCR": the FP comparison flags are
+         * copied into CPSR so a following ARM conditional branch can test
+         * them. It is the only defined use of Rt == 15 in this space. */
+        if (rt == 15u) c->cpsr = (c->cpsr & 0x0fffffffu) | (v & 0xf0000000u);
+        else           c->r[rt] = v;
+        return ARM_OK;
+    }
+
+    if (rt == 15u) return vfp_trap(pc, insn, "PC as a VMSR source is UNPREDICTABLE");
+    switch (vn) {
+        /* Reserved FPSCR bits read as zero on the ARM1176, so they are dropped
+         * on the way in rather than stored and handed back. */
+        case 1: c->vfp_fpscr = c->r[rt] & ARM_FPSCR_WMASK; return ARM_OK;
+        case 8: c->vfp_fpexc = c->r[rt];                   return ARM_OK;
+        case 0: return vfp_trap(pc, insn, "FPSID is read-only");
+        default:
+            return vfp_trap(pc, insn,
+                "VMSR of a VFP system register this unit does not implement");
+    }
+}
+
+/* ======================================== 64-bit core-register transfer ==
+ *
+ * cond 1100 010 L Rt2 Rt 101 sz 00 M 1 Vm — two core registers to or from
+ * either a pair of single registers or one double register.
+ */
+static arm_status_t vfp_xfer64(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    bool     L   = BIT(20), dbl = BIT(8), M = BIT(5);
+    unsigned rt2 = FIELD(16), rt = FIELD(12), vm = insn & 0xfu;
+
+    if ((insn & 0x000000c0u) != 0u)
+        return vfp_trap(pc, insn, "reserved bits set in VMOV (two core registers)");
+    if (rt == 15u || rt2 == 15u)
+        return vfp_trap(pc, insn, "PC as a VMOV core register is UNPREDICTABLE");
+
+    if (dbl) {
+        if (M) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+        if (L) {
+            uint64_t v = vfp_get_d(c, vm);
+            c->r[rt]  = (uint32_t)v;
+            c->r[rt2] = (uint32_t)(v >> 32);
+        } else {
+            vfp_set_d(c, vm, (uint64_t)c->r[rt] | ((uint64_t)c->r[rt2] << 32));
+        }
+        return ARM_OK;
+    }
+
+    {
+        unsigned sm = SREG(vm, M);
+        if (sm == 31u) return vfp_trap(pc, insn, "register pair runs past s31");
+        if (L) {
+            c->r[rt]  = vfp_get_s(c, sm);
+            c->r[rt2] = vfp_get_s(c, sm + 1u);
+        } else {
+            vfp_set_s(c, sm,      c->r[rt]);
+            vfp_set_s(c, sm + 1u, c->r[rt2]);
+        }
+    }
+    return ARM_OK;
+}
+
+/* ================================================== data processing ====== */
+
+enum {
+    A_VMLA, A_VMLS, A_VNMLS, A_VNMLA, A_VMUL, A_VNMUL, A_VADD, A_VSUB, A_VDIV
+};
+
+#define FZ_AMBIGUOUS_WHY                                                      \
+    "flush-to-zero cannot be decided: the exact result straddles the smallest " \
+    "normal, and the architecture tests it before rounding while the host " \
+    "reports it after"
+
+/* The three-operand arithmetic group: opc1 (bits 23,21,20) selects the family
+ * and opc3<0> (bit 6) the variant. Bit 22 is D, not part of the opcode. */
+static arm_status_t vfp_dp_arith(arm_cpu_t *c, uint32_t pc, uint32_t insn,
+                                 unsigned op) {
+    bool     dbl = BIT(8), alt = BIT(6);
+    unsigned kind, rd, rn, rm;
+    uint32_t exc = 0, bad;
+
+    switch (op) {
+        case 0: kind = alt ? A_VMLS  : A_VMLA; break;
+        case 1: kind = alt ? A_VNMLA : A_VNMLS; break;
+        case 2: kind = alt ? A_VNMUL : A_VMUL; break;
+        case 3: kind = alt ? A_VSUB  : A_VADD; break;
+        case 4:
+            if (alt) return vfp_trap(pc, insn, "UNDEFINED VFP data-processing opcode");
+            kind = A_VDIV;
+            break;
+        default:
+            return vfp_trap(pc, insn,
+                "VFPv4 fused multiply-accumulate; the VFP11 has no FMA");
+    }
+
+    bad = c->vfp_fpscr & MODE_ROUNDING;
+    if (bad) return vfp_trap(pc, insn, mode_complaint(bad));
+
+    if (dbl) {
+        if (BIT(22) || BIT(7) || BIT(5))
+            return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+        rd = FIELD(12); rn = FIELD(16); rm = insn & 0xfu;
+    } else {
+        rd = SREG(FIELD(12), BIT(22));
+        rn = SREG(FIELD(16), BIT(7));
+        rm = SREG(insn & 0xfu, BIT(5));
+    }
+
+    if (dbl) {
+        uint32_t fs = c->vfp_fpscr;
+        double n = u2d(vfp_get_d(c, rn)), m = u2d(vfp_get_d(c, rm)), r;
+        switch (kind) {
+            case A_VADD:  r = f64_do(OP_ADD, n, m, fs, &exc); break;
+            case A_VSUB:  r = f64_do(OP_SUB, n, m, fs, &exc); break;
+            case A_VMUL:  r = f64_do(OP_MUL, n, m, fs, &exc); break;
+            case A_VNMUL: r = fneg64(f64_do(OP_MUL, n, m, fs, &exc)); break;
+            case A_VDIV:  r = f64_do(OP_DIV, n, m, fs, &exc); break;
+            default: {
+                double d = u2d(vfp_get_d(c, rd));
+                double p = f64_do(OP_MUL, n, m, fs, &exc);  /* rounded, then...*/
+                if (kind == A_VMLS  || kind == A_VNMLA) p = fneg64(p);
+                if (kind == A_VNMLA || kind == A_VNMLS) d = fneg64(d);
+                r = f64_do(OP_ADD, d, p, fs, &exc);         /* ...rounded again*/
+                break;
+            }
+        }
+        if (exc & VFP_FZ_AMBIGUOUS) return vfp_trap(pc, insn, FZ_AMBIGUOUS_WHY);
+        vfp_set_d(c, rd, d2u(r));
+    } else {
+        uint32_t fs = c->vfp_fpscr;
+        float n = u2f(vfp_get_s(c, rn)), m = u2f(vfp_get_s(c, rm)), r;
+        switch (kind) {
+            case A_VADD:  r = f32_do(OP_ADD, n, m, fs, &exc); break;
+            case A_VSUB:  r = f32_do(OP_SUB, n, m, fs, &exc); break;
+            case A_VMUL:  r = f32_do(OP_MUL, n, m, fs, &exc); break;
+            case A_VNMUL: r = fneg32(f32_do(OP_MUL, n, m, fs, &exc)); break;
+            case A_VDIV:  r = f32_do(OP_DIV, n, m, fs, &exc); break;
+            default: {
+                float d = u2f(vfp_get_s(c, rd));
+                float p = f32_do(OP_MUL, n, m, fs, &exc);
+                if (kind == A_VMLS  || kind == A_VNMLA) p = fneg32(p);
+                if (kind == A_VNMLA || kind == A_VNMLS) d = fneg32(d);
+                r = f32_do(OP_ADD, d, p, fs, &exc);
+                break;
+            }
+        }
+        if (exc & VFP_FZ_AMBIGUOUS) return vfp_trap(pc, insn, FZ_AMBIGUOUS_WHY);
+        vfp_set_s(c, rd, f2u(r));
+    }
+    c->vfp_fpscr |= exc;
+    return ARM_OK;
+}
+
+/*
+ * The "other" group: opc1 == 1x11 with opc3<0> == 1, keyed by opc2 (bits
+ * 19:16) and opc3 (bits 7:6). This is where the unary operations, the
+ * comparisons and every conversion live.
+ */
+static arm_status_t vfp_dp_other(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    unsigned opc2 = FIELD(16);
+    bool     dbl  = BIT(8), top = BIT(7);   /* top == opc3<1> */
+    unsigned D = BIT(22), M = BIT(5);
+    unsigned vd = FIELD(12), vm = insn & 0xfu;
+    uint32_t exc = 0, bad;
+
+    switch (opc2) {
+
+    /* ---- VMOV (register), VABS, VNEG, VSQRT: same width in and out. ---- */
+    case 0u: case 1u: {
+        unsigned rd, rm;
+        bool sqrt_ = (opc2 == 1u) && top;
+        /* VMOV/VABS/VNEG never round and never inspect a value's class, so
+         * they are admissible in any rounding mode; VSQRT rounds. */
+        bad = c->vfp_fpscr & (sqrt_ ? MODE_ROUNDING : MODE_EXACT);
+        if (bad) return vfp_trap(pc, insn, mode_complaint(bad));
+
+        if (dbl) {
+            if (D || M) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+            rd = vd; rm = vm;
+        } else {
+            rd = SREG(vd, D); rm = SREG(vm, M);
+        }
+        if (dbl) {
+            uint64_t s = vfp_get_d(c, rm);
+            double   r;
+            if (opc2 == 0u) r = top ? fabs64(u2d(s)) : u2d(s);        /* VABS/VMOV */
+            else if (!top)  r = fneg64(u2d(s));                       /* VNEG      */
+            else            r = f64_do(OP_SQRT, u2d(s), 0.0, c->vfp_fpscr, &exc);
+            if (exc & VFP_FZ_AMBIGUOUS) return vfp_trap(pc, insn, FZ_AMBIGUOUS_WHY);
+            vfp_set_d(c, rd, d2u(r));
+        } else {
+            uint32_t s = vfp_get_s(c, rm);
+            float    r;
+            if (opc2 == 0u) r = top ? fabs32(u2f(s)) : u2f(s);
+            else if (!top)  r = fneg32(u2f(s));
+            else            r = f32_do(OP_SQRT, u2f(s), 0.0f, c->vfp_fpscr, &exc);
+            if (exc & VFP_FZ_AMBIGUOUS) return vfp_trap(pc, insn, FZ_AMBIGUOUS_WHY);
+            vfp_set_s(c, rd, f2u(r));
+        }
+        c->vfp_fpscr |= exc;
+        return ARM_OK;
+    }
+
+    /* ---- VCMP / VCMPE, against a register (4) or against +0.0 (5). ----
+     * The result goes to FPSCR.NZCV, never to CPSR. VCMPE signals on any NaN;
+     * plain VCMP signals only on a signalling one. Neither rounds. */
+    case 4u: case 5u: {
+        bool zero = (opc2 == 5u);
+        unsigned rd, rm;
+        int order;
+        bool nan_op, snan_op;
+
+        bad = c->vfp_fpscr & MODE_VALUES;
+        if (bad) return vfp_trap(pc, insn, mode_complaint(bad));
+        if (zero && (vm != 0u || M))
+            return vfp_trap(pc, insn, "VCMP #0.0 with a non-zero Vm field");
+
+        if (dbl) {
+            if (D || M) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+            rd = vd; rm = vm;
+        } else {
+            rd = SREG(vd, D); rm = SREG(vm, M);
+        }
+
+        /* FPCompare unpacks its operands, so flush-to-zero applies: with FZ
+         * set a denormal compares equal to zero rather than less than the
+         * smallest normal. The signalling-NaN test reads the ORIGINAL bits,
+         * which is safe because a denormal is never a NaN. */
+        if (dbl) {
+            uint64_t ua = vfp_get_d(c, rd);
+            uint64_t ub = zero ? 0ull : vfp_get_d(c, rm);
+            double a = u2d(ua), b = u2d(ub);
+            if (c->vfp_fpscr & ARM_FPSCR_FZ) {
+                a = fz_in64(a, &exc); b = fz_in64(b, &exc);
+            }
+            nan_op  = (a != a) || (b != b);
+            snan_op = snan64(ua) || (!zero && snan64(ub));
+            order = nan_op ? 2 : (a == b ? 0 : (a < b ? -1 : 1));
+        } else {
+            uint32_t ua = vfp_get_s(c, rd);
+            uint32_t ub = zero ? 0u : vfp_get_s(c, rm);
+            float a = u2f(ua), b = u2f(ub);
+            if (c->vfp_fpscr & ARM_FPSCR_FZ) {
+                a = fz_in32(a, &exc); b = fz_in32(b, &exc);
+            }
+            nan_op  = (a != a) || (b != b);
+            snan_op = snan32(ua) || (!zero && snan32(ub));
+            order = nan_op ? 2 : (a == b ? 0 : (a < b ? -1 : 1));
+        }
+        if (snan_op || (top && nan_op)) exc |= ARM_FPSCR_IOC;
+        c->vfp_fpscr = (c->vfp_fpscr & ~ARM_FPSCR_NZCV)
+                     | cmp_flags_ordered(order) | exc;
+        return ARM_OK;
+    }
+
+    /* ---- VCVT between double and single. sz names the SOURCE width. ---- */
+    case 7u: {
+        if (!top) return vfp_trap(pc, insn, "UNDEFINED VFP data-processing opcode");
+        /* Narrowing rounds; widening is always exact. */
+        bad = c->vfp_fpscr & (dbl ? MODE_ROUNDING : MODE_VALUES);
+        if (bad) return vfp_trap(pc, insn, mode_complaint(bad));
+
+        if (dbl) {                                   /* VCVT.F32.F64        */
+            volatile float vr;
+            float r;
+            double s;
+            if (M) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+            s = u2d(vfp_get_d(c, vm));
+            if (c->vfp_fpscr & ARM_FPSCR_FZ) s = fz_in64(s, &exc);
+            {   volatile double vs = s; double x;
+                feclearexcept(FE_ALL_EXCEPT);
+                x = vs; vr = (float)x;
+                exc |= host_exceptions();
+            }
+            r = vr;
+            if (c->vfp_fpscr & ARM_FPSCR_FZ) r = fz_out32(r, &exc);
+            if (exc & VFP_FZ_AMBIGUOUS) return vfp_trap(pc, insn, FZ_AMBIGUOUS_WHY);
+            vfp_set_s(c, SREG(vd, D), f2u(dn_out32(r, c->vfp_fpscr)));
+        } else {                                     /* VCVT.F64.F32        */
+            volatile double vr;
+            float s;
+            if (D) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+            s = u2f(vfp_get_s(c, SREG(vm, M)));
+            if (c->vfp_fpscr & ARM_FPSCR_FZ) s = fz_in32(s, &exc);
+            {   volatile float vs = s; float x;
+                feclearexcept(FE_ALL_EXCEPT);
+                x = vs; vr = (double)x;
+                exc |= host_exceptions();
+            }
+            /* Widening a binary32 into a binary64 can never produce a
+             * denormal, so there is no output flush to consider here. */
+            vfp_set_d(c, vd, d2u(dn_out64(vr, c->vfp_fpscr)));
+        }
+        c->vfp_fpscr |= exc;
+        return ARM_OK;
+    }
+
+    /* ---- VCVT integer -> floating point. The source is always a single
+     * register holding a 32-bit integer; bit 7 selects signed. ---- */
+    case 8u: {
+        uint32_t raw;
+        /*
+         * The source is an INTEGER, so there is nothing for flush-to-zero to
+         * unpack and no NaN for default-NaN to replace; neither mode can reach
+         * this instruction. int32 -> binary64 is exact for every input and so
+         * cannot raise anything either, leaving only short vectors to refuse.
+         * int32 -> binary32 can round and can be inexact, so it is gated on
+         * the rounding mode and the trap enables.
+         *
+         * That distinction is not pedantry: dyld runs in RunFast mode with
+         * FPSCR.FZ set, and its very first floating-point instruction is
+         * VCVT.F64.U32 on the mach_timebase_info numerator.
+         */
+        bad = c->vfp_fpscr & (dbl ? MODE_EXACT : MODE_ROUNDING);
+        if (bad) return vfp_trap(pc, insn, mode_complaint(bad));
+
+        raw = vfp_get_s(c, SREG(vm, M));
+        if (dbl) {
+            if (D) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+            vfp_set_d(c, vd, d2u(top ? (double)(int32_t)raw : (double)raw));
+        } else {
+            double exact = top ? (double)(int32_t)raw : (double)raw;
+            volatile float vr;
+            {   volatile double vs = exact; double x;
+                feclearexcept(FE_ALL_EXCEPT);
+                x = vs; vr = (float)x;
+                exc |= host_exceptions();
+            }
+            vfp_set_s(c, SREG(vd, D), f2u(vr));
+        }
+        c->vfp_fpscr |= exc;
+        return ARM_OK;
+    }
+
+    /* ---- VCVT / VCVTR floating point -> integer. The destination is always
+     * a single register. bit 16 selects signed, bit 7 selects VCVT's
+     * round-toward-zero over VCVTR's FPSCR rounding. ---- */
+    case 12u: case 13u: {
+        bool is_signed = (opc2 & 1u) != 0;
+        bool to_zero   = top;
+        double v;
+
+        /* VCVTR consults FPSCR.RMode; VCVT does not. */
+        bad = c->vfp_fpscr & (to_zero ? MODE_VALUES : MODE_ROUNDING);
+        if (bad) return vfp_trap(pc, insn, mode_complaint(bad));
+
+        if (dbl) {
+            if (M) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+            v = u2d(vfp_get_d(c, vm));
+            if (c->vfp_fpscr & ARM_FPSCR_FZ) v = fz_in64(v, &exc);
+        } else {
+            float s = u2f(vfp_get_s(c, SREG(vm, M)));
+            if (c->vfp_fpscr & ARM_FPSCR_FZ) s = fz_in32(s, &exc);
+            v = (double)s;                               /* widening: exact  */
+        }
+        /* The destination is an integer, so there is no output to flush and no
+         * NaN to replace; FZ and DN stop at the input. */
+        vfp_set_s(c, SREG(vd, D), fp_to_int(v, is_signed, to_zero, &exc));
+        c->vfp_fpscr |= exc;
+        return ARM_OK;
+    }
+
+    case 2u: case 3u:
+        return vfp_trap(pc, insn, "VCVTB/VCVTT half-precision; VFPv3 only");
+    case 10u: case 11u: case 14u: case 15u:
+        return vfp_trap(pc, insn, "VCVT fixed-point; VFPv3 only");
+    default:
+        return vfp_trap(pc, insn, "UNDEFINED VFP data-processing opcode");
+    }
+}
+
+static arm_status_t vfp_dp(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    unsigned op = (BIT(23) << 2) | (BIT(21) << 1) | BIT(20);
+    if (op == 7u) {
+        if (BIT(6)) return vfp_dp_other(c, pc, insn);
+        return vfp_trap(pc, insn, "VMOV (immediate); VFPv3 only");
+    }
+    return vfp_dp_arith(c, pc, insn, op);
+}
+
+/* ============================================================ entry ====== */
+
+arm_status_t vfp_execute(arm_cpu_t *c, uint32_t pc, uint32_t insn,
+                         const vfp_bus_t *bus) {
+    g_reason = NULL;
+
+    /*
+     * Availability, which is the lazy-enable mechanism itself and NOT an
+     * unimplemented-encoding trap: returning ARM_UNDEFINED here is how the
+     * guest's own handler gets to run and switch VFP on. It must stay silent —
+     * it happens on every first VFP instruction of every thread.
+     *
+     * With FPEXC.EN clear, VMRS/VMSR of FPEXC (CRn 8) and FPSID (CRn 0) remain
+     * accessible; everything else is UNDEFINED. _get_vfp_enabled reads FPEXC
+     * precisely when VFP is off, and _vfp_switch writes FPEXC before it
+     * touches FPSCR, so this asymmetry is load-bearing.
+     */
+    if (!vfp_cpacr_permits(c)) return ARM_UNDEFINED;
+    if (!vfp_enabled(c)) {
+        /* VMRS/VMSR share one pattern; bit 20 (L) is left out of the mask. */
+        bool is_sysreg = (insn & 0x0fe00f10u) == 0x0ee00a10u;
+        unsigned crn = FIELD(16);
+        if (!is_sysreg || (crn != 0u && crn != 8u)) return ARM_UNDEFINED;
+    }
+
+    /* VFP 32-bit register transfer: MCR/MRC on cp10/cp11. */
+    if ((insn & 0x0f000e10u) == 0x0e000a10u) return vfp_xfer32(c, pc, insn);
+    /* VFP data processing: the CDP form. */
+    if ((insn & 0x0f000e10u) == 0x0e000a00u) return vfp_dp(c, pc, insn);
+    /* VFP 64-bit register transfer: MCRR/MRRC on cp10/cp11. */
+    if ((insn & 0x0fe00e00u) == 0x0c400a00u) return vfp_xfer64(c, pc, insn);
+    /* VFP load/store: the LDC/STC form. */
+    if ((insn & 0x0e000e00u) == 0x0c000a00u) return vfp_ldst(c, pc, insn, bus);
+
+    /*
+     * Reached only for a cp10/cp11 encoding outside all four groups — the CDP2
+     * / LDC2 / MCR2 unconditional forms, which VFP does not define. Advanced
+     * SIMD (0xF2/0xF3/0xF4) never arrives here; it is refused in arm_step,
+     * because the ARM1176 has no NEON at all.
+     */
+    return vfp_trap(pc, insn, "not a VFP encoding this unit defines");
+}

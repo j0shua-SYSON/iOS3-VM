@@ -49,7 +49,9 @@
  * one register quietly holding the wrong value, which is the single most
  * expensive class of bug this feature exists to prevent.
  */
-#define SNAPSHOT_VERSION   1u
+/* v2: the VFP register file (arm_cpu_t.vfp_s, s0-s31 aliasing d0-d15) joined
+ *     the CPU section when real VFPv2 arithmetic was implemented. */
+#define SNAPSHOT_VERSION   2u
 
 typedef enum {
     SNAP_OK = 0,

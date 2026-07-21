@@ -243,9 +243,18 @@ typedef struct arm_cpu {
 
     /* VFP11 system registers. The kernel disables VFP and enables it lazily
      * per thread, so the context-switch path reads and writes FPEXC on every
-     * switch. Only the control registers are modelled — no FP arithmetic. */
+     * switch. FPSID is a constant (ARM1176_FPSID) and so is not stored. */
     uint32_t vfp_fpexc;
     uint32_t vfp_fpscr;
+    /*
+     * The VFP register file: s0-s31 as raw bit patterns, in register-number
+     * order. VFPv2 on the ARM1176 has 16 double-precision registers ALIASED
+     * onto these, not a separate bank: dN is the pair (vfp_s[2N], vfp_s[2N+1])
+     * with the LOW-order word first. Keeping one array and deriving dN from it
+     * is what makes the aliasing impossible to get wrong — there is no second
+     * copy that could drift. There is no d16-d31 on this part; see vfp.c.
+     */
+    uint32_t vfp_s[32];
 } arm_cpu_t;
 
 /*
