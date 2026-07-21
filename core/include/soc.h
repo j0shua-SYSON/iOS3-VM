@@ -5,9 +5,11 @@
  * 3G, and the iPod touch 1G — the silicon iPhone OS 1–3 ran on. This header
  * declares its memory map and the device models the CPU talks to over the bus.
  *
- * The peripheral base addresses below come from public reverse-engineering of
- * the S5L8900. They are exercised by our own bare-metal payloads today and will
- * be validated against real Apple firmware at M3.
+ * The peripheral base addresses below started as public reverse-engineering of
+ * the S5L8900 and are now derived from the shipped firmware itself — see the
+ * memory-map block below for the device-tree ranges every one of them is
+ * resolved through, and for the two addresses that are ours rather than the
+ * SoC's (the NOR window) or the SoC's but unmodelled (edram, vrom, SRAM).
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
@@ -18,9 +20,54 @@
 #include <stdint.h>
 #include "arm.h"
 
-/* ------------------------------------------------------------ memory map */
-#define S5L8900_SRAM_BASE   0x22000000u
+/* ------------------------------------------------------------ memory map
+ *
+ * CONFIRMED from the shipped device tree (firmware/devicetree.bin, iPhone1,2
+ * 7E18). /arm-io carries two ranges triples — (child, parent, size):
+ *
+ *     00000000 38000000 08000000     child 0x00000000.. -> phys 0x38000000..
+ *     10000000 18000000 10000000     child 0x10000000.. -> phys 0x18000000..
+ *
+ * so a peripheral's `reg` child address becomes a physical address by adding
+ * 0x38000000 in the first window and 0x08000000 in the second. Two independent
+ * anchors pin the second window, which is the one that matters here:
+ *
+ *   /arm-io/vrom  reg {0x18000000,0x10000}  -> phys 0x20000000  (the boot ROM,
+ *                 the publicly known S5L8900 secure-ROM address)
+ *   /arm-io/amc   reg[1] {0x1a000000,0x2c000} -> phys 0x22000000, and
+ *                 firmware/llb.bin carries 0x22000000 at file+0x310 as its own
+ *                 link address — the bootrom loads LLB into SRAM there.
+ *
+ * The resulting physical map, with what is and is not modelled:
+ *
+ *   0x08000000  DRAM base. 128 MB fitted on an iPhone1,2 (ends 0x10000000).
+ *   0x18000000  edram, 0x140000                    NOT MODELLED
+ *   0x20000000  vrom (boot ROM), 0x10000           NOT MODELLED
+ *   0x22000000  SRAM / AMC window, 0x2c000         NOT MODELLED
+ *   0x28000000  <- first physical byte the device tree assigns to NOTHING
+ *   0x38000000  arm-io, 0x08000000 — every modelled peripheral lives here
+ *
+ * The NOR is NOT in this map. The device tree describes it as an SPI slave —
+ * /arm-io/spi0/nor-flash, compatible "nor-flash,spi", with a flash-RELATIVE
+ * address space (ranges {0,0,0x100000}, which is where S5L8900_NOR_SIZE's 1 MiB
+ * comes from) and partitions at flash offsets (nvram @0xfc000, raw-device
+ * @0x8000). See S5L8900_NOR_BASE for what our memory window therefore is.
+ *
+ * The DRAM aperture ceiling: DRAM starts at 0x08000000 and the next thing the
+ * SoC decodes is edram at 0x18000000, so no DRAM configuration above 256 MB can
+ * be physically real on this part. We allow larger anyway (a RAM-disk root does
+ * not fit otherwise); s5l8900_ram_conflict() is what keeps that fiction from
+ * becoming a silent alias.
+ */
+#define S5L8900_SRAM_BASE   0x22000000u   /* SRAM / AMC window, size 0x2c000 */
+#define S5L8900_SRAM_SIZE   0x0002c000u
+#define S5L8900_VROM_BASE   0x20000000u   /* boot ROM                        */
+#define S5L8900_VROM_SIZE   0x00010000u
+#define S5L8900_EDRAM_BASE  0x18000000u
+#define S5L8900_EDRAM_SIZE  0x00140000u
 #define S5L8900_SDRAM_BASE  0x08000000u
+#define S5L8900_ARMIO_BASE  0x38000000u   /* /arm-io ranges parent           */
+#define S5L8900_ARMIO_SIZE  0x08000000u
 #define S5L8900_UART0_BASE  0x3cc00000u
 #define S5L8900_VIC0_BASE   0x38e00000u
 #define S5L8900_TIMER_BASE  0x3e200000u
@@ -195,8 +242,42 @@ bool s5l_timer_tick(s5l_timer_t *t, uint32_t ticks);
  * replaced with a real table reader once the layout is confirmed against a
  * genuine dump.
  */
-#define S5L8900_NOR_BASE 0x24000000u
-#define S5L8900_NOR_SIZE 0x00100000u   /* 1 MiB */
+/*
+ * WHERE THE NOR WINDOW IS, AND WHY IT MOVED.
+ *
+ * This aperture is OURS, not the SoC's. The shipped device tree does not map
+ * the NOR into the physical address space at all: it is an SPI slave under
+ * /arm-io/spi0 with a flash-relative 1 MiB space (see the memory-map block at
+ * the top of this header). We expose it as memory because that is the cheapest
+ * honest way to give a guest payload the read/program path an untethered
+ * jailbreak needs, without a full SPI protocol model.
+ *
+ * Because the address is ours, it has to be chosen so that it cannot collide
+ * with anything — and 0x24000000, the value this had until now, failed that.
+ * It sat inside the DRAM window we actually boot with (-R 512 gives DRAM
+ * 0x08000000..0x28000000), and since bus_read tested RAM first, every NOR read
+ * silently returned RAM-disk bytes. Nothing faulted and nothing logged.
+ * 0x24000000 also had no source: it appears in no shipped artifact — not in the
+ * device tree, not in firmware/llb.bin — and the commit that introduced it
+ * cited none.
+ *
+ * 0x28000000 is picked from evidence, and two independent lines land on it:
+ *
+ *   - it is the first physical byte the shipped device tree assigns to nothing:
+ *     /arm-io's second range covers phys 0x18000000..0x28000000 and its first
+ *     covers 0x38000000..0x40000000;
+ *   - it is the first byte above the largest DRAM the kernel can use. xnu-1357
+ *     arm_vm_init fixes virtual_avail at 0xe0000000, so with gVirtBase
+ *     0xc0000000 mem_size cannot exceed 512 MB, and DRAM cannot reach past
+ *     0x08000000 + 512 MB = 0x28000000.
+ *
+ * So no RAM aperture this machine will accept can reach it, and no device tree
+ * region claims it. Should either of those stop being true, s5l8900_init()
+ * refuses to build the machine rather than aliasing anything — see
+ * s5l8900_ram_conflict().
+ */
+#define S5L8900_NOR_BASE 0x28000000u
+#define S5L8900_NOR_SIZE 0x00100000u   /* 1 MiB — /arm-io/spi0/nor-flash ranges */
 #define S5L_NOR_MAX_IMAGES 16
 
 typedef struct {
@@ -566,19 +647,95 @@ typedef struct {
 
 /*
  * Declare a stub window. `name` must be a string literal or otherwise outlive
- * the machine. Returns false if the table is full or the window overlaps one
- * already declared — silently shadowing a real device would be worse than
- * refusing. Windows larger than S5L_STUB_REGS*4 are accepted; accesses beyond
- * that are counted in `oob` rather than stored, so the shortfall is visible.
+ * the machine. Returns false if the table is full, or if the window overlaps a
+ * modelled device, another stub, or RAM — silently shadowing, or being silently
+ * shadowed by, anything else on the bus would be worse than refusing. Windows
+ * larger than S5L_STUB_REGS*4 are accepted; accesses beyond that are counted in
+ * `oob` rather than stored, so the shortfall is visible.
  */
 bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
                       const char *name);
 
+/* ------------------------------------------------------- address routing ---
+ *
+ * THE ROUTING CONTRACT. There is exactly one rule, and it is enforced at
+ * construction rather than at every access:
+ *
+ *   RAM MAY NOT OVERLAP ANY WINDOW THIS MACHINE DECODES.
+ *
+ * s5l8900_init() refuses to build a machine whose RAM aperture would cover a
+ * device window, and s5l8900_add_stub() refuses a window that would land inside
+ * RAM. With that invariant held, "device wins" and "RAM wins" are the same
+ * routing, so bus_read()/bus_write() are free to keep RAM on the fast path —
+ * and a silent alias is not a bug that can be reintroduced, it is a machine
+ * that cannot be constructed.
+ *
+ * The alternative contracts were considered and rejected:
+ *
+ *   - Let devices win at access time. The guest is still told through the
+ *     device tree that it owns a contiguous DRAM bank, so the kernel would
+ *     allocate pages inside the device window and quietly corrupt itself. It
+ *     also costs a linear window scan on every RAM access.
+ *   - Clamp RAM to the aperture. bootkernel publishes mem_size in boot_args and
+ *     in /memory:reg from its OWN variable, so a clamp inside the machine just
+ *     moves the lie: the guest would use DRAM the machine does not have.
+ *
+ * WHAT THIS DOES NOT CLAIM. A DRAM window larger than the SoC's real aperture
+ * necessarily covers physical regions the S5L8900 has (edram, vrom, SRAM — see
+ * the memory-map block at the top of this header). We do not model those, so we
+ * do not decode them and nothing is shadowed. The day one of them becomes a
+ * device model it joins this list, and an oversized -R stops constructing.
+ */
+typedef struct {
+    uint32_t    base, size;
+    const char *name;                 /* string literal; never owned */
+} s5l_window_t;
+
+/* Enough for every fixed device window plus every stub. */
+#define S5L_WINDOW_MAX (S5L_STUB_MAX + 8u)
+
+/*
+ * Every window this machine decodes: the modelled devices first, then the
+ * declared stubs. Writes at most `max` entries and returns how many windows
+ * exist (which may exceed `max`, so a short buffer is detectable).
+ */
+unsigned s5l8900_windows(const s5l8900_t *m, s5l_window_t *out, unsigned max);
+
+/*
+ * The first device window a RAM aperture of [ram_base, ram_base+ram_size) would
+ * shadow, or NULL if there is none. Pure: it depends only on the fixed device
+ * map, so a caller can ask BEFORE building a machine (or before choosing -R).
+ * The returned pointer is into a static table and outlives any machine.
+ *
+ * Stub windows are not consulted here because no stub exists before init; stubs
+ * are checked against RAM as they are declared, by s5l8900_add_stub().
+ */
+const s5l_window_t *s5l8900_ram_conflict(uint32_t ram_base, uint32_t ram_size);
+
+/*
+ * Physical regions the S5L8900 itself decodes, as confirmed from the shipped
+ * device tree — INCLUDING the ones we do not model. Sets `*out` to a static
+ * table and returns its length. This exists so "does this RAM size cover
+ * something real?" is a question the core can answer with evidence, instead of
+ * a warning hardcoded in a tool.
+ */
+unsigned s5l8900_soc_regions(const s5l_window_t **out);
+
+/* True if [a, a+alen) and [b, b+blen) intersect. Zero-length ranges never do.
+ * 64-bit inside, so a range near the top of the space cannot wrap into a
+ * false negative. */
+bool s5l8900_overlaps(uint32_t a, uint32_t alen, uint32_t b, uint32_t blen);
+
 /* Advance the devices and refresh the CPU's interrupt lines. */
 void s5l8900_tick(s5l8900_t *m, uint32_t ticks);
 
-/* ram_base/ram_size define where RAM appears. Returns false on allocation
- * failure. Call s5l8900_free() when done. */
+/*
+ * ram_base/ram_size define where RAM appears. Returns false on allocation
+ * failure, or if the RAM aperture would shadow a device window — see the
+ * routing contract above and s5l8900_ram_conflict(), which a caller can use to
+ * find out WHICH window before (or instead of) calling this. Call
+ * s5l8900_free() when done.
+ */
 bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size);
 void s5l8900_free(s5l8900_t *m);
 

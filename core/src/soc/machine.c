@@ -12,6 +12,78 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ------------------------------------------------------- the window map ---
+ *
+ * Every window this machine decodes, in one place. It exists so that "is
+ * anything shadowed?" is a question with a single answer rather than a property
+ * that has to be re-derived from the if-chain in bus_read() every time someone
+ * changes the memory map — which is exactly how the NOR came to be unreachable
+ * at -R 512 without anyone noticing.
+ *
+ * NOR's size here is the constant rather than m->nor.size. They are always
+ * equal (s5l8900_init passes the constant), and using the constant is what lets
+ * s5l8900_ram_conflict() answer before a machine exists.
+ */
+static const s5l_window_t DEVICE_WINDOWS[] = {
+    { S5L8900_NOR_BASE,   S5L8900_NOR_SIZE,   "nor"   },
+    { S5L8900_CLCD_BASE,  S5L8900_DEV_SIZE,   "clcd"  },
+    { S5L8900_VIC0_BASE,  S5L8900_DEV_SIZE,   "vic0"  },
+    { S5L8900_VIC1_BASE,  S5L8900_DEV_SIZE,   "vic1"  },
+    { S5L8900_POWER_BASE, S5L8900_POWER_SIZE, "power" },
+    { S5L8900_UART0_BASE, S5L8900_DEV_SIZE,   "uart0" },
+    { S5L8900_TIMER_BASE, S5L8900_TIMER_SIZE, "timer" },
+};
+#define NDEVICE_WINDOWS (sizeof DEVICE_WINDOWS / sizeof DEVICE_WINDOWS[0])
+
+/*
+ * Physical regions the SoC has, from the shipped device tree. Modelled or not:
+ * the point of listing the unmodelled ones is that an oversized DRAM window
+ * covering them is a stated property of the configuration, not folklore. See
+ * the memory-map block at the top of soc.h for the derivation of each.
+ */
+static const s5l_window_t SOC_REGIONS[] = {
+    { S5L8900_SDRAM_BASE, 0x08000000u,        "dram (128 MB fitted)" },
+    { S5L8900_EDRAM_BASE, S5L8900_EDRAM_SIZE, "edram"                },
+    { S5L8900_VROM_BASE,  S5L8900_VROM_SIZE,  "vrom"                 },
+    { S5L8900_SRAM_BASE,  S5L8900_SRAM_SIZE,  "sram/amc"             },
+    { S5L8900_ARMIO_BASE, S5L8900_ARMIO_SIZE, "arm-io"               },
+};
+
+bool s5l8900_overlaps(uint32_t a, uint32_t alen, uint32_t b, uint32_t blen) {
+    /* 64-bit throughout: a window near the top of the space must not wrap its
+     * end below its base and read as disjoint from everything. */
+    uint64_t a0 = a, a1 = a0 + alen;
+    uint64_t b0 = b, b1 = b0 + blen;
+    if (!alen || !blen) return false;
+    return b0 < a1 && a0 < b1;
+}
+
+unsigned s5l8900_soc_regions(const s5l_window_t **out) {
+    if (out) *out = SOC_REGIONS;
+    return (unsigned)(sizeof SOC_REGIONS / sizeof SOC_REGIONS[0]);
+}
+
+const s5l_window_t *s5l8900_ram_conflict(uint32_t ram_base, uint32_t ram_size) {
+    for (unsigned i = 0; i < NDEVICE_WINDOWS; i++)
+        if (s5l8900_overlaps(ram_base, ram_size,
+                             DEVICE_WINDOWS[i].base, DEVICE_WINDOWS[i].size))
+            return &DEVICE_WINDOWS[i];
+    return NULL;
+}
+
+unsigned s5l8900_windows(const s5l8900_t *m, s5l_window_t *out, unsigned max) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < NDEVICE_WINDOWS; i++, n++)
+        if (out && n < max) out[n] = DEVICE_WINDOWS[i];
+    for (unsigned i = 0; i < m->stub_count; i++, n++)
+        if (out && n < max) {
+            out[n].base = m->stubs[i].base;
+            out[n].size = m->stubs[i].size;
+            out[n].name = m->stubs[i].name;
+        }
+    return n;
+}
+
 /*
  * Bounds checks are done in 64-bit deliberately. The guest controls every
  * address, so a 32-bit "(a - base) + len <= size" can be made to wrap: an
@@ -41,13 +113,21 @@ static inline bool in_timer(uint32_t a) {
 bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
                       const char *name) {
     if (m->stub_count >= S5L_STUB_MAX || !size) return false;
-    /* Refuse to shadow an existing window: a stub that quietly overlays a real
-     * device model would be far harder to notice than a rejected call. */
-    for (unsigned i = 0; i < m->stub_count; i++) {
-        uint64_t a0 = m->stubs[i].base, a1 = a0 + m->stubs[i].size;
-        uint64_t b0 = base,             b1 = b0 + size;
-        if (b0 < a1 && a0 < b1) return false;
-    }
+    /*
+     * Refuse to shadow, or be shadowed by, anything already on the bus: a
+     * modelled device, another stub, or RAM. A stub that quietly overlays a
+     * real device model would be far harder to notice than a rejected call —
+     * and a stub inside the RAM aperture would be unreachable, because RAM is
+     * on the fast path (see the routing contract in soc.h).
+     */
+    for (unsigned i = 0; i < NDEVICE_WINDOWS; i++)
+        if (s5l8900_overlaps(base, size,
+                             DEVICE_WINDOWS[i].base, DEVICE_WINDOWS[i].size))
+            return false;
+    for (unsigned i = 0; i < m->stub_count; i++)
+        if (s5l8900_overlaps(base, size, m->stubs[i].base, m->stubs[i].size))
+            return false;
+    if (s5l8900_overlaps(base, size, m->ram_base, m->ram_size)) return false;
     uint32_t nregs = (size + 3u) / 4u;
     uint32_t *regs = calloc(nregs, sizeof *regs);
     if (!regs) return false;
@@ -87,6 +167,17 @@ static void note_device(s5l8900_t *m, uint32_t addr, uint32_t val, bool is_write
     m->dev_count++;
 }
 
+/*
+ * RAM is tested first, and that is safe ONLY because s5l8900_init() has already
+ * refused to build a machine whose RAM aperture overlaps a device window (and
+ * s5l8900_add_stub() refuses a window inside RAM). Under that invariant "RAM
+ * first" and "device first" route identically, so the cheap test can go first.
+ *
+ * Do not relax the invariant and leave this ordering. It used to be the case
+ * that RAM won by accident rather than by proof, and at -R 512 the DRAM window
+ * reached 0x28000000 and swallowed the NOR: every NOR read returned RAM-disk
+ * bytes, no fault, no log, nothing to find.
+ */
 static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
     s5l8900_t *m = ctx;
 
@@ -211,6 +302,19 @@ static void w8 (void *c, uint32_t a, uint8_t  v) { bus_write(c, a, v, 1); }
 
 bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
     memset(m, 0, sizeof *m);
+
+    /*
+     * Refuse an aliasing configuration before allocating anything.
+     *
+     * This is the whole routing contract in three lines (soc.h explains why it
+     * lives here rather than in bus_read). A machine whose DRAM window covers a
+     * device window can only ever be one of two wrong things: a device that
+     * cannot be reached, or a hole in the DRAM bank the guest was promised.
+     * Neither is worth having, and both are invisible at run time, so the
+     * machine simply does not exist.
+     */
+    if (s5l8900_ram_conflict(ram_base, ram_size)) return false;
+
     m->ram = calloc(ram_size, 1);
     if (!m->ram) return false;
     m->ram_base = ram_base;

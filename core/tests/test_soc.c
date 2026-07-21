@@ -368,6 +368,210 @@ static void test_machine_declares_its_known_windows(void) {
     s5l8900_free(&m);
 }
 
+/* ------------------------------------------------- RAM vs device routing ---
+ *
+ * The bug these four tests exist for: at -R 512 the DRAM window
+ * 0x08000000..0x28000000 reached over the NOR, bus_read tested RAM first and
+ * returned before it ever consulted a device, so every NOR read came back as
+ * whatever byte of the RAM disk happened to live there. No fault, no log, no
+ * counter — and NOR is where an era-appropriate untether (24kpwn) has to
+ * persist, so "we boot fine at -R 512" and "NOR works" could not both be true.
+ */
+
+/*
+ * THE HEADLINE: at the geometry the real boot uses, a NOR read is NOR's bytes.
+ *
+ * "It read back what I programmed" is not on its own proof — RAM would do that
+ * too. What proves the read reached the flash MODEL is a flash-only behaviour:
+ * programming can clear bits but never set one back to 1. RAM would happily
+ * take 0xffffffff; NOR must refuse it and keep the old value.
+ */
+static void test_nor_reads_are_nor_at_the_boot_ram_size(void) {
+    /* Exactly what `bootkernel -R 512` builds: DRAM 0x08000000..0x28000000. */
+    const uint32_t base = S5L8900_SDRAM_BASE, size = 512u << 20;
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, base, size),
+          "the -R 512 geometry must still be constructible");
+    if (!m.ram) return;
+
+    /* Distinctive "RAM disk" bytes in the last word of DRAM, immediately below
+     * the NOR window: if routing ever slips by one window again, this is the
+     * value a NOR read would come back with. */
+    const uint32_t ramdisk = 0xa5a5a5a5u;
+    m.bus.write32(m.bus.ctx, base + size - 4u, ramdisk);
+    CHECK(m.bus.read32(m.bus.ctx, base + size - 4u) == ramdisk,
+          "the last word of DRAM must still be RAM");
+
+    /* Known bytes in the flash, laid down as a factory flasher would. */
+    const uint32_t flashed = 0x0f0f0f0fu;
+    s5l_nor_program(&m.nor, 0x40u, &flashed, 4);
+
+    uint32_t got = m.bus.read32(m.bus.ctx, S5L8900_NOR_BASE + 0x40u);
+    CHECK(got == flashed,
+          "NOR read at 0x%08x = %08x, expect %08x — it is being shadowed",
+          S5L8900_NOR_BASE + 0x40u, got, flashed);
+    CHECK(got != ramdisk, "the NOR read returned the RAM pattern");
+    CHECK(m.unmapped_reads == 0,
+          "the NOR window must be mapped, not counted unmapped (%llu)",
+          (unsigned long long)m.unmapped_reads);
+
+    /* The flash-only property. RAM cannot pass this. */
+    m.bus.write32(m.bus.ctx, S5L8900_NOR_BASE + 0x40u, 0xffffffffu);
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_NOR_BASE + 0x40u) == flashed,
+          "a 1-setting write was accepted: this window is RAM, not flash");
+
+    /* ...and clearing bits, the direction real programming goes, must work
+     * through the bus — this is the path a persisted payload takes. */
+    m.bus.write32(m.bus.ctx, S5L8900_NOR_BASE + 0x40u, 0x03030303u);
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_NOR_BASE + 0x40u) == 0x03030303u,
+          "programming through the bus did not take");
+
+    printf("  [-R 512] DRAM %08x..%08x, NOR@%08x reads %08x (RAM held %08x)\n",
+           base, base + size, S5L8900_NOR_BASE + 0x40u,
+           m.bus.read32(m.bus.ctx, S5L8900_NOR_BASE + 0x40u), ramdisk);
+    s5l8900_free(&m);
+}
+
+/*
+ * The general guard, stated as the invariant rather than as one special case:
+ * a machine that CONSTRUCTS never has RAM sitting on top of anything it
+ * decodes. Probing every window's own edge is what makes this general — add a
+ * device tomorrow and it is covered without touching this test.
+ */
+static void test_no_window_the_machine_decodes_is_shadowed_by_ram(void) {
+    s5l8900_t base_m;
+    CHECK(s5l8900_init(&base_m, 0, 1u << 20), "machine init failed");
+    s5l_window_t w[S5L_WINDOW_MAX];
+    unsigned nw = s5l8900_windows(&base_m, w, S5L_WINDOW_MAX);
+    CHECK(nw > 0 && nw <= S5L_WINDOW_MAX,
+          "window count %u is outside S5L_WINDOW_MAX", nw);
+    s5l8900_free(&base_m);
+
+    for (unsigned i = 0; i < nw && i < S5L_WINDOW_MAX; i++) {
+        /* A 8 KiB aperture straddling this window's first byte. Deliberately
+         * tiny: if the guard were broken the test must fail, not allocate a
+         * gigabyte. */
+        uint32_t rb = w[i].base - 0x1000u, rs = 0x2000u;
+        s5l8900_t t;
+        if (!s5l8900_init(&t, rb, rs)) {
+            /* Refused. That is a correct outcome, and it must be explicable. */
+            CHECK(s5l8900_ram_conflict(rb, rs) != NULL,
+                  "init refused RAM 0x%08x+0x%x but names no conflict", rb, rs);
+            continue;
+        }
+        /* Constructed. Then nothing it decodes may be under RAM — including
+         * the window we aimed at, which must therefore have been dropped. */
+        s5l_window_t got[S5L_WINDOW_MAX];
+        unsigned ng = s5l8900_windows(&t, got, S5L_WINDOW_MAX);
+        for (unsigned k = 0; k < ng && k < S5L_WINDOW_MAX; k++)
+            CHECK(!s5l8900_overlaps(got[k].base, got[k].size, t.ram_base, t.ram_size),
+                  "%s 0x%08x+0x%x is under RAM 0x%08x+0x%x",
+                  got[k].name, got[k].base, got[k].size, t.ram_base, t.ram_size);
+        /* A window that had to be dropped is never dropped silently. */
+        CHECK(ng == nw || t.stub_declare_failures > 0,
+              "a window vanished (%u -> %u) without being counted", nw, ng);
+        s5l8900_free(&t);
+    }
+
+    /* Adjacency is not overlap: RAM ending exactly at a window's base is fine,
+     * and is precisely the -R 512 case. */
+    s5l8900_t ok;
+    CHECK(s5l8900_init(&ok, S5L8900_NOR_BASE - 0x1000u, 0x1000u),
+          "RAM ending exactly at the NOR base must be allowed");
+    CHECK(s5l8900_ram_conflict(S5L8900_NOR_BASE - 0x1000u, 0x1000u) == NULL,
+          "abutting RAM must not be reported as a conflict");
+    s5l8900_free(&ok);
+
+    /* And one byte more must not be. */
+    CHECK(s5l8900_ram_conflict(S5L8900_NOR_BASE - 0x1000u, 0x1001u) != NULL,
+          "RAM overlapping the NOR by one byte must be a conflict");
+    s5l8900_t bad;
+    CHECK(!s5l8900_init(&bad, S5L8900_SDRAM_BASE, 0x20100000u),
+          "a DRAM window that reaches into the NOR must be refused, not aliased");
+}
+
+/*
+ * Where the NOR window is allowed to be. Both bounds are evidence, not taste:
+ *
+ *   - it must sit above the largest DRAM the guest kernel can use. xnu-1357's
+ *     arm_vm_init fixes virtual_avail at 0xe0000000, so with gVirtBase
+ *     0xc0000000 mem_size tops out at 512 MB and DRAM cannot pass
+ *     0x08000000 + 512 MB = 0x28000000;
+ *   - it must sit below arm-io at 0x38000000, which /arm-io's ranges claim
+ *     wholesale, and outside 0x18000000..0x28000000, the SoC's other claimed
+ *     window (edram, vrom, sram/amc live in it).
+ *
+ * 0x24000000 satisfied neither: it was inside the DRAM we boot with, and inside
+ * a range the device tree assigns to the SoC.
+ */
+static void test_the_nor_window_is_out_of_every_drams_reach(void) {
+    const uint32_t max_dram_end = S5L8900_SDRAM_BASE + (512u << 20);
+    CHECK(S5L8900_NOR_BASE >= max_dram_end,
+          "NOR base 0x%08x is inside the largest usable DRAM (ends 0x%08x)",
+          S5L8900_NOR_BASE, max_dram_end);
+    CHECK((uint64_t)S5L8900_NOR_BASE + S5L8900_NOR_SIZE <= S5L8900_ARMIO_BASE,
+          "the NOR window runs into arm-io at 0x%08x", S5L8900_ARMIO_BASE);
+    CHECK(s5l8900_ram_conflict(S5L8900_SDRAM_BASE, 512u << 20) == NULL,
+          "the -R 512 DRAM window must conflict with nothing");
+    /* The value it used to have, pinned as a regression rather than a memory. */
+    CHECK(s5l8900_ram_conflict(S5L8900_SDRAM_BASE, 512u << 20) == NULL &&
+          0x24000000u < max_dram_end,
+          "0x24000000 was inside the -R 512 DRAM window; that is why it moved");
+}
+
+/*
+ * The SoC's own regions, as the shipped device tree gives them. This is the map
+ * the routing contract is argued from, so it is worth pinning: /arm-io ranges
+ * are (child, parent, size) {0,0x38000000,0x08000000} and
+ * {0x10000000,0x18000000,0x10000000}, and the second is anchored twice — vrom's
+ * reg 0x18000000 lands on 0x20000000 (the known S5L8900 boot-ROM address) and
+ * amc's second reg 0x1a000000 lands on 0x22000000, which is also the link
+ * address carried inside firmware/llb.bin.
+ */
+static void test_soc_regions_match_the_device_tree(void) {
+    const s5l_window_t *r = NULL;
+    unsigned n = s5l8900_soc_regions(&r);
+    CHECK(n > 0 && r != NULL, "the SoC region table must not be empty");
+
+    CHECK(S5L8900_ARMIO_BASE == 0x38000000u && S5L8900_ARMIO_SIZE == 0x08000000u,
+          "arm-io = ranges triple 1's parent+size");
+    CHECK(S5L8900_VROM_BASE == 0x20000000u,
+          "vrom reg 0x18000000 over ranges triple 2 (+0x08000000) = 0x20000000");
+    CHECK(S5L8900_SRAM_BASE == 0x22000000u && S5L8900_SRAM_SIZE == 0x0002c000u,
+          "amc reg[1] {0x1a000000,0x2c000} over the same range = 0x22000000");
+    CHECK(S5L8900_EDRAM_BASE == 0x18000000u,
+          "edram reg 0x10000000 over the same range = 0x18000000");
+    CHECK(S5L8900_SDRAM_BASE == 0x08000000u, "DRAM base");
+
+    /* No region may overlap another, or the derivation is wrong somewhere. */
+    for (unsigned i = 0; i < n; i++)
+        for (unsigned k = i + 1; k < n; k++)
+            CHECK(!s5l8900_overlaps(r[i].base, r[i].size, r[k].base, r[k].size),
+                  "SoC regions %s and %s overlap", r[i].name, r[k].name);
+
+    /*
+     * Said out loud, because it is the honest limit of what we claim: the SoC
+     * decodes edram at 0x18000000, so no DRAM above 256 MB can be physically
+     * real on this part. We allow bigger anyway — a RAM-disk root does not fit
+     * otherwise — and an oversized window therefore covers regions the hardware
+     * has. That is not a silent alias: we do not model those regions, so we
+     * decode nothing there, and the moment one of them becomes a device model
+     * it joins DEVICE_WINDOWS and an oversized -R stops constructing.
+     */
+    unsigned covered = 0;
+    for (unsigned i = 0; i < n; i++)
+        if (r[i].base > S5L8900_SDRAM_BASE &&
+            s5l8900_overlaps(S5L8900_SDRAM_BASE, 512u << 20, r[i].base, r[i].size))
+            covered++;
+    CHECK(covered == 3,
+          "expected the -R 512 window to cover edram, vrom and sram/amc, got %u",
+          covered);
+    printf("  [map] DRAM 0x%08x, edram 0x%08x, vrom 0x%08x, sram 0x%08x, "
+           "arm-io 0x%08x, NOR (ours) 0x%08x\n",
+           S5L8900_SDRAM_BASE, S5L8900_EDRAM_BASE, S5L8900_VROM_BASE,
+           S5L8900_SRAM_BASE, S5L8900_ARMIO_BASE, S5L8900_NOR_BASE);
+}
+
 /*
  * S5L8900_GPIO_BASE was 0x3cf00000 — the S5L8720-era address. The device tree
  * says /arm-io/gpio is reg {0x6400000,0x1000} over ranges child+0x38000000,
@@ -897,6 +1101,10 @@ int main(void) {
     test_bare_metal_uart_hello();
     test_stub_window_stores_and_counts();
     test_machine_declares_its_known_windows();
+    test_nor_reads_are_nor_at_the_boot_ram_size();
+    test_no_window_the_machine_decodes_is_shadowed_by_ram();
+    test_the_nor_window_is_out_of_every_drams_reach();
+    test_soc_regions_match_the_device_tree();
     test_gpio_base_is_the_s5l8900_address();
     test_power_gate_state_tracks_onctrl_offctrl();
     test_vic_vectaddr_reports_tagged_source();
