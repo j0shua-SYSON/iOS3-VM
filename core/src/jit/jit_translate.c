@@ -1137,11 +1137,13 @@ static void emit_thumb_bx(jit_t *t, uint16_t insn) {
      * word-aligned ARM address. ARM1176 defines this BX/BLX case as
      * UNPREDICTABLE, and the interpreter deliberately traps it. Test before
      * changing LR or CPSR.T; on that rare path return to the current guest PC
-     * so the dispatcher can replay the instruction in the interpreter. */
+     * so the dispatcher can replay the instruction in the interpreter. AND,
+     * EOR and CBNZ are deliberately flag-neutral: using SUBS+B.NE here would
+     * corrupt guest NZCV on both the fast path and the fallback path. */
     a64_and_imm(e, A64_W, JIT_HOST_S2, wsv, 3u);
-    a64_subs_imm(e, A64_W, A64_ZR, JIT_HOST_S2, 2u, false);
+    a64_eor_imm(e, A64_W, JIT_HOST_S2, JIT_HOST_S2, 2u);
     valid_target = e->n;
-    a64_bcond(e, A64_NE, 0);
+    a64_cbnz(e, A64_W, JIT_HOST_S2, 0);
     emit_exit(t, t->pc, JIT_EXIT_INTERPRET, t->index);
     a64_bind(e, valid_target);
 

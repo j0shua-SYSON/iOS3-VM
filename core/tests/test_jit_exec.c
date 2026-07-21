@@ -495,8 +495,8 @@ static void test_thumb_blocks_match_the_interpreter(void) {
     /* ---- the state boundary ---- */
     { uint16_t p[] = { 0x4700 };
       lockstep16("thumb bx r0 (odd target: stays Thumb)", p, 1); }
-    { uint16_t p[] = { 0x4708 };
-      lockstep16("thumb bx r1 (even target: returns to ARM)", p, 1); }
+    { uint16_t p[] = { 0x4718 };
+      lockstep16("thumb bx r3 (word-aligned target: returns to ARM)", p, 1); }
     { uint16_t p[] = { 0x4780 };
       lockstep16("thumb blx r0 (writes lr with the Thumb bit)", p, 1); }
     { uint16_t p[] = { 0x4778 };
