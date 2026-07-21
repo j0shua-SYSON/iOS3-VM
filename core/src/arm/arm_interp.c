@@ -1314,7 +1314,13 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
             uint32_t sv = (rs == 15) ? pc4 : c->r[rs];
             switch ((insn >> 8) & 3u) {
                 case 0:                                        /* ADD */
-                    if (rd == 15) *next = ((c->r[15] + sv) & ~1u);
+                    /* Reading R15 in Thumb state yields the instruction's
+                     * address + 4 (A6.1.2), which is what pc4 holds. r[15] is
+                     * still the raw instruction address here — arm_step does
+                     * not write it until after this returns — so using it
+                     * branches four bytes short. The sibling CMP and MOV cases
+                     * below already use pc4/sv correctly; this one did not. */
+                    if (rd == 15) *next = ((pc4 + sv) & ~1u);
                     else c->r[rd] += sv;
                     return ARM_OK;
                 case 1: alu_sub(c, (rd == 15) ? pc4 : c->r[rd], sv, 1, true); return ARM_OK; /* CMP */

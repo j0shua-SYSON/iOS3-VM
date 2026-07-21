@@ -347,7 +347,16 @@ static float f32_do(fop_t op, float a, float b, uint32_t fpscr, uint32_t *exc) {
         case OP_SUB: r = x - y;    break;
         case OP_MUL: r = x * y;    break;
         case OP_DIV: r = x / y;    break;
-        default:     r = sqrtf(x); break;
+        default:
+            /* VSQRT of a negative operand other than -0 is an Invalid
+             * Operation: IOC must be set and the result is the Default
+             * NaN. The host's sqrt does not reliably raise FE_INVALID
+             * for this, so raise it explicitly rather than depending on
+             * a libm detail. -0 and NaN both compare false here, which
+             * is correct: sqrt(-0) is -0 and quiet NaNs propagate.  */
+            if (x < 0.0f) e |= ARM_FPSCR_IOC;
+            r = sqrtf(x);
+            break;
     }
     vr = r;
     e |= host_exceptions();
@@ -371,7 +380,16 @@ static double f64_do(fop_t op, double a, double b, uint32_t fpscr, uint32_t *exc
         case OP_SUB: r = x - y;   break;
         case OP_MUL: r = x * y;   break;
         case OP_DIV: r = x / y;   break;
-        default:     r = sqrt(x); break;
+        default:
+            /* VSQRT of a negative operand other than -0 is an Invalid
+             * Operation: IOC must be set and the result is the Default
+             * NaN. The host's sqrt does not reliably raise FE_INVALID
+             * for this, so raise it explicitly rather than depending on
+             * a libm detail. -0 and NaN both compare false here, which
+             * is correct: sqrt(-0) is -0 and quiet NaNs propagate.  */
+            if (x < 0.0) e |= ARM_FPSCR_IOC;
+            r = sqrt(x);
+            break;
     }
     vr = r;
     e |= host_exceptions();
