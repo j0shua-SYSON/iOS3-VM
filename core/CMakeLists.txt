@@ -338,6 +338,15 @@ target_link_libraries(bootkernel PRIVATE
     emucore host_file_block host_guest_patch host_ios3_kernel_patch
     host_rootfs_work)
 
+# Public CI cannot contain Apple's firmware, but it can still exercise the
+# external-md parser's fail-closed boundary before any file is opened. These
+# cases protect the combinations that would otherwise mix incompatible storage
+# or checkpoint ownership models.
+add_test(NAME external_md_cli_preflight
+    COMMAND ${CMAKE_COMMAND}
+            -DBOOTKERNEL=$<TARGET_FILE:bootkernel>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_bootkernel_external_md.cmake)
+
 # snapboot is the snapshot acceptance harness: it boots to a checkpoint, saves,
 # and can restore into a fresh process. Comparing snapshot bytes alone is not
 # enough — a field the format never stores is absent from both sides and

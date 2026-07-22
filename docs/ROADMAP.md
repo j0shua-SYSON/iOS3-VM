@@ -28,7 +28,7 @@ proof that no private or unindexed implementation exists.
 | **M2** | SoC bring-up | A bare-metal payload prints over the emulated UART; a timer IRQ is taken and returned from | ✅ done and covered by host tests |
 | **M3** | Firmware containers + LLB execution | Real IMG3s parse and decrypt; an extracted real Apple LLB payload executes; the kernelcache is extracted | ✅ done; SecureROM/iBoot execution remains future full-chain work |
 | **M4** | XNU boots and logs | The kernel reaches `bsd_init`, prints, and Apple's own kexts match and start | ✅ **done** — plus the real root filesystem mounts |
-| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress — the current checkpoint chain reached a clean 2.98 B cap.** The former ARMv6 `UXTB16` stop is implemented and replay-cleared; a 2.97 B checkpoint was written with no guest panic or emulator undefined stop. No SpringBoard frame or tap has been demonstrated. The app is still a demo host. |
+| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress — the latest measured direct-RAM checkpoint chain reached a clean 2.98 B cap.** The former ARMv6 `UXTB16` stop is implemented and replay-cleared; a 2.97 B checkpoint was written with no guest panic or emulator undefined stop. No SpringBoard frame or tap has been demonstrated. The app is still a demo host. |
 | **D** | Dynarec (parallel) | SpringBoard at interactive frame rates on the phone | 🔵 emitter + ARM/Thumb translator and host execution tests exist (off by default); no code cache or dispatcher calls them |
 | **N** | Guest networking (parallel) | The guest resolves a name and fetches a URL | ⚪ designed, not built |
 | **A** | Guest audio (first-device track) | Guest PCM reaches the host speaker without blocking the CPU thread | ⚪ priority, not designed or built |
@@ -38,10 +38,10 @@ sanitizer jobs, and executes emitted JIT blocks on the arm64 macOS runners. The
 iOS workflow proves compile, link, fake-sign and packaging only; it is not an
 on-device runtime or real-firmware boot test. Exact assertion totals change with
 the suite and optional private firmware, so the workflow log is authoritative.
-At `9c20483`, `ios-build` run
-[`29840841480`](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29840841480)
+At `3c72a15`, `ios-build` run
+[`29885128804`](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29885128804)
 and `core-tests` run
-[`29840840205`](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29840840205)
+[`29885128937`](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29885128937)
 both completed successfully.
 
 ---
@@ -499,8 +499,9 @@ the pool fell from 317 pages at 2.9 B to a low of 97 pages at instruction
 2,934,505,472, recovered to 253 pages at the former opcode stop, and ended at
 214 pages at 2.98 B, against a target of 250. The
 roughly 445 MiB pinned RAM disk remains a severe device-memory constraint, and
-the completed audit's writable md bulk-copy design remains a prerequisite before
-app integration or substantially longer replays.
+the completed audit's writable md bulk-copy design is now integrated as a
+guarded cold-boot mode. It still needs a fresh real-firmware trace before its
+expected memory recovery or further boot progress can be claimed.
 
 For chronology, this is the much earlier pre-VFP measurement from
 `bootkernel`'s milestone probes:
@@ -631,13 +632,20 @@ still runs only a synthetic guest and has no touch or audio path.
   fixed DRAM direct-map delta. The portable bounded writable-block API, locked
   descriptor file adapter, privileged-only transactional SVC seam, and the
   writable range- and page-gated md-strategy bulk-copy bridge are now
-  implemented and tested. Kernel LC_UUID parsing plus a bounded atomic
-  expected-byte patch manifest provide the fail-closed identity gate. They are
-  not yet wired into `bootkernel`, so md0 is still in guest RAM. Work-image
-  provisioning and snapshot identity/overlay state are the next integration;
-  global `_bcopy_phys` replacement is forbidden.
+  implemented and tested. An exact 7E18 manifest gates the complete decrypted
+  kernel image, parsed ARMv6 Mach-O layout, fixed mapping, four expected patch
+  sites and untouched raw-path watcher before an atomic write. A bounded generic
+  work-image provisioner now copies the immutable HFS source, validates reserved
+  and allocation metadata, rewrites the unique stock fstab, grows/revalidates,
+  flushes and publishes without replacement. `bootkernel --external-md` now
+  exact-gates the supported kernel, device tree, and rootfs; publishes the md0
+  media token outside fixed 128 MiB DRAM; and installs the bridge after setup.
+  This is
+  implemented and reviewed, not yet a measured real boot. Snapshot backing
+  identity/overlay state follows, and global `_bcopy_phys` replacement remains
+  forbidden.
   The raw `/dev/rmd0` path instead reaches `_uiomove64`/`_copypv`, so it must be
-  separately instrumented and fail closed until bridged. Historical
+  separately bridged; current external mode stops before its entry. Historical
   older-source experiments reported 312 MiB and
   248 MiB pools with `-R 768 -Y`, but neither reached `_load_init_program` and
   current source correctly rejects both configurations because their RAM

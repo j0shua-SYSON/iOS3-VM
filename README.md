@@ -20,9 +20,12 @@
 
 > **Target versus current build:** the portable core and the `bootkernel` CLI
 > have run Apple's real kernel, root filesystem, `launchd`, and a live
-> `mDNSResponder`. The CLI now streams the root filesystem directly into its
-> checked final guest-RAM range instead of retaining a second image-sized host
-> buffer. The installable iOS app does **not** run that path yet: it runs a small
+> `mDNSResponder`. A new cold-boot mode exact-gates the 7E18 kernel, device tree,
+> and rootfs, then serves a create-only writable work image from the host instead
+> of pinning roughly 445 MiB in guest RAM. Its components, CLI preflight, and
+> negative paths are tested, but the integrated path has not yet produced a
+> fresh real-firmware boot trace. The installable iOS app
+> does **not** run it yet: it runs a small
 > synthetic ARM guest to exercise the CPU, UART and framebuffer bridge. The app
 > currently uses CoreGraphics, with no touch, audio, guest networking or active
 > JIT. Moving the bounded CLI path into a shared real-guest session remains the
@@ -54,7 +57,7 @@ core portable across hosts. Today the evidence is split deliberately:
 | Capability | CLI / portable core | Installable iOS app |
 |---|---|---|
 | ARM1176 and S5L8900 execution | Real-kernel path recorded | Synthetic demo guest |
-| Apple kernel and root filesystem | Historical private-firmware run | Not integrated |
+| Apple kernel and root filesystem | Historical private-firmware run; host-backed cold path implemented, real run pending | Not integrated |
 | Display | Kernel console and CLCD capture | CoreGraphics demo bridge |
 | Touch, audio, guest networking | Not implemented | Not implemented |
 | Dynamic recompiler | Translator tested off-device; inactive in boot | Excluded from target |
@@ -71,10 +74,10 @@ can see.** No months in the dark.
 | **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, CLCD and NOR are integrated; standalone raw-NAND/storage primitives are host-tested, with no NAND controller/VFL/FTL |
 | **M3** | Firmware containers + LLB execution | ✅ **done** — parses/decrypts real IMG3 firmware, runs a real LLB payload and extracts the kernel; SecureROM and iBoot execution remain future full-chain work |
 | **M4** | The real **XNU kernel** boots and logs | ✅ **done** — a broad set of prelinked drivers matched or started in a recorded CLI run; the real 413 MiB root filesystem mounted, and that run did not reach `_panic` |
-| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** A current checkpoint chain reached the configured 2.98-billion retired-instruction cap without a guest panic or emulator undefined stop and wrote a 2.97 B checkpoint. The 2.4–2.8 B interval recorded `systemShutdown false`; the 2.85–2.98 B interval recorded two `_load_machfile` hits. No SpringBoard frame or touch path has been demonstrated; the iOS app remains a demo host. |
+| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** The latest measured direct-RAM checkpoint chain reached the configured 2.98-billion retired-instruction cap without a guest panic or emulator undefined stop and wrote a 2.97 B checkpoint. The 2.4–2.8 B interval recorded `systemShutdown false`; the 2.85–2.98 B interval recorded two `_load_machfile` hits. No SpringBoard frame or touch path has been demonstrated; the iOS app remains a demo host. |
 
-At `9c20483`, hosted [`ios-build` run 29840841480](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29840841480)
-and [`core-tests` run 29840840205](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29840840205)
+At `3c72a15`, hosted [`ios-build` run 29885128804](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29885128804)
+and [`core-tests` run 29885128937](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29885128937)
 both completed successfully. Those runs verify build, package and public tests;
 they do not contain private firmware or prove a SpringBoard boot.
 
@@ -115,7 +118,8 @@ the CPU without inventing retired instructions, and the full related ARMv5TE
 signed-DSP multiply set is implemented: `SMULxy`, `SMLAxy`, `SMLALxy`, `SMULWy`,
 and `SMLAWy`.
 
-The current checkpoint chain first restored the real guest at **2.2 billion**
+The latest measured direct-RAM checkpoint chain first restored the real guest at
+**2.2 billion**
 retired instructions, crossed the former user-mode stop at `0xe1630381`
 (`SMULBB r3, r1, r3`), wrote a **2.4-billion** checkpoint, and reached 2.45 B
 with `launchd` and `mDNSResponder` alive. A restore at 2.4 B then reached 2.8 B
@@ -145,14 +149,21 @@ physical-mode flag: this kernel's `_bcopy_phys` only understands the normal
 DRAM direct map. The portable exact-I/O block API, a descriptor-backed writable
 file adapter, a privileged-only fail-closed SVC seam, and the exact-site md
 bulk-copy bridge now exist and are host-tested. Mach-O UUID parsing and an
-all-or-nothing expected-byte patch transaction gate the version-specific kernel
-edits. Backend errors halt without falsely retiring the trapping instruction,
-and a failed read never publishes a partial buffer into guest RAM. These are
-still foundations, not a mounted external disk: `bootkernel` does not yet create
-or retain the writable work image, install the bridge, or free md0 from guest
-RAM. The separate raw `/dev/rmd0` path and snapshot-coupled immutable
-backing/overlay generations also remain explicit fail-closed work. That is the
-current major device-memory prerequisite.
+all-or-nothing expected-byte patch transaction underpin an exact 7E18 manifest
+that checks the complete decrypted kernel image and parsed layout, fixed RAM
+mapping, four patch sites, and the untouched raw-I/O watcher before changing
+guest RAM. A bounded rootfs provisioner now copies an immutable source into an
+unpublished work image, validates the supported HFS+/HFSX layout, rewrites the
+unique stock fstab, grows and revalidates the volume, flushes it, and publishes
+without replacement. `bootkernel --external-md` now exact-gates the complete
+7E18 kernel, device tree, and immutable rootfs before creating that work image;
+it publishes a synthetic md0 aperture outside DRAM and installs the privileged
+bulk-copy bridge. Backend errors halt without falsely retiring the trapping
+instruction, and a failed read never publishes a partial buffer into guest RAM.
+The separate raw `/dev/rmd0` path is stopped before execution, and this first
+slice deliberately rejects snapshots until backing identity and overlay state
+are serialized. This integration has not yet been exercised in a real guest, so
+recovered memory and further boot progress remain hypotheses awaiting a trace.
 
 That is sustained real userspace, not a completed boot. There is still no
 captured SpringBoard frame, no proof that the current userland reached the home
@@ -245,52 +256,89 @@ cmake --build build-jit --config Release
 ctest --test-dir build-jit -C Release --output-on-failure
 ```
 
-**Boot the kernel** once you have supplied firmware (see below):
+**Boot the kernel** once you have supplied firmware (see below). The recommended
+cold path keeps the immutable source unchanged and requires a work path that
+does not already exist:
 ```sh
+mkdir -p work
 build/core/bootkernel firmware/kernel.macho \
     -d firmware/devicetree.bin \
     -c "debug=0x8 serial=1 nand-enable-adm=0" \
-    -r firmware/rootfs.img -R 512 \
+    --external-md firmware/rootfs.img work/rootfs-7e18-run01.img \
+    -R 128 \
     -n 400000000
 ```
 
-`-R 512` is load-bearing rather than a preference: `arm_vm_init` hardcodes
+External-md mode accepts only the measured 7E18 kernel, 40,544-byte device tree,
+and 433,274,880-byte rootfs identities. It creates, flushes, and publishes the
+grown work image without replacement, then opens that image through a bounded
+host block adapter. With the default growth, that file is exactly 466,825,216
+bytes (445.199 MiB); budget at least 500 MiB plus log and filesystem headroom on
+the work volume. The parent directory must exist. It is cold-boot only. A raw
+`/dev/rmd0` access, storage failure, undefined instruction, guest
+`_panic`/`_Debugger` entry, or other guest halt exits nonzero. The published work
+image is deliberately preserved after such a failure, and the next invocation
+refuses to reuse its path: archive or remove it deliberately, or choose a new
+filename. Larger `--grow` values can take the file up to the 512 MiB volume
+ceiling. A cleanup warning means a second large temporary may also remain in the
+work directory and must be inspected before retrying.
+
+The source kernel, device tree, and rootfs remain byte-for-byte unchanged. Four
+firmware-specific patches are applied only to the loaded kernel copy, iBoot-style
+properties are edited only in the in-memory device-tree copy, and fstab/growth
+changes are made only in the separate work image.
+
+| Accepted input | Bytes | SHA-256 |
+|---|---:|---|
+| `firmware/kernel.macho` | 7,942,144 | `0d8cdb339d37cf37a1db2638fff79272ecd63a17764bf7666efa1618725df70c` |
+| `firmware/devicetree.bin` | 40,544 | `4867c95fedf544bda2ecaa2626ae14c01a60d7771dc53ffe6fd3a6aac8b8ba57` |
+| `firmware/rootfs.img` | 433,274,880 | `c3251e7f092c939d5818e92086cb47680981cfb03731de7b55d238c942eb5e82` |
+
+The historical direct-RAM mode remains available with
+`-r firmware/rootfs.img -R 512` for checkpoint replay. In that mode, `-R 512`
+is load-bearing rather than a preference: `arm_vm_init` hardcodes
 `virtual_avail = 0xe0000000`, so advertising more than 512 MiB of guest RAM makes
 the kernel's zone bootstrap fault at the documented virtual base. The current
 machine also rejects a larger aperture because SDRAM is exactly
 `[0x08000000, 0x28000000)` and NOR starts at `0x28000000`. Historical 768 MiB
 experiments are therefore not valid current recipes. `nand-enable-adm=0` keeps
-`AppleS5L8900XADMFMC` from panicking on a NAND controller we do not model. Two
-further workarounds (the IORTC wait, un-matching the MBX GPU driver) are applied
-automatically and printed in the run header, so they are never invisible.
+`AppleS5L8900XADMFMC` from panicking on a NAND controller we do not model. Three
+further workarounds are applied automatically and printed in the run header: the
+IORTC wait patch, the MBX GPU-node unmatch, and the SHA-1 accelerator-node
+unmatch. `-g` and `-S` deliberately re-enable the two known-broken hardware
+paths for diagnostics; external-md rejects `-K`, which would disable its exact
+kernel patch set.
 
-The large input path is host-memory bounded: `bootkernel` sizes and validates
-the complete guest layout first, allocates guest DRAM once, and streams the
-rootfs into its final range through the same retained source handle. It verifies
-the source metadata around the read and never mirrors the roughly 445 MiB grown
-RAM disk in a second host allocation.
+Both large-input paths are host-memory bounded. External-md provisioning hashes
+the exact bytes copied through a buffer of at most 1 MiB and performs every HFS
+edit on an unpublished temporary file. Direct-RAM mode sizes and validates the
+guest layout first, allocates guest DRAM once, and streams the rootfs into its
+final range through the same retained source handle.
 
-Two more are applied to the **loaded copy** of the RAM disk — `firmware/rootfs.img`
-itself is never written — and are likewise printed on every run. The guest's
+Two filesystem transformations are applied to the writable work image (or to the
+**loaded copy** in
+legacy `-r` mode); `firmware/rootfs.img` itself is never written. The guest's
 `/private/etc/fstab` is retargeted at `md0`, because the stock record names a
-`disk0` that only exists behind the undocumented NAND stack (`--keep-fstab` to
-watch launchd halt instead). And the volume is **grown** by `--grow` MB, default
-32: Apple sizes the system dmg exactly to its contents — `freeBlocks == 0` —
+`disk0` that only exists behind the undocumented NAND stack. Legacy direct-RAM
+mode alone accepts `--keep-fstab` to reproduce launchd's halt; external-md
+rejects it. The volume is **grown** by `--grow` MB, default 32: Apple sizes the
+system dmg exactly to its contents — `freeBlocks == 0` —
 because on hardware everything writable lives on `disk0s2`, which this machine
 does not have, so without this launchd and the daemons cannot create a single
-file. It comes out of the guest's free page pool 1:1; `-Y` (RAM disk below the
-kernel) recovered that space only in historical 768 MiB experiments that current
-source rejects for overlapping NOR. At the valid 512 MiB physical ceiling it is
-not a usable headroom recipe. `docs/BOOTLOG.md` has the numbers and the TN1150
-detail.
+file. In external-md mode growth enlarges only the host work file. In legacy
+`-r` mode it comes out of the guest's free page pool 1:1; `-Y` recovered that
+space only in historical 768 MiB experiments that current source rejects for
+overlapping NOR. At the valid 512 MiB physical ceiling it is not a usable
+headroom recipe. `docs/BOOTLOG.md` has the numbers and the TN1150 detail.
 
 ### The tools
 
 | | |
 |---|---|
 | `bootkernel` | boots the kernelcache and reports where it stopped: milestone probes, a sampled profile, every non-RAM page touched with the PC that touched it, abort sites, and the guest's console output |
+| `bootkernel --external-md <source> <new-work>` | exact-gate the supported 7E18 firmware set, create a writable rootfs work image, and cold-boot md0 through the guarded host block bridge without reserving the disk in guest DRAM; snapshots and raw-rmd access fail closed |
 | `bootkernel -L` | print the prelinked kext load map and exit without booting |
-| `bootkernel --snapshot-at <insn> <file>` / `--restore <file>` | save and resume the currently modelled machine. The current chain restored at 2.2, 2.4, 2.7 and 2.85 B, wrote checkpoints at 2.4, 2.7, 2.85 and 2.97 B, and reached a clean 2.98 B cap after clearing the `UXTB16` stop; older timing numbers are host/commit-specific |
+| `bootkernel --snapshot-at <insn> <file>` / `--restore <file>` | save and resume the currently modelled machine. Instruction positions and diagnostics are 64-bit and absolute across restore; unreachable, missed, malformed and incompatible checkpoint requests fail nonzero instead of silently omitting output. The current chain restored at 2.2, 2.4, 2.7 and 2.85 B, wrote checkpoints at 2.4, 2.7, 2.85 and 2.97 B, and reached a clean 2.98 B cap after clearing the `UXTB16` stop; older timing numbers are host/commit-specific |
 | `snapboot` | the snapshot acceptance harness — also prints a machine-derived report, because comparing two snapshot files alone lets a field the format never stores cancel out on both sides |
 | `machoinfo <kernel> -k` / `-r <addr>` | dump the kext load map, or resolve one address to a kernel symbol or `<bundle-id>+0xNNNN` |
 | `img3dump`, `unlzss`, `runfw` | firmware container, compression, and bare-payload tools |
@@ -309,8 +357,9 @@ Developer account is used by the workflow.
 3.1.3 IPSW-derived files and documented decryption keys in the repository's
 git-ignored `firmware/` directory — see [`docs/BOOT_CHAIN.md`](docs/BOOT_CHAIN.md).
 Reaching the root mount additionally needs the IPSW's root DMG decrypted with
-the published RootFS key; `bootkernel` loads that HFSX volume as a RAM disk
-(`-r`). The IPA has no firmware importer or real-guest session yet, so these
+the published RootFS key; `--external-md` uses it as an immutable source, while
+legacy `-r` loads it into guest DRAM. The IPA has no firmware importer or
+real-guest session yet, so these
 instructions do not currently make the app boot the OS. No Apple firmware is
 committed or bundled.
 

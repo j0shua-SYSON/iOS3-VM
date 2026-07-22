@@ -866,10 +866,16 @@ active, but the available headroom is still unsafe for the app. The storage
 audit also proved that setting md physical mode and adding an external bus
 aperture is insufficient: this kernel's `_bcopy_phys` only applies the normal
 DRAM direct-map delta. The narrowly scoped writable md-strategy bridge, its
-locked file adapter, and the UUID-gated atomic patch helper now exist under unit
-tests, but `bootkernel` has not installed them in a real run yet. Work-image
-provisioning, raw `/dev/rmd0` fail-closed handling, and snapshot backing identity
-and overlay state remain; full NAND is the higher-fidelity, much larger route.
+locked file adapter, an exact full-image/ARMv6/LC_UUID/site-gated 7E18 patch
+manifest, and a bounded immutable-source HFS work-image provisioner now exist
+under unit tests. `bootkernel --external-md` now installs the cold-boot chain:
+it exact-gates the original kernel, device tree, and rootfs; creates a no-replace
+writable work image; publishes md0 through a synthetic address outside the
+128 MiB DRAM aperture; and installs only the two audited strategy-copy exits.
+The implementation is reviewed and build-tested, but no new real-firmware trace
+has exercised it yet. Raw `/dev/rmd0` stops before execution, while snapshot
+backing identity/overlay state remains future work; full NAND is the
+higher-fidelity, much larger route.
 
 This chain is stronger evidence for sustained userspace and snapshot
 repeatability. It is **not** evidence that SpringBoard rendered: the runs used

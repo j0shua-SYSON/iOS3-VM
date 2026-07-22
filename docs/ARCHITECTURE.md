@@ -118,19 +118,20 @@ touch, audio or networking can form an on-device vertical slice, that
 orchestration must become a shared, portable guest-session API with bounded
 scratch memory and random-access firmware input. The portable `vm_source`
 boundary now provides exact ranged reads, short-read/retry handling and
-cancellation, while `bootkernel` already sizes the layout and streams the RAM
-disk directly into final guest memory. The shared app session must adopt those
-pieces rather than duplicating a roughly 445 MiB image beside 512 MiB of guest
-RAM.
+cancellation. Legacy checkpoint replay streams the RAM disk directly into final
+guest memory, but the shared app session should adopt the guarded external block
+backend and fixed 128 MiB geometry instead of pinning a roughly 445 MiB disk in
+guest RAM.
 
 Direct streaming fixes host duplication, but it does not fix the guest physical
 layout: the entire grown RAM disk remains pinned below `topOfKernelData`. Free
 pages fell to 542 at 2.8 B and 317 at 2.9 B, then reached a low of 97 before
 recovering to 253 and ending at 214 at the clean 2.98 B cap; the guest target
 is 250. The movement suggests guest reclamation is active, but the
-headroom remains unsafe for an iOS host. The selected storage bridge must recover
-guest memory without baking a desktop file API into the core. The old `UXTB16` stop
-is now replay-cleared by a complete paired-extend implementation.
+headroom remains unsafe for an iOS host. The selected external storage bridge is
+integrated without baking a desktop file API into the core; its expected memory
+recovery remains unmeasured until the first real cold-boot trace. The old
+`UXTB16` stop is now replay-cleared by a complete paired-extend implementation.
 
 The audited near-term storage design retains the proven md0/HFS path but moves
 its writable bytes behind a portable block backend. The core now has exact
@@ -143,20 +144,32 @@ guest SVCs, and backend errors restore CPU state and halt without incrementing
 the retired-instruction counter. The exact-site md bridge stages reads before
 publishing them to RAM, bounds each operation to one 4 KiB page, and preserves
 the audited register file. LC_UUID parsing and an atomic expected-byte patch
-manifest gate the firmware-specific edits. None of this is wired to md0 yet.
+manifest gate the firmware-specific edits. The concrete 7E18 manifest also
+checks the complete decrypted image and parsed Mach-O layout, fixed mapping, all
+expected patch bytes, loaded zero-fill tails, and the untouched raw-path watcher
+before changing RAM. `bootkernel --external-md` wires this seam into a fixed
+128 MiB cold-boot configuration. It exact-gates the original device tree and
+rootfs too, provisions a create-only work image, publishes a synthetic media
+token outside DRAM, and installs the bridge only after setup succeeds.
 
-The boot integration uses three exact, kernel-identity-gated 7E18 patches to
-select md physical mode and replace only md strategy's two `_bcopy_phys` calls
-with privileged, range-gated bulk-copy exits. A plain
-external physical aperture is not sufficient because this kernel's
+The boot integration uses four exact, kernel-identity-gated 7E18 patches: one
+removes the unmodelled IORTC wait, one selects md physical mode, and two replace
+only md strategy's `_bcopy_phys` calls with privileged, range-gated bulk-copy
+exits. A plain external physical aperture is not sufficient because this kernel's
 `_bcopy_phys` converts both operands through the fixed DRAM direct-map delta and
-calls ordinary `_bcopy`; it never reaches the emulator bus. The portable layer
-still needs a host adapter, immutable source plus generational COW, and snapshot
-coupling to backing identity and overlay generation. Backend failure pauses the
-VM visibly; it must never be converted to zero-filled successful I/O.
+calls ordinary `_bcopy`; it never reaches the emulator bus. The host-side
+provisioner now creates a bounded full work image from an immutable source,
+validates the narrowly supported HFS+/HFSX layout, performs the fstab/growth
+transaction on an unpublished temporary, flushes it and publishes without
+replacement. The generic provisioner does not authenticate firmware, so
+`bootkernel` exact-gates the known 7E18 rootfs before calling it and additionally
+authenticates the kernel and device tree. Snapshot coupling to backing identity
+and overlay generation remains future work after the first cold-boot slice.
+Backend failure pauses the VM visibly; it must never be converted to zero-filled
+successful I/O.
 `/dev/rmd0` is a separate raw-character path through `_uiomove64`/`_copypv`, not
-one of the two strategy calls, so host-md mode must instrument and refuse that
-path until it has its own proven bridge. Merely setting fstab's pass number to
+one of the two strategy calls, so host-md mode stops before executing its entry
+until it has its own proven bridge. Merely setting fstab's pass number to
 zero can be a labelled boot diagnostic, not a claim of raw-I/O or crash-recovery
 support. A future IOMedia device or full NAND/VFL/FTL model can replace this
 compatibility seam without changing the block/session API.
@@ -169,13 +182,15 @@ The CPU thread remains the sole owner of machine state. UIKit, AVFAudio,
 
 ## Memory map and idle-time invariants
 
-The current enlarged boot configuration models 512 MiB of SDRAM at
+The historical direct-RAM configuration models 512 MiB of SDRAM at
 `[0x08000000, 0x28000000)`. NOR begins at `0x28000000`, so those half-open ranges
-meet exactly and do not overlap. Machine initialization rejects a larger RAM
-aperture; older `-R 768` measurements are retained only as history. The loader
-also proves the kernel, device tree, boot arguments, RAM disk and optional
-framebuffer ranges are contained and pairwise disjoint before streaming a byte
-of the rootfs.
+meet exactly and do not overlap. External-md instead fixes real-device-sized
+128 MiB DRAM at `[0x08000000, 0x10000000)` and keeps its media token in
+`[0xe0000000, 0x100000000)`, outside guest RAM. Machine initialization rejects a
+larger direct aperture; older `-R 768` measurements are retained only as history.
+The loader proves the active kernel, device tree, boot arguments, optional
+direct RAM disk, and framebuffer ranges are contained and pairwise disjoint
+before execution.
 
 ARM1176 idle is modelled as a device-time operation rather than a fake CPU loop.
 The exact CP15 wait-for-interrupt form used by XNU invokes a machine callback

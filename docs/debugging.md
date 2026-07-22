@@ -18,37 +18,54 @@ Four tools answer four different questions. Use them in this order.
 ## 0. The recipe everything below assumes
 
 ```sh
+mkdir -p work
 build/core/bootkernel firmware/kernel.macho \
     -d firmware/devicetree.bin \
     -c "debug=0x8 serial=1 nand-enable-adm=0" \
-    -r firmware/rootfs.img -R 512 \
+    --external-md firmware/rootfs.img work/rootfs-7e18-run01.img \
+    -R 128 \
     -n 400000000
 ```
 
-`-R 512` is not cosmetic: `arm_vm_init` hardcodes `virtual_avail = 0xe0000000`,
+The external path is cold-boot only, its parent directory must exist, and the
+work path must not exist. It accepts only the exact 7E18 kernel, device tree, and
+rootfs identities, then creates a no-replace writable image and installs the
+guarded md-strategy bridge. Default growth produces exactly 466,825,216 bytes
+(445.199 MiB); budget at least 500 MiB plus logs and filesystem headroom on the
+work volume. Any raw `/dev/rmd0` entry, bridge error, undefined instruction,
+guest `_panic`/`_Debugger` entry, or other halt exits nonzero. The work image
+remains after a later failure and its path cannot be reused; archive/remove it
+deliberately or select a new filename. A cleanup warning means a second large
+temporary may remain beside it and must be inspected before retrying. No source
+firmware file is opened writable.
+
+Checkpoint replay still uses historical direct-RAM mode:
+`-r firmware/rootfs.img -R 512`. There, `-R 512` is not cosmetic:
+`arm_vm_init` hardcodes `virtual_avail = 0xe0000000`,
 so advertising more than 512 MiB at the documented virtual base makes
 `zone_virtual_addr` index an empty `pv_head_table` and fault during
 `zone_bootstrap` (commit `5625f5c`). The current machine also rejects a larger
 physical aperture because `[0x08000000, 0x28000000)` is exactly 512 MiB and NOR
 begins at `0x28000000`. Historical 768 MiB commands are rejected, not fallback
-recipes. The
-`nand-enable-adm=0` boot-arg is what stops `AppleS5L8900XADMFMC::start` from
-panicking on a NAND controller we do not model. Two more workarounds are applied
-automatically and printed in the header, so they are never invisible: the IORTC
-wait is patched from 30 seconds to 0, and the `mbx` node's `compatible` string is
-broken so the PowerVR driver does not match.
+recipes. The `nand-enable-adm=0` boot-arg is what stops
+`AppleS5L8900XADMFMC::start` from panicking on a NAND controller we do not model.
+Three more workarounds are applied automatically and printed in the header: the
+IORTC wait is patched from 30 seconds to 0, and the `mbx` and `sha1` nodes are
+unmatched so the unmodelled PowerVR and hardware SHA-1 paths do not run. `-g` and
+`-S` deliberately re-enable those known-broken paths for diagnostics;
+external-md rejects `-K`.
 
-Large-input memory is part of the preflight. Current `bootkernel` proves all
-static ranges are inside DRAM and pairwise disjoint, then streams the rootfs
-through a retained source handle directly into its final guest address. It does
-not hold a second roughly 445 MiB grown-image buffer. A source metadata change,
-short read, overflow, overlap, or out-of-range placement fails before guest
-execution.
+Large-input memory is part of the preflight. External mode copies and hashes the
+source through a buffer capped at 1 MiB; the media never occupies guest DRAM.
+Direct mode proves all static ranges are inside DRAM and pairwise disjoint, then
+streams the rootfs through a retained source handle directly into its final
+guest address. A source metadata change, digest mismatch, short read, overflow,
+overlap, or out-of-range placement fails before guest execution.
 
 Everything the tool did to the machine before the first instruction — segments,
-patches, device-tree edits, ramdisk placement, `boot_args` — is echoed at the top
-of the run. Read it. A wrong `-R`, a missing `-r`, or a device-tree patch that
-silently did not apply produces a boot that fails hundreds of millions of
+patches, device-tree edits, storage mode, `boot_args` — is echoed at the top of
+the run. Read it. A wrong `-R`, a missing root source, or a device-tree patch
+that silently did not apply produces a boot that fails hundreds of millions of
 instructions later somewhere that looks unrelated.
 
 ---
@@ -138,12 +155,16 @@ establish the duration of the current frontier or every later iteration:
 ```sh
 # save the machine at a checkpoint (up to 8 per run)
 build/core/bootkernel firmware/kernel.macho -d ... -r ... -R 512 \
-    -n 250000000 --snapshot-at 200000000 /tmp/at200M.snap
+    -n 250000000 --snapshot-at 200000000 work/at200M.snap
 
 # then iterate from there
 build/core/bootkernel firmware/kernel.macho -d ... -r ... -R 512 \
-    -n 400000000 --restore /tmp/at200M.snap
+    -n 400000000 --restore work/at200M.snap
 ```
+
+Keep snapshots on the workspace/non-`C:` volume. They can occupy hundreds of
+MiB, and atomic replacement creates a same-directory temporary, so replacing an
+existing checkpoint can briefly require room for both files.
 
 Historical development-host/commit measurement: cold to 900 M instructions was
 140 s; restoring at 200 M and running to 900 M was 34 s. Current source and
@@ -166,6 +187,12 @@ Three things about it will bite if you do not know them:
   machine's own retired-instruction counter, which is itself part of the
   snapshot — so a run that restored at 200 M still fires `--snapshot-at 300000000`
   at the same instruction a run from zero would have.
+- **Checkpoint requests fail loudly.** Counts are parsed as strict unsigned
+  64-bit values. A target before the restored count or beyond `-n` is rejected;
+  a target equal to the current count is saved before stepping; a terminal CPU
+  stop that leaves any future target unfinished produces the normal diagnostic
+  report and exits with status 5. `-L` rejects restore/checkpoint options instead
+  of silently ignoring them.
 - **Host-side diagnostics are not machine state and are not restored.** The trace
   ring, milestone hit counts, sampled profile and hot-page log start fresh and
   therefore describe only the window since the restore. Instruction *indices* are
@@ -184,9 +211,11 @@ stop, and ended at 214 at 2.98 B against a target of 250. That movement is evide
 the layout is safe. The RAM disk remains pinned guest memory even though its
 host-side duplicate is gone. The storage audit has ruled out a simple external
 aperture. The writable, range-gated md bulk-copy bridge, locked file adapter,
-kernel UUID parser and atomic patch helper are now implemented and unit-tested;
-wire them to a separately provisioned work image with snapshot coupling before app integration or an
-unbounded continuation.
+exact 7E18 kernel manifest and bounded immutable-source work-image provisioner
+are now wired into `--external-md`, including exact kernel, device-tree, and
+rootfs gates. Do not claim the expected memory recovery until a fresh real boot
+measures it. Use that cold-boot slice before app integration or an unbounded
+continuation; then add snapshot backing identity and overlay coupling.
 
 ### WFI changes elapsed device time, not the instruction coordinate
 

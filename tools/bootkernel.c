@@ -21,7 +21,12 @@
 #endif
 
 #include "ksyms.h"
+#include "file_block.h"
+#include "ios3_kernel_patch.h"
 #include "macho.h"
+#include "md_bridge.h"
+#include "rootfs_work.h"
+#include "sha256.h"
 #include "snapshot.h"
 #include "soc.h"
 #include <ctype.h>
@@ -36,6 +41,25 @@
 #else
 #include <unistd.h>
 #endif
+
+#define EXTERNAL_MD_TOKEN_BASE UINT64_C(0xe0000000)
+#define EXTERNAL_MD_MAX_SIZE   UINT64_C(0x20000000)
+#define IOS3_ROOTFS_FILE_SIZE  UINT64_C(433274880)
+#define IOS3_DEVICETREE_FILE_SIZE ((size_t)40544u)
+
+static const uint8_t IOS3_ROOTFS_SHA256[IOS3_SHA256_DIGEST_SIZE] = {
+    0xc3, 0x25, 0x1e, 0x7f, 0x09, 0x2c, 0x93, 0x9d,
+    0x58, 0x18, 0xe9, 0x20, 0x86, 0xcb, 0x47, 0x68,
+    0x09, 0x81, 0xcf, 0xb0, 0x37, 0x31, 0xde, 0x7b,
+    0x55, 0xd2, 0x38, 0xc9, 0x42, 0xeb, 0x5e, 0x82
+};
+
+static const uint8_t IOS3_DEVICETREE_SHA256[IOS3_SHA256_DIGEST_SIZE] = {
+    0x48, 0x67, 0xc9, 0x5f, 0xed, 0xf5, 0x44, 0xbd,
+    0xa2, 0xec, 0xaa, 0x26, 0x26, 0xae, 0x14, 0xc0,
+    0x1a, 0x60, 0xd7, 0x77, 0x1d, 0xc5, 0x3f, 0xfe,
+    0x6f, 0xd3, 0xa6, 0xaa, 0xc8, 0xb8, 0xba, 0x57
+};
 
 static uint8_t *slurp(const char *path, size_t *len_out) {
     FILE *f = fopen(path, "rb");
@@ -227,7 +251,7 @@ static bool parse_u64_span(const char *option, const char *first,
                            const char *last, uint64_t *out) {
     if (!option || !first || !last || !out || first >= last) {
         fprintf(stderr, "%s: expected an unsigned 64-bit integer\n",
-                option ? option : "instruction count");
+                option ? option : "numeric value");
         return false;
     }
     for (const char *p = first; p < last; p++) {
@@ -238,7 +262,7 @@ static bool parse_u64_span(const char *option, const char *first,
         }
     }
     if (*first == '-') {
-        fprintf(stderr, "%s: negative instruction values are not allowed\n",
+        fprintf(stderr, "%s: negative values are not allowed\n",
                 option);
         return false;
     }
@@ -247,7 +271,7 @@ static bool parse_u64_span(const char *option, const char *first,
     char *end = NULL;
     uintmax_t value = strtoumax(first, &end, 0);
     if (errno == ERANGE || value > UINT64_MAX) {
-        fprintf(stderr, "%s: instruction value is outside uint64_t range\n",
+        fprintf(stderr, "%s: value is outside uint64_t range\n",
                 option);
         return false;
     }
@@ -261,6 +285,52 @@ static bool parse_u64_span(const char *option, const char *first,
 
 static bool parse_u64_arg(const char *option, const char *text, uint64_t *out) {
     return text && parse_u64_span(option, text, text + strlen(text), out);
+}
+
+static bool parse_u32_arg(const char *option, const char *text,
+                          uint32_t *out) {
+    uint64_t value;
+    if (!out || !parse_u64_arg(option, text, &value)) return false;
+    if (value > UINT32_MAX) {
+        fprintf(stderr, "%s: value is outside uint32_t range\n", option);
+        return false;
+    }
+    *out = (uint32_t)value;
+    return true;
+}
+
+static bool parse_ram_mb_arg(const char *text, uint32_t *bytes) {
+    uint64_t value;
+    if (!bytes || !parse_u64_arg("-R", text, &value)) return false;
+    if (value > (UINT32_MAX >> 20)) {
+        fprintf(stderr, "-R: MiB value does not fit the 32-bit RAM aperture\n");
+        return false;
+    }
+    *bytes = (uint32_t)(value << 20);
+    return true;
+}
+
+/* Count whitespace-delimited rd= boot arguments. A substring such as
+ * foo_rd=bar is not a root selector and must not suppress the real token. */
+static unsigned cmdline_rd_tokens(const char *line, bool *all_md0) {
+    unsigned count = 0;
+    bool exact = true;
+    const char *p = line ? line : "";
+
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        const char *first = p;
+        while (*p && !isspace((unsigned char)*p)) p++;
+        size_t length = (size_t)(p - first);
+        if (length >= 3u && !memcmp(first, "rd=", 3u)) {
+            count++;
+            if (length != sizeof("rd=md0") - 1u ||
+                memcmp(first, "rd=md0", sizeof("rd=md0") - 1u))
+                exact = false;
+        }
+    }
+    if (all_md0) *all_md0 = exact;
+    return count;
 }
 
 static bool boot_option_takes_value(const char *option) {
@@ -1134,10 +1204,12 @@ static bool dt_memmap_add(uint8_t *b, size_t len, const char *key,
 
     size_t slot = 0;                       /* offset of the property record */
     for (uint32_t i = 0; i < np; i++) {
-        if (p + 36 > len) return false;
+        if (p > len || len - p < 36u) return false;
         char nm[DTNAME + 1];
         memcpy(nm, b + p, DTNAME); nm[DTNAME] = '\0';
         uint32_t l = ld32(b + p + 32) & 0x7fffffffu;
+        size_t padded = ((size_t)l + 3u) & ~(size_t)3u;
+        if (padded > len - p - 36u) return false;
         /* An existing entry with this key wins: re-running must be idempotent
          * rather than burning a second placeholder each time. */
         if (!strcmp(nm, key) && l == 8) { slot = p; break; }
@@ -1145,8 +1217,7 @@ static bool dt_memmap_add(uint8_t *b, size_t len, const char *key,
             ld32(b + p + 36) == 0 && ld32(b + p + 40) == 0)
             slot = p;                      /* first free placeholder; keep looking
                                             * in case the real key already exists */
-        p += 36 + ((l + 3u) & ~3u);
-        if (p > len) return false;
+        p += 36u + padded;
     }
     if (!slot) {
         printf("  dt: no free MemoryMapReserved-* placeholder for %s\n", key);
@@ -1165,6 +1236,35 @@ static bool dt_memmap_add(uint8_t *b, size_t len, const char *key,
     printf("  dt: /chosen/memory-map  %-18s -> %-10s {0x%08x,0x%08x}  (in place)\n",
            old, key, addr, size);
     return true;
+}
+
+static bool dt_memmap_matches_once(uint8_t *b, size_t len, const char *key,
+                                   uint32_t addr, uint32_t size) {
+    size_t node = dtn_path(b, len, "chosen/memory-map");
+    uint32_t np, nc;
+    if (node == DT_NONE) return false;
+    size_t p = dtn_hdr(b, len, node, &np, &nc);
+    if (!p) return false;
+    (void)nc;
+
+    unsigned matches = 0;
+    for (uint32_t i = 0; i < np; i++) {
+        if (p > len || len - p < 36u) return false;
+        char name[DTNAME + 1];
+        memcpy(name, b + p, DTNAME);
+        name[DTNAME] = '\0';
+        uint32_t value_length = ld32(b + p + 32) & UINT32_C(0x7fffffff);
+        size_t padded = ((size_t)value_length + 3u) & ~(size_t)3u;
+        if (padded > len - p - 36u) return false;
+        if (!strcmp(name, key)) {
+            if (value_length != 8u || ++matches != 1u ||
+                ld32(b + p + 36) != addr ||
+                ld32(b + p + 40) != size)
+                return false;
+        }
+        p += 36u + padded;
+    }
+    return matches == 1u;
 }
 
 /*
@@ -2097,6 +2197,7 @@ int main(int argc, char **argv) {
             "usage: %s <kernel.macho> [-p <physbase>] [-V <virtbase>] [-n <steps>]\n"
             "          [-d <devicetree.bin>] [-c <cmdline>] [-a] [-M] [-F] [-g]\n"
             "          [-r <ramdisk.img>] [-R <ram-MB>] [-X phys|virt|<addr>]\n"
+            "          [--external-md <immutable-source.img> <new-work.img>]\n"
             "          [-D <node/path>:<prop>=<value>] ...\n"
             "          [--snapshot-at <insn> <file>] ... [--restore <file>]\n"
             "  --snapshot-at <insn> <file>\n"
@@ -2127,22 +2228,28 @@ int main(int argc, char **argv) {
             "      (empty path == root), e.g. -D cpus/cpu0:timebase-frequency=6000000\n"
             "  -r  load a raw disk image into DRAM, publish it as the RAMDisk\n"
             "      entry of /chosen/memory-map, and append rd=md0 to the cmdline\n"
+            "  --external-md <source> <work>\n"
+            "      verify the exact 3.1.3 rootfs, create (never replace) a grown\n"
+            "      writable work image, and expose it through the guarded md0\n"
+            "      host bridge. This is a 128 MiB cold-boot-only mode.\n"
             "  --fstab <line>  what to write over the guest's /private/etc/fstab\n"
-            "      record in the loaded RAM disk (default\n"
+            "      record in the work image or loaded RAM disk (default\n"
             "      \"/dev/md0 / hfs rw,update 0 1\"). The stock record names\n"
             "      /dev/disk0s1 and /dev/disk0s2, which only exist behind\n"
             "      AppleNANDFTL + IOFlashPartitionScheme; this VM has no NAND-\n"
             "      backed disk0, so launchd's fsck fails and it halts the\n"
             "      machine. The image on disk is never modified.\n"
-            "  --keep-fstab    leave the stock record alone (reproduces the halt)\n"
+            "  --keep-fstab    legacy -r only: leave the stock record alone\n"
+            "      (reproduces the halt; external-md rejects this option)\n"
             "  --grow <MB>  free space to give the guest by growing the HFS+\n"
             "      volume in the loaded RAM disk (default 32, 0 disables). The\n"
             "      stock system dmg is sized exactly to its contents —\n"
             "      freeBlocks is 0 — because on hardware everything writable\n"
             "      lives on disk0s2, which this machine does not have. Without\n"
             "      this, launchd, the daemons and SpringBoard cannot create a\n"
-            "      single file. Costs the guest's free page pool 1:1 (the RAM\n"
-            "      disk is static memory below topOfKernelData), and is capped\n"
+            "      single file. External-md grows only its host work file; -r\n"
+            "      costs the guest's free page pool 1:1 because its RAM disk is\n"
+            "      static memory below topOfKernelData. Growth is capped\n"
             "      by the allocation file at a 512 MB volume. The image on disk\n"
             "      is never modified.\n"
             "  -Y  EXPERIMENT: put the RAM disk at the BOTTOM of DRAM, below\n"
@@ -2208,7 +2315,16 @@ int main(int argc, char **argv) {
 
     /* -r / -R / -X: the RAM-disk root. */
     const char *rdpath  = NULL;
+    const char *external_md_source = NULL;
+    const char *external_md_work = NULL;
     uint32_t    ram_size = 128u << 20;     /* iPhone1,2 fitment; -R overrides */
+    size_t      dt_n = 0;
+    uint8_t    *dt = NULL;
+    size_t      rd_n = 0;
+    uint64_t    external_media_size = 0;
+    bool        saw_rd_option = false;
+    bool        saw_external_md = false;
+    bool        saw_rd_address_form = false;
     /*
      * Which form of the address goes into the device-tree property.
      *
@@ -2337,6 +2453,11 @@ int main(int argc, char **argv) {
     boot_snapshot_request_t snaps[8] = {{0}};
     unsigned nsnaps = 0;
 
+    file_block_t *external_block_adapter = NULL;
+    md_bridge_t external_bridge;
+    bool external_bridge_installed = false;
+    memset(&external_bridge, 0, sizeof external_bridge);
+
     /* Walk the arguments one at a time: pair-stepping breaks as soon as a
      * single-argument flag like -a appears. */
     for (int i = 2; i < argc; i++) {
@@ -2351,6 +2472,20 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-Y")) { rd_low = true; continue; }
         /* Three-argument flag: must be recognised before the two-argument
          * guard below, which would otherwise stop the walk on the last pair. */
+        if (!strcmp(argv[i], "--external-md")) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "--external-md wants <source> <new-work>\n");
+                return 1;
+            }
+            if (saw_external_md) {
+                fprintf(stderr, "--external-md may be specified only once\n");
+                return 1;
+            }
+            external_md_source = argv[i + 1];
+            external_md_work = argv[i + 2];
+            saw_external_md = true;
+            i += 2; continue;
+        }
         if (!strcmp(argv[i], "--snapshot-at")) {
             if (i + 2 >= argc) {
                 fprintf(stderr, "--snapshot-at wants <insn> <file>\n");
@@ -2412,9 +2547,13 @@ int main(int argc, char **argv) {
         if      (!strcmp(argv[i], "-Z")) {
             if (!parse_u64_arg("-Z", argv[++i], &heartbeat)) return 1;
         }
-        else if (!strcmp(argv[i], "-p")) phys_base = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-p")) {
+            if (!parse_u32_arg("-p", argv[++i], &phys_base)) return 1;
+        }
         else if (!strcmp(argv[i], "--restore")) restore_path = argv[++i];
-        else if (!strcmp(argv[i], "-V")) virt_base = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-V")) {
+            if (!parse_u32_arg("-V", argv[++i], &virt_base)) return 1;
+        }
         else if (!strcmp(argv[i], "-n")) {
             if (!parse_u64_arg("-n", argv[++i], &steps)) return 1;
         }
@@ -2423,18 +2562,97 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-c")) cmdline   = argv[++i];
         else if (!strcmp(argv[i], "-b")) ba_rev    = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-w")) ba_ver    = (unsigned)strtoul(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "-r")) rdpath    = argv[++i];
+        else if (!strcmp(argv[i], "-r")) {
+            if (saw_rd_option) {
+                fprintf(stderr, "-r may be specified only once\n");
+                return 1;
+            }
+            rdpath = argv[++i];
+            saw_rd_option = true;
+        }
         else if (!strcmp(argv[i], "--fstab")) fstab_line = argv[++i];
-        else if (!strcmp(argv[i], "--grow")) rd_grow_mb = (uint32_t)strtoul(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "-R")) ram_size  = (uint32_t)strtoul(argv[++i], NULL, 0) << 20;
+        else if (!strcmp(argv[i], "--grow")) {
+            if (!parse_u32_arg("--grow", argv[++i], &rd_grow_mb)) return 1;
+        }
+        else if (!strcmp(argv[i], "-R")) {
+            if (!parse_ram_mb_arg(argv[++i], &ram_size)) return 1;
+        }
         else if (!strcmp(argv[i], "-X")) {
             const char *v = argv[++i];
+            saw_rd_address_form = true;
             if      (!strcmp(v, "phys")) rd_form = RD_ADDR_PHYS;
             else if (!strcmp(v, "virt")) rd_form = RD_ADDR_VIRT;
-            else { rd_form = RD_ADDR_LITERAL; rd_literal = (uint32_t)strtoul(v, NULL, 0); }
+            else {
+                rd_form = RD_ADDR_LITERAL;
+                if (!parse_u32_arg("-X", v, &rd_literal)) return 1;
+            }
         }
         else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
+            return 1;
+        }
+    }
+
+    enum {
+        BOOT_STORAGE_NONE = 0,
+        BOOT_STORAGE_GUEST_RAM,
+        BOOT_STORAGE_EXTERNAL_MD
+    } storage_mode = saw_external_md ? BOOT_STORAGE_EXTERNAL_MD
+                                     : saw_rd_option ? BOOT_STORAGE_GUEST_RAM
+                                                     : BOOT_STORAGE_NONE;
+    const bool root_present = storage_mode != BOOT_STORAGE_NONE;
+    const bool legacy_ramdisk = storage_mode == BOOT_STORAGE_GUEST_RAM;
+    const bool external_md = storage_mode == BOOT_STORAGE_EXTERNAL_MD;
+
+    if (external_md) {
+        bool rd_tokens_are_md0 = true;
+        unsigned rd_tokens = cmdline_rd_tokens(cmdline, &rd_tokens_are_md0);
+        size_t cmdline_length = strlen(cmdline);
+        size_t appended = cmdline_length + (cmdline_length ? 1u : 0u) +
+                          (sizeof("rd=md0") - 1u);
+        if (saw_rd_option) {
+            fprintf(stderr, "--external-md cannot be combined with -r\n");
+            return 1;
+        }
+        if (restore_path || nsnaps) {
+            fprintf(stderr,
+                    "--external-md is cold-boot only; snapshots and restore "
+                    "are unsupported\n");
+            return 1;
+        }
+        if (no_kpatch || !patch_memnode || rd_low || saw_rd_address_form ||
+            !fstab_fixup || want_kextmap) {
+            fprintf(stderr,
+                    "--external-md conflicts with -K, -M, -Y, -X, "
+                    "--keep-fstab, and -L\n");
+            return 1;
+        }
+        if (!dtpath) {
+            fprintf(stderr, "--external-md requires -d <devicetree.bin>\n");
+            return 1;
+        }
+        if (phys_base != UINT32_C(0x08000000) ||
+            virt_base != UINT32_C(0xc0000000) ||
+            ram_size != (UINT32_C(128) << 20)) {
+            fprintf(stderr,
+                    "--external-md requires -p 0x08000000, -V 0xc0000000, "
+                    "and effective -R 128\n");
+            return 1;
+        }
+        if (!external_md_source || !*external_md_source ||
+            !external_md_work || !*external_md_work) {
+            fprintf(stderr, "--external-md paths must be non-empty\n");
+            return 1;
+        }
+        if (rd_tokens > 1u || (rd_tokens == 1u && !rd_tokens_are_md0)) {
+            fprintf(stderr,
+                    "--external-md requires at most one exact rd=md0 token\n");
+            return 1;
+        }
+        if (cmdline_length > 255u || (rd_tokens == 0u && appended > 255u)) {
+            fprintf(stderr,
+                    "--external-md command line plus rd=md0 exceeds the "
+                    "255-byte boot_args field\n");
             return 1;
         }
     }
@@ -2612,7 +2830,161 @@ int main(int argc, char **argv) {
      *   The proper fix is to model the PMU RTC so it publishes IORTC; until then
      *   this one byte is the difference between "idle forever" and "BSD root".
      */
-    if (!no_kpatch) {
+    if (external_md) {
+        ios3_kernel_patch_request_t request;
+        ios3_kernel_patch_report_t report;
+        memset(&request, 0, sizeof request);
+        memset(&report, 0, sizeof report);
+        request.kernel_file = img;
+        request.kernel_file_size = len;
+        request.ram = mach.ram;
+        request.ram_size = mach.ram_size;
+        request.ram_base = mach.ram_base;
+        request.virt_base = virt_base;
+
+        ios3_kernel_patch_status_t patch_status =
+            ios3_kernel_patch_apply(&request, &report);
+        if (patch_status != IOS3_KERNEL_PATCH_STATUS_OK) {
+            fprintf(stderr,
+                    "external-md kernel gate: %s; site=%s va=0x%llx "
+                    "pa=0x%llx expected=0x%llx actual=0x%llx\n",
+                    ios3_kernel_patch_status_string(patch_status),
+                    ios3_kernel_patch_site_string(report.site),
+                    (unsigned long long)report.virtual_address,
+                    (unsigned long long)report.physical_address,
+                    (unsigned long long)report.expected_value,
+                    (unsigned long long)report.actual_value);
+            s5l8900_free(&mach);
+            ksyms_free(&KS);
+            free(img);
+            return 1;
+        }
+        printf("kernel gate: exact iPhone OS 3.1.3 kernel accepted; "
+               "md0 bridge sites installed\n");
+
+        dt = slurp(dtpath, &dt_n);
+        if (!dt) {
+            fprintf(stderr,
+                    "external-md device-tree gate: cannot read %s; rootfs "
+                    "work image was not created\n",
+                    dtpath);
+            s5l8900_free(&mach);
+            ksyms_free(&KS);
+            free(img);
+            return 1;
+        }
+        if (dt_n != IOS3_DEVICETREE_FILE_SIZE) {
+            fprintf(stderr,
+                    "external-md device-tree gate: size mismatch for %s "
+                    "(got %llu, expected %llu); rootfs work image was not "
+                    "created\n",
+                    dtpath, (unsigned long long)dt_n,
+                    (unsigned long long)IOS3_DEVICETREE_FILE_SIZE);
+            free(dt);
+            s5l8900_free(&mach);
+            ksyms_free(&KS);
+            free(img);
+            return 1;
+        }
+        uint8_t dt_digest[IOS3_SHA256_DIGEST_SIZE];
+        if (!ios3_sha256(dt, dt_n, dt_digest)) {
+            fprintf(stderr,
+                    "external-md device-tree gate: SHA-256 failed for %s; "
+                    "rootfs work image was not created\n",
+                    dtpath);
+            free(dt);
+            s5l8900_free(&mach);
+            ksyms_free(&KS);
+            free(img);
+            return 1;
+        }
+        if (memcmp(dt_digest, IOS3_DEVICETREE_SHA256,
+                   sizeof dt_digest) != 0) {
+            fprintf(stderr,
+                    "external-md device-tree gate: SHA-256 mismatch for %s\n"
+                    "  expected: "
+                    "4867c95fedf544bda2ecaa2626ae14c01a60d7771dc53ffe6fd3a6aac8b8ba57\n"
+                    "  actual  : ",
+                    dtpath);
+            for (size_t i = 0; i < sizeof dt_digest; i++)
+                fprintf(stderr, "%02x", dt_digest[i]);
+            fprintf(stderr, "\n  rootfs work image was not created\n");
+            free(dt);
+            s5l8900_free(&mach);
+            ksyms_free(&KS);
+            free(img);
+            return 1;
+        }
+        printf("device tree: exact iPhone OS 3.1.3 tree accepted (%u bytes)\n",
+               (unsigned)dt_n);
+
+        rootfs_work_options_t options;
+        rootfs_work_result_t result;
+        memset(&options, 0, sizeof options);
+        memset(&result, 0, sizeof result);
+        options.fstab_line = fstab_line;
+        options.growth_bytes = (uint64_t)rd_grow_mb << 20;
+        options.source_identity.required = true;
+        options.source_identity.expected_size = IOS3_ROOTFS_FILE_SIZE;
+        memcpy(options.source_identity.expected_sha256, IOS3_ROOTFS_SHA256,
+               sizeof options.source_identity.expected_sha256);
+
+        rootfs_work_status_t root_status =
+            rootfs_work_create(external_md_source, external_md_work,
+                               &options, &result);
+        if (root_status != ROOTFS_WORK_OK || !result.published ||
+            !result.source_identity_verified) {
+            fprintf(stderr,
+                    "external-md rootfs: %s at %s: %s%s"
+                    " (host error %d)\n",
+                    rootfs_work_status_name(root_status),
+                    rootfs_work_stage_name(result.stage), result.detail,
+                    result.published ? " (published work image preserved)" : "",
+                    result.system_error);
+            if (result.temporary_left) {
+                fprintf(stderr,
+                        "external-md rootfs: WARNING: a large temporary file "
+                        "or link may remain beside %s (cleanup host error %d); "
+                        "operation host error %d; inspect that directory before "
+                        "retrying\n",
+                        external_md_work, result.cleanup_system_error,
+                        result.system_error);
+            } else if (result.cleanup_system_error) {
+                fprintf(stderr,
+                        "external-md rootfs: cleanup also failed with host "
+                        "error %d\n",
+                        result.cleanup_system_error);
+            }
+            free(dt);
+            s5l8900_free(&mach);
+            ksyms_free(&KS);
+            free(img);
+            return 1;
+        }
+
+        external_media_size = result.final_size;
+        uint64_t token_end;
+        if (!external_media_size ||
+            external_media_size > EXTERNAL_MD_MAX_SIZE ||
+            external_media_size > UINT32_MAX ||
+            (external_media_size & UINT64_C(0xfff)) != 0u ||
+            !add_u64(EXTERNAL_MD_TOKEN_BASE, external_media_size, &token_end) ||
+            token_end > UINT64_C(0x100000000)) {
+            fprintf(stderr,
+                    "external-md: published %llu-byte work image has invalid "
+                    "media geometry; image preserved\n",
+                    (unsigned long long)external_media_size);
+            free(dt);
+            s5l8900_free(&mach);
+            ksyms_free(&KS);
+            free(img);
+            return 1;
+        }
+        rd_n = (size_t)external_media_size;
+        printf("external md: verified %s; created %s (%llu bytes, +%u MiB)\n",
+               external_md_source, external_md_work,
+               (unsigned long long)external_media_size, rd_grow_mb);
+    } else if (!no_kpatch) {
         struct { uint32_t va; uint8_t want, set; const char *why; } kp[] = {
             { 0xc0175b3eu, 0x1e, 0x00, "IORTC wait tv_sec 30->0 (reach IOFindBSDRoot)" },
         };
@@ -2657,8 +3029,8 @@ int main(int argc, char **argv) {
     /* The tree has to be read before the layout is fixed, because the RAMDisk
      * entry written into it names an address that depends on where everything
      * else landed — and the tree's own length is part of that arithmetic. */
-    size_t dt_n = 0;
-    uint8_t *dt = dtpath ? slurp(dtpath, &dt_n) : NULL;
+    if (!external_md)
+        dt = dtpath ? slurp(dtpath, &dt_n) : NULL;
     if (dtpath && !dt) {
         fprintf(stderr, "devicetree: cannot read %s\n", dtpath);
         return 1;
@@ -2673,11 +3045,10 @@ int main(int argc, char **argv) {
 
     /* Learn the RAM-disk size now, but do not allocate or read it yet. It is
      * streamed into its final guest-DRAM address after the layout is checked. */
-    size_t rd_n = 0;
     uint8_t *rd = NULL;
     streamed_file_t rd_source;
     memset(&rd_source, 0, sizeof rd_source);
-    if (rdpath && !streamed_file_open(rdpath, &rd_source, &rd_n)) {
+    if (legacy_ramdisk && !streamed_file_open(rdpath, &rd_source, &rd_n)) {
         fprintf(stderr, "ramdisk: cannot size %s\n", rdpath);
         return 1;
     }
@@ -2726,7 +3097,7 @@ int main(int argc, char **argv) {
      * topOfKernelData, still static, but no longer pushing that line — and
      * therefore the free page pool — up by the size of the root filesystem. */
     uint64_t rd_pa64, capacity64 = 0, rd_reserve_len64 = 0;
-    if (rdpath &&
+    if (legacy_ramdisk &&
         (!add_u64((uint64_t)rd_n, (uint64_t)rd_grow_mb << 20,
                   &capacity64) ||
          capacity64 > SIZE_MAX || capacity64 > UINT32_MAX ||
@@ -2735,18 +3106,21 @@ int main(int argc, char **argv) {
         streamed_file_close(&rd_source);
         return 1;
     }
-    if (rd_low) {
+    if (legacy_ramdisk && rd_low) {
         rd_pa64 = phys_base;
-    } else if (!align_u64(ba_range.end, 0x1000u, &rd_pa64)) {
+    } else if (!external_md &&
+               !align_u64(ba_range.end, 0x1000u, &rd_pa64)) {
         fprintf(stderr, "layout: RAM-disk address overflow\n");
         streamed_file_close(&rd_source);
         return 1;
+    } else if (external_md) {
+        rd_pa64 = EXTERNAL_MD_TOKEN_BASE;
     }
 
     boot_range_t rd_range;
     if (rd_pa64 > UINT32_MAX ||
         !boot_range_make(&rd_range, "RAM disk reserve", rd_pa64,
-                         rd_reserve_len64, rdpath != NULL)) {
+                         rd_reserve_len64, legacy_ramdisk)) {
         fprintf(stderr, "layout: RAM-disk span exceeds 32-bit physical space\n");
         streamed_file_close(&rd_source);
         return 1;
@@ -2781,8 +3155,8 @@ int main(int argc, char **argv) {
         streamed_file_close(&rd_source);
         return 1;
     }
-    uint64_t static_input_end64 = (rdpath && !rd_low) ? rd_range.end
-                                                       : ba_range.end;
+    uint64_t static_input_end64 = (legacy_ramdisk && !rd_low)
+                                ? rd_range.end : ba_range.end;
     if (!align_u64(static_input_end64, 0x4000u, &planned_static_end64) ||
         planned_static_end64 > dram_range.end ||
         (want_fb && planned_static_end64 > fb_range.begin)) {
@@ -2796,7 +3170,7 @@ int main(int argc, char **argv) {
 
     /* The complete conservative layout is proved disjoint before this direct
      * write. Keep the source handle open through the final metadata check. */
-    if (rdpath) {
+    if (legacy_ramdisk) {
         rd = mach.ram + (size_t)(rd_range.begin - dram_range.begin);
         bool read_ok = stream_file(&rd_source, rd, rd_n);
         bool close_ok = streamed_file_close(&rd_source);
@@ -2830,7 +3204,7 @@ int main(int argc, char **argv) {
     if (!align_u64((uint64_t)rd_n, 0x1000u, &rd_len64) ||
         rd_len64 > UINT32_MAX ||
         !add_u64(rd_pa64, rd_len64, &rd_actual_end64) ||
-        (rdpath && rd_actual_end64 > rd_range.end)) {
+        (legacy_ramdisk && rd_actual_end64 > rd_range.end)) {
         fprintf(stderr, "layout: final padded RAM-disk span exceeds its reserve\n");
         return 1;
     }
@@ -2867,8 +3241,8 @@ int main(int argc, char **argv) {
      * above looked like a framebuffer problem.
      */
     uint64_t top_of_kernel_data64;
-    uint64_t actual_static_end64 = (rd && !rd_low) ? rd_actual_end64
-                                                    : ba_range.end;
+    uint64_t actual_static_end64 = (legacy_ramdisk && !rd_low)
+                                 ? rd_actual_end64 : ba_range.end;
     if (!align_u64(actual_static_end64, 0x4000u, &top_of_kernel_data64) ||
         top_of_kernel_data64 > planned_static_end64 ||
         top_of_kernel_data64 > UINT32_MAX) {
@@ -2879,7 +3253,7 @@ int main(int argc, char **argv) {
     /* With -Y the disk is below the kernel, so the only thing that can go
      * wrong is running into it. Say so in those terms rather than as a
      * generic "does not fit". */
-    if (rd && rd_low) {
+    if (legacy_ramdisk && rd_low) {
         uint32_t kern_pa = (uint32_t)kernel_range.begin;
         if (rd_actual_end64 > kernel_range.begin) {
             fprintf(stderr,
@@ -2959,7 +3333,7 @@ int main(int argc, char **argv) {
      * arrived in r1.
      */
     uint64_t rd_virt64 = 0, dt_virt64 = 0, top_virt64;
-    if ((rd &&
+    if ((legacy_ramdisk &&
          (!add_u64(virt_base, rd_pa64 - dram_range.begin, &rd_virt64) ||
           rd_virt64 > UINT32_MAX)) ||
         (dt &&
@@ -2970,7 +3344,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "layout: a boot-data virtual address exceeds 32 bits\n");
         return 1;
     }
-    uint32_t rd_dt_addr = rd_form == RD_ADDR_PHYS    ? rd_pa
+    uint32_t rd_dt_addr = external_md ? (uint32_t)EXTERNAL_MD_TOKEN_BASE
+                        : rd_form == RD_ADDR_PHYS    ? rd_pa
                         : rd_form == RD_ADDR_LITERAL ? rd_literal
                         : (uint32_t)rd_virt64;
     uint32_t dt_boot_addr = dt ? (uint32_t)dt_virt64 : 0;
@@ -2998,16 +3373,26 @@ int main(int argc, char **argv) {
         }
         /* /memory reg: the real iBoot fills in the DRAM bank. Ours is
          * zero, which would advertise a zero-sized bank. */
-        if (patch_memnode)
-            dt_set_reg(dt, dt_n, "memory", "reg", phys_base, ram_size);
+        if (patch_memnode &&
+            !dt_set_reg(dt, dt_n, "memory", "reg", phys_base, ram_size) &&
+            external_md) {
+            fprintf(stderr, "external-md: cannot publish exact DRAM geometry\n");
+            free(dt);
+            return 1;
+        }
         /* NOT touched: the shipped "DeviceTree" entry, whose address is still
          * zero. IODTFreeLoaderInfo() runs ml_static_ptovirt() over that value
          * and then ml_static_mfree()s the result, so filling it in changes what
          * gets freed during early IOKit start. The boot currently gets to
          * _bsd_init with it at zero; correcting it is a separate experiment,
          * not something to smuggle into this one. */
-        if (rd)
-            dt_memmap_add(dt, dt_n, "RAMDisk", rd_dt_addr, rd_len);
+        if (root_present &&
+            !dt_memmap_add(dt, dt_n, "RAMDisk", rd_dt_addr, rd_len) &&
+            external_md) {
+            fprintf(stderr, "external-md: cannot publish RAMDisk geometry\n");
+            free(dt);
+            return 1;
+        }
         /* Keep the PowerVR MBX driver from matching unless -g asks for it: it
          * busy-polls a reset bit in a register block we do not model and hangs
          * the boot. Disabled by default so the boot can reach the root device. */
@@ -3035,6 +3420,15 @@ int main(int argc, char **argv) {
             dt_unmatch(dt, dt_n, "arm-io/sha1");
         for (unsigned i = 0; i < ndtov; i++)
             dt_set_u32(dt, dt_n, dtov[i].path, dtov[i].prop, dtov[i].val);
+        if (external_md &&
+            !dt_memmap_matches_once(dt, dt_n, "RAMDisk", rd_dt_addr,
+                                    rd_len)) {
+            fprintf(stderr,
+                    "external-md: RAMDisk device-tree entry is missing, "
+                    "duplicated, or not exact\n");
+            free(dt);
+            return 1;
+        }
         printf("  ---------------------------------------------------------\n");
         s5l8900_load(&mach, dt_pa, dt, dt_n);
         free(dt);
@@ -3044,14 +3438,19 @@ int main(int argc, char **argv) {
                 "CLCD will work, but AppleMerlotLCD cannot be configured\n");
     }
 
-    if (rd) {
+    if (legacy_ramdisk) {
         printf("ramdisk    : %s -> pa 0x%08x  %u bytes (%u padded, direct stream)\n",
                rdpath, rd_pa, (unsigned)rd_n, rd_len);
         printf("             DT RAMDisk = {0x%08x, 0x%08x}  (%s)\n",
                rd_dt_addr, rd_len,
                rd_form == RD_ADDR_PHYS ? "physical" :
-               rd_form == RD_ADDR_LITERAL ? "literal sentinel" :
-               "virtual, ml_static_ptovirt form");
+                rd_form == RD_ADDR_LITERAL ? "literal sentinel" :
+                "virtual, ml_static_ptovirt form");
+    } else if (external_md) {
+        printf("ramdisk    : %s (host-backed, not copied into guest DRAM)\n",
+               external_md_work);
+        printf("             DT RAMDisk = {0x%08x, 0x%08x}  (synthetic token)\n",
+               rd_dt_addr, rd_len);
     }
 
     /*
@@ -3060,10 +3459,25 @@ int main(int argc, char **argv) {
      * "md<digit>" — mdevlookup then resolves the minor number.
      */
     char cmdbuf[512];
-    if (rd && !strstr(cmdline, "rd=")) {
-        snprintf(cmdbuf, sizeof cmdbuf, "%s%srd=md0",
-                 cmdline, *cmdline ? " " : "");
+    bool ignored_exact = true;
+    unsigned rd_tokens = cmdline_rd_tokens(cmdline, &ignored_exact);
+    if (root_present && rd_tokens == 0u) {
+        int needed = snprintf(cmdbuf, sizeof cmdbuf, "%s%srd=md0",
+                              cmdline, *cmdline ? " " : "");
+        if (needed < 0 || (size_t)needed >= sizeof cmdbuf ||
+            (external_md && needed > 255)) {
+            fprintf(stderr, "boot args: cannot append exact rd=md0 token\n");
+            return 1;
+        }
         cmdline = cmdbuf;
+    }
+    if (external_md) {
+        bool exact_md0 = false;
+        if (cmdline_rd_tokens(cmdline, &exact_md0) != 1u || !exact_md0 ||
+            strlen(cmdline) > 255u) {
+            fprintf(stderr, "external-md: final command line is not exact\n");
+            return 1;
+        }
     }
 
     uint8_t ba[0x138];
@@ -3149,15 +3563,19 @@ int main(int argc, char **argv) {
         printf("  DRAM                 : 0x%08x..0x%08x  %u MB\n",
                phys_base, dram_end, ram_size >> 20);
         uint32_t kern_pa = m.vm_low - virt_base + phys_base;
-        uint32_t kern_bytes = (rd && rd_low) ? top_of_kernel_data - kern_pa
-                                             : rd_pa - phys_base;
+        uint32_t kern_bytes = (legacy_ramdisk && rd_low)
+                            ? top_of_kernel_data - kern_pa
+                            : external_md ? top_of_kernel_data - phys_base
+                                          : rd_pa - phys_base;
         printf("  kernel image+DT+args : %u.%02u MB\n",
                kern_bytes >> 20, ((kern_bytes & 0xfffffu) * 100u) >> 20);
         printf("  RAM disk             : %u.%02u MB%s\n",
                rd_len >> 20, ((rd_len & 0xfffffu) * 100u) >> 20,
-               rd ? (rd_low ? "  (-Y: at the bottom, below the kernel)" : "")
-                  : "  (none)");
-        if (rd && rd_low) {
+               legacy_ramdisk
+                   ? (rd_low ? "  (-Y: at the bottom, below the kernel)" : "")
+                   : external_md ? "  (host-backed; outside guest DRAM)"
+                                 : "  (none)");
+        if (legacy_ramdisk && rd_low) {
             uint32_t gap = kern_pa - (rd_pa + rd_len);
             printf("  unused gap           : %u.%02u MB   [-V puts the kernel "
                    "at 0x%08x; lower it to reclaim this]\n",
@@ -3187,6 +3605,66 @@ int main(int argc, char **argv) {
 
     /* Interpose on the bus so every non-RAM access is attributed to a PC. */
     spy_install(&mach, virt_base, phys_base);
+
+    if (external_md) {
+        external_block_adapter = file_block_create();
+        if (!external_block_adapter) {
+            fprintf(stderr, "external-md: cannot allocate file adapter\n");
+            s5l8900_free(&mach);
+            ksyms_free(&KS);
+            free(img);
+            return 1;
+        }
+
+        file_block_status_t open_status =
+            file_block_open(external_block_adapter, external_md_work,
+                            external_media_size);
+        if (open_status != FILE_BLOCK_STATUS_OK) {
+            fprintf(stderr, "external-md: open work image: %s (host error %d)\n",
+                    file_block_strerror(open_status),
+                    file_block_last_system_error(external_block_adapter));
+            (void)file_block_destroy(&external_block_adapter);
+            s5l8900_free(&mach);
+            ksyms_free(&KS);
+            free(img);
+            return 1;
+        }
+
+        md_bridge_config_t bridge_config;
+        memset(&bridge_config, 0, sizeof bridge_config);
+        bridge_config.read_site.pc = IOS3_KERNEL_PATCH_MD_READ_VA;
+        bridge_config.read_site.encoding = UINT32_C(0xdfe1);
+        bridge_config.write_site.pc = IOS3_KERNEL_PATCH_MD_WRITE_VA;
+        bridge_config.write_site.encoding = UINT32_C(0xdfe2);
+        bridge_config.token_base = EXTERNAL_MD_TOKEN_BASE;
+        bridge_config.media_size = external_media_size;
+        bridge_config.ram_base = UINT64_C(0x08000000);
+        bridge_config.ram_size = UINT64_C(128) << 20;
+        bridge_config.ram = mach.ram;
+        bridge_config.block = file_block_get(external_block_adapter);
+        if (!md_bridge_config_valid(&bridge_config)) {
+            fprintf(stderr, "external-md: guarded bridge rejected fixed geometry\n");
+            bridge_config.block = NULL;
+            (void)file_block_flush(external_block_adapter);
+            (void)file_block_close(external_block_adapter);
+            (void)file_block_destroy(&external_block_adapter);
+            s5l8900_free(&mach);
+            ksyms_free(&KS);
+            free(img);
+            return 1;
+        }
+
+        md_bridge_init(&external_bridge, &bridge_config);
+        arm_bus_set_privileged_svc_handler(&mach.bus, md_bridge_handle_svc,
+                                           &external_bridge);
+        external_bridge_installed = true;
+        printf("md bridge   : token 0x%08x..0x%08llx -> %s; "
+               "SVC dfe1/dfe2 armed\n",
+               (unsigned)EXTERNAL_MD_TOKEN_BASE,
+               (unsigned long long)(EXTERNAL_MD_TOKEN_BASE +
+                                    external_media_size),
+               external_md_work);
+    }
 
     /*
      * --restore: replace everything built above with a saved machine.
@@ -3295,12 +3773,27 @@ int main(int argc, char **argv) {
     uint32_t last_pc = restore_path ? mach.cpu.r[15] : entry_pa;
     uint64_t first_abort_at = 0, first_exc = 0;
     bool have_first_abort = false, have_first_exc = false;
+    bool raw_mdevrw_guard_hit = false;
+    bool guest_fatal_entry_seen = false;
     uint32_t abort_dfar = 0, abort_dfsr = 0;
 
     G.hot_steps = steps;
     for (; n < steps; n++) {
         G.hot_now = n;
         last_pc = mach.cpu.r[15];
+        if (external_md) {
+            uint32_t pc = last_pc & ~1u;
+            if (pc == IOS3_KERNEL_PATCH_RAW_WATCHER_VA ||
+                pc == UINT32_C(0x08073f94)) {
+                raw_mdevrw_guard_hit = true;
+                st = ARM_HALT;
+                fprintf(stderr,
+                        "external-md: raw mdevrw path reached at pc 0x%08x, "
+                        "retired=%" PRIu64 "; stopped before execution\n",
+                        last_pc, mach.cpu.cycles);
+                break;
+            }
+        }
         tr[tw].pc = last_pc;
         tr[tw].cpsr = mach.cpu.cpsr;
         memcpy(tr[tw].r, mach.cpu.r, sizeof mach.cpu.r);
@@ -3422,6 +3915,18 @@ int main(int argc, char **argv) {
             }
             printf("\n");
             fflush(stdout);
+            if (external_md &&
+                (!strcmp(wps[w].name, "_panic") ||
+                 !strcmp(wps[w].name, "_Debugger")))
+                guest_fatal_entry_seen = true;
+        }
+        if (guest_fatal_entry_seen) {
+            st = ARM_HALT;
+            fprintf(stderr,
+                    "external-md: guest fatal entry reached; stopped before "
+                    "executing it at retired=%" PRIu64 "\n",
+                    mach.cpu.cycles);
+            break;
         }
 
         uint32_t mode_before = mach.cpu.cpsr & ARM_CPSR_MODE_MASK;
@@ -3592,6 +4097,21 @@ int main(int argc, char **argv) {
             if (stop_on_abort) { n++; break; }
         }
 
+    }
+
+    bool bridge_halt_failure =
+        external_md && !raw_mdevrw_guard_hit && st == ARM_HALT &&
+        external_bridge.last_error.code != MD_BRIDGE_ERROR_NONE;
+    if (bridge_halt_failure) {
+        const md_bridge_error_t *error = &external_bridge.last_error;
+        fprintf(stderr,
+                "external-md bridge halted: %s pc=0x%08x svc=0x%04x "
+                "len=%u media+0x%llx transferred=%llu block=%s\n",
+                md_bridge_error_string(error->code), error->pc,
+                error->encoding, error->length,
+                (unsigned long long)error->media_offset,
+                (unsigned long long)error->transferred,
+                vm_block_strerror(error->block_status));
     }
 
     /* A terminal CPU status can end the run before a statically reachable
@@ -4068,8 +4588,61 @@ int main(int argc, char **argv) {
         free(rgb);
     }
 
+    int exit_code = snapshot_unreached ? 5 : 0;
+    if (raw_mdevrw_guard_hit) exit_code = 6;
+    else if (bridge_halt_failure) exit_code = 7;
+    else if (guest_fatal_entry_seen) exit_code = 10;
+    else if (external_md && st != ARM_OK) {
+        fprintf(stderr, "external-md: CPU stopped with %s\n", status_name(st));
+        exit_code = 9;
+    }
+
+    if (external_md) {
+        printf("\n=== EXTERNAL MD BRIDGE ===\n");
+        printf("  reads  : %llu (%llu bytes)\n",
+               (unsigned long long)external_bridge.stats.successful_reads,
+               (unsigned long long)external_bridge.stats.bytes_read);
+        printf("  writes : %llu (%llu bytes)\n",
+               (unsigned long long)external_bridge.stats.successful_writes,
+               (unsigned long long)external_bridge.stats.bytes_written);
+        printf("  failures: %llu\n",
+               (unsigned long long)external_bridge.stats.failures);
+
+        if (external_bridge_installed) {
+            arm_bus_set_privileged_svc_handler(&mach.bus, NULL, NULL);
+            external_bridge_installed = false;
+        }
+        /* End the bridge's borrowed vm_block_t lifetime before touching the
+         * retained adapter. */
+        external_bridge.config.block = NULL;
+
+        file_block_status_t flush_status =
+            file_block_flush(external_block_adapter);
+        if (flush_status != FILE_BLOCK_STATUS_OK) {
+            fprintf(stderr, "external-md: final flush: %s (host error %d)\n",
+                    file_block_strerror(flush_status),
+                    file_block_last_system_error(external_block_adapter));
+            if (!exit_code) exit_code = 8;
+        }
+        file_block_status_t close_status =
+            file_block_close(external_block_adapter);
+        if (close_status != FILE_BLOCK_STATUS_OK) {
+            fprintf(stderr, "external-md: close: %s (host error %d)\n",
+                    file_block_strerror(close_status),
+                    file_block_last_system_error(external_block_adapter));
+            if (!exit_code) exit_code = 8;
+        }
+        file_block_status_t destroy_status =
+            file_block_destroy(&external_block_adapter);
+        if (destroy_status != FILE_BLOCK_STATUS_OK) {
+            fprintf(stderr, "external-md: destroy adapter: %s\n",
+                    file_block_strerror(destroy_status));
+            if (!exit_code) exit_code = 8;
+        }
+    }
+
     s5l8900_free(&mach);
     ksyms_free(&KS);
     free(img);
-    return snapshot_unreached ? 5 : 0;
+    return exit_code;
 }
