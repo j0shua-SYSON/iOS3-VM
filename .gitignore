@@ -6,6 +6,7 @@
 /.tmp/
 /.cache/
 /.m5-lab/
+/work/
 
 # XcodeGen output (generated from app/project.yml — never committed)
 *.xcodeproj
