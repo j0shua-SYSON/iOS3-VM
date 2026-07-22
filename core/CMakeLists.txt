@@ -233,6 +233,90 @@ else()
 endif()
 add_test(NAME atomic_guest_patch COMMAND test_guest_patch)
 
+# The exact kernel and rootfs policies authenticate caller-selected bytes with
+# the same small, allocation-free implementation.  Keep that primitive in a
+# separate strict target so neither host policy carries a private hash copy.
+add_library(host_sha256 STATIC ../tools/sha256.c)
+target_include_directories(host_sha256 PUBLIC ../tools)
+set_target_properties(host_sha256 PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(host_sha256 PRIVATE /W4 /WX)
+else()
+    target_compile_options(host_sha256 PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+
+# The exact iPhone OS 3.1.3 kernel manifest is a second host-policy layer over
+# the firmware-neutral transaction helper.  Keeping it in its own target makes
+# the supported build identity explicit and prevents the portable CPU core from
+# silently accepting version-specific patches.
+add_library(host_ios3_kernel_patch STATIC ../tools/ios3_kernel_patch.c)
+target_include_directories(host_ios3_kernel_patch PUBLIC ../tools include)
+target_link_libraries(host_ios3_kernel_patch
+    PUBLIC host_guest_patch host_sha256
+    PRIVATE emucore)
+set_target_properties(host_ios3_kernel_patch PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(host_ios3_kernel_patch PRIVATE /W4 /WX)
+else()
+    target_compile_options(host_ios3_kernel_patch PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+
+add_executable(test_ios3_kernel_patch tests/test_ios3_kernel_patch.c)
+target_link_libraries(test_ios3_kernel_patch PRIVATE host_ios3_kernel_patch)
+set_target_properties(test_ios3_kernel_patch PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(test_ios3_kernel_patch PRIVATE /W4 /WX)
+else()
+    target_compile_options(test_ios3_kernel_patch PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+add_test(NAME exact_ios3_kernel_patch COMMAND test_ios3_kernel_patch)
+
+# Provisioning a writable rootfs image is host filesystem work, not emulated
+# machine behavior.  The implementation is intentionally standalone and uses
+# at most a 1 MiB transfer buffer, so its format and publication tests remain
+# cheap on every hosted runner.
+add_library(host_rootfs_work STATIC ../tools/rootfs_work.c)
+target_include_directories(host_rootfs_work PUBLIC ../tools)
+target_link_libraries(host_rootfs_work PUBLIC host_sha256)
+set_target_properties(host_rootfs_work PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(host_rootfs_work PRIVATE /W4 /WX)
+else()
+    target_compile_options(host_rootfs_work PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+
+add_executable(test_rootfs_work tests/test_rootfs_work.c)
+target_link_libraries(test_rootfs_work PRIVATE host_rootfs_work)
+set_target_properties(test_rootfs_work PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(test_rootfs_work PRIVATE /W4 /WX)
+else()
+    target_compile_options(test_rootfs_work PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+add_test(NAME bounded_rootfs_work_image COMMAND test_rootfs_work)
+set_tests_properties(bounded_rootfs_work_image PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
 # img3dump points the real parser at real firmware, so inspecting an IPSW also
 # validates our format handling.
 add_executable(img3dump ../tools/img3dump.c)
@@ -251,7 +335,8 @@ target_link_libraries(machoinfo PRIVATE emucore)
 
 add_executable(bootkernel ../tools/bootkernel.c)
 target_link_libraries(bootkernel PRIVATE
-    emucore host_file_block host_guest_patch)
+    emucore host_file_block host_guest_patch host_ios3_kernel_patch
+    host_rootfs_work)
 
 # snapboot is the snapshot acceptance harness: it boots to a checkpoint, saves,
 # and can restore into a fresh process. Comparing snapshot bytes alone is not
