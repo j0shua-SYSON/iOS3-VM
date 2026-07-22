@@ -135,10 +135,15 @@ is now replay-cleared by a complete paired-extend implementation.
 The audited near-term storage design retains the proven md0/HFS path but moves
 its writable bytes behind a portable block backend. The core now has exact
 64-bit ranged reads/writes, bounded host callback sizes, flush, cancellation,
-and explicit identity/generation metadata. Its ARM bus also has a
+and explicit identity/generation metadata. The host adapter uses retained file
+descriptors, denies conflicting opens where the platform permits it, and
+revalidates file size and identity around I/O. Its ARM bus also has a
 privileged-only SVC seam: handled calls retire normally, ordinary calls remain
 guest SVCs, and backend errors restore CPU state and halt without incrementing
-the retired-instruction counter. Neither foundation is wired to md0 yet.
+the retired-instruction counter. The exact-site md bridge stages reads before
+publishing them to RAM, bounds each operation to one 4 KiB page, and preserves
+the audited register file. LC_UUID parsing and an atomic expected-byte patch
+manifest gate the firmware-specific edits. None of this is wired to md0 yet.
 
 The boot integration uses three exact, kernel-identity-gated 7E18 patches to
 select md physical mode and replace only md strategy's two `_bcopy_phys` calls

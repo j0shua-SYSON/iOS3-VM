@@ -865,9 +865,11 @@ pages below target at 2.98 B. That movement suggests XNU's reclamation path is
 active, but the available headroom is still unsafe for the app. The storage
 audit also proved that setting md physical mode and adding an external bus
 aperture is insufficient: this kernel's `_bcopy_phys` only applies the normal
-DRAM direct-map delta. The near-term design therefore needs a narrowly scoped,
-writable bulk-copy bridge for md strategy, plus snapshot backing identity and
-overlay state; full NAND remains the higher-fidelity, much larger route.
+DRAM direct-map delta. The narrowly scoped writable md-strategy bridge, its
+locked file adapter, and the UUID-gated atomic patch helper now exist under unit
+tests, but `bootkernel` has not installed them in a real run yet. Work-image
+provisioning, raw `/dev/rmd0` fail-closed handling, and snapshot backing identity
+and overlay state remain; full NAND is the higher-fidelity, much larger route.
 
 This chain is stronger evidence for sustained userspace and snapshot
 repeatability. It is **not** evidence that SpringBoard rendered: the runs used

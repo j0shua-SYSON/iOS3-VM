@@ -107,6 +107,13 @@ macho_status_t macho_parse(const uint8_t *buf, size_t len, macho_t *out) {
                 out->entry     = rd32(regs + 15 * 4);
                 out->has_entry = true;
             }
+        } else if (cmd == LC_UUID) {
+            /* uuid_command is exactly cmd/cmdsize plus 16 opaque bytes.
+             * Multiple identities are ambiguous and therefore malformed. */
+            if (cmdsize != 24 || out->has_uuid)
+                return MACHO_ERR_MALFORMED;
+            memcpy(out->uuid, buf + off + 8, sizeof out->uuid);
+            out->has_uuid = true;
         }
         off += cmdsize;
     }

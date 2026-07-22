@@ -183,8 +183,9 @@ a low of 97 pages at 2,934,505,472, recovered to 253 near the former opcode
 stop, and ended at 214 at 2.98 B against a target of 250. That movement is evidence of reclamation, not proof that
 the layout is safe. The RAM disk remains pinned guest memory even though its
 host-side duplicate is gone. The storage audit has ruled out a simple external
-aperture and selected a writable, range-gated md bulk-copy bridge with snapshot
-coupling; implement and test that bounded path before app integration or an
+aperture. The writable, range-gated md bulk-copy bridge, locked file adapter,
+kernel UUID parser and atomic patch helper are now implemented and unit-tested;
+wire them to a separately provisioned work image with snapshot coupling before app integration or an
 unbounded continuation.
 
 ### WFI changes elapsed device time, not the instruction coordinate

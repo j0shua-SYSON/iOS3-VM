@@ -7,6 +7,7 @@ add_library(emucore STATIC
     src/snapshot.c
     src/vm_source.c
     src/vm_block.c
+    src/md_bridge.c
     src/soc/uart.c
     src/soc/vic.c
     src/soc/timer.c
@@ -142,6 +143,14 @@ add_executable(test_vm_block tests/test_vm_block.c)
 target_link_libraries(test_vm_block PRIVATE emucore)
 add_test(NAME vm_block COMMAND test_vm_block)
 
+add_executable(test_md_bridge tests/test_md_bridge.c)
+target_link_libraries(test_md_bridge PRIVATE emucore)
+add_test(NAME host_memory_disk_bridge COMMAND test_md_bridge)
+
+add_executable(test_macho tests/test_macho.c)
+target_link_libraries(test_macho PRIVATE emucore)
+add_test(NAME macho_parser COMMAND test_macho)
+
 # VMGuest is the portable-C seam between the iOS shell and emucore.  Building
 # it only with Xcode left its physical-address and scanout bounds checks outside
 # the sanitizer suite, even though a mistake there becomes an out-of-bounds
@@ -156,6 +165,74 @@ target_link_libraries(test_vmguest PRIVATE emucore)
 add_test(NAME app_vmguest_bridge COMMAND test_vmguest)
 
 # --- host tools -------------------------------------------------------------
+# The host-owned writable-file adapter stays outside emucore: the portable core
+# exposes vm_block_t callbacks but never depends on descriptors, locks, or
+# platform sync APIs.  Build this small boundary with the strictest warnings.
+add_library(host_file_block STATIC ../tools/file_block.c)
+target_include_directories(host_file_block PUBLIC ../tools include)
+set_target_properties(host_file_block PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(NOT WIN32)
+    target_compile_definitions(host_file_block PRIVATE _FILE_OFFSET_BITS=64)
+endif()
+if(MSVC)
+    target_compile_options(host_file_block PRIVATE /W4 /WX)
+else()
+    target_compile_options(host_file_block PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+
+add_executable(test_file_block tests/test_file_block.c)
+target_link_libraries(test_file_block PRIVATE emucore host_file_block)
+set_target_properties(test_file_block PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    # Fixture helpers deliberately use ISO fopen; contain the secure-CRT opt-out
+    # to this test instead of weakening warnings for production targets.
+    target_compile_definitions(test_file_block PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(test_file_block PRIVATE /W4 /WX)
+else()
+    target_compile_options(test_file_block PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+add_test(NAME file_block_adapter COMMAND test_file_block)
+set_tests_properties(file_block_adapter PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+# Kernel compatibility patches are a host policy, not a property of the CPU
+# core.  Keep their bounded, firmware-neutral transaction helper outside
+# emucore so a frontend must opt into a version-specific manifest explicitly.
+add_library(host_guest_patch STATIC ../tools/guest_patch.c)
+target_include_directories(host_guest_patch PUBLIC ../tools)
+set_target_properties(host_guest_patch PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(host_guest_patch PRIVATE /W4 /WX)
+else()
+    target_compile_options(host_guest_patch PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+
+add_executable(test_guest_patch tests/test_guest_patch.c)
+target_link_libraries(test_guest_patch PRIVATE host_guest_patch)
+set_target_properties(test_guest_patch PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(test_guest_patch PRIVATE /W4 /WX)
+else()
+    target_compile_options(test_guest_patch PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+add_test(NAME atomic_guest_patch COMMAND test_guest_patch)
+
 # img3dump points the real parser at real firmware, so inspecting an IPSW also
 # validates our format handling.
 add_executable(img3dump ../tools/img3dump.c)
@@ -173,7 +250,8 @@ add_executable(machoinfo ../tools/machoinfo.c)
 target_link_libraries(machoinfo PRIVATE emucore)
 
 add_executable(bootkernel ../tools/bootkernel.c)
-target_link_libraries(bootkernel PRIVATE emucore)
+target_link_libraries(bootkernel PRIVATE
+    emucore host_file_block host_guest_patch)
 
 # snapboot is the snapshot acceptance harness: it boots to a checkpoint, saves,
 # and can restore into a fresh process. Comparing snapshot bytes alone is not

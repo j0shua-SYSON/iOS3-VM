@@ -53,6 +53,14 @@ int main(int argc, char **argv) {
     }
     printf("vm range   : 0x%08x .. 0x%08x (%.1f MB)\n",
            m.vm_low, m.vm_high, (m.vm_high - m.vm_low) / 1048576.0);
+    if (m.has_uuid) {
+        printf("uuid       : ");
+        for (unsigned i = 0; i < sizeof m.uuid; i++)
+            printf("%02x", m.uuid[i]);
+        printf("\n");
+    } else {
+        printf("uuid       : NONE\n");
+    }
     if (m.has_entry) printf("entry PC   : 0x%08x   (initial SP 0x%08x)\n", m.entry, m.entry_sp);
     else             printf("entry PC   : NOT FOUND (no LC_UNIXTHREAD)\n");
     if (m.has_symtab)

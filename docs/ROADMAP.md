@@ -33,7 +33,7 @@ proof that no private or unindexed implementation exists.
 | **N** | Guest networking (parallel) | The guest resolves a name and fetches a URL | ⚪ designed, not built |
 | **A** | Guest audio (first-device track) | Guest PCM reaches the host speaker without blocking the CPU thread | ⚪ priority, not designed or built |
 
-CI builds the portable core on Linux and macOS, runs strict-warning and
+CI builds the portable core on Linux, macOS and Windows, runs strict-warning and
 sanitizer jobs, and executes emitted JIT blocks on the arm64 macOS runners. The
 iOS workflow proves compile, link, fake-sign and packaging only; it is not an
 on-device runtime or real-firmware boot test. Exact assertion totals change with
@@ -628,11 +628,14 @@ still runs only a synthetic guest and has no touch or audio path.
   but such headroom is still unsafe for an iOS host and the roughly 445 MiB
   pinned disk remains a major architecture frontier. The audit has ruled out a
   simple external PA aperture: `_bcopy_phys` converts both operands through one
-  fixed DRAM direct-map delta. The portable bounded writable-block API and
-  privileged-only, transactional SVC seam are now implemented and tested, but
-  they are not yet wired to the guest. The selected near-term integration is a
-  writable, range-gated bulk-copy path limited to md strategy, with snapshot
-  identity and overlay state; global `_bcopy_phys` replacement is forbidden.
+  fixed DRAM direct-map delta. The portable bounded writable-block API, locked
+  descriptor file adapter, privileged-only transactional SVC seam, and the
+  writable range- and page-gated md-strategy bulk-copy bridge are now
+  implemented and tested. Kernel LC_UUID parsing plus a bounded atomic
+  expected-byte patch manifest provide the fail-closed identity gate. They are
+  not yet wired into `bootkernel`, so md0 is still in guest RAM. Work-image
+  provisioning and snapshot identity/overlay state are the next integration;
+  global `_bcopy_phys` replacement is forbidden.
   The raw `/dev/rmd0` path instead reaches `_uiomove64`/`_copypv`, so it must be
   separately instrumented and fail closed until bridged. Historical
   older-source experiments reported 312 MiB and

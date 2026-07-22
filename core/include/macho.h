@@ -27,6 +27,7 @@
 #define LC_SEGMENT        0x01u
 #define LC_SYMTAB         0x02u
 #define LC_UNIXTHREAD     0x05u
+#define LC_UUID           0x1bu
 
 #define MACHO_MAX_SEGMENTS 16u
 
@@ -58,6 +59,11 @@ typedef struct {
     bool     has_symtab;
     uint32_t symoff, nsyms;  /* nlist_32 array: 12 bytes per entry */
     uint32_t stroff, strsize;
+
+    /* LC_UUID is the kernel-build identity used to gate version-specific
+     * compatibility patches. It is an opaque 16-byte value, not text. */
+    bool     has_uuid;
+    uint8_t  uuid[16];
 
     uint32_t vm_low;         /* lowest  vmaddr across segments */
     uint32_t vm_high;        /* highest vmaddr + vmsize        */

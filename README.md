@@ -142,13 +142,17 @@ layout safe: the roughly 445 MiB pinned RAM disk consumes pages that a real
 device would keep on storage. The
 host-backed-storage audit ruled out merely relocating md0 or flipping its
 physical-mode flag: this kernel's `_bcopy_phys` only understands the normal
-DRAM direct map. The portable exact-I/O block API and a privileged-only,
-fail-closed SVC host-service seam now exist and are host-tested; backend errors
-halt without falsely retiring the trapping instruction. They are foundations,
-not a mounted external disk yet. The remaining boot integration is a narrow,
-writable, range-checked bulk-copy bridge for md strategy I/O, plus explicit
-handling of the separate raw `/dev/rmd0` path and snapshot-coupled immutable
-backing/overlay generations. That remains a major device-memory prerequisite.
+DRAM direct map. The portable exact-I/O block API, a descriptor-backed writable
+file adapter, a privileged-only fail-closed SVC seam, and the exact-site md
+bulk-copy bridge now exist and are host-tested. Mach-O UUID parsing and an
+all-or-nothing expected-byte patch transaction gate the version-specific kernel
+edits. Backend errors halt without falsely retiring the trapping instruction,
+and a failed read never publishes a partial buffer into guest RAM. These are
+still foundations, not a mounted external disk: `bootkernel` does not yet create
+or retain the writable work image, install the bridge, or free md0 from guest
+RAM. The separate raw `/dev/rmd0` path and snapshot-coupled immutable
+backing/overlay generations also remain explicit fail-closed work. That is the
+current major device-memory prerequisite.
 
 That is sustained real userspace, not a completed boot. There is still no
 captured SpringBoard frame, no proof that the current userland reached the home
