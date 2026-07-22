@@ -80,15 +80,23 @@ static const expected_site_t expected_sites[] = {
     }
 };
 
+/* A union's alignment is sufficient for every member.  Using the two API
+ * structures as members keeps these byte fixtures suitably aligned without
+ * depending on max_align_t, which is absent in some supported MSVC C modes. */
+typedef union {
+    ios3_kernel_patch_request_t request;
+    ios3_kernel_patch_report_t report;
+} patch_api_alignment_t;
+
 /* BSS-backed fixtures keep heap use at zero while still presenting the exact
  * production-sized immutable file and complete file-backed RAM span. */
 typedef union {
-    max_align_t alignment;
+    patch_api_alignment_t alignment;
     uint8_t bytes[0x007d1000u];
 } aligned_kernel_storage_t;
 
 typedef union {
-    max_align_t alignment;
+    patch_api_alignment_t alignment;
     uint8_t bytes[0x007d1000u];
 } aligned_ram_storage_t;
 
@@ -604,14 +612,14 @@ static void test_geometry_and_nulls(fixture_t *fixture) {
 
 static void test_overlap_rules_precede_report_writes(fixture_t *fixture) {
     union {
-        max_align_t alignment;
+        patch_api_alignment_t alignment;
         uint8_t bytes[sizeof(ios3_kernel_patch_report_t) >
                       sizeof(ios3_kernel_patch_request_t)
                           ? sizeof(ios3_kernel_patch_report_t)
                           : sizeof(ios3_kernel_patch_request_t)];
     } alias;
     union {
-        max_align_t alignment;
+        patch_api_alignment_t alignment;
         uint8_t bytes[64u + sizeof(ios3_kernel_patch_report_t)];
     } adjacent;
     ios3_kernel_patch_request_t request;

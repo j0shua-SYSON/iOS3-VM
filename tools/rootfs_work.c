@@ -938,6 +938,10 @@ static bool host_file_sync(host_file_t *file, int *system_error) {
     return false;
 }
 
+static uint32_t links_to_u32(uintmax_t links) {
+    return links > (uintmax_t)UINT32_MAX ? UINT32_MAX : (uint32_t)links;
+}
+
 static bool host_file_stamp(host_file_t *file, file_stamp_t *stamp,
                             int *system_error) {
     struct stat info;
@@ -955,9 +959,13 @@ static bool host_file_stamp(host_file_t *file, file_stamp_t *stamp,
     stamp->identity_b = (uint64_t)info.st_ino;
     stamp->modified_a = (uint64_t)info.st_mtime;
     stamp->changed_a = (uint64_t)info.st_ctime;
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(_DARWIN_C_SOURCE)
     stamp->modified_b = (uint64_t)info.st_mtimespec.tv_nsec;
     stamp->changed_b = (uint64_t)info.st_ctimespec.tv_nsec;
+#elif defined(__APPLE__)
+    /* Darwin's strict POSIX layout exposes nanoseconds as scalar fields. */
+    stamp->modified_b = (uint64_t)info.st_mtimensec;
+    stamp->changed_b = (uint64_t)info.st_ctimensec;
 #elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
       defined(__OpenBSD__)
     stamp->modified_b = (uint64_t)info.st_mtim.tv_nsec;
@@ -966,8 +974,7 @@ static bool host_file_stamp(host_file_t *file, file_stamp_t *stamp,
     stamp->modified_b = 0;
     stamp->changed_b = 0;
 #endif
-    stamp->links = info.st_nlink > UINT32_MAX ? UINT32_MAX :
-                   (uint32_t)info.st_nlink;
+    stamp->links = links_to_u32((uintmax_t)info.st_nlink);
     return true;
 }
 
