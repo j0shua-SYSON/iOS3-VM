@@ -24,7 +24,9 @@
 #include "macho.h"
 #include "snapshot.h"
 #include "soc.h"
+#include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -214,6 +216,121 @@ static bool align_u64(uint64_t value, uint64_t alignment, uint64_t *out) {
         value > UINT64_MAX - (alignment - 1)) return false;
     *out = (value + alignment - 1) & ~(alignment - 1);
     return true;
+}
+
+/* Parse one command-line integer without the silent wrap/truncation of
+ * strtoul()+cast.  Instruction positions are persisted in snapshots and can
+ * legitimately exceed UINT32_MAX, so every character and the full uint64_t
+ * range matter.  Reject whitespace too: accepting " -1" would otherwise let
+ * strtoumax() turn a negative value into UINTMAX_MAX. */
+static bool parse_u64_span(const char *option, const char *first,
+                           const char *last, uint64_t *out) {
+    if (!option || !first || !last || !out || first >= last) {
+        fprintf(stderr, "%s: expected an unsigned 64-bit integer\n",
+                option ? option : "instruction count");
+        return false;
+    }
+    for (const char *p = first; p < last; p++) {
+        if (isspace((unsigned char)*p)) {
+            fprintf(stderr, "%s: whitespace is not allowed in the integer\n",
+                    option);
+            return false;
+        }
+    }
+    if (*first == '-') {
+        fprintf(stderr, "%s: negative instruction values are not allowed\n",
+                option);
+        return false;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    uintmax_t value = strtoumax(first, &end, 0);
+    if (errno == ERANGE || value > UINT64_MAX) {
+        fprintf(stderr, "%s: instruction value is outside uint64_t range\n",
+                option);
+        return false;
+    }
+    if (end != last) {
+        fprintf(stderr, "%s: invalid unsigned 64-bit integer\n", option);
+        return false;
+    }
+    *out = (uint64_t)value;
+    return true;
+}
+
+static bool parse_u64_arg(const char *option, const char *text, uint64_t *out) {
+    return text && parse_u64_span(option, text, text + strlen(text), out);
+}
+
+static bool boot_option_takes_value(const char *option) {
+    static const char *const options[] = {
+        "-D", "-W", "-Z", "-p", "--restore", "-V", "-n", "-T",
+        "-d", "-c", "-b", "-w", "-r", "--fstab", "--grow", "-R",
+        "-X"
+    };
+
+    if (!option) return false;
+    for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++)
+        if (!strcmp(option, options[i])) return true;
+    return false;
+}
+
+typedef struct {
+    uint64_t at;
+    const char *path;
+    bool done;
+} boot_snapshot_request_t;
+
+/* Save every checkpoint due at the machine's current absolute retired-
+ * instruction count.  Keeping completion state prevents a checkpoint at the
+ * restored starting count from being written again if a failed arm_step()
+ * retires no instruction. */
+static bool save_due_snapshots(s5l8900_t *mach,
+                               boot_snapshot_request_t *snaps,
+                               unsigned nsnaps) {
+    if (!mach || (!snaps && nsnaps)) return false;
+    for (unsigned s = 0; s < nsnaps; s++) {
+        if (snaps[s].done || snaps[s].at != mach->cpu.cycles) continue;
+        snapshot_status_t status = snapshot_save(mach, snaps[s].path);
+        printf("snapshot   : @%" PRIu64 " -> %s: %s\n",
+               mach->cpu.cycles, snaps[s].path, snapshot_strerror(status));
+        fflush(stdout);
+        if (status != SNAP_OK) {
+            fprintf(stderr, "snapshot %s: %s\n",
+                    snaps[s].path, snapshot_strerror(status));
+            return false;
+        }
+        snaps[s].done = true;
+    }
+    return true;
+}
+
+/* ceil(part * total / 40), without overflowing when total is near
+ * UINT64_MAX. These are the exact half-open boundaries produced by
+ * floor(instruction * 40 / total); part is always in [0,40]. */
+static uint64_t instruction_bucket_boundary(uint64_t total, unsigned part) {
+    return (total / 40u) * part +
+           ((total % 40u) * part + 39u) / 40u;
+}
+
+/* floor(at * 40 / limit), clamped to the 40-element histogram, again without
+ * performing the potentially overflowing multiplication. */
+static unsigned instruction_bucket(uint64_t at, uint64_t limit) {
+    if (!limit || at >= limit) return at ? 39u : 0u;
+    /* Keep the hot-MMIO probe's overwhelmingly common path as cheap as the
+     * old expression.  Only astronomical counters need the overflow-safe
+     * threshold search. */
+    if (at <= UINT64_MAX / 40u)
+        return (unsigned)((at * 40u) / limit);
+    uint64_t q = limit / 40u;
+    uint64_t r = limit % 40u;
+    for (unsigned bucket = 0; bucket < 39u; bucket++) {
+        unsigned part = bucket + 1u;
+        uint64_t ceiling = q * part + (r * part + 39u) / 40u;
+        if (at < ceiling) return bucket;
+    }
+    return 39u;
 }
 
 static bool boot_range_make(boot_range_t *range, const char *name,
@@ -1197,14 +1314,14 @@ static struct {
     uint32_t sane_va, maxmem_va, memsize_va;
     uint32_t availstart_va, availend_va, firstavail_va;
     uint32_t free_peak;         /* most free pages ever seen = end of bootstrap */
-    unsigned free_peak_at;
+    uint64_t free_peak_at;
     uint32_t free_min;          /* low-water mark AFTER the peak, in pages */
-    unsigned free_min_at;       /* instruction index of that minimum */
+    uint64_t free_min_at;       /* absolute instruction index of that minimum */
     uint32_t free_first;        /* first non-zero sample */
-    unsigned free_first_at;
-    unsigned samples;
-    uint32_t hist[40];          /* free pages over the run, 40 buckets */
-    unsigned hist_n[40];
+    uint64_t free_first_at;
+    uint64_t samples;
+    uint64_t hist[40];          /* free-page sums over the run, 40 buckets */
+    uint64_t hist_n[40];
 } VM;
 
 static void vm_resolve(void) {
@@ -1222,7 +1339,7 @@ static void vm_resolve(void) {
     VM.free_min = 0xffffffffu;
 }
 
-static void vm_sample(unsigned n, unsigned steps) {
+static void vm_sample(uint64_t n, uint64_t steps) {
     if (!VM.free_va) return;
     uint32_t f = guest_u32(VM.free_va);
     /* Zero means vm_page_bootstrap has not run yet, not "out of memory". */
@@ -1238,8 +1355,7 @@ static void vm_sample(unsigned n, unsigned steps) {
      */
     if (f >= VM.free_peak) { VM.free_peak = f; VM.free_peak_at = n; VM.free_min = f; }
     else if (f < VM.free_min) { VM.free_min = f; VM.free_min_at = n; }
-    unsigned b = steps ? (unsigned)((uint64_t)n * 40u / steps) : 0;
-    if (b > 39) b = 39;
+    unsigned b = instruction_bucket(n, steps);
     VM.hist[b] += f;
     VM.hist_n[b]++;
 }
@@ -1274,18 +1390,22 @@ static void vm_report(void) {
             printf("    %-24s 0x%08x       %8.2f MB\n", row[i].nm, v, v / 1048576.0);
     }
     if (VM.samples) {
-        printf("    ---- free pages over the run (%u samples) ----\n", VM.samples);
-        printf("    first  %8u pages %7.2f MB  @instr %u  (mid-bootstrap)\n",
+        printf("    ---- free pages over the run (%" PRIu64 " samples) ----\n",
+               VM.samples);
+        printf("    first  %8u pages %7.2f MB  @instr %" PRIu64
+               "  (mid-bootstrap)\n",
                VM.free_first, VM_MB(VM.free_first), VM.free_first_at);
-        printf("    peak   %8u pages %7.2f MB  @instr %u  (pool fully built)\n",
+        printf("    peak   %8u pages %7.2f MB  @instr %" PRIu64
+               "  (pool fully built)\n",
                VM.free_peak, VM_MB(VM.free_peak), VM.free_peak_at);
-        printf("    LOWEST %8u pages %7.2f MB  @instr %u   <-- the headroom "
+        printf("    LOWEST %8u pages %7.2f MB  @instr %" PRIu64
+               "   <-- the headroom "
                "that actually has to hold everything\n",
                VM.free_min, VM_MB(VM.free_min), VM.free_min_at);
         for (unsigned i = 0; i < 40; i++)
             if (VM.hist_n[i])
                 printf("      bucket %2u  mean free %8.2f MB\n",
-                       i, VM_MB((double)VM.hist[i] / VM.hist_n[i]));
+                       i, VM_MB((double)VM.hist[i] / (double)VM.hist_n[i]));
     } else {
         printf("    (never sampled non-zero — vm_page_bootstrap not reached)\n");
     }
@@ -1441,7 +1561,7 @@ static struct {
     /* milestones */
     uint32_t    mile_pa[NMILE_MAX];
     uint64_t    mile_hits[NMILE_MAX];
-    unsigned    mile_first[NMILE_MAX];
+    uint64_t    mile_first[NMILE_MAX];
 
     /* --- WHAT MODE THE GUEST IS ACTUALLY IN ------------------------------
      * Indexed by CPSR[4:0]. The single most decisive number for a stall is the
@@ -1456,7 +1576,8 @@ static struct {
      * Sampled on EVERY user-mode instruction, not every 1024: user mode is
      * rare enough here that a 1-in-1024 sample of it rounds to nothing. */
 #define UPCHASH 4096u
-    unsigned    upc_n, upc_dropped;
+    unsigned    upc_n;
+    uint64_t    upc_dropped;
     struct { uint32_t va; uint64_t hits; } upc_hist[UPCHASH];
 
     /* --- SYSTEM CALLS ----------------------------------------------------
@@ -1469,16 +1590,17 @@ static struct {
      *   r12 >  0   BSD syscall r12
      * (_unix_syscall corroborates: it reloads the number from savedstate+0x30,
      * i.e. regs->r12, and takes r0 as the number when it is zero.) */
-    unsigned    sc_n, sc_dropped;
-    struct { unsigned at; uint32_t r12, r[4], lr, spsr; } sc[512];
+    unsigned    sc_n;
+    uint64_t    sc_dropped;
+    struct { uint64_t at; uint32_t r12, r[4], lr, spsr; } sc[512];
 
     /* IRQ entries, for the same reason FIQ entries are counted. */
     uint64_t    irq_n;
 
     /* distinct MMU faults */
     unsigned    fault_n;
-    unsigned    fault_dropped;
-    struct { uint32_t far_, fsr, pc; bool prefetch; unsigned first_at; uint64_t n; } fault[48];
+    uint64_t    fault_dropped;
+    struct { uint32_t far_, fsr, pc; bool prefetch; uint64_t first_at, n; } fault[48];
 
     /* --- DIAGNOSTIC: exception returns that resume in Thumb state ---------
      * A "MOVS pc,lr" / "LDM ^" leaving an ARM handler for Thumb code must
@@ -1489,15 +1611,16 @@ static struct {
      * split roughly evenly between +0 and +2 mod 4. */
     uint64_t    exret_thumb, exret_thumb_aligned4, exret_mismatch;
     unsigned    exret_log_n;
-    struct { unsigned at; uint32_t from_pc, lr, to_pc, mode_from, mode_to; } exret_log[24];
+    struct { uint64_t at; uint32_t from_pc, lr, to_pc, mode_from, mode_to; } exret_log[24];
 
     /* --- DIAGNOSTIC: failed STREX/STREXD/STREXB/STREXH -------------------- */
     uint64_t    strex_total, strex_failed;
     unsigned    strex_log_n;
-    struct { unsigned at; uint32_t pc, addr; } strex_log[32];
+    struct { uint64_t at; uint32_t pc, addr; } strex_log[32];
 
     /* --- DIAGNOSTIC: FIQ arrival rate and the timer latch ------------------ */
-    unsigned    fiq_n, fiq_last;
+    uint64_t    fiq_n;
+    uint64_t    fiq_last;
     uint64_t    fiq_instrs, fiq_longest;
     unsigned    fiq_storm_logged;
 
@@ -1506,8 +1629,9 @@ static struct {
      * instructions without reaching its next milestone, the question is not
      * "where did it crash" but "what is it doing instead", and a call-path
      * snapshot at an arbitrary stopping point does not answer that. */
-    unsigned    prof_n, prof_dropped;
-    struct { const char *fn; unsigned hits; } prof[1024];
+    unsigned    prof_n;
+    uint64_t    prof_dropped;
+    struct { const char *fn; uint64_t hits; } prof[1024];
 
     /*
      * The same samples keyed by EXACT pc, not by function.
@@ -1520,8 +1644,9 @@ static struct {
      * probe; capacity is a power of two and never grows.
      */
 #define PCHASH 8192u
-    unsigned    pc_n, pc_dropped;
-    struct { uint32_t va; unsigned hits; } pc_hist[PCHASH];
+    unsigned    pc_n;
+    uint64_t    pc_dropped;
+    struct { uint32_t va; uint64_t hits; } pc_hist[PCHASH];
 
     /* --- DIAGNOSTIC: the single hottest unmodelled MMIO page ---------------
      * One physical page absorbs ~2% of every instruction in a 200M boot. This
@@ -1545,14 +1670,6 @@ static struct {
 
 #define HOTPG 0x39a00000u
 
-/* --- EXPERIMENT (-P): a candidate model for the power block at 0x39a00000 ---
- * Lives in the tool, not the core, so it can be tested without asserting
- * anything about hardware in the emulator proper. Semantics come entirely from
- * the traced AppleS5L8900XPowerController::start sequence:
- *   0x0C <- bits to clear in STATE      (write-1-to-clear)
- *   0x10 <- bits to set   in STATE      (write-1-to-set)
- *   0x14 -> STATE, read-only
- * plus plain storage for 0x00/0x04/0x08/0x24/0x28. */
 /* Attribute one sample to an exact PC. Cheap: no name is resolved here, only
  * at report time. */
 static void pc_sample(uint32_t va) {
@@ -1661,8 +1778,7 @@ static void note_hot(uint32_t addr, uint32_t val, unsigned bytes, bool wr) {
         G.hot_tail_w = (k + 1) % 64; G.hot_tail_n++;
     }
     if (G.hot_steps) {
-        uint64_t b = G.hot_now * 40 / G.hot_steps;
-        if (b > 39) b = 39;
+        unsigned b = instruction_bucket(G.hot_now, G.hot_steps);
         G.hot_bucket[b]++;
     }
 }
@@ -1725,7 +1841,8 @@ static void milestones_build(void) {
     }
 }
 
-static void note_fault(uint32_t far_, uint32_t fsr, uint32_t pc, bool pref, unsigned at) {
+static void note_fault(uint32_t far_, uint32_t fsr, uint32_t pc, bool pref,
+                       uint64_t at) {
     for (unsigned i = 0; i < G.fault_n; i++)
         if (G.fault[i].far_ == far_ && G.fault[i].pc == pc && G.fault[i].prefetch == pref) {
             G.fault[i].n++; return;
@@ -1881,7 +1998,7 @@ static void syscall_report(uint32_t virt_base, uint32_t phys_base) {
             nm = trapname(BSD_SYSCALL, (unsigned)(sizeof BSD_SYSCALL / sizeof BSD_SYSCALL[0]), bn);
             if (!nm) { snprintf(buf, sizeof buf, "bsd_syscall #%u", bn); nm = buf; }
         }
-        printf("    #%-3u @%-11u r12 %-11d %-32s\n"
+        printf("    #%-3u @%-11" PRIu64 " r12 %-11d %-32s\n"
                "         args %08x %08x %08x %08x   from user pc %08x (%s, spsr %08x)\n",
                i, G.sc[i].at, num, nm,
                G.sc[i].r[0], G.sc[i].r[1], G.sc[i].r[2], G.sc[i].r[3],
@@ -1909,13 +2026,20 @@ static void syscall_report(uint32_t virt_base, uint32_t phys_base) {
  * user-mode instructions, launchd is not running: it is parked inside the
  * kernel, and the thing to find is what it is parked on — not a user PC.
  */
-static void mode_report(unsigned n, unsigned win_lo, unsigned win_hi) {
+static uint64_t observed_instructions(void) {
+    uint64_t total = 0;
+    for (unsigned mode = 0; mode < 32u; mode++) total += G.mode_all[mode];
+    return total;
+}
+
+static void mode_report(uint64_t win_lo, uint64_t win_hi) {
     static const struct { unsigned m; const char *nm; } MODES[] = {
         {ARM_MODE_USR,"USR (user)"},{ARM_MODE_FIQ,"FIQ"},{ARM_MODE_IRQ,"IRQ"},
         {ARM_MODE_SVC,"SVC (kernel)"},{ARM_MODE_ABT,"ABT (abort)"},
         {ARM_MODE_UND,"UND (undefined)"},{ARM_MODE_SYS,"SYS"},
     };
-    bool windowed = (win_lo || win_hi != 0xffffffffu);
+    uint64_t n = observed_instructions();
+    bool windowed = (win_lo || win_hi != UINT64_MAX);
     printf("\n=== CPU MODE HISTOGRAM ===\n");
     printf("    %-18s %-22s %s\n", "mode", "whole run",
            windowed ? "WINDOW (-W)" : "");
@@ -1935,7 +2059,7 @@ static void mode_report(unsigned n, unsigned win_lo, unsigned win_hi) {
     if (windowed) printf("%-12llu", (unsigned long long)G.thumb_win);
     printf("\n");
     if (windowed)
-        printf("    window covered %llu instructions [%u,%u)\n",
+        printf("    window covered %llu instructions [%" PRIu64 ",%" PRIu64 ")\n",
                (unsigned long long)G.win_instrs, win_lo, win_hi);
     printf("    IRQ entries %llu\n", (unsigned long long)G.irq_n);
     if (!G.mode_all[ARM_MODE_USR])
@@ -2054,22 +2178,13 @@ int main(int argc, char **argv) {
             "      characterises what is actually spinning.\n"
             "  -Z  <n> print pc/mode/symbol every n instructions\n"
             "  -T  how many trace lines to print at the first data abort\n"
-            "  -K  disable the post-load kernel patches (see the kpatch table)\n"
-            "  -A  DIAGNOSTIC SHIM, not a fix: after an exception return that\n"
-            "      resumes in Thumb state, undo the word alignment the core\n"
-            "      applies to the resume address. Use it to confirm that a\n"
-            "      failure is caused by that alignment, never to 'work'.\n"
-            "  -P  EXPERIMENT, not a fix: model the S5L8900X power block at\n"
-            "      0x39a00000 inside this tool (0x0C write-1-to-clear,\n"
-            "      0x10 write-1-to-set, 0x14 = state). Proves what the\n"
-            "      AppleS5L8900XPowerController poll is waiting for. The real\n"
-            "      model belongs in the core; this switch only demonstrates it.\n",
+            "  -K  disable the post-load kernel patches (see the kpatch table)\n",
             argv[0]);
         return 1;
     }
     uint32_t phys_base = S5L8900_SDRAM_BASE;
     uint32_t virt_base = 0xc0000000u;
-    unsigned steps = 2000000u;
+    uint64_t steps = UINT64_C(2000000);
     const char *dtpath = NULL;
     const char *cmdline = "debug=0x8 serial=1";
     bool stop_on_abort = false;
@@ -2082,9 +2197,6 @@ int main(int argc, char **argv) {
     bool want_sha1hw = false; /* -S keeps the (unmodelled) SHA-1 engine matched */
     bool no_kpatch = false;   /* -K disables the post-load kernel patches */
     bool want_kextmap = false;/* -L prints the kext load map and exits */
-    /* -A: from outside the core, undo the word-alignment the interpreter
-     * applies when an exception return resumes in Thumb state. This is a
-     * PROOF SHIM for a suspected core bug, not a fix. */
     /*
      * boot_args header. MEASURED, not guessed: pe_identify_machine() at
      * 0xc01a7f22 does `ldrh r3,[r0,#2]; cmp r3,#6` and panics
@@ -2195,7 +2307,7 @@ int main(int argc, char **argv) {
 
     /* -W <lo>[:<hi>] profile window, -Z <n> heartbeat. Defaults are "the whole
      * run" and "silent", so neither changes an existing invocation. */
-    unsigned win_lo = 0, win_hi = 0xffffffffu, heartbeat = 0;
+    uint64_t win_lo = 0, win_hi = UINT64_MAX, heartbeat = 0;
     /* Filled once the symbol table is loaded; 0 disables syscall capture. */
     uint32_t fleh_swi_va = 0, fleh_swi_pa = 0;
 
@@ -2222,7 +2334,7 @@ int main(int argc, char **argv) {
      * exactly the instruction the original run would have.
      */
     const char *restore_path = NULL;
-    struct { uint64_t at; const char *path; } snaps[8];
+    boot_snapshot_request_t snaps[8] = {{0}};
     unsigned nsnaps = 0;
 
     /* Walk the arguments one at a time: pair-stepping breaks as soon as a
@@ -2239,15 +2351,29 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-Y")) { rd_low = true; continue; }
         /* Three-argument flag: must be recognised before the two-argument
          * guard below, which would otherwise stop the walk on the last pair. */
-        if (!strcmp(argv[i], "--snapshot-at") && i + 2 < argc) {
-            if (nsnaps < 8) {
-                snaps[nsnaps].at   = strtoull(argv[i + 1], NULL, 0);
-                snaps[nsnaps].path = argv[i + 2];
-                nsnaps++;
+        if (!strcmp(argv[i], "--snapshot-at")) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "--snapshot-at wants <insn> <file>\n");
+                return 1;
             }
+            if (nsnaps >= 8) {
+                fprintf(stderr, "--snapshot-at: at most 8 checkpoints are supported\n");
+                return 1;
+            }
+            if (!parse_u64_arg("--snapshot-at", argv[i + 1],
+                               &snaps[nsnaps].at)) return 1;
+            snaps[nsnaps].path = argv[i + 2];
+            nsnaps++;
             i += 2; continue;
         }
-        if (i + 1 >= argc) break;
+        if (!boot_option_takes_value(argv[i])) {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            return 1;
+        }
+        if (i + 1 >= argc) {
+            fprintf(stderr, "%s: missing option value\n", argv[i]);
+            return 1;
+        }
         if (!strcmp(argv[i], "-D")) {
             if (ndtov >= 32) { i++; continue; }
             snprintf(dtbuf[ndtov], sizeof dtbuf[0], "%s", argv[++i]);
@@ -2266,17 +2392,32 @@ int main(int argc, char **argv) {
         }
         if (!strcmp(argv[i], "-W")) {
             const char *v = argv[++i];
-            char *colon = NULL;
-            win_lo = (unsigned)strtoul(v, &colon, 0);
-            win_hi = (colon && *colon == ':') ? (unsigned)strtoul(colon + 1, NULL, 0)
-                                              : 0xffffffffu;
+            const char *colon = strchr(v, ':');
+            if (colon && strchr(colon + 1, ':')) {
+                fprintf(stderr, "-W: expected <lo>[:<hi>]\n");
+                return 1;
+            }
+            if (!parse_u64_span("-W lower bound", v,
+                                colon ? colon : v + strlen(v), &win_lo))
+                return 1;
+            win_hi = UINT64_MAX;
+            if (colon && !parse_u64_arg("-W upper bound", colon + 1, &win_hi))
+                return 1;
+            if (win_hi < win_lo) {
+                fprintf(stderr, "-W: upper bound is below lower bound\n");
+                return 1;
+            }
             continue;
         }
-        if      (!strcmp(argv[i], "-Z")) heartbeat = (unsigned)strtoul(argv[++i], NULL, 0);
+        if      (!strcmp(argv[i], "-Z")) {
+            if (!parse_u64_arg("-Z", argv[++i], &heartbeat)) return 1;
+        }
         else if (!strcmp(argv[i], "-p")) phys_base = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--restore")) restore_path = argv[++i];
         else if (!strcmp(argv[i], "-V")) virt_base = (uint32_t)strtoul(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "-n")) steps     = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-n")) {
+            if (!parse_u64_arg("-n", argv[++i], &steps)) return 1;
+        }
         else if (!strcmp(argv[i], "-T")) ktail     = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-d")) dtpath    = argv[++i];
         else if (!strcmp(argv[i], "-c")) cmdline   = argv[++i];
@@ -2292,6 +2433,19 @@ int main(int argc, char **argv) {
             else if (!strcmp(v, "virt")) rd_form = RD_ADDR_VIRT;
             else { rd_form = RD_ADDR_LITERAL; rd_literal = (uint32_t)strtoul(v, NULL, 0); }
         }
+        else {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            return 1;
+        }
+    }
+
+    /* -L exits after parsing the Mach-O and never creates or restores a
+     * machine.  Combining it with stateful checkpoint options used to return
+     * success while silently ignoring them. */
+    if (want_kextmap && (restore_path != NULL || nsnaps != 0u)) {
+        fprintf(stderr,
+                "-L cannot be combined with --restore or --snapshot-at\n");
+        return 1;
     }
 
     /*
@@ -3072,6 +3226,22 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Snapshot positions are absolute. Reject requests that the selected
+     * starting state has already passed or that the selected run limit cannot
+     * reach; silently accepting either makes a long unattended run appear to
+     * have checkpointed when it did not. Equality with the starting state is
+     * meaningful and is saved before the first step. */
+    for (unsigned s = 0; s < nsnaps; s++) {
+        if (snaps[s].at < mach.cpu.cycles || snaps[s].at > steps) {
+            fprintf(stderr,
+                    "--snapshot-at %" PRIu64 " is outside reachable range "
+                    "[%" PRIu64 ", %" PRIu64 "]\n",
+                    snaps[s].at, mach.cpu.cycles, steps);
+            return 1;
+        }
+    }
+    if (!save_due_snapshots(&mach, snaps, nsnaps)) return 4;
+
     /*
      * Ring buffer of recent execution. When the kernel faults we want the
      * instructions that led there, not the state a few million instructions
@@ -3080,6 +3250,7 @@ int main(int argc, char **argv) {
 #define KTRACE (1u << 18)
     static struct { uint32_t pc, cpsr, r[16]; } tr[KTRACE];
     unsigned tw = 0, tcount = 0;
+    uint64_t trace_last_at = 0;
 
     /*
      * Watchpoints on the failure machinery itself. panic() takes its printf
@@ -3087,7 +3258,7 @@ int main(int argc, char **argv) {
      * the entry instruction is enough to recover the message the kernel was
      * trying to print — which is exactly what never reaches the UART.
      */
-    struct wp { const char *name; uint32_t va; unsigned hits; };
+    struct wp { const char *name; uint32_t va; uint64_t hits; };
     struct wp wps[] = {
         { "_panic",      ksym_value("_panic"),      0 },
         { "_Debugger",   ksym_value("_Debugger"),   0 },
@@ -3120,9 +3291,10 @@ int main(int argc, char **argv) {
      * snapshot, so starting from it makes the numbering identical. On a fresh
      * boot it is zero and this is the old `n = 0`.
      */
-    unsigned n = (unsigned)mach.cpu.cycles;
+    uint64_t n = mach.cpu.cycles;
     uint32_t last_pc = restore_path ? mach.cpu.r[15] : entry_pa;
-    unsigned first_abort_at = 0, first_exc = 0;
+    uint64_t first_abort_at = 0, first_exc = 0;
+    bool have_first_abort = false, have_first_exc = false;
     uint32_t abort_dfar = 0, abort_dfsr = 0;
 
     G.hot_steps = steps;
@@ -3134,6 +3306,7 @@ int main(int argc, char **argv) {
         memcpy(tr[tw].r, mach.cpu.r, sizeof mach.cpu.r);
         tw = (tw + 1) % KTRACE;
         if (tcount < KTRACE) tcount++;
+        trace_last_at = n;
 
         /* How far down the console-init chain did we get? Each milestone is
          * matched at its virtual address and at its pre-MMU physical alias. */
@@ -3192,7 +3365,7 @@ int main(int argc, char **argv) {
         if (heartbeat && n && (n % heartbeat) == 0) {
             uint32_t va = last_pc >= phys_base && last_pc < virt_base
                         ? last_pc - phys_base + virt_base : last_pc;
-            printf("  [@%-11u] pc %08x m%02x%s  %s\n", n, last_pc,
+            printf("  [@%-11" PRIu64 "] pc %08x m%02x%s  %s\n", n, last_pc,
                    mach.cpu.cpsr & ARM_CPSR_MODE_MASK,
                    (mach.cpu.cpsr & ARM_CPSR_T) ? "T" : " ", ksym_at(va));
             fflush(stdout);
@@ -3204,8 +3377,10 @@ int main(int argc, char **argv) {
             if (!va) continue;
             uint32_t pa = va - virt_base + phys_base;
             if ((last_pc & ~1u) != (va & ~1u) && (last_pc & ~1u) != (pa & ~1u)) continue;
-            if (wps[w].hits++ >= 3) continue;    /* first few calls only */
-            printf("=== %s entered (call #%u) at instruction %u ===\n",
+            if (wps[w].hits >= 3u) continue;     /* first few calls only */
+            wps[w].hits++;
+            printf("=== %s entered (call #%" PRIu64
+                   ") at instruction %" PRIu64 " ===\n",
                    wps[w].name, wps[w].hits, n);
             printf("  called from lr 0x%08x  (%s)\n",
                    mach.cpu.r[14], ksym_at(mach.cpu.r[14]));
@@ -3287,8 +3462,15 @@ int main(int argc, char **argv) {
         }
 
         st = arm_step(&mach.cpu);
-        if (st != ARM_OK) break;
+        if (st != ARM_OK) {
+            /* Some terminal steps still advance the architectural cycle
+             * counter. Honor a checkpoint reached by such a step before
+             * reporting the stop. */
+            if (!save_due_snapshots(&mach, snaps, nsnaps)) return 4;
+            break;
+        }
         s5l8900_tick(&mach, 1);
+        if (!save_due_snapshots(&mach, snaps, nsnaps)) return 4;
 
         if (strex_rd < 16 && mach.cpu.r[15] != last_pc) {
             G.strex_total++;
@@ -3316,9 +3498,15 @@ int main(int argc, char **argv) {
                 /* Log the first few, and then the first few *close-spaced*
                  * ones: a storm that starts late is invisible if only the
                  * opening FIQs are sampled. */
-                if (G.fiq_n < 12 ||
-                    (n - G.fiq_last < 1000 && G.fiq_storm_logged++ < 10))
-                    printf("  FIQ #%u @instr %u  gap %u  latch=%08x "
+                bool log_fiq = G.fiq_n < 12u;
+                if (!log_fiq && n - G.fiq_last < 1000u &&
+                    G.fiq_storm_logged < 10u) {
+                    G.fiq_storm_logged++;
+                    log_fiq = true;
+                }
+                if (log_fiq)
+                    printf("  FIQ #%" PRIu64 " @instr %" PRIu64
+                           "  gap %" PRIu64 "  latch=%08x "
                            "t4_count=%u t4_value=%u ticks=%llu\n",
                            G.fiq_n, n, n - G.fiq_last, mach.timer.irqlatch,
                            mach.timer.t4_count, mach.timer.t4_value,
@@ -3327,10 +3515,10 @@ int main(int argc, char **argv) {
                 G.fiq_n++;
             }
             if (mode_before == ARM_MODE_FIQ && mode_after != ARM_MODE_FIQ) {
-                uint64_t dur = (uint64_t)n - G.fiq_last;
+                uint64_t dur = n - G.fiq_last;
                 if (dur > G.fiq_longest) G.fiq_longest = dur;
                 if (G.fiq_n <= 12)
-                    printf("      FIQ exit @instr %u  latch=%08x t4_value=%u\n",
+                    printf("      FIQ exit @instr %" PRIu64 "  latch=%08x t4_value=%u\n",
                            n, mach.timer.irqlatch, mach.timer.t4_value);
             }
         }
@@ -3380,14 +3568,15 @@ int main(int argc, char **argv) {
                            pref ? mach.cpu.cp15.ifsr : mach.cpu.cp15.dfsr,
                            last_pc, pref, n);
             }
-            if (!first_exc && mode_after != mode_before &&
+            if (!have_first_exc && mode_after != mode_before &&
                 (mode_after == ARM_MODE_ABT || mode_after == ARM_MODE_UND ||
                  mode_after == ARM_MODE_IRQ || mode_after == ARM_MODE_FIQ)) {
                 first_exc = n;
-                printf("FIRST exception entry at instruction %u: mode %02x -> %02x,\n"
+                have_first_exc = true;
+                printf("FIRST exception entry at instruction %" PRIu64 ": mode %02x -> %02x,\n"
                        "  caused by pc 0x%08x, vectored to 0x%08x\n"
                        "  (IFSR 0x%08x IFAR 0x%08x  DFSR 0x%08x DFAR 0x%08x)\n\n",
-                       n, mode_before, mode_after, last_pc, mach.cpu.r[15],
+                       first_exc, mode_before, mode_after, last_pc, mach.cpu.r[15],
                        mach.cpu.cp15.ifsr, mach.cpu.cp15.ifar,
                        mach.cpu.cp15.dfsr, mach.cpu.cp15.dfar);
             }
@@ -3395,38 +3584,28 @@ int main(int argc, char **argv) {
 
         /* Catch the very first data abort and stop, so the trace above is the
          * code that actually faulted. */
-        if (!first_abort_at && mach.cpu.cp15.dfsr) {
+        if (!have_first_abort && mach.cpu.cp15.dfsr) {
             first_abort_at = n;
+            have_first_abort = true;
             abort_dfsr = mach.cpu.cp15.dfsr;
             abort_dfar = mach.cpu.cp15.dfar;
             if (stop_on_abort) { n++; break; }
         }
 
-        /*
-         * --snapshot-at: checkpoints, taken last in the body so the machine is
-         * exactly one retired instruction past where it was at the top.
-         *
-         * Keyed on mach.cpu.cycles and NOT on n. The two are equal here, but
-         * only cycles is snapshotted: it is the machine's own counter, so a
-         * checkpoint requested for instruction 300,000,000 fires at the same
-         * instruction whether the process started at 0 or restored at
-         * 200,000,000. Keying on a host-side loop variable would make the
-         * trigger relative to the process, which is precisely the property
-         * that would make two snapshots incomparable.
-         */
-        for (unsigned s = 0; s < nsnaps; s++) {
-            if (snaps[s].at != mach.cpu.cycles) continue;
-            snapshot_status_t ss = snapshot_save(&mach, snaps[s].path);
-            printf("snapshot   : @%llu -> %s: %s\n",
-                   (unsigned long long)mach.cpu.cycles, snaps[s].path,
-                   snapshot_strerror(ss));
-            fflush(stdout);
-            if (ss != SNAP_OK) {
-                fprintf(stderr, "snapshot %s: %s\n",
-                        snaps[s].path, snapshot_strerror(ss));
-                return 4;
-            }
-        }
+    }
+
+    /* A terminal CPU status can end the run before a statically reachable
+     * checkpoint. Never let an unattended invocation exit successfully while
+     * silently omitting a requested snapshot; keep producing the full stop
+     * report below, then return a distinct failure code. */
+    bool snapshot_unreached = false;
+    for (unsigned s = 0; s < nsnaps; s++) {
+        if (snaps[s].done) continue;
+        fprintf(stderr,
+                "snapshot %s at %" PRIu64 " was not reached; stopped at %"
+                PRIu64 " retired instructions (%s)\n",
+                snaps[s].path, snaps[s].at, mach.cpu.cycles, status_name(st));
+        snapshot_unreached = true;
     }
 
     /*
@@ -3438,13 +3617,15 @@ int main(int argc, char **argv) {
      * earlier fault. Say so instead, and point at the (correctly numbered)
      * end-of-run tail above.
      */
-    if (first_abort_at && !stop_on_abort) {
-        printf("FIRST data abort at instruction %u: DFSR 0x%08x  DFAR 0x%08x\n",
+    if (have_first_abort && !stop_on_abort) {
+        printf("FIRST data abort at instruction %" PRIu64
+               ": DFSR 0x%08x  DFAR 0x%08x\n",
                first_abort_at, abort_dfsr, abort_dfar);
         printf("  (no trace: the ring holds the END of the run, not this point."
                " Re-run with -a to stop here.)\n\n");
-    } else if (first_abort_at) {
-        printf("FIRST data abort at instruction %u: DFSR 0x%08x  DFAR 0x%08x\n\n",
+    } else if (have_first_abort) {
+        printf("FIRST data abort at instruction %" PRIu64
+               ": DFSR 0x%08x  DFAR 0x%08x\n\n",
                first_abort_at, abort_dfsr, abort_dfar);
         printf("  instructions leading up to it (newest last):\n");
         unsigned start = (tw + KTRACE - tcount) % KTRACE;
@@ -3452,8 +3633,8 @@ int main(int argc, char **argv) {
         for (unsigned i = skip; i < tcount; i++) {
             unsigned k = (start + i) % KTRACE;
             /* absolute instruction index of this entry */
-            unsigned idx = first_abort_at - (tcount - 1 - i);
-            printf("    %-9u %08x %c m%02x r0=%08x r5=%08x r6=%08x "
+            uint64_t idx = first_abort_at - (tcount - 1u - i);
+            printf("    %-9" PRIu64 " %08x %c m%02x r0=%08x r5=%08x r6=%08x "
                    "fp=%08x ip=%08x sp=%08x lr=%08x  %s\n",
                    idx, tr[k].pc,
                    (tr[k].cpsr & ARM_CPSR_T) ? 'T' : 'A',
@@ -3524,7 +3705,8 @@ int main(int argc, char **argv) {
     }
 
     mach.uart0.tx[mach.uart0.tx_len] = '\0';
-    printf("stopped after %u instructions: %s\n", n, status_name(st));
+    printf("stopped after %" PRIu64 " instructions: %s\n",
+           mach.cpu.cycles, status_name(st));
     printf("  pc             : 0x%08x", last_pc);
     if (last_pc >= phys_base && last_pc < phys_base + ram_size)
         printf("  (vm 0x%08x)", last_pc - phys_base + virt_base);
@@ -3625,8 +3807,8 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < 40; i++)
         if (G.hot_bucket[i])
             printf("    instr %10llu..%-10llu  %llu\n",
-                   (unsigned long long)(steps / 40 * i),
-                   (unsigned long long)(steps / 40 * (i + 1)),
+                   (unsigned long long)instruction_bucket_boundary(steps, i),
+                   (unsigned long long)instruction_bucket_boundary(steps, i + 1u),
                    (unsigned long long)G.hot_bucket[i]);
 
     /*
@@ -3657,8 +3839,8 @@ int main(int argc, char **argv) {
                 snprintf(base, sizeof base, "%.*s",
                          bar ? (int)(bar - nm) : (int)strlen(nm), nm);
                 if (strcmp(base, seen)) {
-                    printf("    %-9u %08x m%02x  %s\n",
-                           n - (tcount - 1 - i), tr[k].pc,
+                    printf("    %-9" PRIu64 " %08x m%02x  %s\n",
+                           trace_last_at - (tcount - 1u - i), tr[k].pc,
                            tr[k].cpsr & ARM_CPSR_MODE_MASK, nm);
                     snprintf(seen, sizeof seen, "%s", base);
                 }
@@ -3670,9 +3852,9 @@ int main(int argc, char **argv) {
             unsigned k = (start + i) % KTRACE;
             uint32_t va = tr[k].pc >= phys_base && tr[k].pc < virt_base
                         ? tr[k].pc - phys_base + virt_base : tr[k].pc;
-            printf("    %-9u %08x %c m%02x r0=%08x r1=%08x r2=%08x r3=%08x "
+            printf("    %-9" PRIu64 " %08x %c m%02x r0=%08x r1=%08x r2=%08x r3=%08x "
                    "sp=%08x lr=%08x  %s\n",
-                   n - (tcount - 1 - i), tr[k].pc,
+                   trace_last_at - (tcount - 1u - i), tr[k].pc,
                    (tr[k].cpsr & ARM_CPSR_T) ? 'T' : 'A',
                    tr[k].cpsr & ARM_CPSR_MODE_MASK,
                    tr[k].r[0], tr[k].r[1], tr[k].r[2], tr[k].r[3],
@@ -3688,31 +3870,36 @@ int main(int argc, char **argv) {
     printf("    --- reached, with call counts and first instruction index ---\n");
     for (unsigned i = 0; i < NM; i++)
         if (G.mile_hits[i])
-            printf("    %-28s hits %-10llu first @ instr %u\n", MILE[i].name,
+            printf("    %-28s hits %-10llu first @ instr %" PRIu64 "\n", MILE[i].name,
                    (unsigned long long)G.mile_hits[i], G.mile_first[i]);
 
-    mode_report(n, win_lo, win_hi);
+    mode_report(win_lo, win_hi);
     syscall_report(virt_base, phys_base);
 
     printf("\n=== WHERE THE TIME WENT (sampled every 1024 instructions%s) ===\n",
-           (win_lo || win_hi != 0xffffffffu) ? ", WINDOWED" : "");
-    if (win_lo || win_hi != 0xffffffffu)
-        printf("    window: instructions %u .. %u  (-W)\n", win_lo, win_hi);
+           (win_lo || win_hi != UINT64_MAX) ? ", WINDOWED" : "");
+    if (win_lo || win_hi != UINT64_MAX)
+        printf("    window: instructions %" PRIu64 " .. %" PRIu64 "  (-W)\n",
+               win_lo, win_hi);
     {
-        unsigned total = 0;
+        uint64_t total = 0;
         for (unsigned i = 0; i < G.prof_n; i++) total += G.prof[i].hits;
-        printf("    %u samples over %u distinct functions%s\n", total, G.prof_n,
+        printf("    %" PRIu64 " samples over %u distinct functions%s\n",
+               total, G.prof_n,
                G.prof_dropped ? "" : "");
         if (G.prof_dropped)
-            printf("    WARNING: %u samples dropped (table full) — profile is "
+            printf("    WARNING: %" PRIu64
+                   " samples dropped (table full) — profile is "
                    "NOT representative\n", G.prof_dropped);
         for (unsigned rank = 0; rank < 12; rank++) {
-            unsigned best = 0, bi = G.prof_n;
+            uint64_t best = 0;
+            unsigned bi = G.prof_n;
             for (unsigned i = 0; i < G.prof_n; i++)
                 if (G.prof[i].hits > best) { best = G.prof[i].hits; bi = i; }
             if (bi == G.prof_n || !best) break;
-            printf("    %5.1f%%  %-44s %u samples\n",
-                   total ? 100.0 * best / total : 0.0, G.prof[bi].fn, best);
+            printf("    %5.1f%%  %-44s %" PRIu64 " samples\n",
+                   total ? 100.0 * (double)best / (double)total : 0.0,
+                   G.prof[bi].fn, best);
             G.prof[bi].hits = 0;   /* consume */
         }
     }
@@ -3728,8 +3915,8 @@ int main(int argc, char **argv) {
      * list below consumes entries.
      */
     if (KS.nkext_exec) {
-        static unsigned per_kext[KSYMS_MAX_KEXTS];
-        unsigned total = 0, attributed = 0;
+        static uint64_t per_kext[KSYMS_MAX_KEXTS];
+        uint64_t total = 0, attributed = 0;
         for (unsigned i = 0; i < PCHASH; i++) {
             if (!G.pc_hist[i].hits) continue;
             total += G.pc_hist[i].hits;
@@ -3740,14 +3927,17 @@ int main(int argc, char **argv) {
         }
         printf("\n=== TIME BY PRELINKED KEXT ===\n");
         printf("    %.1f%% of samples are inside a prelinked kext; the rest is "
-               "the kernel proper\n", total ? 100.0 * attributed / total : 0.0);
+               "the kernel proper\n",
+               total ? 100.0 * (double)attributed / (double)total : 0.0);
         for (unsigned rank = 0; rank < 10; rank++) {
-            unsigned best = 0, bi = KS.nkext_exec;
+            uint64_t best = 0;
+            unsigned bi = KS.nkext_exec;
             for (unsigned i = 0; i < KS.nkext_exec; i++)
                 if (per_kext[i] > best) { best = per_kext[i]; bi = i; }
             if (bi == KS.nkext_exec || !best) break;
             printf("    %5.1f%%  %-46s 0x%08x+0x%x\n",
-                   total ? 100.0 * best / total : 0.0, KS.kext[bi].bundle,
+                   total ? 100.0 * (double)best / (double)total : 0.0,
+                   KS.kext[bi].bundle,
                    KS.kext[bi].addr, KS.kext[bi].size);
             per_kext[bi] = 0;
         }
@@ -3761,29 +3951,33 @@ int main(int argc, char **argv) {
      */
     printf("\n=== HOTTEST INDIVIDUAL PCs (same samples, exact address) ===\n");
     {
-        unsigned total = 0;
+        uint64_t total = 0;
         for (unsigned i = 0; i < PCHASH; i++) total += G.pc_hist[i].hits;
-        printf("    %u samples over %u distinct PCs\n", total, G.pc_n);
+        printf("    %" PRIu64 " samples over %u distinct PCs\n", total,
+               G.pc_n);
         if (G.pc_dropped)
-            printf("    WARNING: %u samples dropped (hash full) — this list is "
+            printf("    WARNING: %" PRIu64
+                   " samples dropped (hash full) — this list is "
                    "NOT complete\n", G.pc_dropped);
         for (unsigned rank = 0; rank < 16; rank++) {
-            unsigned best = 0, bi = PCHASH;
+            uint64_t best = 0;
+            unsigned bi = PCHASH;
             for (unsigned i = 0; i < PCHASH; i++)
                 if (G.pc_hist[i].hits > best) { best = G.pc_hist[i].hits; bi = i; }
             if (bi == PCHASH || !best) break;
-            printf("    %5.1f%%  0x%08x  %-52s %u samples\n",
-                   total ? 100.0 * best / total : 0.0,
+            printf("    %5.1f%%  0x%08x  %-52s %" PRIu64 " samples\n",
+                   total ? 100.0 * (double)best / (double)total : 0.0,
                    G.pc_hist[bi].va, ksym_at(G.pc_hist[bi].va), best);
             G.pc_hist[bi].hits = 0;   /* consume */
         }
     }
 
     printf("\n=== FIQ COST ===\n");
-    printf("    entries              : %u\n", G.fiq_n);
+    uint64_t run_instrs = observed_instructions();
+    printf("    entries              : %" PRIu64 "\n", G.fiq_n);
     printf("    instructions in FIQ  : %llu (%.1f%% of the run)\n",
            (unsigned long long)G.fiq_instrs,
-           100.0 * (double)G.fiq_instrs / (double)(n ? n : 1));
+           100.0 * (double)G.fiq_instrs / (double)(run_instrs ? run_instrs : 1u));
     printf("    longest single FIQ   : %llu instructions\n",
            (unsigned long long)G.fiq_longest);
 
@@ -3793,7 +3987,7 @@ int main(int argc, char **argv) {
            (unsigned long long)G.exret_thumb_aligned4);
     printf("    resumed != lr (MOVS pc,lr)  : %llu\n", (unsigned long long)G.exret_mismatch);
     for (unsigned i = 0; i < G.exret_log_n; i++)
-        printf("      @%-10u mode %02x->%02x  handler pc 0x%08x  lr 0x%08x -> resumed 0x%08x  %s\n",
+        printf("      @%-10" PRIu64 " mode %02x->%02x  handler pc 0x%08x  lr 0x%08x -> resumed 0x%08x  %s\n",
                G.exret_log[i].at, G.exret_log[i].mode_from, G.exret_log[i].mode_to,
                G.exret_log[i].from_pc, G.exret_log[i].lr, G.exret_log[i].to_pc,
                ksym_at(G.exret_log[i].to_pc));
@@ -3802,16 +3996,17 @@ int main(int argc, char **argv) {
     printf("    executed : %llu\n", (unsigned long long)G.strex_total);
     printf("    FAILED   : %llu\n", (unsigned long long)G.strex_failed);
     for (unsigned i = 0; i < G.strex_log_n; i++)
-        printf("      @%-10u pc 0x%08x addr 0x%08x  %s\n",
+        printf("      @%-10" PRIu64 " pc 0x%08x addr 0x%08x  %s\n",
                G.strex_log[i].at, G.strex_log[i].pc, G.strex_log[i].addr,
                ksym_at(G.strex_log[i].pc));
 
     printf("\n=== DISTINCT ABORT SITES (%u) ===\n", G.fault_n);
     if (G.fault_dropped)
-        printf("    WARNING: %u aborts at NEW sites were dropped (table full)"
+        printf("    WARNING: %" PRIu64
+               " aborts at NEW sites were dropped (table full)"
                " — this list is NOT complete\n", G.fault_dropped);
     for (unsigned i = 0; i < G.fault_n; i++)
-        printf("    %s FAR 0x%08x FSR 0x%02x  pc 0x%08x %s  n=%llu first@%u\n",
+        printf("    %s FAR 0x%08x FSR 0x%02x  pc 0x%08x %s  n=%llu first@%" PRIu64 "\n",
                G.fault[i].prefetch ? "IFETCH" : "DATA  ",
                G.fault[i].far_, G.fault[i].fsr & 0xff, G.fault[i].pc,
                ksym_at(G.fault[i].pc >= phys_base && G.fault[i].pc < virt_base
@@ -3876,5 +4071,5 @@ int main(int argc, char **argv) {
     s5l8900_free(&mach);
     ksyms_free(&KS);
     free(img);
-    return 0;
+    return snapshot_unreached ? 5 : 0;
 }
