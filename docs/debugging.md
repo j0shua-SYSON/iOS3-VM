@@ -213,9 +213,11 @@ host-side duplicate is gone. The storage audit has ruled out a simple external
 aperture. The writable, range-gated md bulk-copy bridge, locked file adapter,
 exact 7E18 kernel manifest and bounded immutable-source work-image provisioner
 are now wired into `--external-md`, including exact kernel, device-tree, and
-rootfs gates. Do not claim the expected memory recovery until a fresh real boot
-measures it. Use that cold-boot slice before app integration or an unbounded
-continuation; then add snapshot backing identity and overlay coupling.
+rootfs gates. The first 400 M real cold boot measured 21,826 free pages (85.26
+MiB) at the cap and completed 6,695 reads with no bridge failure. It had only just
+entered boot-volume fsck and issued zero bridged writes, so extend this cold-boot
+slice before app integration; then add snapshot backing identity and overlay
+coupling.
 
 ### WFI changes elapsed device time, not the instruction coordinate
 

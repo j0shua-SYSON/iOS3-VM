@@ -129,9 +129,11 @@ pages fell to 542 at 2.8 B and 317 at 2.9 B, then reached a low of 97 before
 recovering to 253 and ending at 214 at the clean 2.98 B cap; the guest target
 is 250. The movement suggests guest reclamation is active, but the
 headroom remains unsafe for an iOS host. The selected external storage bridge is
-integrated without baking a desktop file API into the core; its expected memory
-recovery remains unmeasured until the first real cold-boot trace. The old
-`UXTB16` stop is now replay-cleared by a complete paired-extend implementation.
+integrated without baking a desktop file API into the core. Its first 128 MiB
+real cold-boot trace reached `launchd` at a 400 M cap with 21,826 free pages
+(85.26 MiB), after 6,695 successful bridged reads and no storage failure. The
+write exit was not reached in that bounded run. The old `UXTB16` stop is now
+replay-cleared by a complete paired-extend implementation.
 
 The audited near-term storage design retains the proven md0/HFS path but moves
 its writable bytes behind a portable block backend. The core now has exact

@@ -22,9 +22,11 @@
 > have run Apple's real kernel, root filesystem, `launchd`, and a live
 > `mDNSResponder`. A new cold-boot mode exact-gates the 7E18 kernel, device tree,
 > and rootfs, then serves a create-only writable work image from the host instead
-> of pinning roughly 445 MiB in guest RAM. Its components, CLI preflight, and
-> negative paths are tested, but the integrated path has not yet produced a
-> fresh real-firmware boot trace. The installable iOS app
+> of pinning roughly 445 MiB in guest RAM. A fresh 400-million-instruction run
+> exercised that integrated path: `BSD root: md0`, `launchd[1] has started up`,
+> and 6,695 bridged reads completed with zero bridge failures while 85.26 MiB of
+> guest pages remained free. The write exit was not reached in that bounded run.
+> The installable iOS app
 > does **not** run it yet: it runs a small
 > synthetic ARM guest to exercise the CPU, UART and framebuffer bridge. The app
 > currently uses CoreGraphics, with no touch, audio, guest networking or active
@@ -57,7 +59,7 @@ core portable across hosts. Today the evidence is split deliberately:
 | Capability | CLI / portable core | Installable iOS app |
 |---|---|---|
 | ARM1176 and S5L8900 execution | Real-kernel path recorded | Synthetic demo guest |
-| Apple kernel and root filesystem | Historical private-firmware run; host-backed cold path implemented, real run pending | Not integrated |
+| Apple kernel and root filesystem | Host-backed cold path reached `launchd` in a fresh 400 M real-firmware run | Not integrated |
 | Display | Kernel console and CLCD capture | CoreGraphics demo bridge |
 | Touch, audio, guest networking | Not implemented | Not implemented |
 | Dynamic recompiler | Translator tested off-device; inactive in boot | Excluded from target |
@@ -162,8 +164,10 @@ bulk-copy bridge. Backend errors halt without falsely retiring the trapping
 instruction, and a failed read never publishes a partial buffer into guest RAM.
 The separate raw `/dev/rmd0` path is stopped before execution, and this first
 slice deliberately rejects snapshots until backing identity and overlay state
-are serialized. This integration has not yet been exercised in a real guest, so
-recovered memory and further boot progress remain hypotheses awaiting a trace.
+are serialized. A 400 M real-guest cold run completed 6,695 reads (27,397,632
+bytes) with no bridge failure, reached `launchd` and boot-volume fsck, and ended
+at its configured cap with 21,826 free pages (85.26 MiB). It issued no bridged
+writes, so write-side integration and progress beyond fsck remain to be proven.
 
 That is sustained real userspace, not a completed boot. There is still no
 captured SpringBoard frame, no proof that the current userland reached the home

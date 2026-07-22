@@ -872,10 +872,31 @@ under unit tests. `bootkernel --external-md` now installs the cold-boot chain:
 it exact-gates the original kernel, device tree, and rootfs; creates a no-replace
 writable work image; publishes md0 through a synthetic address outside the
 128 MiB DRAM aperture; and installs only the two audited strategy-copy exits.
-The implementation is reviewed and build-tested, but no new real-firmware trace
-has exercised it yet. Raw `/dev/rmd0` stops before execution, while snapshot
-backing identity/overlay state remains future work; full NAND is the
-higher-fidelity, much larger route.
+### 2026-07-22: first 128 MiB external-md real-firmware run
+
+Commit `d9d9e40` was run cold to a 400,000,000 retired-instruction cap with the
+documented exact 7E18 inputs and default 32 MiB growth. All three identity gates
+passed, and the create-only work image was 466,825,216 bytes with SHA-256
+`4fb9b51eaca0f52fdba8d2a7909b57eab7e8d5c6e67112f277f501a8af76cc61`.
+The immutable source hashes were identical before and after the run.
+
+The guest reported `BSD root: md0, major 2, minor 0`, first entered
+`_load_init_program` at 235,856,815, first entered `_execve` at 235,888,017,
+and printed `*** launchd[1] has started up. ***` followed by
+`Running fsck on the boot volume...`. At the cap the machine reported status
+`OK`: no `_panic`, `_Debugger`, raw-mdevrw guard, undefined emulator stop, or
+bridge failure. The bridge completed 6,695 reads (27,397,632 bytes), zero writes,
+and zero failures. The zero writes mean the write exit is still unit-tested only;
+the bounded run ended just after fsck began.
+
+The memory hypothesis is now measured. The guest advertised 128 MiB, began with
+a 120.14 MiB post-layout free pool, and ended with 21,826 free pages (85.26 MiB),
+well above its 406-page target. The last live host sample used roughly 62 MiB of
+resident memory. This is not directly comparable to the later 2.98 B direct-RAM
+age, but it removes the old 445 MiB static guest allocation and avoids the former
+near-zero headroom at the same architectural boundary. Raw `/dev/rmd0` still
+stops before execution, snapshot backing identity/overlay state remains future
+work, and full NAND is the higher-fidelity, much larger route.
 
 This chain is stronger evidence for sustained userspace and snapshot
 repeatability. It is **not** evidence that SpringBoard rendered: the runs used

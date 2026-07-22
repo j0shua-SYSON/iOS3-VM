@@ -498,10 +498,11 @@ That diagnostic also crossed the free-page target without an immediate OOM:
 the pool fell from 317 pages at 2.9 B to a low of 97 pages at instruction
 2,934,505,472, recovered to 253 pages at the former opcode stop, and ended at
 214 pages at 2.98 B, against a target of 250. The
-roughly 445 MiB pinned RAM disk remains a severe device-memory constraint, and
-the completed audit's writable md bulk-copy design is now integrated as a
-guarded cold-boot mode. It still needs a fresh real-firmware trace before its
-expected memory recovery or further boot progress can be claimed.
+roughly 445 MiB pinned RAM disk remains a severe device-memory constraint. The
+completed audit's writable md bulk-copy design is now integrated as a guarded
+cold-boot mode. Its first 128 MiB real-firmware trace reached `launchd` and fsck
+at a 400 M cap with 21,826 free pages (85.26 MiB), 6,695 successful bridge reads,
+and no bridge failure. No write occurred yet, and it has not reached SpringBoard.
 
 For chronology, this is the much earlier pre-VFP measurement from
 `bootkernel`'s milestone probes:
@@ -640,10 +641,10 @@ still runs only a synthetic guest and has no touch or audio path.
   flushes and publishes without replacement. `bootkernel --external-md` now
   exact-gates the supported kernel, device tree, and rootfs; publishes the md0
   media token outside fixed 128 MiB DRAM; and installs the bridge after setup.
-  This is
-  implemented and reviewed, not yet a measured real boot. Snapshot backing
-  identity/overlay state follows, and global `_bcopy_phys` replacement remains
-  forbidden.
+  A measured 400 M cold boot reached `launchd` and boot-volume fsck with 6,695
+  reads (27,397,632 bytes), zero writes, zero bridge failures, and 85.26 MiB of
+  guest pages still free. Snapshot backing identity/overlay state follows, and
+  global `_bcopy_phys` replacement remains forbidden.
   The raw `/dev/rmd0` path instead reaches `_uiomove64`/`_copypv`, so it must be
   separately bridged; current external mode stops before its entry. Historical
   older-source experiments reported 312 MiB and
