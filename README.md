@@ -76,8 +76,8 @@ can see.** No months in the dark.
 | **M4** | The real **XNU kernel** boots and logs | ✅ **done** — a broad set of prelinked drivers matched or started in a recorded CLI run; the real 413 MiB root filesystem mounted, and that run did not reach `_panic` |
 | **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** The latest measured direct-RAM checkpoint chain reached the configured 2.98-billion retired-instruction cap without a guest panic or emulator undefined stop and wrote a 2.97 B checkpoint. The 2.4–2.8 B interval recorded `systemShutdown false`; the 2.85–2.98 B interval recorded two `_load_machfile` hits. No SpringBoard frame or touch path has been demonstrated; the iOS app remains a demo host. |
 
-At `3c72a15`, hosted [`ios-build` run 29885128804](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29885128804)
-and [`core-tests` run 29885128937](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29885128937)
+At `d9d9e40`, hosted [`ios-build` run 29891178730](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29891178730)
+and [`core-tests` run 29891178706](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29891178706)
 both completed successfully. Those runs verify build, package and public tests;
 they do not contain private firmware or prove a SpringBoard boot.
 
