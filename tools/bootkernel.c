@@ -1972,15 +1972,17 @@ typedef struct {
 } springboard_child_config_t;
 
 /*
- * Runtime evidence paired one-to-one with springboard_return_probe_t.  The
- * _posix_spawn -> _thread_resume call occurs only after image activation has
- * succeeded.  Capturing its r0 child thread under the exact parent thread lets
- * us follow that child by object identity instead of guessing from a later PID,
- * reusable proc pointer, or unrelated _exit1.
+ * Runtime evidence paired one-to-one with springboard_return_probe_t.  This
+ * older XNU vfork path reaches _thread_resume after both image-activation
+ * success and error cleanup, so the call is identity/lifetime evidence only;
+ * the paired raw parent syscall return remains the success authority. Capturing
+ * r0 under the exact parent thread still lets us follow any exposed child by
+ * object identity instead of guessing from a later PID, reusable proc pointer,
+ * or unrelated _exit1.
  */
 typedef struct {
     uint64_t entry_at;
-    uint64_t success_call_at;
+    uint64_t resume_entry_at;
     uint64_t resume_return_at;
     uint64_t first_user_at;
     uint64_t first_signal_at;
@@ -2002,7 +2004,7 @@ typedef struct {
     uint32_t first_signal;
     uint32_t first_exit_status;
     uint8_t map_stage;
-    bool success_call_seen;
+    bool resume_entry_seen;
     bool resume_return_seen;
     bool first_user_seen;
     bool identity_invalidated;
@@ -2205,7 +2207,7 @@ static void discover_springboard_child_probe(void) {
     static const uint8_t proc_pid_shape[] = {
         0x80, 0x68, 0x70, 0x47
     };
-    static const uint8_t spawn_success_window[] = {
+    static const uint8_t spawn_resume_window[] = {
         0x00, 0x2c, 0x24, 0xd1, 0x03, 0x98,
         0x00, 0x28, 0x1c, 0xd1, 0x01, 0x9b, 0x40, 0x46,
         0x00, 0x21, 0x1c, 0x60, 0x22, 0x1c, 0x02, 0xf0,
@@ -2259,22 +2261,22 @@ static void discover_springboard_child_probe(void) {
         return;
     }
     config->return_pc = config->callsite + 4u;
-    const uint32_t success_prefix =
-        (uint32_t)sizeof spawn_success_window - 4u;
-    if (config->callsite < success_prefix) {
+    const uint32_t resume_prefix =
+        (uint32_t)sizeof spawn_resume_window - 4u;
+    if (config->callsite < resume_prefix) {
         snprintf(config->reason, sizeof config->reason,
-                 "posix_spawn success window address underflow");
+                 "posix_spawn resume window address underflow");
         printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
         return;
     }
-    const uint8_t *success_window = guest_ptr(
-        config->callsite - success_prefix,
-        (uint32_t)sizeof spawn_success_window);
-    if (!success_window ||
-        memcmp(success_window, spawn_success_window,
-               sizeof spawn_success_window) != 0) {
+    const uint8_t *resume_window = guest_ptr(
+        config->callsite - resume_prefix,
+        (uint32_t)sizeof spawn_resume_window);
+    if (!resume_window ||
+        memcmp(resume_window, spawn_resume_window,
+               sizeof spawn_resume_window) != 0) {
         snprintf(config->reason, sizeof config->reason,
-                 "posix_spawn success-only callsite window mismatch");
+                 "posix_spawn child-resume callsite window mismatch");
         printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
         return;
     }
@@ -2549,8 +2551,8 @@ static void springboard_child_capture_mapping(
     const springboard_child_config_t *config =
         &G.springboard_child_config;
 
-    child->success_call_seen = true;
-    child->success_call_at = at;
+    child->resume_entry_seen = true;
+    child->resume_entry_at = at;
     child->child_thread = cpu->r[0];
     child->map_stage = SPRINGBOARD_CHILD_MAP_THREAD_TO_TASK;
     if (!child->child_thread ||
@@ -2622,8 +2624,9 @@ static bool springboard_probe_is_active(unsigned index) {
 /*
  * Called at instruction entry.  The two kernel-PC comparisons are cheap and
  * inactive until the exact firmware validates; user-thread matching is only
- * attempted after the uniquely validated success-only call has actually
- * entered _thread_resume with its exact Thumb return address.
+ * attempted after the uniquely validated child-resume call has actually
+ * entered _thread_resume with its exact Thumb return address. This shared
+ * vfork path does not itself prove that posix_spawn succeeded.
  */
 static void springboard_child_note_instruction(arm_cpu_t *cpu,
                                                uint64_t at, uint32_t pc) {
@@ -2641,7 +2644,7 @@ static void springboard_child_note_instruction(arm_cpu_t *cpu,
             springboard_child_probe_t *child =
                 &G.springboard_child[index];
             if (!springboard_probe_is_active(index) ||
-                child->success_call_seen || at <= child->entry_at ||
+                child->resume_entry_seen || at <= child->entry_at ||
                 cpu->cp15.tpidrprw != child->parent_thread) continue;
             springboard_child_capture_mapping(child, cpu, at);
             break;
@@ -2654,8 +2657,8 @@ static void springboard_child_note_instruction(arm_cpu_t *cpu,
             unsigned index = next - 1u;
             springboard_child_probe_t *child = &G.springboard_child[index];
             if (!springboard_probe_is_active(index) ||
-                !child->success_call_seen || child->resume_return_seen ||
-                at <= child->success_call_at ||
+                !child->resume_entry_seen || child->resume_return_seen ||
+                at <= child->resume_entry_at ||
                 cpu->cp15.tpidrprw != child->parent_thread) continue;
             child->resume_return_seen = true;
             child->resume_return_at = at;
@@ -3248,9 +3251,14 @@ static void springboard_return_report(void) {
             printf("        RESULT: raw Darwin syscall error; errno candidate"
                    " r0=%u (0x%08x).\n",
                    probe->return_r0, probe->return_r0);
-        else
+        else if (probe->return_r0 == 0)
             printf("        RESULT: raw Darwin syscall success (carry clear);"
                    " r0=%u (0x%08x).\n",
+                   probe->return_r0, probe->return_r0);
+        else
+            printf("        RESULT: NONCANONICAL posix_spawn return:"
+                   " carry clear but r0=%u (0x%08x); success is not"
+                   " accepted.\n",
                    probe->return_r0, probe->return_r0);
         printf("        IMPORTANT: even a successful spawn return does not"
                " prove that the child executed, stayed alive, or rendered.\n");
@@ -3268,6 +3276,13 @@ static const char *springboard_child_map_stage_name(unsigned stage) {
     }
 }
 
+static bool springboard_spawn_return_succeeded(
+        const springboard_return_probe_t *probe) {
+    return probe && probe->returned &&
+           !(probe->return_cpsr & ARM_CPSR_C) &&
+           probe->return_r0 == 0;
+}
+
 static void springboard_child_report(void) {
     const springboard_child_config_t *config =
         &G.springboard_child_config;
@@ -3277,7 +3292,8 @@ static void springboard_child_report(void) {
         return;
     }
 
-    printf("    SpringBoard child probe: validated success-only BL %08x"
+    printf("    SpringBoard child probe: validated exact vfork child-resume"
+           " BL %08x"
            " -> _thread_resume %08x (return %08x)\n",
            config->callsite, config->thread_resume, config->return_pc);
     printf("      decoded object offsets: thread->task +%x,"
@@ -3286,21 +3302,42 @@ static void springboard_child_report(void) {
            config->proc_pid_offset);
 
     for (unsigned i = 0; i < G.springboard_return_n; i++) {
+        const springboard_return_probe_t *parent =
+            &G.springboard_return[i];
         const springboard_child_probe_t *child =
             &G.springboard_child[i];
+        bool spawn_succeeded =
+            springboard_spawn_return_succeeded(parent);
         printf("      attempt #%u entry @%" PRIu64
                " parent thread %08x\n",
                i, child->entry_at, child->parent_thread);
-        if (!child->success_call_seen) {
-            printf("        no matching success-only _thread_resume call"
+        if (parent->returned) {
+            bool carry = (parent->return_cpsr & ARM_CPSR_C) != 0;
+            if (spawn_succeeded)
+                printf("        CORRELATED PARENT RETURN: SPAWN SUCCESS"
+                       " (C=0 r0=0)\n");
+            else if (carry)
+                printf("        CORRELATED PARENT RETURN: SPAWN ERROR"
+                       " (C=1 errno=%u/0x%08x)\n",
+                       parent->return_r0, parent->return_r0);
+            else
+                printf("        CORRELATED PARENT RETURN: NONCANONICAL"
+                       " (C=0 r0=%u/0x%08x); success not accepted\n",
+                       parent->return_r0, parent->return_r0);
+        } else {
+            printf("        CORRELATED PARENT RETURN: UNPROVED; see paired"
+                   " return-probe terminal state above\n");
+        }
+        if (!child->resume_entry_seen) {
+            printf("        no matching child-resume _thread_resume entry"
                    " observed before stop\n");
             continue;
         }
 
-        printf("        success-only call @%" PRIu64
+        printf("        child-resume entry @%" PRIu64
                " child thread/task/proc/pid"
                " %08x/%08x/%08x/%u; map %s",
-               child->success_call_at, child->child_thread,
+               child->resume_entry_at, child->child_thread,
                child->child_task, child->child_proc, child->child_pid,
                springboard_child_map_stage_name(child->map_stage));
         if (child->map_stage != SPRINGBOARD_CHILD_MAP_COMPLETE)
@@ -3341,10 +3378,17 @@ static void springboard_child_report(void) {
         printf("\n");
         if (child->map_stage == SPRINGBOARD_CHILD_MAP_COMPLETE &&
             (child->first_user_seen || child->signal_count ||
-             child->exit_count))
-            printf("        IMPORTANT: revalidated object identity ties these"
-                   " entries to the exact-path child; rendering still requires"
-                   " framebuffer/display evidence.\n");
+             child->exit_count)) {
+            if (spawn_succeeded)
+                printf("        IMPORTANT: proven parent success plus"
+                       " revalidated identity ties these entries to the exact"
+                       " SpringBoard child; rendering still requires"
+                       " framebuffer/display evidence.\n");
+            else
+                printf("        IMPORTANT: identity ties these entries only"
+                       " to the attempt-associated object; without C=0/r0=0"
+                       " they do not prove SpringBoard image activation.\n");
+        }
     }
 }
 
