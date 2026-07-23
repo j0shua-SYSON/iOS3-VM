@@ -55,6 +55,10 @@ static const uint8_t expected_watcher[] = {
     0xf0u, 0xb5u, 0x46u, 0x46u
 };
 
+static const uint8_t expected_uiomove[] = {
+    0xf0u, 0xb5u, 0x5eu, 0x46u
+};
+
 static const expected_site_t expected_sites[] = {
     {
         IOS3_KERNEL_PATCH_IORTC_VA, 2u,
@@ -81,7 +85,7 @@ static const expected_site_t expected_sites[] = {
     {
         IOS3_KERNEL_PATCH_RAW_WATCHER_VA, 4u,
         {0xf0u, 0xb5u, 0x46u, 0x46u},
-        {0xe3u, 0xdfu, 0x70u, 0x47u},
+        {0xe3u, 0xdfu, 0xe4u, 0xdfu},
         IOS3_KERNEL_PATCH_SITE_RAW_WATCHER
     }
 };
@@ -192,6 +196,8 @@ static void build_synthetic_kernel(void) {
     memcpy(kernel + text_file_offset_for_va(
                IOS3_KERNEL_PATCH_RAW_WATCHER_VA),
            expected_watcher, sizeof expected_watcher);
+    memcpy(kernel + text_file_offset_for_va(IOS3_KERNEL_UIOMOVE_VA),
+           expected_uiomove, sizeof expected_uiomove);
     for (site_index = 0u;
          site_index < sizeof expected_sites / sizeof expected_sites[0];
          site_index++) {
@@ -358,6 +364,7 @@ static void test_manifest_constants(void) {
           IOS3_KERNEL_PATCH_RAM_BASE == UINT64_C(0x08000000),
           "kernel VA-to-PA mapping constants drifted");
     CHECK(IOS3_KERNEL_PATCH_RAW_WATCHER_VA == UINT32_C(0xc0073f94) &&
+          IOS3_KERNEL_UIOMOVE_VA == UINT32_C(0xc0128d14) &&
           IOS3_KERNEL_PATCH_IORTC_VA == UINT32_C(0xc0175b3e) &&
           IOS3_KERNEL_PATCH_BSD_ROOT_VA == UINT32_C(0xc01a1b5a) &&
           IOS3_KERNEL_PATCH_MD_READ_VA == UINT32_C(0xc0074140) &&
@@ -835,6 +842,31 @@ static void test_raw_and_patch_site_mismatches(fixture_t *fixture) {
               "raw watcher mismatch changed RAM");
     }
 
+    for (byte_index = 0u; byte_index < sizeof expected_uiomove; byte_index++) {
+        size_t offset =
+            ram_offset_for_va(IOS3_KERNEL_UIOMOVE_VA) + byte_index;
+        uint8_t corrupted;
+        ios3_kernel_patch_report_t report;
+
+        prepare_synthetic_fixture(fixture);
+        fixture->ram[offset] ^= 0xffu;
+        corrupted = fixture->ram[offset];
+        CHECK(ios3_kernel_patch_apply(&fixture->request, &report) ==
+                  IOS3_KERNEL_PATCH_STATUS_UIOMOVE_MISMATCH &&
+              report.site == IOS3_KERNEL_PATCH_NO_SITE &&
+              report.byte_index == byte_index &&
+              report.virtual_address ==
+                  (uint64_t)IOS3_KERNEL_UIOMOVE_VA + byte_index &&
+              report.physical_address ==
+                  IOS3_KERNEL_PATCH_RAM_BASE + offset &&
+              report.expected_value == expected_uiomove[byte_index] &&
+              report.actual_value == corrupted,
+              "uiomove target byte %u mismatch lost its exact report",
+              (unsigned)byte_index);
+        CHECK(fixture->ram[offset] == corrupted,
+              "uiomove target mismatch changed RAM");
+    }
+
     for (site_index = 0u;
          site_index < sizeof expected_sites / sizeof expected_sites[0];
          site_index++) {
@@ -915,6 +947,10 @@ static void test_private_kernel_positive(fixture_t *fixture,
                      IOS3_KERNEL_PATCH_RAW_WATCHER_VA),
                  expected_watcher, sizeof expected_watcher) == 0,
           "private kernel raw watcher bytes drifted");
+    CHECK(memcmp(g_kernel_storage.bytes +
+                     text_file_offset_for_va(IOS3_KERNEL_UIOMOVE_VA),
+                 expected_uiomove, sizeof expected_uiomove) == 0,
+          "private kernel uiomove target bytes drifted");
     for (site_index = 0u;
          site_index < sizeof expected_sites / sizeof expected_sites[0];
          site_index++) {

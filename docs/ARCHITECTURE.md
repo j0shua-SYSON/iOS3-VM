@@ -162,8 +162,10 @@ The boot integration uses five exact, kernel-identity-gated 7E18 patches: one
 removes the unmodelled IORTC wait, one selects md physical mode, and two replace
 only md strategy's `_bcopy_phys` calls with privileged, range-gated bulk-copy
 exits. The fifth replaces `_mdevrw`'s audited four-byte Thumb prologue with
-`svc #0xe3; bx lr`; the handler returns the Darwin errno in `r0` and the
-patched `bx lr` performs the ordinary function return. A plain external
+`svc #0xe3; svc #0xe4`. The raw handler returns `ARM_SVC_REDIRECTED`: a direct
+result redirects to the saved caller LR, while a faultable request redirects to
+the exact Thumb `_uiomove64` entry at `0xc0128d14` and returns through the
+second, completion SVC. A plain external
 physical aperture is not sufficient because this kernel's `_bcopy_phys`
 converts both operands through the fixed DRAM direct-map delta and calls
 ordinary `_bcopy`; it never reaches the emulator bus. The host-side
@@ -180,15 +182,35 @@ successful I/O.
 one of the two strategy calls. The raw bridge reproduces the reached
 `mdevrw`/`uio_update` contract, including physical-user segment variants,
 partial final iovecs, the exclusive `0xc0000000` user limit, and legacy ARM
-1 KiB permission subpages. It returns guest `ENXIO`, `EINVAL`, or `EFAULT` for
-bounded request errors and leaves guest metadata unchanged on backend failure.
-It cannot yet ask XNU to fault in a missing demand-zero page or resolve COW the
-way native `copyin`/`copyout` can; a real-run `USER_TRANSLATION` result therefore
-means the bridge needs a guest fault/retry handshake or a lower interposition,
-not that fsck is corrupt. The last captured run stopped at the first raw call
-before this bridge existed, so runtime proof remains pending. A future IOMedia
-device or full NAND/VFL/FTL model can replace this compatibility seam without
-changing the block/session API.
+1 KiB permission subpages. Resident user mappings use the bounded host-direct
+path. A missing translation instead allocates one of four 128 KiB guest-RAM
+bounce slots keyed by the entry kernel SP, temporarily selects the corresponding
+physical-user segment, and lets XNU's own `_uiomove64` perform demand-zero and
+COW fault handling. The completion SVC validates the pending SP and resulting
+`uio`, restores the original segment, persists any completed write prefix, and
+redirects to the saved LR. The slots are page-aligned, pairwise disjoint, and
+reserved below `topOfKernelData`, so the guest allocator cannot reuse them.
+Malformed or out-of-aperture bounded requests still return guest `ENXIO`,
+`EINVAL`, or `EFAULT`; a host backend failure remains a fail-closed VM halt.
+
+The closest public XNU `_mdevrw` performs one `uiomove64` and does not enforce a
+logical EOF bound. The compatibility aperture therefore extends only 128 KiB
+beyond the work image. A zero-initialized host-memory overlay makes tail writes
+visible to later reads while the source and work files retain their exact
+sizes. Anything beyond that bounded tail fails closed. This is narrower than
+silently extending the host file while preserving allocation-tail coherence.
+
+Run03 proved that the old raw-entry guard can be crossed, reaching its
+420,000,000-instruction cap with `launchd` and fsck active, but fsck exited with
+signal 8. Run04 at 405 M isolated the two repeatable causes: a write-side
+demand-page fault at user VA `0x01001000` (`FSR 0x807`) on the 32 KiB offset-zero
+raw read, and a 32 KiB read at `0x1bd30000` crossing media end `0x1bd33000`
+(12 KiB media plus 20 KiB allocation tail). The `-p` and `-fy` fsck passes
+reproduced the pair. The redirected bridge above is locally tested
+implementation evidence, not real-firmware proof; run05 must validate it. A
+future IOMedia device or full
+NAND/VFL/FTL model can replace this compatibility seam without changing the
+block/session API.
 
 In the planned shared-session design, host services cross explicit non-blocking
 seams: frame descriptors out; bounded touch, PCM and network queues in/out;
@@ -205,8 +227,10 @@ meet exactly and do not overlap. External-md instead fixes real-device-sized
 `[0xe0000000, 0x100000000)`, outside guest RAM. Machine initialization rejects a
 larger direct aperture; older `-R 768` measurements are retained only as history.
 The loader proves the active kernel, device tree, boot arguments, optional
-direct RAM disk, and framebuffer ranges are contained and pairwise disjoint
-before execution.
+direct RAM disk, external-md bounce reservation, and framebuffer ranges are
+contained and pairwise disjoint before execution. Firmware-specific edits are
+made only to the loaded kernel and device-tree copies; the authenticated source
+files remain original and immutable.
 
 ARM1176 idle is modelled as a device-time operation rather than a fake CPU loop.
 The exact CP15 wait-for-interrupt form used by XNU invokes a machine callback

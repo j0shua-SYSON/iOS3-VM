@@ -54,8 +54,22 @@ static const guest_patch_entry_t kernel_patches[] = {
         .virtual_address = IOS3_KERNEL_PATCH_RAW_WATCHER_VA,
         .length = 4u,
         .expected = {0xf0u, 0xb5u, 0x46u, 0x46u},
-        .replacement = {0xe3u, 0xdfu, 0x70u, 0x47u}
+        /*
+         * SVC #0xe3 starts the host-backed raw transfer. SVC #0xe4 is the
+         * exact in-text completion trampoline used after native _uiomove64
+         * has resolved any user-page fault and returned.
+         */
+        .replacement = {0xe3u, 0xdfu, 0xe4u, 0xdfu}
     }
+};
+
+/*
+ * The raw bridge redirects guest control to this unmodified helper. Pinning
+ * its first two Thumb instructions makes a mistyped target constant fail
+ * during the same exact-build preflight as the patched sites.
+ */
+static const uint8_t uiomove_prologue[] = {
+    0xf0u, 0xb5u, 0x5eu, 0x46u
 };
 
 typedef struct {
@@ -469,6 +483,23 @@ ios3_kernel_patch_status_t ios3_kernel_patch_apply(
                               (uint64_t)saved_request.ram_size);
     }
 
+    for (byte_index = 0u; byte_index < sizeof uiomove_prologue;
+         byte_index++) {
+        size_t ram_offset =
+            ram_offset_for_va(IOS3_KERNEL_UIOMOVE_VA) + byte_index;
+        uint8_t actual = saved_request.ram[ram_offset];
+        if (actual != uiomove_prologue[byte_index]) {
+            return report_failure(
+                report, IOS3_KERNEL_PATCH_STATUS_UIOMOVE_MISMATCH,
+                IOS3_KERNEL_PATCH_NO_SITE, IOS3_KERNEL_PATCH_NO_SEGMENT,
+                (uint32_t)byte_index,
+                (uint64_t)IOS3_KERNEL_UIOMOVE_VA + byte_index,
+                saved_request.ram_base + ram_offset,
+                uiomove_prologue[byte_index], actual, MACHO_OK,
+                GUEST_PATCH_STATUS_OK);
+        }
+    }
+
     {
         size_t site_index;
         for (site_index = 0u;
@@ -653,6 +684,8 @@ const char *ios3_kernel_patch_status_string(
         return "loaded kernel segment differs from kernel file";
     case IOS3_KERNEL_PATCH_STATUS_RAW_WATCHER_MISMATCH:
         return "raw mdev watcher byte mismatch";
+    case IOS3_KERNEL_PATCH_STATUS_UIOMOVE_MISMATCH:
+        return "raw mdev uiomove target mismatch";
     case IOS3_KERNEL_PATCH_STATUS_PATCH_TRANSACTION_FAILED:
         return "kernel patch transaction failed";
     default: return "unknown iOS 3 kernel patch status";

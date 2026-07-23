@@ -173,16 +173,19 @@ typedef enum {
 } arm_status_t;
 
 /*
- * Result from the optional privileged-SVC host hook below. Only the exact
- * HANDLED value consumes the instruction. UNHANDLED and values not named by
- * this enum take the ordinary guest SVC exception. ERROR stops arm_step with
- * ARM_HALT after rolling back CPU changes, so a failed host service cannot be
- * mistaken for a guest syscall or let execution continue.
+ * Result from the optional privileged-SVC host hook below. HANDLED consumes
+ * the instruction and retires sequentially. REDIRECTED also consumes it, but
+ * retains the callback's r15 and CPSR.T as the next fetch target and ISA.
+ * UNHANDLED and values not named by this enum take the ordinary guest SVC
+ * exception. ERROR stops arm_step with ARM_HALT after rolling back CPU
+ * changes, so a failed host service cannot be mistaken for a guest syscall or
+ * let execution continue.
  */
 typedef enum {
-    ARM_SVC_UNHANDLED = 0,
-    ARM_SVC_HANDLED   = 1,
-    ARM_SVC_ERROR     = -1
+    ARM_SVC_UNHANDLED  = 0,
+    ARM_SVC_HANDLED    = 1,
+    ARM_SVC_REDIRECTED = 2,
+    ARM_SVC_ERROR      = -1
 } arm_svc_result_t;
 
 struct arm_cpu;
@@ -231,6 +234,9 @@ typedef struct arm_bus {
      * ARM_SVC_HANDLED commits CPU-register changes and retires sequentially
      * past the SVC. The core writes r15=pc+4 for A32 or r15=pc+2 for Thumb
      * afterward, so a callback's r15 write is deliberately not retained.
+     * ARM_SVC_REDIRECTED commits the same CPU state, but the callback's r15
+     * and CPSR.T select the next fetch address and instruction set instead of
+     * the sequential address.
      * ARM_SVC_UNHANDLED and unknown values roll the CPU back and follow the
      * normal guest exception path. ARM_SVC_ERROR rolls back and makes
      * arm_step return ARM_HALT without entering the guest exception handler

@@ -919,14 +919,66 @@ segment 5, and residual `0x8000`. Before that call the strategy bridge completed
 21,187 free pages (82.76 MiB); the run's low was 21,186 pages. The immutable
 firmware inputs and create-only work image were unchanged by the guard stop.
 
-The current tree replaces the audited `_mdevrw` prologue with
-`svc #0xe3; bx lr` under the same exact 7E18 transaction and installs a separate
-bounded raw-uio bridge. Host tests cover reads, writes, XNU partial-iovec
+Commit `b0ec58c` replaced the audited `_mdevrw` prologue with
+`svc #0xe3; bx lr` under the same exact 7E18 transaction and installed the first
+bounded raw-uio bridge. Host tests covered reads, writes, XNU partial-iovec
 updates, all user segment variants, the `0xc0000000` user ceiling, TTBR0/TTBR1,
 legacy 1 KiB AP subpages, malformed metadata, aliases, and partial backend
-failures. This is implementation evidence, not runtime evidence: the next cold
-run must prove that first 32 KiB read and reveal whether native
-`copyin`/`copyout` fault recovery is needed.
+failures. The next two cold runs tested that implementation rather than
+assuming those host-only mappings were enough.
+
+### 2026-07-23: run03 crossed the raw guard but fsck failed
+
+Run03 reached `launchd` and fsck and continued to the configured
+**420,000,000** retired-instruction cap, so the old `_mdevrw` guard was no longer
+the boundary. The guest nevertheless reported that `/dev/rmd0 (hfs)` exited
+with signal 8 (`SIGFPE`), and fsck did not complete. This was progress past the
+old stop, not a successful boot: no SpringBoard frame was captured.
+
+### 2026-07-23: run04 isolated both raw-I/O mismatches
+
+Run04 added a per-request diagnostic and reproduced the fsck path through
+405,000,000 instructions. The first failure was the offset-zero raw read:
+
+```text
+seg=5  rw=0  resid=32768  offset=0
+fault=0x01001000/pa=0x00000000/fsr=0x00000807
+```
+
+This is a read from `/dev/rmd0`, but it requires a write into the user buffer.
+The first page was resident and the next page needed XNU's native write-side
+demand-page/COW handling; host-side page-table inspection cannot manufacture
+that fault correctly.
+
+The second failure was another 32 KiB read:
+
+```text
+offset=0x1bd30000  resid=32768  media_end=0x1bd33000
+```
+
+Only 12 KiB is inside the work image; the remaining 20 KiB is in the adjacent
+allocation tail. The same two request shapes recurred in fsck's `-p` and `-fy`
+passes. The closest public XNU `_mdevrw` has no logical EOF bounds check and
+calls `uiomove64` once, so treating this request as an immediate `EINVAL` was
+also incompatible.
+
+The locally tested correction changes the exact four-byte patch to
+`svc #0xe3; svc #0xe4` and adds `ARM_SVC_REDIRECTED`. Resident requests can
+still use the bounded direct path. A translation fault redirects to the exact
+Thumb `_uiomove64` entry at `0xc0128d14`, backed by one of four 128 KiB slots
+keyed by the entry kernel SP and reserved below `topOfKernelData`; native XNU
+then handles demand paging/COW and returns through the second SVC. A
+zero-initialized, coherent 128 KiB in-memory tail preserves write-then-read
+behavior beyond the media without growing either the immutable rootfs or its
+work image.
+
+The authenticated kernel, device tree, and rootfs source files remain original
+and byte-for-byte immutable. All exact kernel patches are applied only to the
+loaded guest-RAM copy, and filesystem edits remain confined to the separate
+work image. Hosted `core-tests` were green at checkpoint `8ac4af3` (run
+29997710500), but that checkpoint predates this redesign. The new implementation
+still needs public-test/CI validation and a real-firmware run05; it is not yet
+evidence that fsck completes or SpringBoard renders.
 
 This chain is stronger evidence for sustained userspace and snapshot
 repeatability. It is **not** evidence that SpringBoard rendered: the runs used

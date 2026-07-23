@@ -28,7 +28,7 @@ proof that no private or unindexed implementation exists.
 | **M2** | SoC bring-up | A bare-metal payload prints over the emulated UART; a timer IRQ is taken and returned from | ✅ done and covered by host tests |
 | **M3** | Firmware containers + LLB execution | Real IMG3s parse and decrypt; an extracted real Apple LLB payload executes; the kernelcache is extracted | ✅ done; SecureROM/iBoot execution remains future full-chain work |
 | **M4** | XNU boots and logs | The kernel reaches `bsd_init`, prints, and Apple's own kexts match and start | ✅ **done** — plus the real root filesystem mounts |
-| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress — the latest measured direct-RAM checkpoint chain reached a clean 2.98 B cap.** The former ARMv6 `UXTB16` stop is implemented and replay-cleared; a 2.97 B checkpoint was written with no guest panic or emulator undefined stop. No SpringBoard frame or tap has been demonstrated. The app is still a demo host. |
+| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress.** The historical direct-RAM chain reached a clean 2.98 B cap. The 128 MiB external-md path reaches `launchd` and fsck; run04 isolated its current raw-I/O stop to native demand-page recovery and one bounded allocation-tail read. The locally tested fix still needs run05. No SpringBoard frame or tap has been demonstrated. The app is still a demo host. |
 | **D** | Dynarec (parallel) | SpringBoard at interactive frame rates on the phone | 🔵 emitter + ARM/Thumb translator and host execution tests exist (off by default); no code cache or dispatcher calls them |
 | **N** | Guest networking (parallel) | The guest resolves a name and fetches a URL | ⚪ designed, not built |
 | **A** | Guest audio (first-device track) | Guest PCM reaches the host speaker without blocking the CPU thread | ⚪ priority, not designed or built |
@@ -42,7 +42,10 @@ At `d9d9e40`, `ios-build` run
 [`29891178730`](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29891178730)
 and `core-tests` run
 [`29891178706`](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29891178706)
-both completed successfully.
+both completed successfully. Hosted `core-tests` remained green at checkpoint
+`8ac4af3`, run
+[`29997710500`](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29997710500).
+That checkpoint predates the locally tested faultable raw-bridge redesign.
 
 ---
 
@@ -503,8 +506,13 @@ completed audit's writable md bulk-copy design is now integrated as a guarded
 cold-boot mode. A fresh 128 MiB real-firmware continuation reached `launchd`,
 fsck, and the first raw `/dev/rmd0` read at 402,741,536 instructions with 21,187
 free pages (82.76 MiB), 6,715 successful strategy reads, and no bridge failure.
-That pre-raw-bridge run stopped intentionally at `_mdevrw`; no write occurred,
-and it has not reached SpringBoard.
+That pre-raw-bridge run stopped intentionally at `_mdevrw`. Run03 crossed the
+guard and reached its 420,000,000 cap, but fsck exited with signal 8. Run04
+reproduced two exact causes by 405 M: the segment-5 offset-zero 32 KiB read
+needed native write-side demand paging at user VA `0x01001000` (`FSR 0x807`),
+and a 32 KiB read at `0x1bd30000` crossed media end `0x1bd33000` by 20 KiB.
+Both recurred across fsck's `-p` and `-fy` passes. It has not reached
+SpringBoard.
 
 For chronology, this is the much earlier pre-VFP measurement from
 `bootkernel`'s milestone probes:
@@ -612,8 +620,9 @@ still runs only a synthetic guest and has no touch or audio path.
   came out of it that are *not* done:
   - **The forced full `fsck_hfs` check needs revalidation.** The historical
     forced scan stopped on `SMULBB r6, r3, r5` at `fsck_hfs+0x12130`. The full
-    related multiply family is implemented now, so that exact CPU gap is closed,
-    but no new forced-dirty scan has yet established its next result.
+    related multiply family is implemented now, so that exact CPU gap is closed.
+    Run04 entered both the `-p` and `-fy` paths, but each reproduced the raw
+    demand-page/tail-read pair before fsck could establish a filesystem result.
   - **In the historical comparison it changed nothing by itself.** Out to 3 G
     instructions the console was
     identical with and without `--grow`. And `_execve` stuck at 11 was never
@@ -646,9 +655,22 @@ still runs only a synthetic guest and has no touch or audio path.
   bridges after setup. A measured pre-raw-bridge cold run reached the first
   32 KiB `/dev/rmd0` read at 402,741,536 instructions after 6,715 strategy reads
   (27,479,552 bytes), zero writes, zero bridge failures, and with 82.76 MiB of
-  guest pages still free. The new raw bridge exact-gates the `_mdevrw` entry,
-  validates and stages the XNU `uio`, and commits partial-iovec state only after
-  complete backend I/O; its first real run is the next acceptance step.
+  guest pages still free. Run03 crossed that guard and reached 420 M, but fsck
+  exited with signal 8. Run04 at 405 M reduced the failure to two repeatable
+  contracts: native write-side demand paging at user VA `0x01001000`
+  (`FSR 0x807`) and a 32 KiB read with 12 KiB inside the media plus 20 KiB in
+  the adjacent allocation tail. The closest public XNU `_mdevrw` calls
+  `uiomove64` once without a logical EOF check.
+
+  The implemented replacement exact-patches `_mdevrw` to
+  `svc #0xe3; svc #0xe4`, adds the explicit `ARM_SVC_REDIRECTED` control-flow
+  result, and redirects faultable requests through exact Thumb `_uiomove64`
+  at `0xc0128d14`. Four 128 KiB guest bounce slots, keyed by entry kernel SP,
+  are reserved below `topOfKernelData`; the completion SVC validates and
+  releases the pending slot. A zero-initialized, coherent 128 KiB in-memory
+  tail preserves later reads without extending the immutable source or work
+  image. Run05
+  must still validate the implementation and prove progress beyond fsck.
   Snapshot backing identity/overlay state follows, and global `_bcopy_phys`
   replacement remains forbidden. Historical
   older-source experiments reported 312 MiB and

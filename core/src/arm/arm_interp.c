@@ -36,11 +36,12 @@ static inline bool cpu_is_priv(const arm_cpu_t *c) {
 
 /*
  * Give an explicitly opted-in platform one chance to consume a privileged
- * SVC as a host service. The architectural CPU state is transactional: any
- * result other than HANDLED discards callback register changes. ERROR remains
- * distinct so arm_step can stop instead of misreading failed host I/O as an
- * ordinary guest SVC. Platform state reached through the callback context is
- * outside the CPU's control and is covered by the contract in arm.h.
+ * SVC as a host service. The architectural CPU state is transactional:
+ * HANDLED and REDIRECTED commit callback changes; every other result discards
+ * them. ERROR remains distinct so arm_step can stop instead of misreading
+ * failed host I/O as an ordinary guest SVC. Platform state reached through
+ * the callback context is outside the CPU's control and is covered by the
+ * contract in arm.h.
  */
 static arm_svc_result_t privileged_svc_result(arm_cpu_t *c, uint32_t pc,
                                                uint32_t encoding) {
@@ -51,7 +52,8 @@ static arm_svc_result_t privileged_svc_result(arm_cpu_t *c, uint32_t pc,
     arm_svc_result_t result =
         c->bus->privileged_svc_handler(c->bus->privileged_svc_ctx,
                                        c, pc, encoding);
-    if (result == ARM_SVC_HANDLED) return ARM_SVC_HANDLED;
+    if (result == ARM_SVC_HANDLED || result == ARM_SVC_REDIRECTED)
+        return result;
 
     *c = saved;
     if (result == ARM_SVC_ERROR) {
@@ -2016,7 +2018,9 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
             arm_svc_result_t result =
                 privileged_svc_result(c, pc, (uint32_t)insn);
             if (result == ARM_SVC_ERROR) return ARM_HALT;
-            if (result != ARM_SVC_HANDLED)
+            if (result == ARM_SVC_REDIRECTED)
+                *next = c->r[15];
+            else if (result != ARM_SVC_HANDLED)
                 take_exception(c, ARM_VEC_SWI, ARM_MODE_SVC, pc + 2, false, next);
             return ARM_OK;
         }
@@ -2530,7 +2534,9 @@ arm_status_t arm_step(arm_cpu_t *c) {
     } else if ((insn & 0x0f000000u) == 0x0f000000u) {     /* SWI / SVC */
         arm_svc_result_t result = privileged_svc_result(c, pc, insn);
         if (result == ARM_SVC_ERROR) return ARM_HALT;
-        if (result != ARM_SVC_HANDLED)
+        if (result == ARM_SVC_REDIRECTED)
+            next = c->r[15];
+        else if (result != ARM_SVC_HANDLED)
             take_exception(c, ARM_VEC_SWI, ARM_MODE_SVC, pc + 4, false, &next);
     } else if ((insn & 0x0c000000u) == 0x00000000u) {     /* data processing / PSR */
         st = exec_data_processing(c, pc, insn, &next);

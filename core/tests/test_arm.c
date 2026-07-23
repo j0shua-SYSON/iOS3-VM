@@ -50,6 +50,9 @@ typedef struct svc_probe {
     uint32_t         seen_cpu_pc;
     bool             saw_expected_cpu;
     bool             mutate;
+    bool             redirect;
+    bool             redirect_thumb;
+    uint32_t         redirect_pc;
 } svc_probe_t;
 
 static arm_svc_result_t probe_privileged_svc(void *ctx, arm_cpu_t *cpu,
@@ -72,6 +75,11 @@ static arm_svc_result_t probe_privileged_svc(void *ctx, arm_cpu_t *cpu,
         cpu->cpsr ^= ARM_CPSR_N;
         cpu->excl_valid = false;
         cpu->excl_addr = 0xfeedeeeeu;
+    }
+    if (probe->redirect) {
+        cpu->r[15] = probe->redirect_pc;
+        if (probe->redirect_thumb) cpu->cpsr |= ARM_CPSR_T;
+        else                       cpu->cpsr &= ~ARM_CPSR_T;
     }
     return probe->result;
 }
@@ -3502,6 +3510,65 @@ static void test_privileged_svc_hook_handles_a32(void) {
           "handled host service must not enter or alter the SVC exception bank");
 }
 
+static void test_privileged_svc_hook_redirects_a32_to_thumb(void) {
+    const uint32_t svc = 0xefabc123u;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w32(NULL, 0x100u, svc);
+    m_w16(NULL, 0x202u, 0x225au);             /* MOVS r2,#0x5a (Thumb) */
+
+    svc_probe_t probe = {0};
+    probe.result = ARM_SVC_REDIRECTED;
+    probe.mutate = true;
+    probe.redirect = true;
+    probe.redirect_thumb = true;
+    probe.redirect_pc = 0x202u;
+    arm_bus_t bus = bus_with_svc_probe(&probe);
+    arm_cpu_t c;
+    arm_reset(&c, &bus);
+    arm_set_mode(&c, ARM_MODE_SYS);
+    c.cpsr = ARM_MODE_SYS | ARM_CPSR_Z | ARM_CPSR_C;
+    c.r[0] = 0x12345678u;
+    c.r[7] = 0x77777777u;
+    c.r[15] = 0x100u;
+    c.cp15.context_id = 0x13572468u;
+    c.excl_valid = true;
+    c.excl_addr = 0x400u;
+    c.spsr[ARM_BANK_SVC] = 0xa5a5a5a5u;
+    c.bank_r14[ARM_BANK_SVC] = 0x5a5a5a5au;
+    c.cycles = 40u;
+    probe.expected_cpu = &c;
+
+    arm_status_t st = arm_step(&c);
+    CHECK(st == ARM_OK && probe.calls == 1u && probe.saw_expected_cpu,
+          "A32 redirect status=%d calls=%u", (int)st, probe.calls);
+    CHECK(probe.seen_pc == 0x100u && probe.seen_cpu_pc == 0x100u &&
+          probe.seen_encoding == svc,
+          "A32 redirect hook saw pc=%08x cpu.pc=%08x encoding=%08x",
+          probe.seen_pc, probe.seen_cpu_pc, probe.seen_encoding);
+    CHECK(c.r[15] == 0x202u && (c.cpsr & ARM_CPSR_T) != 0u &&
+          c.cycles == 41u,
+          "A32 redirect pc=%08x cpsr=%08x cycles=%llu expect Thumb 202/41",
+          c.r[15], c.cpsr, (unsigned long long)c.cycles);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SYS &&
+          (c.cpsr & ARM_CPSR_N) != 0u &&
+          c.r[0] == 0xfeed0001u && c.r[7] == 0xfeed0007u &&
+          c.cp15.context_id == 0xfeedc013u &&
+          !c.excl_valid && c.excl_addr == 0xfeedeeeeu,
+          "A32 redirect did not commit the callback's complete CPU mutation");
+    CHECK(c.spsr[ARM_BANK_SVC] == 0xa5a5a5a5u &&
+          c.bank_r14[ARM_BANK_SVC] == 0x5a5a5a5au,
+          "A32 redirect incorrectly entered or altered the SVC bank");
+
+    st = arm_step(&c);
+    CHECK(st == ARM_OK && c.r[2] == 0x5au && c.r[15] == 0x204u &&
+          (c.cpsr & ARM_CPSR_T) != 0u && c.cycles == 42u &&
+          probe.calls == 1u,
+          "redirect target did not fetch as Thumb: status=%d r2=%08x pc=%08x "
+          "cpsr=%08x cycles=%llu calls=%u",
+          (int)st, c.r[2], c.r[15], c.cpsr,
+          (unsigned long long)c.cycles, probe.calls);
+}
+
 static void test_privileged_svc_hook_nonhandled_is_transactional(void) {
     static const arm_svc_result_t results[] = {
         ARM_SVC_UNHANDLED,
@@ -3686,6 +3753,60 @@ static void test_privileged_svc_hook_handles_thumb(void) {
           "handled Thumb hook writes were not committed");
     CHECK(c.spsr[ARM_BANK_SVC] == 0x55aa55aau,
           "handled Thumb SVC incorrectly entered the SVC exception bank");
+}
+
+static void test_privileged_svc_hook_redirects_thumb_to_a32(void) {
+    const uint16_t svc = 0xdfa5u;
+    memset(g_ram, 0, sizeof g_ram);
+    m_w16(NULL, 0x100u, svc);
+    m_w32(NULL, 0x200u, 0xe3a02066u);         /* MOV r2,#0x66 (A32) */
+
+    svc_probe_t probe = {0};
+    probe.result = ARM_SVC_REDIRECTED;
+    probe.mutate = true;
+    probe.redirect = true;
+    probe.redirect_thumb = false;
+    probe.redirect_pc = 0x200u;
+    arm_bus_t bus = bus_with_svc_probe(&probe);
+    arm_cpu_t c;
+    arm_reset(&c, &bus);
+    arm_set_mode(&c, ARM_MODE_SYS);
+    c.cpsr = ARM_MODE_SYS | ARM_CPSR_T | ARM_CPSR_C;
+    c.r[0] = 0x2468ace0u;
+    c.r[15] = 0x100u;
+    c.spsr[ARM_BANK_SVC] = 0x55aa55aau;
+    c.cycles = 90u;
+    probe.expected_cpu = &c;
+
+    arm_status_t st = arm_step(&c);
+    CHECK(st == ARM_OK && probe.calls == 1u && probe.saw_expected_cpu,
+          "Thumb redirect status=%d calls=%u", (int)st, probe.calls);
+    CHECK(probe.seen_pc == 0x100u && probe.seen_cpu_pc == 0x100u &&
+          probe.seen_encoding == (uint32_t)svc &&
+          (probe.seen_cpsr & ARM_CPSR_T) != 0u,
+          "Thumb redirect hook saw pc=%08x cpu.pc=%08x encoding=%08x cpsr=%08x",
+          probe.seen_pc, probe.seen_cpu_pc, probe.seen_encoding, probe.seen_cpsr);
+    CHECK(c.r[15] == 0x200u && (c.cpsr & ARM_CPSR_T) == 0u &&
+          c.cycles == 91u,
+          "Thumb redirect pc=%08x cpsr=%08x cycles=%llu expect A32 200/91",
+          c.r[15], c.cpsr, (unsigned long long)c.cycles);
+    CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SYS &&
+          (c.cpsr & ARM_CPSR_N) != 0u &&
+          c.r[0] == 0xfeed0001u && c.r[7] == 0xfeed0007u &&
+          c.cp15.context_id == 0xfeedc013u &&
+          !c.excl_valid && c.excl_addr == 0xfeedeeeeu,
+          "Thumb redirect did not commit the callback's complete CPU mutation");
+    CHECK(c.spsr[ARM_BANK_SVC] == 0x55aa55aau,
+          "Thumb redirect incorrectly entered the SVC exception bank");
+
+    st = arm_step(&c);
+    CHECK(st == ARM_OK && c.r[2] == 0x66u && c.r[15] == 0x204u &&
+          (c.cpsr & ARM_CPSR_T) == 0u && c.cycles == 92u &&
+          probe.calls == 1u,
+          "redirect target did not fetch as A32: status=%d r2=%08x pc=%08x "
+          "cpsr=%08x cycles=%llu calls=%u",
+          (int)st, c.r[2], c.r[15], c.cpsr,
+          (unsigned long long)c.cycles, probe.calls);
 }
 
 static void test_privileged_svc_hook_thumb_error_and_user_guard(void) {
@@ -4611,10 +4732,12 @@ int main(void) {
     test_vfp_cpacr_denial_vectors();
     test_vfp_lazy_trap_cannot_loop();
     test_privileged_svc_hook_handles_a32();
+    test_privileged_svc_hook_redirects_a32_to_thumb();
     test_privileged_svc_hook_nonhandled_is_transactional();
     test_privileged_svc_hook_a32_error_halts_transactionally();
     test_privileged_svc_hook_obeys_a32_guards();
     test_privileged_svc_hook_handles_thumb();
+    test_privileged_svc_hook_redirects_thumb_to_a32();
     test_privileged_svc_hook_thumb_error_and_user_guard();
     test_swi_entry_state_from_user_mode();
     test_thumb_swi_lr_is_the_next_halfword();

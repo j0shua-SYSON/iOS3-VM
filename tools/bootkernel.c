@@ -46,6 +46,9 @@
 #define EXTERNAL_MD_TOKEN_BASE UINT64_C(0xe0000000)
 #define EXTERNAL_MD_MAX_SIZE   UINT64_C(0x20000000)
 #define EXTERNAL_MD_RAW_DEVICE UINT32_C(0x09000000)
+#define EXTERNAL_MD_RAW_SLOT_COUNT UINT32_C(4)
+#define EXTERNAL_MD_RAW_RESERVE_SIZE \
+    (EXTERNAL_MD_RAW_SLOT_COUNT * MD_RAW_BRIDGE_MAX_TRANSFER)
 #define IOS3_ROOTFS_FILE_SIZE  UINT64_C(433274880)
 #define IOS3_DEVICETREE_FILE_SIZE ((size_t)40544u)
 
@@ -2230,7 +2233,7 @@ static arm_svc_result_t external_md_svc_handler(void *context,
         return result;
     guest_errors_before = mux->raw->stats.guest_errors;
     result = md_raw_bridge_handle_svc(mux->raw, cpu, pc, encoding);
-    if (result == ARM_SVC_HANDLED &&
+    if ((result == ARM_SVC_HANDLED || result == ARM_SVC_REDIRECTED) &&
         mux->raw->stats.guest_errors != guest_errors_before) {
         external_md_print_raw_guest_error(
             "external-md raw guest error",
@@ -3183,6 +3186,23 @@ int main(int argc, char **argv) {
     uint32_t rd_pa = (uint32_t)rd_pa64;
     size_t capacity = (size_t)capacity64;
 
+    uint64_t raw_bounce_pa64 = 0;
+    boot_range_t raw_bounce_range;
+    if ((external_md &&
+         (!align_u64(ba_range.end, 0x4000u, &raw_bounce_pa64) ||
+          raw_bounce_pa64 > UINT32_MAX)) ||
+        !boot_range_make(&raw_bounce_range, "raw md bounce reserve",
+                         raw_bounce_pa64,
+                         external_md ? EXTERNAL_MD_RAW_RESERVE_SIZE : 0u,
+                         external_md)) {
+        fprintf(stderr,
+                "layout: faultable raw-md bounce slots do not fit in "
+                "32-bit space\n");
+        streamed_file_close(&rd_source);
+        return 1;
+    }
+    uint32_t raw_bounce_pa = (uint32_t)raw_bounce_pa64;
+
     uint64_t fb_start64 = 0, planned_static_end64 = 0;
     boot_range_t fb_range;
     if (want_fb) {
@@ -3203,15 +3223,17 @@ int main(int argc, char **argv) {
     }
 
     boot_range_t layout_ranges[] = {
-        kernel_range, dt_range, ba_range, rd_range, fb_range
+        kernel_range, dt_range, ba_range, rd_range, raw_bounce_range, fb_range
     };
     if (!boot_layout_validate(&dram_range, layout_ranges,
                               sizeof layout_ranges / sizeof layout_ranges[0])) {
         streamed_file_close(&rd_source);
         return 1;
     }
-    uint64_t static_input_end64 = (legacy_ramdisk && !rd_low)
-                                ? rd_range.end : ba_range.end;
+    uint64_t static_input_end64 = external_md
+                                ? raw_bounce_range.end
+                                : (legacy_ramdisk && !rd_low)
+                                      ? rd_range.end : ba_range.end;
     if (!align_u64(static_input_end64, 0x4000u, &planned_static_end64) ||
         planned_static_end64 > dram_range.end ||
         (want_fb && planned_static_end64 > fb_range.begin)) {
@@ -3296,8 +3318,10 @@ int main(int argc, char **argv) {
      * above looked like a framebuffer problem.
      */
     uint64_t top_of_kernel_data64;
-    uint64_t actual_static_end64 = (legacy_ramdisk && !rd_low)
-                                 ? rd_actual_end64 : ba_range.end;
+    uint64_t actual_static_end64 = external_md
+                                 ? raw_bounce_range.end
+                                 : (legacy_ramdisk && !rd_low)
+                                       ? rd_actual_end64 : ba_range.end;
     if (!align_u64(actual_static_end64, 0x4000u, &top_of_kernel_data64) ||
         top_of_kernel_data64 > planned_static_end64 ||
         top_of_kernel_data64 > UINT32_MAX) {
@@ -3506,6 +3530,12 @@ int main(int argc, char **argv) {
                external_md_work);
         printf("             DT RAMDisk = {0x%08x, 0x%08x}  (synthetic token)\n",
                rd_dt_addr, rd_len);
+        printf("raw bounce : pa 0x%08x..0x%08llx  %u x %u KiB slots "
+               "(below topOfKernelData)\n",
+               raw_bounce_pa,
+               (unsigned long long)raw_bounce_range.end,
+               (unsigned)EXTERNAL_MD_RAW_SLOT_COUNT,
+               (unsigned)(MD_RAW_BRIDGE_MAX_TRANSFER >> 10));
     }
 
     /*
@@ -3701,6 +3731,13 @@ int main(int argc, char **argv) {
         memset(&raw_config, 0, sizeof raw_config);
         raw_config.site.pc = IOS3_KERNEL_PATCH_RAW_WATCHER_VA;
         raw_config.site.encoding = UINT32_C(0xdfe3);
+        raw_config.completion_site.pc =
+            IOS3_KERNEL_PATCH_RAW_WATCHER_VA + UINT32_C(2);
+        raw_config.completion_site.encoding = UINT32_C(0xdfe4);
+        raw_config.uiomove_thumb_pc = IOS3_KERNEL_UIOMOVE_VA;
+        raw_config.bounce_base_pa = raw_bounce_pa;
+        raw_config.bounce_stride = MD_RAW_BRIDGE_MAX_TRANSFER;
+        raw_config.bounce_slot_count = EXTERNAL_MD_RAW_SLOT_COUNT;
         raw_config.expected_device = EXTERNAL_MD_RAW_DEVICE;
         raw_config.user_address_limit = UINT32_C(0xc0000000);
         raw_config.media_size = external_media_size;
@@ -3733,11 +3770,11 @@ int main(int argc, char **argv) {
                                            &external_bridge_mux);
         external_bridge_installed = true;
         printf("md bridge   : token 0x%08x..0x%08llx -> %s; "
-               "SVC dfe1/dfe2/dfe3 armed\n",
+               "SVC dfe1/dfe2/dfe3/dfe4 armed; uiomove 0x%08x\n",
                (unsigned)EXTERNAL_MD_TOKEN_BASE,
                (unsigned long long)(EXTERNAL_MD_TOKEN_BASE +
                                     external_media_size),
-               external_md_work);
+               external_md_work, IOS3_KERNEL_UIOMOVE_VA);
     }
 
     /*
@@ -4671,6 +4708,17 @@ int main(int argc, char **argv) {
         free(rgb);
     }
 
+    uint32_t external_raw_pending = 0u;
+    if (external_md) {
+        uint32_t raw_slot;
+        for (raw_slot = 0u;
+             raw_slot < external_raw_bridge.config.bounce_slot_count;
+             raw_slot++) {
+            if (external_raw_bridge.pending[raw_slot].active)
+                external_raw_pending++;
+        }
+    }
+
     int exit_code = snapshot_unreached ? 5 : 0;
     if (bridge_halt_failure) exit_code = 7;
     else if (guest_fatal_entry_seen) exit_code = 10;
@@ -4684,6 +4732,12 @@ int main(int argc, char **argv) {
                 (unsigned long long)
                     external_raw_bridge.stats.guest_errors);
         exit_code = 11;
+    } else if (external_md && external_raw_pending != 0u) {
+        fprintf(stderr,
+                "external-md: instruction cap left %u native raw "
+                "continuation(s) pending\n",
+                external_raw_pending);
+        exit_code = 12;
     }
 
     if (external_md) {
@@ -4732,6 +4786,22 @@ int main(int argc, char **argv) {
                (unsigned long long)external_raw_bridge.stats.successful_reads,
                (unsigned long long)external_raw_bridge.stats.successful_writes,
                (unsigned long long)external_raw_bridge.stats.guest_errors);
+        printf("  raw native: %llu redirects, %llu completions, %u pending\n",
+               (unsigned long long)
+                   external_raw_bridge.stats.redirected_requests,
+               (unsigned long long)
+                   external_raw_bridge.stats.redirected_completions,
+               external_raw_pending);
+        printf("  raw media : %llu read + %llu written bytes; "
+               "%llu read + %llu written coherent guard bytes\n",
+               (unsigned long long)
+                   external_raw_bridge.stats.media_bytes_read,
+               (unsigned long long)
+                   external_raw_bridge.stats.media_bytes_written,
+               (unsigned long long)
+                   external_raw_bridge.stats.guard_bytes_read,
+               (unsigned long long)
+                   external_raw_bridge.stats.guard_bytes_written);
         if (external_raw_bridge.stats.guest_errors != 0u) {
             const md_raw_bridge_error_t *error =
                 &external_raw_bridge.last_guest_error;

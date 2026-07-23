@@ -26,6 +26,7 @@
 #define IOS3_KERNEL_PATCH_RAM_BASE UINT64_C(0x08000000)
 
 #define IOS3_KERNEL_PATCH_RAW_WATCHER_VA UINT32_C(0xc0073f94)
+#define IOS3_KERNEL_UIOMOVE_VA UINT32_C(0xc0128d14)
 #define IOS3_KERNEL_PATCH_IORTC_VA UINT32_C(0xc0175b3e)
 #define IOS3_KERNEL_PATCH_BSD_ROOT_VA UINT32_C(0xc01a1b5a)
 #define IOS3_KERNEL_PATCH_MD_READ_VA UINT32_C(0xc0074140)
@@ -89,6 +90,7 @@ typedef enum {
     IOS3_KERNEL_PATCH_STATUS_RAM_TOO_SMALL,
     IOS3_KERNEL_PATCH_STATUS_LOADED_SEGMENT_MISMATCH,
     IOS3_KERNEL_PATCH_STATUS_RAW_WATCHER_MISMATCH,
+    IOS3_KERNEL_PATCH_STATUS_UIOMOVE_MISMATCH,
     IOS3_KERNEL_PATCH_STATUS_PATCH_TRANSACTION_FAILED
 } ios3_kernel_patch_status_t;
 
@@ -143,7 +145,8 @@ typedef struct {
 /*
  * Validate the complete build identity, exact segment topology, loaded file
  * bytes and zero-fill tails, fixed mapping, and every expected byte at all five
- * patch sites (including the raw-mdev entry) before applying any replacement.
+ * patch sites (including the raw-mdev entry/completion SVC pair) before
+ * applying any replacement.
  * Any rejection leaves the kernel file and guest RAM unchanged. The
  * implementation performs no allocation.
  */

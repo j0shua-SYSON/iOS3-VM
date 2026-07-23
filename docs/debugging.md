@@ -36,10 +36,19 @@ guarded md-strategy and raw-uio bridges. Default growth produces exactly
 work volume. Any bridge failure, raw guest errno, undefined instruction, guest
 `_panic`/`_Debugger` entry, or other halt exits nonzero. Raw guest errors use
 status 11 and retain a separate exact diagnostic even if a later bridge failure
-occurs. The work image remains after a later failure and its path cannot be
+occurs. If the instruction cap lands inside native `_uiomove64`, active
+continuations instead produce status 12; that is an incomplete measurement,
+not a successful raw transfer. The work image remains after a later failure and its path cannot be
 reused; archive/remove it deliberately or select a new filename. A cleanup
 warning means a second large temporary may remain beside it and must be
 inspected before retrying. No source firmware file is opened writable.
+
+The run05 bridge reserves four 128 KiB bounce slots below
+`topOfKernelData`; they are guest-RAM reservations, not extra host disk files.
+Its zero-initialized 128 KiB host-memory tail keeps guard writes coherent with
+later reads, while neither the 466,825,216-byte work image nor the immutable
+source grows. External snapshots remain rejected because this overlay is not
+serialized yet.
 
 Checkpoint replay still uses historical direct-RAM mode:
 `-r firmware/rootfs.img -R 512`. There, `-R 512` is not cosmetic:
@@ -209,20 +218,47 @@ prints a machine-derived report to diff.
 **Do not blindly extend the latest checkpoint yet.** Free pages fell from 2,004
 at 2.45 B to 542 at 2.8 B and 317 at 2.9 B. The diagnostic continuation reached
 a low of 97 pages at 2,934,505,472, recovered to 253 near the former opcode
-stop, and ended at 214 at 2.98 B against a target of 250. That movement is evidence of reclamation, not proof that
-the layout is safe. The RAM disk remains pinned guest memory even though its
-host-side duplicate is gone. The storage audit has ruled out a simple external
-aperture. The writable, range-gated md bulk-copy bridge, locked file adapter,
-exact 7E18 kernel manifest and bounded immutable-source work-image provisioner
-are now wired into `--external-md`, including exact kernel, device-tree, and
-rootfs gates. The last pre-raw-bridge cold run reached the first 32 KiB
-`/dev/rmd0` read at 402,741,536 instructions with 21,187 free pages (82.76 MiB)
-after 6,715 strategy reads and no bridge failure. The 420 M recipe above is the
-short acceptance probe for the new raw bridge. If it reports
-`USER_TRANSLATION`/EFAULT, treat that as missing native demand/COW fault recovery
-and build the guest bounce/trampoline path; do not weaken MMU permissions.
-After the raw read is proven, extend the cold slice before app integration, then
-add snapshot backing identity and overlay coupling.
+stop, and ended at 214 at 2.98 B against a target of 250. That movement is
+evidence of reclamation, not proof that the direct-RAM layout is safe. The
+external-md path avoids pinning that disk in guest memory. Its pre-raw-bridge
+run reached the first 32 KiB `/dev/rmd0` read at 402,741,536 instructions with
+21,187 free pages (82.76 MiB) after 6,715 strategy reads and no bridge failure.
+
+Run03 crossed that guard and reached 420,000,000 instructions, but fsck exited
+with signal 8. Run04's per-request diagnostics found the same pair during
+fsck's `-p` and `-fy` passes:
+
+```text
+#1 seg=5 rw=0 resid=32768 offset=0
+   fault=0x01001000/pa=0x00000000/fsr=0x00000807
+#2 seg=5 rw=0 resid=32768 offset=0x1bd30000
+   media_end=0x1bd33000
+```
+
+The first is a guest write-side demand-page/COW requirement: a raw-device read
+must copy into a user page that is not resident yet. Do not weaken page-table
+permissions or fabricate a host translation. The second has 12 KiB inside the
+work image and a 20 KiB adjacent tail. The closest public XNU `_mdevrw` calls
+`uiomove64` once without a logical EOF bounds check, so an immediate `EINVAL`
+is not faithful either.
+
+The implemented fix exact-patches the four bytes to
+`svc #0xe3; svc #0xe4`. The first SVC uses `ARM_SVC_REDIRECTED` to enter exact
+Thumb `_uiomove64` at `0xc0128d14` when direct translation fails. One of four
+128 KiB slots is selected by entry kernel SP, and the second SVC validates the
+native completion before returning to `_spec_read`/`_spec_write`. The adjacent
+128 KiB tail is a zero-initialized coherent memory overlay and is never added
+to either disk file.
+
+For run05, use a fresh work filename and retain the complete stdout/stderr
+logs. Acceptance requires both request shapes to complete without a raw guest
+error, fsck to progress past the run03 failure, the work-image length to remain
+466,825,216 bytes, and all three source hashes to remain unchanged. A redirect
+counter by itself proves only that native `_uiomove64` was entered. Hosted
+`core-tests` run 29997710500 was green at checkpoint `8ac4af3`, before this
+redesign; run05 and new CI are still pending. Only after this slice is proven
+should the cap be extended before app integration, followed by snapshot backing
+identity and overlay coupling.
 
 ### WFI changes elapsed device time, not the instruction coordinate
 
