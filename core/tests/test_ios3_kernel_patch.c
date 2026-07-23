@@ -77,6 +77,12 @@ static const expected_site_t expected_sites[] = {
         {0xefu, 0xf7u, 0xbfu, 0xf8u},
         {0xe2u, 0xdfu, 0xc0u, 0x46u},
         IOS3_KERNEL_PATCH_SITE_MD_WRITE
+    },
+    {
+        IOS3_KERNEL_PATCH_RAW_WATCHER_VA, 4u,
+        {0xf0u, 0xb5u, 0x46u, 0x46u},
+        {0xe3u, 0xdfu, 0x70u, 0x47u},
+        IOS3_KERNEL_PATCH_SITE_RAW_WATCHER
     }
 };
 
@@ -833,6 +839,10 @@ static void test_raw_and_patch_site_mismatches(fixture_t *fixture) {
          site_index < sizeof expected_sites / sizeof expected_sites[0];
          site_index++) {
         const expected_site_t *site = &expected_sites[site_index];
+        /* The raw entry has a deliberately more precise pre-transaction
+         * diagnostic, exercised byte-for-byte by the loop above. */
+        if (site->site == IOS3_KERNEL_PATCH_SITE_RAW_WATCHER)
+            continue;
         for (byte_index = 0u; byte_index < site->length; byte_index++) {
             size_t offset = ram_offset_for_va(site->va) + byte_index;
             uint8_t corrupted;
@@ -949,10 +959,6 @@ static void test_private_kernel_positive(fixture_t *fixture,
           report.macho_status == MACHO_OK &&
           report.guest_patch_status == GUEST_PATCH_STATUS_OK,
           "private-kernel success report retained stale detail");
-    CHECK(memcmp(fixture->ram + ram_offset_for_va(
-                     IOS3_KERNEL_PATCH_RAW_WATCHER_VA),
-                 expected_watcher, sizeof expected_watcher) == 0,
-          "successful patch changed the raw watcher");
     for (site_index = 0u;
          site_index < sizeof expected_sites / sizeof expected_sites[0];
          site_index++) {

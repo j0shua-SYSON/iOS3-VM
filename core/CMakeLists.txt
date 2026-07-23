@@ -8,6 +8,7 @@ add_library(emucore STATIC
     src/vm_source.c
     src/vm_block.c
     src/md_bridge.c
+    src/md_raw_bridge.c
     src/soc/uart.c
     src/soc/vic.c
     src/soc/timer.c
@@ -146,6 +147,10 @@ add_test(NAME vm_block COMMAND test_vm_block)
 add_executable(test_md_bridge tests/test_md_bridge.c)
 target_link_libraries(test_md_bridge PRIVATE emucore)
 add_test(NAME host_memory_disk_bridge COMMAND test_md_bridge)
+
+add_executable(test_md_raw_bridge tests/test_md_raw_bridge.c)
+target_link_libraries(test_md_raw_bridge PRIVATE emucore)
+add_test(NAME host_raw_memory_disk_bridge COMMAND test_md_raw_bridge)
 
 add_executable(test_macho tests/test_macho.c)
 target_link_libraries(test_macho PRIVATE emucore)

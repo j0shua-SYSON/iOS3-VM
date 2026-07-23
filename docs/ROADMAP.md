@@ -500,9 +500,11 @@ the pool fell from 317 pages at 2.9 B to a low of 97 pages at instruction
 214 pages at 2.98 B, against a target of 250. The
 roughly 445 MiB pinned RAM disk remains a severe device-memory constraint. The
 completed audit's writable md bulk-copy design is now integrated as a guarded
-cold-boot mode. Its first 128 MiB real-firmware trace reached `launchd` and fsck
-at a 400 M cap with 21,826 free pages (85.26 MiB), 6,695 successful bridge reads,
-and no bridge failure. No write occurred yet, and it has not reached SpringBoard.
+cold-boot mode. A fresh 128 MiB real-firmware continuation reached `launchd`,
+fsck, and the first raw `/dev/rmd0` read at 402,741,536 instructions with 21,187
+free pages (82.76 MiB), 6,715 successful strategy reads, and no bridge failure.
+That pre-raw-bridge run stopped intentionally at `_mdevrw`; no write occurred,
+and it has not reached SpringBoard.
 
 For chronology, this is the much earlier pre-VFP measurement from
 `bootkernel`'s milestone probes:
@@ -634,19 +636,21 @@ still runs only a synthetic guest and has no touch or audio path.
   descriptor file adapter, privileged-only transactional SVC seam, and the
   writable range- and page-gated md-strategy bulk-copy bridge are now
   implemented and tested. An exact 7E18 manifest gates the complete decrypted
-  kernel image, parsed ARMv6 Mach-O layout, fixed mapping, four expected patch
-  sites and untouched raw-path watcher before an atomic write. A bounded generic
+  kernel image, parsed ARMv6 Mach-O layout, fixed mapping, and all five expected
+  patch sites before an atomic write. A bounded generic
   work-image provisioner now copies the immutable HFS source, validates reserved
   and allocation metadata, rewrites the unique stock fstab, grows/revalidates,
   flushes and publishes without replacement. `bootkernel --external-md` now
   exact-gates the supported kernel, device tree, and rootfs; publishes the md0
-  media token outside fixed 128 MiB DRAM; and installs the bridge after setup.
-  A measured 400 M cold boot reached `launchd` and boot-volume fsck with 6,695
-  reads (27,397,632 bytes), zero writes, zero bridge failures, and 85.26 MiB of
-  guest pages still free. Snapshot backing identity/overlay state follows, and
-  global `_bcopy_phys` replacement remains forbidden.
-  The raw `/dev/rmd0` path instead reaches `_uiomove64`/`_copypv`, so it must be
-  separately bridged; current external mode stops before its entry. Historical
+  media token outside fixed 128 MiB DRAM; and installs strategy plus raw-uio
+  bridges after setup. A measured pre-raw-bridge cold run reached the first
+  32 KiB `/dev/rmd0` read at 402,741,536 instructions after 6,715 strategy reads
+  (27,479,552 bytes), zero writes, zero bridge failures, and with 82.76 MiB of
+  guest pages still free. The new raw bridge exact-gates the `_mdevrw` entry,
+  validates and stages the XNU `uio`, and commits partial-iovec state only after
+  complete backend I/O; its first real run is the next acceptance step.
+  Snapshot backing identity/overlay state follows, and global `_bcopy_phys`
+  replacement remains forbidden. Historical
   older-source experiments reported 312 MiB and
   248 MiB pools with `-R 768 -Y`, but neither reached `_load_init_program` and
   current source correctly rejects both configurations because their RAM

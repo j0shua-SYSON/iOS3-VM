@@ -22,11 +22,13 @@
 > have run Apple's real kernel, root filesystem, `launchd`, and a live
 > `mDNSResponder`. A new cold-boot mode exact-gates the 7E18 kernel, device tree,
 > and rootfs, then serves a create-only writable work image from the host instead
-> of pinning roughly 445 MiB in guest RAM. A fresh 400-million-instruction run
-> exercised that integrated path: `BSD root: md0`, `launchd[1] has started up`,
-> and 6,695 bridged reads completed with zero bridge failures while 85.26 MiB of
-> guest pages remained free. The write exit was not reached in that bounded run.
-> The installable iOS app
+> of pinning roughly 445 MiB in guest RAM. A fresh cold run then reached the
+> first raw `/dev/rmd0` fsck read at **402,741,536** retired instructions after
+> `BSD root: md0` and `launchd[1] has started up`; 6,715 strategy reads completed
+> with zero bridge failures and 82.76 MiB of guest pages remained free. That run
+> deliberately stopped at the raw entry. The current tree adds an exact,
+> bounded raw-uio bridge, but a post-bridge real-firmware result is not recorded
+> yet. The installable iOS app
 > does **not** run it yet: it runs a small
 > synthetic ARM guest to exercise the CPU, UART and framebuffer bridge. The app
 > currently uses CoreGraphics, with no touch, audio, guest networking or active
@@ -59,7 +61,7 @@ core portable across hosts. Today the evidence is split deliberately:
 | Capability | CLI / portable core | Installable iOS app |
 |---|---|---|
 | ARM1176 and S5L8900 execution | Real-kernel path recorded | Synthetic demo guest |
-| Apple kernel and root filesystem | Host-backed cold path reached `launchd` in a fresh 400 M real-firmware run | Not integrated |
+| Apple kernel and root filesystem | Host-backed cold path reached `launchd`, fsck, and the first raw `/dev/rmd0` read in a fresh 402.7 M real-firmware run | Not integrated |
 | Display | Kernel console and CLCD capture | CoreGraphics demo bridge |
 | Touch, audio, guest networking | Not implemented | Not implemented |
 | Dynamic recompiler | Translator tested off-device; inactive in boot | Excluded from target |
@@ -153,21 +155,25 @@ file adapter, a privileged-only fail-closed SVC seam, and the exact-site md
 bulk-copy bridge now exist and are host-tested. Mach-O UUID parsing and an
 all-or-nothing expected-byte patch transaction underpin an exact 7E18 manifest
 that checks the complete decrypted kernel image and parsed layout, fixed RAM
-mapping, four patch sites, and the untouched raw-I/O watcher before changing
-guest RAM. A bounded rootfs provisioner now copies an immutable source into an
+mapping, and all five patch sites before changing guest RAM. The fifth exact
+edit replaces `_mdevrw`'s audited four-byte Thumb prologue with
+`svc #0xe3; bx lr`. A bounded rootfs provisioner now copies an immutable source into an
 unpublished work image, validates the supported HFS+/HFSX layout, rewrites the
 unique stock fstab, grows and revalidates the volume, flushes it, and publishes
 without replacement. `bootkernel --external-md` now exact-gates the complete
 7E18 kernel, device tree, and immutable rootfs before creating that work image;
-it publishes a synthetic md0 aperture outside DRAM and installs the privileged
-bulk-copy bridge. Backend errors halt without falsely retiring the trapping
-instruction, and a failed read never publishes a partial buffer into guest RAM.
-The separate raw `/dev/rmd0` path is stopped before execution, and this first
-slice deliberately rejects snapshots until backing identity and overlay state
-are serialized. A 400 M real-guest cold run completed 6,695 reads (27,397,632
-bytes) with no bridge failure, reached `launchd` and boot-volume fsck, and ended
-at its configured cap with 21,826 free pages (85.26 MiB). It issued no bridged
-writes, so write-side integration and progress beyond fsck remain to be proven.
+it publishes a synthetic md0 aperture outside DRAM and installs privileged
+strategy and raw-uio bridges. Backend errors halt without falsely retiring the
+trapping instruction, and failed reads never publish partial buffers into guest
+RAM. The raw bridge validates the exact 32-bit XNU `uio`, enforces the
+`0xc0000000` user/kernel split and ARMv6 permissions at 1 KiB granularity,
+stages at most 128 KiB, and commits XNU-compatible partial-iovec state only
+after complete backend I/O. External mode deliberately rejects snapshots until
+backing identity and overlay state are serialized. The last pre-bridge cold run
+completed 6,715 strategy reads (27,479,552 bytes) with no bridge failure, then
+stopped intentionally at the first 32 KiB `/dev/rmd0` read with 21,187 free
+pages (82.76 MiB). A fresh run must now prove the raw read, write-side
+integration, and progress beyond fsck.
 
 That is sustained real userspace, not a completed boot. There is still no
 captured SpringBoard frame, no proof that the current userland reached the home
@@ -270,7 +276,7 @@ build/core/bootkernel firmware/kernel.macho \
     -c "debug=0x8 serial=1 nand-enable-adm=0" \
     --external-md firmware/rootfs.img work/rootfs-7e18-run01.img \
     -R 128 \
-    -n 400000000
+    -n 420000000
 ```
 
 External-md mode accepts only the measured 7E18 kernel, 40,544-byte device tree,
@@ -279,15 +285,15 @@ grown work image without replacement, then opens that image through a bounded
 host block adapter. With the default growth, that file is exactly 466,825,216
 bytes (445.199 MiB); budget at least 500 MiB plus log and filesystem headroom on
 the work volume. The parent directory must exist. It is cold-boot only. A raw
-`/dev/rmd0` access, storage failure, undefined instruction, guest
-`_panic`/`_Debugger` entry, or other guest halt exits nonzero. The published work
-image is deliberately preserved after such a failure, and the next invocation
+guest errno, storage failure, undefined instruction, guest `_panic`/`_Debugger`
+entry, or other guest halt exits nonzero. The published work image is
+deliberately preserved after such a failure, and the next invocation
 refuses to reuse its path: archive or remove it deliberately, or choose a new
 filename. Larger `--grow` values can take the file up to the 512 MiB volume
 ceiling. A cleanup warning means a second large temporary may also remain in the
 work directory and must be inspected before retrying.
 
-The source kernel, device tree, and rootfs remain byte-for-byte unchanged. Four
+The source kernel, device tree, and rootfs remain byte-for-byte unchanged. Five
 firmware-specific patches are applied only to the loaded kernel copy, iBoot-style
 properties are edited only in the in-memory device-tree copy, and fstab/growth
 changes are made only in the separate work image.
@@ -340,7 +346,7 @@ headroom recipe. `docs/BOOTLOG.md` has the numbers and the TN1150 detail.
 | | |
 |---|---|
 | `bootkernel` | boots the kernelcache and reports where it stopped: milestone probes, a sampled profile, every non-RAM page touched with the PC that touched it, abort sites, and the guest's console output |
-| `bootkernel --external-md <source> <new-work>` | exact-gate the supported 7E18 firmware set, create a writable rootfs work image, and cold-boot md0 through the guarded host block bridge without reserving the disk in guest DRAM; snapshots and raw-rmd access fail closed |
+| `bootkernel --external-md <source> <new-work>` | exact-gate the supported 7E18 firmware set, create a writable rootfs work image, and cold-boot md0 through guarded strategy and raw-uio host bridges without reserving the disk in guest DRAM; snapshots remain rejected |
 | `bootkernel -L` | print the prelinked kext load map and exit without booting |
 | `bootkernel --snapshot-at <insn> <file>` / `--restore <file>` | save and resume the currently modelled machine. Instruction positions and diagnostics are 64-bit and absolute across restore; unreachable, missed, malformed and incompatible checkpoint requests fail nonzero instead of silently omitting output. The current chain restored at 2.2, 2.4, 2.7 and 2.85 B, wrote checkpoints at 2.4, 2.7, 2.85 and 2.97 B, and reached a clean 2.98 B cap after clearing the `UXTB16` stop; older timing numbers are host/commit-specific |
 | `snapboot` | the snapshot acceptance harness — also prints a machine-derived report, because comparing two snapshot files alone lets a field the format never stores cancel out on both sides |

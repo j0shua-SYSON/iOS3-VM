@@ -24,20 +24,22 @@ build/core/bootkernel firmware/kernel.macho \
     -c "debug=0x8 serial=1 nand-enable-adm=0" \
     --external-md firmware/rootfs.img work/rootfs-7e18-run01.img \
     -R 128 \
-    -n 400000000
+    -n 420000000
 ```
 
 The external path is cold-boot only, its parent directory must exist, and the
 work path must not exist. It accepts only the exact 7E18 kernel, device tree, and
 rootfs identities, then creates a no-replace writable image and installs the
-guarded md-strategy bridge. Default growth produces exactly 466,825,216 bytes
+guarded md-strategy and raw-uio bridges. Default growth produces exactly
+466,825,216 bytes
 (445.199 MiB); budget at least 500 MiB plus logs and filesystem headroom on the
-work volume. Any raw `/dev/rmd0` entry, bridge error, undefined instruction,
-guest `_panic`/`_Debugger` entry, or other halt exits nonzero. The work image
-remains after a later failure and its path cannot be reused; archive/remove it
-deliberately or select a new filename. A cleanup warning means a second large
-temporary may remain beside it and must be inspected before retrying. No source
-firmware file is opened writable.
+work volume. Any bridge failure, raw guest errno, undefined instruction, guest
+`_panic`/`_Debugger` entry, or other halt exits nonzero. Raw guest errors use
+status 11 and retain a separate exact diagnostic even if a later bridge failure
+occurs. The work image remains after a later failure and its path cannot be
+reused; archive/remove it deliberately or select a new filename. A cleanup
+warning means a second large temporary may remain beside it and must be
+inspected before retrying. No source firmware file is opened writable.
 
 Checkpoint replay still uses historical direct-RAM mode:
 `-r firmware/rootfs.img -R 512`. There, `-R 512` is not cosmetic:
@@ -213,11 +215,14 @@ host-side duplicate is gone. The storage audit has ruled out a simple external
 aperture. The writable, range-gated md bulk-copy bridge, locked file adapter,
 exact 7E18 kernel manifest and bounded immutable-source work-image provisioner
 are now wired into `--external-md`, including exact kernel, device-tree, and
-rootfs gates. The first 400 M real cold boot measured 21,826 free pages (85.26
-MiB) at the cap and completed 6,695 reads with no bridge failure. It had only just
-entered boot-volume fsck and issued zero bridged writes, so extend this cold-boot
-slice before app integration; then add snapshot backing identity and overlay
-coupling.
+rootfs gates. The last pre-raw-bridge cold run reached the first 32 KiB
+`/dev/rmd0` read at 402,741,536 instructions with 21,187 free pages (82.76 MiB)
+after 6,715 strategy reads and no bridge failure. The 420 M recipe above is the
+short acceptance probe for the new raw bridge. If it reports
+`USER_TRANSLATION`/EFAULT, treat that as missing native demand/COW fault recovery
+and build the guest bounce/trampoline path; do not weaken MMU permissions.
+After the raw read is proven, extend the cold slice before app integration, then
+add snapshot backing identity and overlay coupling.
 
 ### WFI changes elapsed device time, not the instruction coordinate
 

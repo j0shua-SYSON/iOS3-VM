@@ -142,10 +142,10 @@ typedef struct {
 
 /*
  * Validate the complete build identity, exact segment topology, loaded file
- * bytes and zero-fill tails, fixed mapping, untouched raw-mdev watcher, and
- * every expected patch byte before applying any replacement. Any rejection
- * leaves the kernel file and guest RAM unchanged. The implementation performs
- * no allocation.
+ * bytes and zero-fill tails, fixed mapping, and every expected byte at all five
+ * patch sites (including the raw-mdev entry) before applying any replacement.
+ * Any rejection leaves the kernel file and guest RAM unchanged. The
+ * implementation performs no allocation.
  */
 ios3_kernel_patch_status_t ios3_kernel_patch_apply(
     const ios3_kernel_patch_request_t *request,

@@ -894,9 +894,39 @@ a 120.14 MiB post-layout free pool, and ended with 21,826 free pages (85.26 MiB)
 well above its 406-page target. The last live host sample used roughly 62 MiB of
 resident memory. This is not directly comparable to the later 2.98 B direct-RAM
 age, but it removes the old 445 MiB static guest allocation and avoids the former
-near-zero headroom at the same architectural boundary. Raw `/dev/rmd0` still
-stops before execution, snapshot backing identity/overlay state remains future
-work, and full NAND is the higher-fidelity, much larger route.
+near-zero headroom at the same architectural boundary. Snapshot backing
+identity/overlay state remains future work, and full NAND is the
+higher-fidelity, much larger route.
+
+### 2026-07-22: exact first raw `/dev/rmd0` boundary
+
+A second create-only cold run extended the same guarded strategy path until the
+first raw-character read. It stopped intentionally before executing `_mdevrw`
+at **402,741,536** retired instructions, with no panic, undefined instruction,
+or bridge failure. At the boundary:
+
+```text
+pc  c0073f94  _mdevrw entry
+lr  c009920d  _spec_read+0x118
+r0  09000000  /dev/rmd0
+r1  ea967ef0  struct uio *
+r2  00000000
+```
+
+The exact XNU32 `uio` held one 32 KiB iovec, offset zero, read direction,
+segment 5, and residual `0x8000`. Before that call the strategy bridge completed
+6,715 reads (27,479,552 bytes), zero writes, and zero failures. The guest had
+21,187 free pages (82.76 MiB); the run's low was 21,186 pages. The immutable
+firmware inputs and create-only work image were unchanged by the guard stop.
+
+The current tree replaces the audited `_mdevrw` prologue with
+`svc #0xe3; bx lr` under the same exact 7E18 transaction and installs a separate
+bounded raw-uio bridge. Host tests cover reads, writes, XNU partial-iovec
+updates, all user segment variants, the `0xc0000000` user ceiling, TTBR0/TTBR1,
+legacy 1 KiB AP subpages, malformed metadata, aliases, and partial backend
+failures. This is implementation evidence, not runtime evidence: the next cold
+run must prove that first 32 KiB read and reveal whether native
+`copyin`/`copyout` fault recovery is needed.
 
 This chain is stronger evidence for sustained userspace and snapshot
 repeatability. It is **not** evidence that SpringBoard rendered: the runs used

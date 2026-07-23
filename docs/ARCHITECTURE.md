@@ -143,23 +143,30 @@ descriptors, denies conflicting opens where the platform permits it, and
 revalidates file size and identity around I/O. Its ARM bus also has a
 privileged-only SVC seam: handled calls retire normally, ordinary calls remain
 guest SVCs, and backend errors restore CPU state and halt without incrementing
-the retired-instruction counter. The exact-site md bridge stages reads before
-publishing them to RAM, bounds each operation to one 4 KiB page, and preserves
-the audited register file. LC_UUID parsing and an atomic expected-byte patch
-manifest gate the firmware-specific edits. The concrete 7E18 manifest also
-checks the complete decrypted image and parsed Mach-O layout, fixed mapping, all
-expected patch bytes, loaded zero-fill tails, and the untouched raw-path watcher
-before changing RAM. `bootkernel --external-md` wires this seam into a fixed
-128 MiB cold-boot configuration. It exact-gates the original device tree and
-rootfs too, provisions a create-only work image, publishes a synthetic media
-token outside DRAM, and installs the bridge only after setup succeeds.
+the retired-instruction counter. The exact-site md strategy bridge stages reads
+before publishing them to RAM, bounds each operation to one 4 KiB page, and
+preserves the audited register file. A separate raw bridge owns a bounded
+128 KiB scratch buffer and transfer plan; it validates the exact 32-bit XNU
+`uio`/8-byte iovec layout, user-address ceiling, MMU permissions, media range,
+and metadata aliasing before backend I/O. LC_UUID parsing and an atomic
+expected-byte patch manifest gate the firmware-specific edits. The concrete
+7E18 manifest also checks the complete decrypted image and parsed Mach-O
+layout, fixed mapping, expected bytes at all five sites, and loaded zero-fill
+tails before changing RAM. `bootkernel --external-md` wires both bridges into a
+fixed 128 MiB cold-boot configuration. It exact-gates the original device tree
+and rootfs too, provisions a create-only work image, publishes a synthetic media
+token outside DRAM, and installs the bridge multiplexer only after setup
+succeeds.
 
-The boot integration uses four exact, kernel-identity-gated 7E18 patches: one
+The boot integration uses five exact, kernel-identity-gated 7E18 patches: one
 removes the unmodelled IORTC wait, one selects md physical mode, and two replace
 only md strategy's `_bcopy_phys` calls with privileged, range-gated bulk-copy
-exits. A plain external physical aperture is not sufficient because this kernel's
-`_bcopy_phys` converts both operands through the fixed DRAM direct-map delta and
-calls ordinary `_bcopy`; it never reaches the emulator bus. The host-side
+exits. The fifth replaces `_mdevrw`'s audited four-byte Thumb prologue with
+`svc #0xe3; bx lr`; the handler returns the Darwin errno in `r0` and the
+patched `bx lr` performs the ordinary function return. A plain external
+physical aperture is not sufficient because this kernel's `_bcopy_phys`
+converts both operands through the fixed DRAM direct-map delta and calls
+ordinary `_bcopy`; it never reaches the emulator bus. The host-side
 provisioner now creates a bounded full work image from an immutable source,
 validates the narrowly supported HFS+/HFSX layout, performs the fstab/growth
 transaction on an unpublished temporary, flushes it and publishes without
@@ -170,11 +177,18 @@ and overlay generation remains future work after the first cold-boot slice.
 Backend failure pauses the VM visibly; it must never be converted to zero-filled
 successful I/O.
 `/dev/rmd0` is a separate raw-character path through `_uiomove64`/`_copypv`, not
-one of the two strategy calls, so host-md mode stops before executing its entry
-until it has its own proven bridge. Merely setting fstab's pass number to
-zero can be a labelled boot diagnostic, not a claim of raw-I/O or crash-recovery
-support. A future IOMedia device or full NAND/VFL/FTL model can replace this
-compatibility seam without changing the block/session API.
+one of the two strategy calls. The raw bridge reproduces the reached
+`mdevrw`/`uio_update` contract, including physical-user segment variants,
+partial final iovecs, the exclusive `0xc0000000` user limit, and legacy ARM
+1 KiB permission subpages. It returns guest `ENXIO`, `EINVAL`, or `EFAULT` for
+bounded request errors and leaves guest metadata unchanged on backend failure.
+It cannot yet ask XNU to fault in a missing demand-zero page or resolve COW the
+way native `copyin`/`copyout` can; a real-run `USER_TRANSLATION` result therefore
+means the bridge needs a guest fault/retry handshake or a lower interposition,
+not that fsck is corrupt. The last captured run stopped at the first raw call
+before this bridge existed, so runtime proof remains pending. A future IOMedia
+device or full NAND/VFL/FTL model can replace this compatibility seam without
+changing the block/session API.
 
 In the planned shared-session design, host services cross explicit non-blocking
 seams: frame descriptors out; bounded touch, PCM and network queues in/out;

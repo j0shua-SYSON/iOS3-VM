@@ -25,6 +25,7 @@
 #include "ios3_kernel_patch.h"
 #include "macho.h"
 #include "md_bridge.h"
+#include "md_raw_bridge.h"
 #include "rootfs_work.h"
 #include "sha256.h"
 #include "snapshot.h"
@@ -44,6 +45,7 @@
 
 #define EXTERNAL_MD_TOKEN_BASE UINT64_C(0xe0000000)
 #define EXTERNAL_MD_MAX_SIZE   UINT64_C(0x20000000)
+#define EXTERNAL_MD_RAW_DEVICE UINT32_C(0x09000000)
 #define IOS3_ROOTFS_FILE_SIZE  UINT64_C(433274880)
 #define IOS3_DEVICETREE_FILE_SIZE ((size_t)40544u)
 
@@ -2191,6 +2193,26 @@ static const char *status_name(arm_status_t s) {
     }
 }
 
+typedef struct {
+    md_bridge_t *strategy;
+    md_raw_bridge_t *raw;
+} external_md_svc_mux_t;
+
+static arm_svc_result_t external_md_svc_handler(void *context,
+                                                arm_cpu_t *cpu,
+                                                uint32_t pc,
+                                                uint32_t encoding) {
+    external_md_svc_mux_t *mux = (external_md_svc_mux_t *)context;
+    arm_svc_result_t result;
+
+    if (mux == NULL || mux->strategy == NULL || mux->raw == NULL)
+        return ARM_SVC_ERROR;
+    result = md_bridge_handle_svc(mux->strategy, cpu, pc, encoding);
+    if (result != ARM_SVC_UNHANDLED)
+        return result;
+    return md_raw_bridge_handle_svc(mux->raw, cpu, pc, encoding);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
@@ -2240,7 +2262,9 @@ int main(int argc, char **argv) {
             "      backed disk0, so launchd's fsck fails and it halts the\n"
             "      machine. The image on disk is never modified.\n"
             "  --keep-fstab    legacy -r only: leave the stock record alone\n"
-            "      (reproduces the halt; external-md rejects this option)\n"
+            "      (reproduces the halt; external-md rejects this option)\n",
+            argv[0]);
+        fputs(
             "  --grow <MB>  free space to give the guest by growing the HFS+\n"
             "      volume in the loaded RAM disk (default 32, 0 disables). The\n"
             "      stock system dmg is sized exactly to its contents —\n"
@@ -2286,7 +2310,7 @@ int main(int argc, char **argv) {
             "  -Z  <n> print pc/mode/symbol every n instructions\n"
             "  -T  how many trace lines to print at the first data abort\n"
             "  -K  disable the post-load kernel patches (see the kpatch table)\n",
-            argv[0]);
+            stderr);
         return 1;
     }
     uint32_t phys_base = S5L8900_SDRAM_BASE;
@@ -2455,8 +2479,12 @@ int main(int argc, char **argv) {
 
     file_block_t *external_block_adapter = NULL;
     md_bridge_t external_bridge;
+    static md_raw_bridge_t external_raw_bridge;
+    external_md_svc_mux_t external_bridge_mux;
     bool external_bridge_installed = false;
     memset(&external_bridge, 0, sizeof external_bridge);
+    memset(&external_raw_bridge, 0, sizeof external_raw_bridge);
+    memset(&external_bridge_mux, 0, sizeof external_bridge_mux);
 
     /* Walk the arguments one at a time: pair-stepping breaks as soon as a
      * single-argument flag like -a appears. */
@@ -3642,9 +3670,24 @@ int main(int argc, char **argv) {
         bridge_config.ram_size = UINT64_C(128) << 20;
         bridge_config.ram = mach.ram;
         bridge_config.block = file_block_get(external_block_adapter);
-        if (!md_bridge_config_valid(&bridge_config)) {
-            fprintf(stderr, "external-md: guarded bridge rejected fixed geometry\n");
+        md_raw_bridge_config_t raw_config;
+        memset(&raw_config, 0, sizeof raw_config);
+        raw_config.site.pc = IOS3_KERNEL_PATCH_RAW_WATCHER_VA;
+        raw_config.site.encoding = UINT32_C(0xdfe3);
+        raw_config.expected_device = EXTERNAL_MD_RAW_DEVICE;
+        raw_config.user_address_limit = UINT32_C(0xc0000000);
+        raw_config.media_size = external_media_size;
+        raw_config.ram_base = UINT64_C(0x08000000);
+        raw_config.ram_size = UINT64_C(128) << 20;
+        raw_config.ram = mach.ram;
+        raw_config.block = file_block_get(external_block_adapter);
+
+        if (!md_bridge_config_valid(&bridge_config) ||
+            !md_raw_bridge_config_valid(&raw_config)) {
+            fprintf(stderr,
+                    "external-md: guarded bridges rejected fixed geometry\n");
             bridge_config.block = NULL;
+            raw_config.block = NULL;
             (void)file_block_flush(external_block_adapter);
             (void)file_block_close(external_block_adapter);
             (void)file_block_destroy(&external_block_adapter);
@@ -3655,11 +3698,15 @@ int main(int argc, char **argv) {
         }
 
         md_bridge_init(&external_bridge, &bridge_config);
-        arm_bus_set_privileged_svc_handler(&mach.bus, md_bridge_handle_svc,
-                                           &external_bridge);
+        md_raw_bridge_init(&external_raw_bridge, &raw_config);
+        external_bridge_mux.strategy = &external_bridge;
+        external_bridge_mux.raw = &external_raw_bridge;
+        arm_bus_set_privileged_svc_handler(&mach.bus,
+                                           external_md_svc_handler,
+                                           &external_bridge_mux);
         external_bridge_installed = true;
         printf("md bridge   : token 0x%08x..0x%08llx -> %s; "
-               "SVC dfe1/dfe2 armed\n",
+               "SVC dfe1/dfe2/dfe3 armed\n",
                (unsigned)EXTERNAL_MD_TOKEN_BASE,
                (unsigned long long)(EXTERNAL_MD_TOKEN_BASE +
                                     external_media_size),
@@ -3773,7 +3820,6 @@ int main(int argc, char **argv) {
     uint32_t last_pc = restore_path ? mach.cpu.r[15] : entry_pa;
     uint64_t first_abort_at = 0, first_exc = 0;
     bool have_first_abort = false, have_first_exc = false;
-    bool raw_mdevrw_guard_hit = false;
     bool guest_fatal_entry_seen = false;
     uint32_t abort_dfar = 0, abort_dfsr = 0;
 
@@ -3781,19 +3827,6 @@ int main(int argc, char **argv) {
     for (; n < steps; n++) {
         G.hot_now = n;
         last_pc = mach.cpu.r[15];
-        if (external_md) {
-            uint32_t pc = last_pc & ~1u;
-            if (pc == IOS3_KERNEL_PATCH_RAW_WATCHER_VA ||
-                pc == UINT32_C(0x08073f94)) {
-                raw_mdevrw_guard_hit = true;
-                st = ARM_HALT;
-                fprintf(stderr,
-                        "external-md: raw mdevrw path reached at pc 0x%08x, "
-                        "retired=%" PRIu64 "; stopped before execution\n",
-                        last_pc, mach.cpu.cycles);
-                break;
-            }
-        }
         tr[tw].pc = last_pc;
         tr[tw].cpsr = mach.cpu.cpsr;
         memcpy(tr[tw].r, mach.cpu.r, sizeof mach.cpu.r);
@@ -4099,19 +4132,42 @@ int main(int argc, char **argv) {
 
     }
 
+    bool strategy_bridge_halt_failure =
+        external_md && st == ARM_HALT &&
+        external_bridge.stats.failures != 0u;
+    bool raw_bridge_halt_failure =
+        external_md && st == ARM_HALT &&
+        external_raw_bridge.stats.failures != 0u;
     bool bridge_halt_failure =
-        external_md && !raw_mdevrw_guard_hit && st == ARM_HALT &&
-        external_bridge.last_error.code != MD_BRIDGE_ERROR_NONE;
-    if (bridge_halt_failure) {
+        strategy_bridge_halt_failure || raw_bridge_halt_failure;
+    if (strategy_bridge_halt_failure) {
         const md_bridge_error_t *error = &external_bridge.last_error;
         fprintf(stderr,
-                "external-md bridge halted: %s pc=0x%08x svc=0x%04x "
+                "external-md strategy bridge halted: %s pc=0x%08x svc=0x%04x "
                 "len=%u media+0x%llx transferred=%llu block=%s\n",
                 md_bridge_error_string(error->code), error->pc,
                 error->encoding, error->length,
                 (unsigned long long)error->media_offset,
                 (unsigned long long)error->transferred,
                 vm_block_strerror(error->block_status));
+    }
+    if (raw_bridge_halt_failure) {
+        const md_raw_bridge_error_t *error = &external_raw_bridge.last_error;
+        fprintf(stderr,
+                "external-md raw bridge halted: %s pc=0x%08x svc=0x%04x "
+                "uio=0x%08x iov=0x%08x resid=%d media+0x%llx "
+                "fault=0x%08x/fsr=0x%08x",
+                md_raw_bridge_error_string(error->code), error->pc,
+                error->encoding, error->uio_va, error->iov_va,
+                error->residual,
+                (unsigned long long)error->media_offset,
+                error->fault_va, error->mmu_status);
+        if (error->code == MD_RAW_BRIDGE_ERROR_BLOCK_IO) {
+            fprintf(stderr, " transferred=%llu block=%s",
+                    (unsigned long long)error->transferred,
+                    vm_block_strerror(error->block_status));
+        }
+        fputc('\n', stderr);
     }
 
     /* A terminal CPU status can end the run before a statically reachable
@@ -4589,24 +4645,74 @@ int main(int argc, char **argv) {
     }
 
     int exit_code = snapshot_unreached ? 5 : 0;
-    if (raw_mdevrw_guard_hit) exit_code = 6;
-    else if (bridge_halt_failure) exit_code = 7;
+    if (bridge_halt_failure) exit_code = 7;
     else if (guest_fatal_entry_seen) exit_code = 10;
     else if (external_md && st != ARM_OK) {
         fprintf(stderr, "external-md: CPU stopped with %s\n", status_name(st));
         exit_code = 9;
+    } else if (external_md &&
+               external_raw_bridge.stats.guest_errors != 0u) {
+        fprintf(stderr,
+                "external-md: raw bridge returned %llu guest error(s)\n",
+                (unsigned long long)
+                    external_raw_bridge.stats.guest_errors);
+        exit_code = 11;
     }
 
     if (external_md) {
+        uint64_t total_reads =
+            UINT64_MAX - external_bridge.stats.successful_reads <
+                    external_raw_bridge.stats.successful_reads
+                ? UINT64_MAX
+                : external_bridge.stats.successful_reads +
+                  external_raw_bridge.stats.successful_reads;
+        uint64_t total_writes =
+            UINT64_MAX - external_bridge.stats.successful_writes <
+                    external_raw_bridge.stats.successful_writes
+                ? UINT64_MAX
+                : external_bridge.stats.successful_writes +
+                  external_raw_bridge.stats.successful_writes;
+        uint64_t total_bytes_read =
+            UINT64_MAX - external_bridge.stats.bytes_read <
+                    external_raw_bridge.stats.bytes_read
+                ? UINT64_MAX
+                : external_bridge.stats.bytes_read +
+                  external_raw_bridge.stats.bytes_read;
+        uint64_t total_bytes_written =
+            UINT64_MAX - external_bridge.stats.bytes_written <
+                    external_raw_bridge.stats.bytes_written
+                ? UINT64_MAX
+                : external_bridge.stats.bytes_written +
+                  external_raw_bridge.stats.bytes_written;
+        uint64_t total_failures =
+            UINT64_MAX - external_bridge.stats.failures <
+                    external_raw_bridge.stats.failures
+                ? UINT64_MAX
+                : external_bridge.stats.failures +
+                  external_raw_bridge.stats.failures;
         printf("\n=== EXTERNAL MD BRIDGE ===\n");
         printf("  reads  : %llu (%llu bytes)\n",
-               (unsigned long long)external_bridge.stats.successful_reads,
-               (unsigned long long)external_bridge.stats.bytes_read);
+               (unsigned long long)total_reads,
+               (unsigned long long)total_bytes_read);
         printf("  writes : %llu (%llu bytes)\n",
-               (unsigned long long)external_bridge.stats.successful_writes,
-               (unsigned long long)external_bridge.stats.bytes_written);
-        printf("  failures: %llu\n",
-               (unsigned long long)external_bridge.stats.failures);
+               (unsigned long long)total_writes,
+               (unsigned long long)total_bytes_written);
+        printf("  failures: %llu\n", (unsigned long long)total_failures);
+        printf("  strategy: %llu reads, %llu writes\n",
+               (unsigned long long)external_bridge.stats.successful_reads,
+               (unsigned long long)external_bridge.stats.successful_writes);
+        printf("  raw     : %llu reads, %llu writes, %llu guest errors\n",
+               (unsigned long long)external_raw_bridge.stats.successful_reads,
+               (unsigned long long)external_raw_bridge.stats.successful_writes,
+               (unsigned long long)external_raw_bridge.stats.guest_errors);
+        if (external_raw_bridge.stats.guest_errors != 0u) {
+            const md_raw_bridge_error_t *error =
+                &external_raw_bridge.last_guest_error;
+            printf("  last raw guest error: %s errno=%d va=0x%08x "
+                   "fsr=0x%08x\n",
+                   md_raw_bridge_error_string(error->code),
+                   error->guest_errno, error->fault_va, error->mmu_status);
+        }
 
         if (external_bridge_installed) {
             arm_bus_set_privileged_svc_handler(&mach.bus, NULL, NULL);
@@ -4615,6 +4721,9 @@ int main(int argc, char **argv) {
         /* End the bridge's borrowed vm_block_t lifetime before touching the
          * retained adapter. */
         external_bridge.config.block = NULL;
+        external_raw_bridge.config.block = NULL;
+        external_bridge_mux.strategy = NULL;
+        external_bridge_mux.raw = NULL;
 
         file_block_status_t flush_status =
             file_block_flush(external_block_adapter);

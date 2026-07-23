@@ -24,10 +24,6 @@ const uint8_t ios3_kernel_patch_expected_uuid[
         0xa8u, 0x43u, 0x07u, 0x57u, 0x08u, 0x59u, 0x35u, 0x7eu
     };
 
-static const uint8_t raw_watcher_expected[] = {
-    0xf0u, 0xb5u, 0x46u, 0x46u
-};
-
 /* Keep this order synchronized with ios3_kernel_patch_site_t. */
 static const guest_patch_entry_t kernel_patches[] = {
     {
@@ -53,6 +49,12 @@ static const guest_patch_entry_t kernel_patches[] = {
         .length = 4u,
         .expected = {0xefu, 0xf7u, 0xbfu, 0xf8u},
         .replacement = {0xe2u, 0xdfu, 0xc0u, 0x46u}
+    },
+    {
+        .virtual_address = IOS3_KERNEL_PATCH_RAW_WATCHER_VA,
+        .length = 4u,
+        .expected = {0xf0u, 0xb5u, 0x46u, 0x46u},
+        .replacement = {0xe3u, 0xdfu, 0x70u, 0x47u}
     }
 };
 
@@ -467,28 +469,6 @@ ios3_kernel_patch_status_t ios3_kernel_patch_apply(
                               (uint64_t)saved_request.ram_size);
     }
 
-    /* Preserve site-specific diagnostics while still performing the full
-     * file-to-RAM relationship check below before any write. */
-    for (byte_index = 0u; byte_index < sizeof raw_watcher_expected;
-         byte_index++) {
-        size_t offset = ram_offset_for_va(
-            IOS3_KERNEL_PATCH_RAW_WATCHER_VA) + byte_index;
-        uint8_t actual = saved_request.ram[offset];
-        if (actual != raw_watcher_expected[byte_index]) {
-            uint64_t va = (uint64_t)IOS3_KERNEL_PATCH_RAW_WATCHER_VA +
-                          byte_index;
-            uint64_t pa = IOS3_KERNEL_PATCH_RAM_BASE +
-                          ram_offset_for_va(
-                              IOS3_KERNEL_PATCH_RAW_WATCHER_VA) +
-                          byte_index;
-            return report_failure(
-                report, IOS3_KERNEL_PATCH_STATUS_RAW_WATCHER_MISMATCH,
-                IOS3_KERNEL_PATCH_SITE_RAW_WATCHER,
-                IOS3_KERNEL_PATCH_NO_SEGMENT, (uint32_t)byte_index,
-                va, pa, raw_watcher_expected[byte_index], actual,
-                MACHO_OK, GUEST_PATCH_STATUS_OK);
-        }
-    }
     {
         size_t site_index;
         for (site_index = 0u;
@@ -501,15 +481,20 @@ ios3_kernel_patch_status_t ios3_kernel_patch_apply(
             for (site_byte = 0u; site_byte < entry->length; site_byte++) {
                 uint8_t actual = saved_request.ram[ram_offset + site_byte];
                 if (actual != entry->expected[site_byte]) {
+                    bool raw_entry =
+                        site_index == IOS3_KERNEL_PATCH_SITE_RAW_WATCHER;
                     return report_failure(
                         report,
-                        IOS3_KERNEL_PATCH_STATUS_PATCH_TRANSACTION_FAILED,
+                        raw_entry
+                            ? IOS3_KERNEL_PATCH_STATUS_RAW_WATCHER_MISMATCH
+                            : IOS3_KERNEL_PATCH_STATUS_PATCH_TRANSACTION_FAILED,
                         (uint32_t)site_index,
                         IOS3_KERNEL_PATCH_NO_SEGMENT, site_byte,
                         (uint64_t)entry->virtual_address + site_byte,
                         saved_request.ram_base + ram_offset + site_byte,
                         entry->expected[site_byte], actual, MACHO_OK,
-                        GUEST_PATCH_STATUS_EXPECTED_MISMATCH);
+                        raw_entry ? GUEST_PATCH_STATUS_OK
+                                  : GUEST_PATCH_STATUS_EXPECTED_MISMATCH);
                 }
             }
         }
