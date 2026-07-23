@@ -206,11 +206,46 @@ signal 8. Run04 at 405 M isolated the two repeatable causes: a write-side
 demand-page fault at user VA `0x01001000` (`FSR 0x807`) on the 32 KiB offset-zero
 raw read, and a 32 KiB read at `0x1bd30000` crossing media end `0x1bd33000`
 (12 KiB media plus 20 KiB allocation tail). The `-p` and `-fy` fsck passes
-reproduced the pair. The redirected bridge above is locally tested
-implementation evidence, not real-firmware proof; run05 must validate it. A
-future IOMedia device or full
-NAND/VFL/FTL model can replace this compatibility seam without changing the
-block/session API.
+reproduced the pair.
+
+Fresh run05 provides the real-firmware evidence for the redirected design. It
+reached its 430,000,000-instruction cap with exit status 0 after `launchd`,
+`Running fsck on the boot volume...`, and
+`/dev/md0 on / (hfs, local, noatime)`. Both raw
+reads completed through native `_uiomove64`: two redirects, two completions,
+zero pending continuations, 45,056 media bytes, and 20,480 coherent-tail bytes.
+The complete external path recorded 6,901 reads (28,295,168 bytes), one
+512-byte write, and zero failures; the work image remained exactly 466,825,216
+bytes. The lowest free-page observation was 20,820 pages (81.33 MiB) at
+425,852,928 instructions.
+
+Run06 extended the same architecture to a clean 1,000,000,000-instruction cap.
+It retained the two-redirect/two-completion raw result with zero guest errors
+and zero pending continuations, while the aggregate external path reached
+10,004 reads (40,994,304 bytes), 27 writes (107,008 bytes), and zero failures.
+Strategy handled 10,002 reads and all 27 writes; the raw split remained 45,056
+media bytes plus 20,480 coherent-tail bytes. The low-water mark was 17,221
+pages (67.27 MiB) at 980,615,168 instructions. The work image stayed exactly
+466,825,216 bytes, stderr was empty, and the source firmware hashes were
+unchanged.
+
+Run07 extended the same 128 MiB external-md architecture to a clean
+2,000,000,000-instruction cap. It ended at PC `0x3145ad4c` in USR mode
+(`CPSR 0x20000010`), after 731,259,769 USR instructions (36.6%).
+`_thread_bootstrap_return` reached 92,620 and `_unix_syscall` 58,166. The
+external path completed 12,782 reads (52,372,992 bytes), 82 writes (325,120
+bytes), and zero failures; strategy accounted for 12,780 reads and all writes.
+The raw two-redirect/two-completion result remained unchanged, with no raw
+writes, guest errors, pending continuations, or guard writes. Final free memory
+was 13,000 pages (50.78 MiB); the low was 12,983 pages (50.71 MiB) at
+1,836,056,576 instructions. The work image and source hashes remained exact,
+and stderr was empty.
+
+This validates the compatibility seam at the reached path, but it does not
+prove that SpringBoard rendered. Run07 disabled the framebuffer, and its CLCD
+status, mask, and scanning values were all zero; it provides no display-path
+evidence. A future IOMedia device or full NAND/VFL/FTL model can replace this
+compatibility seam without changing the block/session API.
 
 In the planned shared-session design, host services cross explicit non-blocking
 seams: frame descriptors out; bounded touch, PCM and network queues in/out;

@@ -43,7 +43,7 @@ reused; archive/remove it deliberately or select a new filename. A cleanup
 warning means a second large temporary may remain beside it and must be
 inspected before retrying. No source firmware file is opened writable.
 
-The run05 bridge reserves four 128 KiB bounce slots below
+The faultable raw bridge reserves four 128 KiB bounce slots below
 `topOfKernelData`; they are guest-RAM reservations, not extra host disk files.
 Its zero-initialized 128 KiB host-memory tail keeps guard writes coherent with
 later reads, while neither the 466,825,216-byte work image nor the immutable
@@ -250,15 +250,62 @@ native completion before returning to `_spec_read`/`_spec_write`. The adjacent
 128 KiB tail is a zero-initialized coherent memory overlay and is never added
 to either disk file.
 
-For run05, use a fresh work filename and retain the complete stdout/stderr
-logs. Acceptance requires both request shapes to complete without a raw guest
-error, fsck to progress past the run03 failure, the work-image length to remain
-466,825,216 bytes, and all three source hashes to remain unchanged. A redirect
-counter by itself proves only that native `_uiomove64` was entered. Hosted
-`core-tests` run 29997710500 was green at checkpoint `8ac4af3`, before this
-redesign; run05 and new CI are still pending. Only after this slice is proven
-should the cap be extended before app integration, followed by snapshot backing
-identity and overlay coupling.
+Run05 met those acceptance conditions with a fresh work image. It reached its
+430,000,000-instruction cap with status 0 after `launchd`, `Running fsck on the
+boot volume...`, and `/dev/md0 on / (hfs, local, noatime)`. Both raw requests
+completed: two reads, two native `_uiomove64` redirects, two checked
+completions, zero guest errors, and zero pending continuations. The raw split was 45,056 bytes
+from media plus 20,480 bytes from the coherent guard. Across both bridges the
+run completed 6,901 reads (28,295,168 bytes), one 512-byte write, and zero
+failures; strategy I/O accounted for 6,899 reads and the write. The work image
+remained exactly 466,825,216 bytes, and all source firmware hashes remained
+unchanged.
+
+The low-water sample was 20,820 free pages (81.33 MiB) at instruction
+425,852,928. `_execve` recorded 11 hits and `_load_machfile` recorded 6, so the
+clean cap was progress past the raw/fsck blocker, not evidence that SpringBoard
+started.
+
+Run06 then extended the same path to a clean 1,000,000,000-instruction cap with
+empty stderr. It retained launchd, fsck, and the root mount, printed both
+`mDNSResponder[14]` Seatbelt lines and `systemShutdown false`, and recorded
+10,004 external reads (40,994,304 bytes), 27 writes (107,008 bytes), and zero
+failures. Strategy accounted for 10,002 reads and all 27 writes; raw I/O
+remained two reads, two native redirects, two completions, zero guest errors,
+and zero pending continuations. The raw media/guard split remained
+45,056/20,480 bytes. Free pages reached a low of 17,221 (67.27 MiB) at
+980,615,168 instructions. `_execve` remained at 11 while `_load_machfile`
+advanced to 25. The work image stayed exactly 466,825,216 bytes and all source
+firmware hashes remained unchanged. No SpringBoard frame was captured.
+
+Run07 extended the same fresh 128 MiB path to a clean
+2,000,000,000-instruction cap. The exit file contained 0, stdout was 234,838
+bytes, and stderr was empty. The final PC was `0x3145ad4c` in USR mode
+(`CPSR 0x20000010`); 731,259,769 instructions (36.6%) retired in USR mode.
+`_execve` reached 12, `_load_machfile` 32, `_thread_bootstrap_return` 92,620,
+and `_unix_syscall` 58,166. The launchd/fsck/root-mount,
+`mDNSResponder[14]` Seatbelt, and `systemShutdown false` lines all remained.
+
+The bridge reported 12,782 reads (52,372,992 bytes), 82 writes (325,120
+bytes), and zero failures. Strategy accounted for 12,780 reads and every
+write. Raw I/O remained two reads, zero writes, zero guest errors, two native
+redirects, two checked completions, and zero pending continuations. It read
+45,056 media bytes and 20,480 coherent-guard bytes, with no raw media or guard
+writes. Final free memory was 13,000 pages (50.78 MiB); the low was 12,983 pages
+(50.71 MiB) at instruction 1,836,056,576. The work image stayed exactly
+466,825,216 bytes and all source firmware hashes remained unchanged.
+
+Do not use run07 as a display check. Its framebuffer was disabled, and CLCD
+status, interrupt mask, and scanning were all zero. The run proves additional
+serial userspace execution, not SpringBoard startup or display-path operation.
+
+At `df9dc7b`, hosted
+[`core-tests` run 30004015881](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30004015881)
+and
+[`ios-build` run 30004015807](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30004015807)
+also completed successfully. Continue with a new work filename and a higher
+bounded cap before app integration. Snapshot backing-identity and overlay
+coupling remain separate work.
 
 ### WFI changes elapsed device time, not the instruction coordinate
 

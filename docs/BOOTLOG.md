@@ -12,10 +12,14 @@ device behind each stage.
 > reached 2,944,340,624 instructions and stopped on ARMv6 `UXTB16`
 > (`0xe6cf3073`) in user mode. The complete paired-extend implementation then
 > replayed through that stop, wrote a 2.97 B checkpoint and reached a clean
-> 2.98 B cap. It still did not prove a SpringBoard frame. Free pages dipped to
-> 97 and ended at 214 against a target of 250. The installable app
-> runs a synthetic guest through CoreGraphics and has no real-boot session,
-> touch, audio or guest networking.
+> 2.98 B cap. Free pages dipped to 97 and ended at 214 against a target of 250.
+> The current memory-safe external-md evidence is run07: a fresh 128 MiB cold
+> boot reached a clean 2 B cap after launchd, fsck, the root mount,
+> `mDNSResponder` Seatbelt setup, and `systemShutdown false`, with 12,983 pages
+> (50.71 MiB) at its low-water sample. Its framebuffer was disabled and CLCD
+> status/mask/scanning were zero. Neither path proves a SpringBoard frame. The
+> installable app runs a synthetic guest through CoreGraphics and has no
+> real-boot session, touch, audio or guest networking.
 
 Everything here is from actual historical runs. The command below is the recipe,
 not a promise of byte-identical current output: the stopping point and log are
@@ -962,7 +966,7 @@ passes. The closest public XNU `_mdevrw` has no logical EOF bounds check and
 calls `uiomove64` once, so treating this request as an immediate `EINVAL` was
 also incompatible.
 
-The locally tested correction changes the exact four-byte patch to
+The correction changes the exact four-byte patch to
 `svc #0xe3; svc #0xe4` and adds `ARM_SVC_REDIRECTED`. Resident requests can
 still use the bounded direct path. A translation fault redirects to the exact
 Thumb `_uiomove64` entry at `0xc0128d14`, backed by one of four 128 KiB slots
@@ -972,19 +976,102 @@ zero-initialized, coherent 128 KiB in-memory tail preserves write-then-read
 behavior beyond the media without growing either the immutable rootfs or its
 work image.
 
-The authenticated kernel, device tree, and rootfs source files remain original
-and byte-for-byte immutable. All exact kernel patches are applied only to the
-loaded guest-RAM copy, and filesystem edits remain confined to the separate
-work image. Hosted `core-tests` were green at checkpoint `8ac4af3` (run
-29997710500), but that checkpoint predates this redesign. The new implementation
-still needs public-test/CI validation and a real-firmware run05; it is not yet
-evidence that fsck completes or SpringBoard renders.
+### 2026-07-23: run05 cleared raw I/O and progressed through fsck
+
+Run05 used a fresh work image and reached its **430,000,000** retired-instruction
+cap with exit status 0. The serial sequence included `launchd`, then:
+
+```text
+Running fsck on the boot volume...
+/dev/md0 on / (hfs, local, noatime)
+```
+
+The raw bridge completed two reads and no writes. Both reads took the native
+path: two redirects, two checked completions, zero pending continuations, and
+zero raw guest errors. Of the 65,536 raw bytes, 45,056 came from media and
+20,480 came from the coherent guard tail. The aggregate external-md counters
+were 6,901 reads (28,295,168 bytes), one 512-byte write, and zero failures;
+6,899 reads and the write used the strategy bridge.
+
+The lowest observed free-page count was 20,820 pages (81.33 MiB) at instruction
+425,852,928. `_execve` recorded 11 hits and `_load_machfile` recorded 6. The
+work image remained exactly 466,825,216 bytes. The authenticated kernel, device
+tree, and rootfs hashes were unchanged: exact kernel patches still touched only
+the loaded guest-RAM copy, and filesystem edits remained confined to the
+separate work image.
+
+The matching hosted checks at `df9dc7b` also completed successfully:
+[`core-tests` run 30004015881](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30004015881)
+and
+[`ios-build` run 30004015807](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30004015807).
+Those workflows validate the public build and tests; run05 through run07 are
+the separate private-firmware runtime evidence.
+
+### 2026-07-23: run06 sustained the cold path to 1 B
+
+Run06 used another fresh work image and extended the external-md cold path to
+its **1,000,000,000** retired-instruction cap with exit status 0 and empty
+stderr. It retained the launchd, fsck, and root-mount sequence from run05, then
+printed:
+
+```text
+mDNSResponder[14] syscall_builtin_profile: mDNSResponder (seatbelt)
+mDNSResponder[14] Builtin profile: mDNSResponder (seatbelt)
+systemShutdown false
+```
+
+The external bridge completed 10,004 reads (40,994,304 bytes), 27 writes
+(107,008 bytes), and zero failures. Strategy I/O accounted for 10,002 reads and
+all 27 writes. Raw I/O remained two reads and no writes, with zero guest errors:
+two native redirects, two checked completions, and zero pending continuations.
+Those raw reads again split into 45,056 media bytes and 20,480 coherent-guard
+bytes.
+
+The lowest observed free-page count was 17,221 pages (67.27 MiB) at instruction
+980,615,168. `_execve` remained at 11 hits while `_load_machfile` advanced to
+25. The work image stayed exactly 466,825,216 bytes and the authenticated
+kernel, device tree, and rootfs hashes remained unchanged.
+
+### 2026-07-23: run07 reached a clean 2 B in userspace
+
+Run07 used a fresh 128 MiB external-md work image and reached its
+**2,000,000,000** retired-instruction cap. The exit file contained 0, stdout was
+234,838 bytes, and stderr was empty. The serial record retained `launchd`, the
+fsck and `/dev/md0` root-mount sequence, both `mDNSResponder[14]` Seatbelt
+lines, and `systemShutdown false`.
+
+The final PC was `0x3145ad4c` in USR mode with `CPSR 0x20000010`.
+731,259,769 instructions, 36.6% of the run, retired in USR mode. The reached
+probes were:
+
+```text
+_execve                    12
+_load_machfile             32
+_thread_bootstrap_return   92620
+_unix_syscall              58166
+```
+
+The external bridge completed 12,782 reads (52,372,992 bytes), 82 writes
+(325,120 bytes), and zero failures. Strategy I/O accounted for 12,780 reads and
+all 82 writes. Raw I/O remained two reads and no writes, with zero guest errors:
+two native redirects, two checked completions, and zero pending continuations.
+Those raw reads consumed 45,056 media bytes and 20,480 coherent-guard bytes;
+neither the raw media path nor the guard recorded a write.
+
+The run ended with 13,000 free pages (50.78 MiB). Its low was 12,983 pages
+(50.71 MiB) at instruction 1,836,056,576. The work image stayed exactly
+466,825,216 bytes, and the source kernel, device-tree, and rootfs hashes were
+unchanged.
+
+This run cannot answer the display question. The framebuffer was disabled, and
+CLCD status, interrupt mask, and scanning were all zero. Therefore run07 is
+absolutely not evidence that SpringBoard started or that the real display path
+works.
 
 This chain is stronger evidence for sustained userspace and snapshot
-repeatability. It is **not** evidence that SpringBoard rendered: the runs used
-the serial debugging configuration and captured no SpringBoard frame. The
-bounded continuations either reached their configured caps or, for the one
-diagnostic interval, stopped fail-closed on the named `UXTB16` encoding.
+repeatability. It is **not** evidence that SpringBoard rendered. The bounded
+continuations either reached their configured caps or, for the one diagnostic
+interval, stopped fail-closed on the named `UXTB16` encoding.
 
 ---
 

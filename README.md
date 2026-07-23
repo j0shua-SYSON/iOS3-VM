@@ -24,14 +24,18 @@
 > and rootfs, then serves a create-only writable work image from the host instead
 > of pinning roughly 445 MiB in guest RAM. A guarded cold run first reached raw
 > `/dev/rmd0` fsck I/O at **402,741,536** retired instructions after `BSD root:
-> md0` and `launchd[1] has started up`; 6,715 strategy reads completed with zero
-> bridge failures and 82.76 MiB of guest pages remained free. Run03 then crossed
-> that old guard and reached 420,000,000 instructions, but `fsck_hfs` exited
-> with signal 8. A 405 M diagnostic run identified two exact raw-I/O mismatches:
-> native write-side demand paging for a read into user address `0x01001000`, and
-> a 32 KiB read whose final 20 KiB lies just past the work image. The faultable
-> native-`uiomove64` bridge described below is implemented and passes its
-> focused host suite; run05 still has to validate it against the real firmware.
+> md0` and `launchd[1] has started up`. The latest fresh 128 MiB real-firmware
+> cold run, run07, extended the completed faultable native-`uiomove64` path
+> through its **2,000,000,000**-instruction cap with exit status 0. It retained
+> the fsck/root-mount, `mDNSResponder[14]` Seatbelt, and `systemShutdown false`
+> evidence, and completed 12,782 external reads plus 82 writes with zero
+> failures.
+> Both raw reads finished through two native redirects and two checked
+> completions, with zero raw guest errors and zero pending continuations. The
+> 466,825,216-byte work image did not grow, stderr was empty, and the firmware
+> hashes remained unchanged. This serial run explicitly disabled the framebuffer:
+> CLCD status, mask, and scanning were all zero, so it provides absolutely no
+> SpringBoard or display-path proof.
 > The installable iOS app
 > does **not** run it yet: it runs a small
 > synthetic ARM guest to exercise the CPU, UART and framebuffer bridge. The app
@@ -65,7 +69,7 @@ core portable across hosts. Today the evidence is split deliberately:
 | Capability | CLI / portable core | Installable iOS app |
 |---|---|---|
 | ARM1176 and S5L8900 execution | Real-kernel path recorded | Synthetic demo guest |
-| Apple kernel and root filesystem | Host-backed cold path reached `launchd` and fsck; run04 isolated its two repeatable raw-I/O failures at 405 M | Not integrated |
+| Apple kernel and root filesystem | Host-backed cold path reached `launchd`; run07 passed fsck, mounted `/dev/md0`, retained `mDNSResponder`, and reached a clean 2 B cap | Not integrated |
 | Display | Kernel console and CLCD capture | CoreGraphics demo bridge |
 | Touch, audio, guest networking | Not implemented | Not implemented |
 | Dynamic recompiler | Translator tested off-device; inactive in boot | Excluded from target |
@@ -82,17 +86,15 @@ can see.** No months in the dark.
 | **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, CLCD and NOR are integrated; standalone raw-NAND/storage primitives are host-tested, with no NAND controller/VFL/FTL |
 | **M3** | Firmware containers + LLB execution | ✅ **done** — parses/decrypts real IMG3 firmware, runs a real LLB payload and extracts the kernel; SecureROM and iBoot execution remain future full-chain work |
 | **M4** | The real **XNU kernel** boots and logs | ✅ **done** — a broad set of prelinked drivers matched or started in a recorded CLI run; the real 413 MiB root filesystem mounted, and that run did not reach `_panic` |
-| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** The historical direct-RAM chain reached a clean 2.98 B cap. The memory-safe 128 MiB cold path now reaches `launchd` and fsck, and run04 reduced its current stop to native user-page fault recovery plus a bounded md tail read. The fix is not yet proven by run05. No SpringBoard frame or touch path has been demonstrated; the iOS app remains a demo host. |
+| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** The historical direct-RAM chain reached a clean 2.98 B cap. The memory-safe 128 MiB run07 cold path reaches `launchd`, passes fsck and the root mount, retains `mDNSResponder`, and reaches a clean 2 B cap with a 50.71 MiB free-page low. Its framebuffer was disabled and CLCD status/mask/scanning were zero, so it is not SpringBoard or display-path evidence. The iOS app remains a demo host. |
 
-At `d9d9e40`, hosted
-[`ios-build` run 29891178730](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29891178730)
+At `df9dc7b`, hosted
+[`core-tests` run 30004015881](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30004015881)
 and
-[`core-tests` run 29891178706](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29891178706)
-both completed successfully. Core CI remains green through checkpoint `8ac4af3`:
-[`core-tests` run 29997710500](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/29997710500)
-completed successfully. That checkpoint predates the locally tested
-faultable-raw-bridge implementation, and hosted CI cannot contain private
-firmware or prove a SpringBoard boot.
+[`ios-build` run 30004015807](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30004015807)
+both completed successfully with the faultable raw bridge. Hosted CI cannot
+contain private firmware or prove a SpringBoard boot; that runtime evidence
+comes from the separately recorded run07 cold boot.
 
 ### What it actually does today
 
@@ -191,9 +193,47 @@ fsck exited with signal 8. Run04 reproduced the underlying pair during fsck's
 `-p` and `-fy` passes: a segment-5 32 KiB read at offset zero faulted while
 writing user VA `0x01001000` (`FSR 0x807`), and another 32 KiB read began at
 `0x1bd30000` against media end `0x1bd33000`, leaving 12 KiB in media and 20 KiB
-in the native md allocation tail. The redesign above is implementation in
-progress, not runtime proof; run05 must clear both cases and progress beyond
-fsck.
+in the native md allocation tail. Run05 cleared both cases: two raw reads
+completed through two native redirects and completions, with 45,056 media bytes
+and 20,480 guard bytes read, zero raw guest errors, and zero pending
+continuations. Across strategy and raw paths it completed 6,901 external reads
+(28,295,168 bytes), one 512-byte write, and zero failures while preserving the
+466,825,216-byte work-image length.
+
+Run06 retained those raw results and extended the cold path to
+1,000,000,000 instructions with exit status 0. It printed the launchd/fsck/root
+mount sequence, both `mDNSResponder[14]` Seatbelt lines, and the
+`systemShutdown false` marker. It completed 10,004 external reads (40,994,304
+bytes) and 27 writes
+(107,008 bytes), with zero failures; strategy handled 10,002 reads and all 27
+writes. Raw I/O remained two reads, two redirects, two completions, zero guest
+errors, and zero pending continuations, split into 45,056 media bytes and
+20,480 coherent-guard bytes. The low-water sample was 17,221 free pages
+(67.27 MiB) at instruction 980,615,168; `_execve` remained at 11 hits while
+`_load_machfile` advanced to 25. Stderr was empty, the firmware hashes remained
+unchanged, and the work image remained exactly 466,825,216 bytes.
+
+Run07 extended the fresh 128 MiB external-md cold path to
+2,000,000,000 instructions with exit status 0. The final PC was `0x3145ad4c` in
+USR mode (`CPSR 0x20000010`); 731,259,769 instructions, 36.6% of the run,
+retired in USR mode. `_execve` reached 12, `_load_machfile` 32,
+`_thread_bootstrap_return` 92,620, and `_unix_syscall` 58,166. The prior
+launchd/fsck/`/dev/md0` mount, `mDNSResponder[14]` Seatbelt, and
+`systemShutdown false` lines remained present.
+
+The bridge completed 12,782 reads (52,372,992 bytes), 82 writes (325,120
+bytes), and zero failures; strategy handled 12,780 reads and all 82 writes.
+Raw I/O remained two reads, zero writes, zero guest errors, two native
+redirects, two completions, and zero pending continuations. It read 45,056
+media bytes plus 20,480 coherent-guard bytes and wrote neither region. The run
+ended with 13,000 free pages (50.78 MiB), after a low of 12,983 pages
+(50.71 MiB) at instruction 1,836,056,576. Stdout was 234,838 bytes, stderr was
+empty, the work image stayed exactly 466,825,216 bytes, and all three source
+firmware hashes were unchanged.
+
+The run07 framebuffer was disabled, and CLCD status, mask, and scanning were
+all zero. Therefore none of its additional userspace execution is evidence
+that SpringBoard started or that the real display path works.
 
 That is sustained real userspace, not a completed boot. There is still no
 captured SpringBoard frame, no proof that the current userland reached the home
