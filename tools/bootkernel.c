@@ -2198,19 +2198,46 @@ typedef struct {
     md_raw_bridge_t *raw;
 } external_md_svc_mux_t;
 
+static void external_md_print_raw_guest_error(
+    const char *prefix, uint64_t sequence,
+    const md_raw_bridge_error_t *error) {
+    fprintf(stderr,
+            "%s #%llu: %s errno=%d pc=0x%08x svc=0x%04x "
+            "dev=0x%08x uio=0x%08x iov=0x%08x iovcnt=%d resid=%d "
+            "offset=0x%llx seg=%u rw=%u fault=0x%08x/pa=0x%08x/"
+            "fsr=0x%08x\n",
+            prefix, (unsigned long long)sequence,
+            md_raw_bridge_error_string(error->code), error->guest_errno,
+            error->pc, error->encoding, error->device, error->uio_va,
+            error->iov_va, error->iov_count, error->residual,
+            (unsigned long long)error->media_offset, error->segment,
+            error->rw, error->fault_va, error->fault_pa,
+            error->mmu_status);
+}
+
 static arm_svc_result_t external_md_svc_handler(void *context,
                                                 arm_cpu_t *cpu,
                                                 uint32_t pc,
                                                 uint32_t encoding) {
     external_md_svc_mux_t *mux = (external_md_svc_mux_t *)context;
     arm_svc_result_t result;
+    uint64_t guest_errors_before;
 
     if (mux == NULL || mux->strategy == NULL || mux->raw == NULL)
         return ARM_SVC_ERROR;
     result = md_bridge_handle_svc(mux->strategy, cpu, pc, encoding);
     if (result != ARM_SVC_UNHANDLED)
         return result;
-    return md_raw_bridge_handle_svc(mux->raw, cpu, pc, encoding);
+    guest_errors_before = mux->raw->stats.guest_errors;
+    result = md_raw_bridge_handle_svc(mux->raw, cpu, pc, encoding);
+    if (result == ARM_SVC_HANDLED &&
+        mux->raw->stats.guest_errors != guest_errors_before) {
+        external_md_print_raw_guest_error(
+            "external-md raw guest error",
+            mux->raw->stats.guest_errors,
+            &mux->raw->last_guest_error);
+    }
+    return result;
 }
 
 int main(int argc, char **argv) {
@@ -4708,10 +4735,9 @@ int main(int argc, char **argv) {
         if (external_raw_bridge.stats.guest_errors != 0u) {
             const md_raw_bridge_error_t *error =
                 &external_raw_bridge.last_guest_error;
-            printf("  last raw guest error: %s errno=%d va=0x%08x "
-                   "fsr=0x%08x\n",
-                   md_raw_bridge_error_string(error->code),
-                   error->guest_errno, error->fault_va, error->mmu_status);
+            external_md_print_raw_guest_error(
+                "  last raw guest error",
+                external_raw_bridge.stats.guest_errors, error);
         }
 
         if (external_bridge_installed) {
