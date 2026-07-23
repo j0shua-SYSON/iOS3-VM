@@ -97,10 +97,13 @@
  *     (0xc0705ccc..0xc0705ce0), and the register at 0x218 written 1 at start.
  *     Base 0x38900000 and interrupt line 13 are confirmed from the device tree.
  *
- *   CONFIRMED-BY-ABSENCE: 0x0d8, 0x0dc, 0x0e0, 0x0e4, 0x0ec are only ever
- *     saved (0xc070405c..0xc070409c) and restored (0xc07041fc..0xc070423c) by
- *     the sleep path. The driver never initialises them, so iBoot must, and
- *     plain read/write storage is exactly right for us.
+ *   CORRECTED REGISTER LABELS: 0x0d8/0x0dc, 0x0e0/0x0e4 and 0x0e8/0x0ec
+ *     are per-window configuration pairs in openiBoot, not panel timings.
+ *     AppleH1CLCD also uses 0x0e8 as its update word. The real clock/timing
+ *     handoff is VIDCON0/1 and VIDTCON0..3 at 0x200..0x218. The N82 values
+ *     planted by s5l_clcd_seed_window0() follow openiBoot's optC and its
+ *     recorded divisor-five iPhone 3G handoff (10.8 MHz pixels, inverted
+ *     VCLK, 15/15/16 horizontal and 4/4/4 vertical porch/sync).
  *
  *   INFERRED: 0x024 backdrop colour, the 11 video-overlay registers at
  *     0x028..0x054, the 8 colour-matrix registers at 0x1c8..0x1e8, the opaque
@@ -143,11 +146,11 @@
  *     have no evidence for what they select. s5l_clcd_window() reports the
  *     field; s5l_clcd_scanout() ignores it rather than inventing a swizzle.
  *
- *   DECIDED, and stated: 0x204 reads as 0. Bits [7:6] are the only bits the
- *     driver looks at and it defers the swap when they are both set, so any
- *     value with (v >> 6) & 3 == 3 stalls the display. Zero means "not busy",
- *     which is the only answer that cannot deadlock, and it is what we return
- *     unconditionally. We do NOT model whatever real state those bits carry.
+ *   DECIDED, and stated: VIDCON1 preserves the N82 IVCLK polarity bit when the
+ *     N82 display-clock handoff is present. Bits [7:6] are the only live-state
+ *     bits AppleH1CLCD examines and it defers a swap when both are set. We keep
+ *     those bits clear ("not busy") because no scanline engine exists to move
+ *     them; inventing 0xc0 would deadlock every swap.
  *
  *   NOT MODELLED, deliberately: the hardware scanout does not read the
  *     framebuffer on its own, gamma is not applied, the video overlay does
@@ -229,10 +232,11 @@ uint32_t s5l_clcd_read(s5l_clcd_t *c, uint32_t off) {
          *   0xc0705ccc  ldr r3,[r3,#0x204]; lsr r3,r3,#6; and r3,r3,#3
          *   0xc0705cdc  cmp r3,#3; beq <defer the swap>
          * so a value of 0xC0 makes AppleH1CLCD postpone every swap it is ever
-         * asked to do. We return 0 — "not busy" — and model nothing else here,
-         * because we do not know what else those bits mean.
+         * asked to do. Preserve optC's N82 IVCLK polarity bit when VIDCON0
+         * selects the display clock, while leaving those live-state bits clear.
          */
-        case CLCD_STATUS:    return 0;
+        case CLCD_STATUS:
+            return (c->gate & 0xc0u) == 0x40u ? CLCD_N82_VIDCON1 : 0u;
         default: break;
     }
     if (in_range(off, CLCD_VIDEO_FIRST, CLCD_VIDEO_LAST))
@@ -241,10 +245,10 @@ uint32_t s5l_clcd_read(s5l_clcd_t *c, uint32_t off) {
         return c->csc[(off - CLCD_CSC_FIRST) / 4u];
     if (in_range(off, CLCD_OPAQUE_FIRST, CLCD_OPAQUE_LAST))
         return c->opaque[(off - CLCD_OPAQUE_FIRST) / 4u];
-    if (off == CLCD_TIMING0 || off == CLCD_TIMING0 + 4u ||
-        off == CLCD_TIMING0 + 8u || off == CLCD_TIMING0 + 12u)
-        return c->timing[(off - CLCD_TIMING0) / 4u];
-    if (off == CLCD_TIMING4) return c->timing[4];
+    if (off == CLCD_WINCFG0 || off == CLCD_WINCFG0 + 4u ||
+        off == CLCD_WINCFG0 + 8u || off == CLCD_WINCFG0 + 12u)
+        return c->wincfg_aux[(off - CLCD_WINCFG0) / 4u];
+    if (off == CLCD_WINCFG2_AUX) return c->wincfg_aux[4];
     {
         uint32_t sub;
         s5l_clcd_window_t *w = window_at(c, off, &sub);
@@ -314,11 +318,11 @@ void s5l_clcd_write(s5l_clcd_t *c, uint32_t off, uint32_t val) {
     if (in_range(off, CLCD_OPAQUE_FIRST, CLCD_OPAQUE_LAST)) {
         c->opaque[(off - CLCD_OPAQUE_FIRST) / 4u] = val; return;
     }
-    if (off == CLCD_TIMING0 || off == CLCD_TIMING0 + 4u ||
-        off == CLCD_TIMING0 + 8u || off == CLCD_TIMING0 + 12u) {
-        c->timing[(off - CLCD_TIMING0) / 4u] = val; return;
+    if (off == CLCD_WINCFG0 || off == CLCD_WINCFG0 + 4u ||
+        off == CLCD_WINCFG0 + 8u || off == CLCD_WINCFG0 + 12u) {
+        c->wincfg_aux[(off - CLCD_WINCFG0) / 4u] = val; return;
     }
-    if (off == CLCD_TIMING4) { c->timing[4] = val; return; }
+    if (off == CLCD_WINCFG2_AUX) { c->wincfg_aux[4] = val; return; }
     {
         uint32_t sub;
         s5l_clcd_window_t *w = window_at(c, off, &sub);
@@ -338,8 +342,14 @@ void s5l_clcd_write(s5l_clcd_t *c, uint32_t off, uint32_t val) {
     }
 }
 
+bool s5l_clcd_running(const s5l_clcd_t *c) {
+    return c && c->scanning &&
+           (c->ctrl & CLCD_CTRL_ENABLE) != 0u &&
+           (c->gate & 1u) != 0u;
+}
+
 bool s5l_clcd_tick(s5l_clcd_t *c, uint32_t ticks) {
-    if (c->scanning && c->frame_ticks) {
+    if (s5l_clcd_running(c) && c->frame_ticks) {
         /*
          * Accumulate rather than test-and-reset against a running counter, so a
          * long tick cannot swallow a frame boundary and a short one cannot
@@ -371,7 +381,7 @@ bool s5l_clcd_tick(s5l_clcd_t *c, uint32_t ticks) {
 bool s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
                            uint32_t width, uint32_t height,
                            uint32_t stride, uint32_t format, uint32_t order) {
-    if (!c || width == 0 || width > 0x7ffu ||
+    if (!c || width == 0 || width > 0x400u ||
         height == 0 || height > 0x3ffu ||
         format > CLCD_FMT_MASK || order > CLCD_ORDER_MASK ||
         (stride & 3u) != 0u) {
@@ -398,7 +408,36 @@ bool s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
     /* Display on, window 0 on. These are the same bits start_hardware forces,
      * so the driver's read-modify-write leaves them set. */
     c->ctrl |= CLCD_CTRL_ENABLE | CLCD_CTRL_WIN0;
-    c->gate |= 1u;
+
+    /*
+     * Supply the N82 clock and panel geometry instead of planting only a
+     * framebuffer. openiBoot's optC is:
+     *
+     *   320x480, H back/front/sync 15/15/16, V 4/4/4,
+     *   inverted VCLK, 54 MHz display clock / 5, scanout enabled.
+     *
+     * The emulator's VBL cadence does not depend on these registers, but
+     * AppleH1CLCD preserves/restores them across power transitions. VIDTCON2
+     * follows the requested window geometry so the public seed helper never
+     * exposes contradictory active-area and window dimensions; production N82
+     * callers request the native 320x480.
+     */
+    c->gate = CLCD_N82_VIDCON0;
+    c->opaque[(CLCD_VIDTCON0 - CLCD_OPAQUE_FIRST) / 4u] = 0x00030303u;
+    c->opaque[(CLCD_VIDTCON1 - CLCD_OPAQUE_FIRST) / 4u] = 0x000e0e0fu;
+    c->opaque[(CLCD_VIDTCON2 - CLCD_OPAQUE_FIRST) / 4u] =
+        ((width - 1u) << 16) | (height - 1u);
+    c->opaque[(CLCD_VIDTCON3 - CLCD_OPAQUE_FIRST) / 4u] = 0x00000001u;
+
+    /* openiBoot initializes the three window-configuration words to 0x1000
+     * and their paired auxiliaries to zero before programming the window. The
+     * 0xe8 word later becomes AppleH1CLCD's 0x50001000 update command. */
+    c->wincfg_aux[0] = 0x00001000u;
+    c->wincfg_aux[1] = 0u;
+    c->wincfg_aux[2] = 0x00001000u;
+    c->wincfg_aux[3] = 0u;
+    c->update2 = 0x00001000u;
+    c->wincfg_aux[4] = 0u;
 
     /*
      * iBoot leaves the panel lit and scanning. Starting scanout here means the

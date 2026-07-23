@@ -247,6 +247,38 @@ status, mask, and scanning values were all zero; it provides no display-path
 evidence. A future IOMedia device or full NAND/VFL/FTL model can replace this
 compatibility seam without changing the block/session API.
 
+## CLCD handoff and live-scanout invariant
+
+The CLCD register map now distinguishes window configuration from panel timing.
+Offsets `0x0d8..0x0ec` are per-window auxiliary configuration pairs; the old
+`TIMING` label for that range was incorrect. Offset `0x0e8` is additionally the
+update word used by `AppleH1CLCD` during a window update. The actual display
+timing state is `VIDTCON0..3` at offsets `0x20c`, `0x210`, `0x214`, and
+`0x218`. `VIDCON0` at `0x200` carries the display-clock selection and scanout
+gate.
+
+The host-side N82 seed models an iBoot-compatible handoff. It plants
+`VIDCON0 = 0x00000441` for the 54 MHz display clock divided by five, scanout
+enabled, and exposes `VIDCON1 = 0x00000008` for inverted VCLK polarity.
+`VIDTCON0`, `VIDTCON1`, and `VIDTCON3` are `0x00030303`, `0x000e0e0f`, and
+`0x00000001`. `VIDTCON2` is derived from the requested window geometry as
+`((width - 1) << 16) | (height - 1)`; the production N82 320x480 request yields
+`0x013f01df`. The initial window-configuration words at `0x0d8`, `0x0e0`, and
+`0x0e8` are `0x00001000`, with their paired auxiliary words clear. This state
+is guest-visible and remains part of snapshot state.
+
+An enabled RGB window is remembered configuration, not proof of live scanout.
+The controller is running only when its start/stop state, the `CLCD_CTRL` global
+enable, and `VIDCON0` bit 0 are all active. Frame ticking, CLCD-driven WFI wake
+selection, and host frame publication use that same invariant, so a powered-down
+controller cannot emit stale frames or interrupts merely because a window is
+still configured.
+
+This is correctness preparation for the next display-enabled firmware run. It
+does not retroactively validate the display path: run07 had no framebuffer and
+all reported CLCD activity was zero, and no corrected-handoff run has captured
+SpringBoard.
+
 In the planned shared-session design, host services cross explicit non-blocking
 seams: frame descriptors out; bounded touch, PCM and network queues in/out;
 storage and monotonic-clock operations; and a platform-specific JIT allocator.

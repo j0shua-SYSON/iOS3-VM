@@ -307,6 +307,62 @@ also completed successfully. Continue with a new work filename and a higher
 bounded cap before app integration. Snapshot backing-identity and overlay
 coupling remain separate work.
 
+### CLCD: configured is not scanning
+
+When diagnosing a future display run, do not use the old `0x0d8..0x0ec`
+`TIMING` labels. Those words are per-window auxiliary configuration pairs. The
+`0x0e8` word also participates in `AppleH1CLCD` window updates. The actual N82
+panel timing registers are `VIDTCON0..3` at `0x20c..0x218`; an iBoot-compatible
+320x480 seed reads back as:
+
+```text
+VIDCON0   00000441
+VIDCON1   00000008
+VIDTCON0  00030303
+VIDTCON1  000e0e0f
+VIDTCON2  013f01df
+VIDTCON3  00000001
+```
+
+For the production N82 handoff, `VIDCON0` means 54 MHz display clock divided
+by five with scanout enabled, and `VIDCON1` preserves inverted-VCLK polarity.
+`VIDTCON2` must match the requested geometry rather than a universal constant:
+320x480 produces `0x013f01df`. The initial configuration should also show
+`0x00001000` at `0x0d8`, `0x0e0`, and `0x0e8`, with `0x0dc`, `0x0e4`, and
+`0x0ec` clear.
+
+An enabled window proves only that its address, geometry, stride, and format
+remain configured. Live scanout additionally requires controller start state,
+the `CLCD_CTRL` global enable, and `VIDCON0` bit 0. Frame progression, frame IRQ
+timing, WFI wake selection, and host frame publication must all stop when any
+one of those gates is off. This prevents a stale window from masquerading as a
+live panel.
+
+These checks describe the corrected model, not a successful display boot.
+Run07 disabled the framebuffer and reported zero CLCD activity, and no later
+real-firmware display run has yet exercised this handoff or captured
+SpringBoard.
+
+For a display-focused CLI run, `-H 0x38900000` moves the bounded hot-page
+register trace to the CLCD page; `-H` rejects unaligned or out-of-range physical
+pages. The final report also counts every observed instruction-entry PC in the
+`AppleH1DisplayDrivers` and `AppleMerlotLCD` executable ranges rather than
+relying on the one-in-1,024 profiler. Low physical aliases count only before the
+MMU is enabled, so a userspace PC in the DRAM-sized numeric aperture cannot
+become false display-driver evidence.
+
+The process-lifecycle section retains the newest 256 fork, exec, spawn, wait,
+kill, exit, `_exit1`, and `_psignal` entries. Exec/spawn pathnames are copied
+through the caller's live user MMU mapping with user permissions, one byte at a
+time and within a 256-byte bound. An exact SpringBoard pathname is labeled as an
+attempt only; it does not prove syscall success, process execution, or a frame.
+
+With `-F`, `firmware/screen.ppm` is invalidated before guest execution. A final
+PPM is published only from a currently running CLCD and active, valid RGB
+window, and the report labels it `ALL BLACK` or `NONBLACK`. Either result is
+scanout evidence only. A recognizable SpringBoard frame, together with
+lifecycle and driver evidence, is still required for boot-completion proof.
+
 ### WFI changes elapsed device time, not the instruction coordinate
 
 XNU spends substantial time in the ARM1176 CP15 wait-for-interrupt form. The

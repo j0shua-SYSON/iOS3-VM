@@ -236,8 +236,8 @@ static void test_device_state_round_trips(void) {
         a->clcd.win[k].position  = k;
     }
     a->clcd.update = 2; a->clcd.update2 = 0x50001000u;
-    for (unsigned i = 0; i < sizeof a->clcd.timing / sizeof a->clcd.timing[0]; i++)
-        a->clcd.timing[i] = 0x7000u + i;
+    for (unsigned i = 0; i < sizeof a->clcd.wincfg_aux / sizeof a->clcd.wincfg_aux[0]; i++)
+        a->clcd.wincfg_aux[i] = 0x7000u + i;
     for (unsigned i = 0; i < sizeof a->clcd.csc / sizeof a->clcd.csc[0]; i++)
         a->clcd.csc[i] = 0x8000u + i;
     a->clcd.gate = 1;
@@ -295,8 +295,8 @@ static void test_device_state_round_trips(void) {
         SAME(clcd.win[k].linewords); SAME(clcd.win[k].position);
     }
     SAME(clcd.update); SAME(clcd.update2);
-    for (unsigned i = 0; i < sizeof a->clcd.timing / sizeof a->clcd.timing[0]; i++)
-        SAME(clcd.timing[i]);
+    for (unsigned i = 0; i < sizeof a->clcd.wincfg_aux / sizeof a->clcd.wincfg_aux[0]; i++)
+        SAME(clcd.wincfg_aux[i]);
     for (unsigned i = 0; i < sizeof a->clcd.csc / sizeof a->clcd.csc[0]; i++)
         SAME(clcd.csc[i]);
     SAME(clcd.gate);

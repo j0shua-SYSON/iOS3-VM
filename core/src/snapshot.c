@@ -364,7 +364,7 @@ static void snap_clcd(sn_io_t *io, s5l_clcd_t *c) {
         F32(w->geometry); F32(w->linewords); F32(w->position);
     }
     F32(c->update); F32(c->update2);
-    FA32(c->timing, sizeof c->timing / sizeof c->timing[0]);
+    FA32(c->wincfg_aux, sizeof c->wincfg_aux / sizeof c->wincfg_aux[0]);
     FA32(c->csc,    sizeof c->csc    / sizeof c->csc[0]);
     F32(c->gate);
     FA32(c->opaque, sizeof c->opaque / sizeof c->opaque[0]);

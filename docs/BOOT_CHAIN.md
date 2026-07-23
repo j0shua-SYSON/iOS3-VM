@@ -34,6 +34,18 @@ emulator has reproduced each verification or handoff stage.
 | kernelcache | The current direct path provides VICs, timers, ARM1176 WFI wake handling, MMU/TLB maintenance, a device tree and an iBoot-like handoff. Historical mode validates a 512 MiB layout and streams the root filesystem into guest RAM. The current cold path instead exact-gates the 7E18 kernel, device tree, and rootfs, fixes guest DRAM at 128 MiB, and serves a create-only work image through guarded md strategy/raw bridges. The real-firmware-tested raw fix exact-patches `_mdevrw` to `svc #0xe3; svc #0xe4`; `ARM_SVC_REDIRECTED` sends a missing user mapping through exact Thumb `_uiomove64` at `0xc0128d14`, using four 128 KiB SP-and-mode-keyed bounce slots below `topOfKernelData`. A zero-initialized coherent 128 KiB in-memory tail preserves XNU's observed no-EOF-check behavior without growing either disk image. Run07 retained two redirects and two completions with no guest raw error or pending continuation through a clean 2 B cap. NAND-controller/VFL/FTL integration remains a separate hardware-fidelity path. |
 | launchd → SpringBoard | Historical checkpoint evidence reaches a clean 2.98 B cap without a guest panic or emulator undefined stop, but direct-RAM free pages dipped to 97. The fresh 128 MiB external-md run07 cold path retained `launchd`, fsck, the `/dev/md0` root mount, both `mDNSResponder[14]` Seatbelt lines, and `systemShutdown false`, then finished its 2 B cap in USR mode with exit status 0 and empty stderr. It completed 12,782 reads, 82 writes, and zero failures; the free-page low was 12,983 pages (50.71 MiB). `_load_machfile` reached 32 and `_execve` 12. This run disabled the framebuffer and reported zero CLCD status/mask/scanning, so it provides absolutely no SpringBoard or display-path proof. Completion still needs the LCD/framebuffer path under the real session, multitouch, and enough IOKit-backing devices for remaining userland. |
 
+The synthesized display handoff is being corrected before that last stage is
+tested. CLCD offsets `0x0d8..0x0ec` are per-window auxiliary configuration, not
+panel timing; the actual `VIDTCON0..3` timing registers live at
+`0x20c..0x218`. The N82 seed now carries the iBoot-compatible 54 MHz display
+clock divided by five, inverted-VCLK polarity, and porch/sync state.
+`VIDTCON2` derives from the requested geometry, with production using 320x480,
+and the initial `0x0d8`, `0x0e0`, and `0x0e8` window words are `0x1000`. A
+configured window counts as live scanout only while start state, `CLCD_CTRL`
+global enable, and `VIDCON0` bit 0 are all active. This removes false-positive
+frames and wake events, but it is preparation only: no corrected-handoff
+firmware run or SpringBoard frame has been recorded.
+
 The accepted kernel, device tree, and rootfs source files remain original and
 immutable. Exact firmware-specific patches and device-tree edits touch only
 loaded guest RAM; fstab and volume-growth edits touch only the separate

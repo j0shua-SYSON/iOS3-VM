@@ -247,6 +247,13 @@ memory we handed it. It proves console rendering, not that Apple's display
 driver started; the current tree has a tested CLCD model, but the run below did
 not reach that kext's code.
 
+The current CLCD correction does not change that historical result. It prepares
+the controller handoff for a new run by treating `0x0d8..0x0ec` as window
+configuration rather than panel timing, seeding the actual `VIDTCON0..3`
+registers at `0x20c..0x218` with iBoot-compatible N82 320x480 timing, and
+requiring every hardware scanout gate before frames or wake edges are produced.
+No real-firmware display run has validated that preparation yet.
+
 ### The five bugs that got us here
 
 Each was found in the last stretch of work, and each is worth naming for *how*
@@ -443,10 +450,12 @@ later.
   correctly times out because no card is modelled. Every one is counted and
   attributed to a PC *and now to a kext*, which is the point; but each is a
   driver talking to a device that is not listening.
-- **`AppleH1CLCD` did not start in this run** — but NOT because the CLCD was
-  unmodelled. That earlier claim was wrong on both halves: `core/src/soc/clcd.c`
-  is a tested model, and the nub's registers were simply never read, because the
-  kext executed zero instructions. The display controller is
+- **`AppleH1CLCD` was not observed starting in this run** — but NOT because the
+  CLCD was unmodelled. That earlier claim was wrong on both halves:
+  `core/src/soc/clcd.c` is a tested model, and the nub's registers were never
+  read. The sampled profiler also recorded no PC in the kext, but its
+  one-in-1,024 sampling interval cannot prove that the kext executed literally
+  zero instructions. The display controller is
   `/device-tree/arm-io/clcd`, `compatible = "clcd,s5l8900x"`, physical
   0x38900000, interrupt 13.
 - **`AppleMerlotLCD` needed a panel ID in this run.**
@@ -455,6 +464,16 @@ later.
   the panel's ID over SPI. The current CLI can patch a non-zero value, seed CLCD
   window 0 and capture the active buffer, but there is no fresh private-firmware
   trace proving how far the Apple display kexts proceed with those changes.
+- **The CLCD seed needed real timing, not mislabeled window words.**
+  Offsets `0x0d8..0x0ec` are per-window auxiliary configuration pairs; actual
+  `VIDTCON0..3` lives at `0x20c..0x218`. The corrected N82 handoff seeds
+  `VIDCON0 = 0x441` for the 54 MHz clock divided by five with scanout enabled,
+  plus `VIDCON1 = 0x8` for inverted VCLK. The porch/sync values are fixed for
+  N82, while `VIDTCON2` derives from the requested geometry; production 320x480
+  yields `0x013f01df`. Initial `0x0d8`, `0x0e0`, and `0x0e8` window words are
+  `0x1000`. Live scanout additionally requires start state, `CLCD_CTRL` global
+  enable, and `VIDCON0` bit 0. This is host-side correctness preparation, not
+  evidence that either Apple display kext ran or that SpringBoard rendered.
 - **The same audit recorded three fault-path gaps** (`e2d6c44`). Two have since
   been closed and regression-tested: instruction fetches enforce `XN`, and
   unaligned accesses that cross a page boundary translate both pages. The third
@@ -646,10 +665,12 @@ still runs only a synthetic guest and has no touch or audio path.
   kernelcache. The instant launchd retires an instruction, the milestone table,
   the profiler and the kext symbolizer all go quiet — which is exactly the
   regime we have now entered. This is a known gap, not a solved one.
-- **The display path** — the CLCD model, Merlot panel seed and CLI capture now
-  exist. The app's CoreGraphics bridge now follows the controller's validated
-  active window, but it still needs the shared real-guest session; Metal is
-  optional and not implemented.
+- **The display path** — the CLCD model now separates `VIDTCON0..3` timing from
+  the `0x0d8..0x0ec` window configuration, seeds an iBoot-compatible N82
+  handoff, and gates frame publication and WFI edges on genuinely live scanout.
+  The app's CoreGraphics bridge follows a validated active window only while
+  those gates are live. This still needs a display-enabled real-firmware run and
+  the shared real-guest session; Metal is optional and not implemented.
 - **Multitouch**, mapped from the host touchscreen to the guest's controller.
   `AppleMultitouchZ2SPI` already starts and reports "using DMA for bootloading",
   which proves that the recorded boot reached that request. Device, DMA and

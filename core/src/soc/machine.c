@@ -374,7 +374,7 @@ static bool machine_wait_for_interrupt(void *ctx) {
 
     if ((m->vic[0].enable & clcd_bit) != 0u &&
         (m->clcd.intmask & CLCD_INT_FRAME) != 0u &&
-        m->clcd.scanning && m->clcd.frame_ticks != 0u) {
+        s5l_clcd_running(&m->clcd) && m->clcd.frame_ticks != 0u) {
         /* frame_accum is normally strictly below frame_ticks.  If a malformed
          * in-memory caller violates that invariant, one tick is the only safe
          * boundary: the CLCD normalizes it and asserts the frame latch there. */

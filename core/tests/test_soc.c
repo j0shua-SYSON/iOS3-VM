@@ -349,6 +349,8 @@ static void test_wfi_stops_at_earliest_deliverable_device_edge(void) {
     m.timer.t4_count = m.timer.t4_value = 10u;
     m.timer.t4_state = TIMER4_STATE_START;
     m.clcd.scanning = true;
+    m.clcd.ctrl = CLCD_CTRL_ENABLE;
+    m.clcd.gate = 1u;
     m.clcd.frame_ticks = 4u;
     m.clcd.frame_accum = 1u;
     m.clcd.intmask = CLCD_INT_FRAME;
@@ -382,6 +384,8 @@ static void test_wfi_lump_preserves_non_waking_device_side_effects(void) {
     m.timer.t4_state = TIMER4_STATE_START;
     m.vic[0].enable = 1u << S5L8900_IRQ_TIMER;
     m.clcd.scanning = true;
+    m.clcd.ctrl = CLCD_CTRL_ENABLE;
+    m.clcd.gate = 1u;
     m.clcd.frame_ticks = 3u;
     m.clcd.frame_accum = 0u;
     m.clcd.intmask = 0u;                       /* frames cannot wake the CPU */
@@ -437,6 +441,8 @@ static void test_wfi_no_event_falls_back_without_time_or_host_hang(void) {
     zero.timer.t4_state = TIMER4_STATE_START;
     zero.timer.t4_count = zero.timer.t4_value = 0u;
     zero.clcd.scanning = true;
+    zero.clcd.ctrl = CLCD_CTRL_ENABLE;
+    zero.clcd.gate = 1u;
     zero.clcd.frame_ticks = 0u;
     zero.clcd.intmask = CLCD_INT_FRAME;
     zero.vic[0].enable = (1u << S5L8900_IRQ_TIMER) |
@@ -970,7 +976,11 @@ static void test_clcd_raises_the_frame_interrupt(void) {
     CHECK(c.frames == 0, "frames=%llu expect 0 while stopped",
           (unsigned long long)c.frames);
 
-    /* The driver's own order: mask first, enable last. */
+    /* The driver's own order: program global/clock gates, mask first, enable
+     * last. A start command without the other gates is remembered state, not
+     * live scanout. */
+    s5l_clcd_write(&c, CLCD_CTRL, CLCD_CTRL_ENABLE);
+    s5l_clcd_write(&c, CLCD_GATE, 1u);
     s5l_clcd_write(&c, CLCD_ENABLE, 1);
     CHECK(!s5l_clcd_tick(&c, c.frame_ticks - 1u),
           "the first VBL must be a whole frame after start, not immediate");
@@ -1003,6 +1013,8 @@ static void test_clcd_large_tick_preserves_phase(void) {
     s5l_clcd_t c; s5l_clcd_reset(&c);
     c.frame_ticks = 100u;
     c.scanning = true;
+    c.ctrl = CLCD_CTRL_ENABLE;
+    c.gate = 1u;
     c.frame_accum = 99u;
     c.intmask = CLCD_INT_FRAME;
 
@@ -1028,6 +1040,8 @@ static void test_clcd_large_tick_preserves_phase(void) {
  */
 static void test_clcd_line_is_gated_by_the_mask(void) {
     s5l_clcd_t c; s5l_clcd_reset(&c);
+    s5l_clcd_write(&c, CLCD_CTRL, CLCD_CTRL_ENABLE);
+    s5l_clcd_write(&c, CLCD_GATE, 1u);
     s5l_clcd_write(&c, CLCD_ENABLE, 1);
 
     /* Mask clear: a frame still latches in the status (the hardware does not
@@ -1056,8 +1070,8 @@ static void test_clcd_line_is_gated_by_the_mask(void) {
  *   0xc0705ccc  ldr r3,[reg,#0x204]; lsr r3,r3,#6; and r3,r3,#3; cmp r3,#3
  * and DEFERS the swap when both bits are set. A stub that echoed a previous
  * write, or any model that guessed at those bits, could stall every swap the
- * display ever attempts. Zero is "not busy" and is the only answer that cannot
- * deadlock.
+ * display ever attempts. The N82 polarity bit is stable state; the two live
+ * status bits must remain "not busy" because this model has no scanline phase.
  */
 static void test_clcd_status_never_defers_the_swap(void) {
     s5l_clcd_t c; s5l_clcd_reset(&c);
@@ -1069,18 +1083,28 @@ static void test_clcd_status_never_defers_the_swap(void) {
     CHECK(s5l_clcd_read(&c, CLCD_STATUS) == 0,
           "status=%08x expect 0 — a write must not be able to stall the display",
           s5l_clcd_read(&c, CLCD_STATUS));
+
+    c.gate = CLCD_N82_VIDCON0;
+    CHECK(s5l_clcd_read(&c, CLCD_STATUS) == CLCD_N82_VIDCON1,
+          "N82 inverted-VCLK polarity was not preserved: %08x",
+          s5l_clcd_read(&c, CLCD_STATUS));
+    s5l_clcd_write(&c, CLCD_STATUS, 0xffffffffu);
+    CHECK(s5l_clcd_read(&c, CLCD_STATUS) == CLCD_N82_VIDCON1,
+          "read-only N82 VIDCON1 was changed by a write: %08x",
+          s5l_clcd_read(&c, CLCD_STATUS));
 }
 
 /*
  * Everything else on the page is storage the driver saves and restores across
- * sleep. It never initialises the panel timing at 0x0d8..0x0ec — it only saves
- * and restores it — so iBoot must set it, and read-back is the whole contract.
+ * sleep. 0x0d8..0x0ec are per-window configuration pairs (not panel timing);
+ * the actual VIDTCON timing registers are 0x20c..0x218. Read-back is the
+ * contract for both groups.
  */
 static void test_clcd_saved_registers_read_back(void) {
     s5l_clcd_t c; s5l_clcd_reset(&c);
     static const uint32_t OFFS[] = {
-        CLCD_TIMING0, CLCD_TIMING0 + 4u, CLCD_TIMING0 + 8u, CLCD_TIMING0 + 12u,
-        CLCD_TIMING4, CLCD_CTRL, CLCD_FIFO, CLCD_BACKDROP,
+        CLCD_WINCFG0, CLCD_WINCFG0 + 4u, CLCD_WINCFG0 + 8u, CLCD_WINCFG0 + 12u,
+        CLCD_WINCFG2_AUX, CLCD_CTRL, CLCD_FIFO, CLCD_BACKDROP,
         CLCD_VIDEO_FIRST, CLCD_VIDEO_LAST, CLCD_CSC_FIRST, CLCD_CSC_LAST,
         CLCD_OPAQUE_FIRST, CLCD_OPAQUE_LAST, CLCD_GATE,
         CLCD_GAMMA0, CLCD_GAMMA0 + CLCD_GAMMA_SIZE - 4u,
@@ -1126,6 +1150,32 @@ static void test_clcd_seed_is_visible_to_the_guest(void) {
            & CLCD_FMT_MASK) == CLCD_FMT_32BPP, "pixel format");
     CHECK((m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_CTRL) & CLCD_CTRL_WIN0) != 0,
           "window 0 must be enabled in CLCD_CTRL");
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_GATE) ==
+              CLCD_N82_VIDCON0,
+          "VIDCON0 must retain the N82 display clock divisor and scanout enable");
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_STATUS) ==
+              CLCD_N82_VIDCON1,
+          "VIDCON1 must retain the N82 inverted-VCLK polarity");
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_VIDTCON0) == 0x00030303u,
+          "N82 vertical porch/sync timing");
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_VIDTCON1) == 0x000e0e0fu,
+          "N82 horizontal porch/sync timing");
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_VIDTCON2) == 0x013f01dfu,
+          "N82 active 320x480 timing");
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_VIDTCON3) == 1u,
+          "N82 VIDTCON3 handoff");
+    CHECK(m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_WINCFG0) ==
+              0x00001000u &&
+          m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_WINCFG0 + 4u) == 0u &&
+          m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_WINCFG0 + 8u) ==
+              0x00001000u &&
+          m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_WINCFG0 + 12u) == 0u &&
+          m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_UPDATE2) ==
+              0x00001000u &&
+          m.bus.read32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_WINCFG2_AUX) == 0u,
+          "openiBoot window-configuration handoff");
+    CHECK(s5l_clcd_running(&m.clcd),
+          "the seeded N82 display must be actively scanning");
 
     /* And the host-side accessor reports the same thing, which is the seam a
      * renderer reads. */
@@ -1163,7 +1213,7 @@ static void test_clcd_seed_rejects_invalid_layouts_atomically(void) {
     } bad[] = {
         { 0x0ff00000u, 0u,      480u, 1280u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
           "zero width" },
-        { 0x0ff00000u, 0x800u,  480u, 8192u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+        { 0x0ff00000u, 0x401u,  480u, 8192u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
           "width field overflow" },
         { 0x0ff00000u, 320u,      0u, 1280u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
           "zero height" },
@@ -1197,6 +1247,9 @@ static void test_clcd_seed_rejects_invalid_layouts_atomically(void) {
     CHECK(s5l_clcd_seed_window0(&edge, 0xfffffff0u, 4u, 1u, 16u,
                                 CLCD_FMT_32BPP, CLCD_ORDER_BGRA),
           "a framebuffer ending exactly at 4 GiB was rejected");
+    CHECK(s5l_clcd_read(&edge, CLCD_VIDTCON2) == 0x00030000u,
+          "non-native seed exposed fixed 320x480 active timing: %08x",
+          s5l_clcd_read(&edge, CLCD_VIDTCON2));
 }
 
 /*
@@ -1226,6 +1279,41 @@ static void test_clcd_active_window_follows_the_drivers_order(void) {
     s5l_clcd_write(&c, CLCD_CTRL, CLCD_CTRL_VIDEO | CLCD_CTRL_ENABLE);
     CHECK(s5l_clcd_active_window(&c) == CLCD_WIN_NONE,
           "the video overlay bit is not an RGB window");
+}
+
+/*
+ * A remembered window is not necessarily live scanout. Power-management paths
+ * stop the controller by clearing any of three independent gates; stale seeded
+ * pixels must not keep producing VBLs or be advertised as a running display.
+ */
+static void test_clcd_running_requires_every_scanout_gate(void) {
+    s5l_clcd_t c;
+    s5l_clcd_reset(&c);
+    c.frame_ticks = 4;
+    CHECK(s5l_clcd_seed_window0(&c, 0x0ff00000u, 320u, 480u, 1280u,
+                                CLCD_FMT_32BPP, CLCD_ORDER_BGRA),
+          "baseline seed failed");
+    CHECK(s5l_clcd_running(&c), "seeded controller is not running");
+
+    s5l_clcd_t stopped = c;
+    stopped.scanning = false;
+    CHECK(!s5l_clcd_running(&stopped), "start/stop state was ignored");
+    stopped = c;
+    stopped.ctrl &= ~CLCD_CTRL_ENABLE;
+    CHECK(!s5l_clcd_running(&stopped), "CLCD_CTRL global enable was ignored");
+    stopped = c;
+    stopped.gate &= ~1u;
+    CHECK(!s5l_clcd_running(&stopped), "VIDCON0 scanout gate was ignored");
+    CHECK(s5l_clcd_active_window(&stopped) == 0,
+          "stopping scanout must not erase the driver's remembered window");
+
+    stopped.intmask = CLCD_INT_FRAME;
+    stopped.intstatus = 0;
+    stopped.frame_accum = 0;
+    CHECK(!s5l_clcd_tick(&stopped, stopped.frame_ticks),
+          "a gated-off controller asserted an interrupt");
+    CHECK(stopped.frames == 0 && stopped.intstatus == 0,
+          "a gated-off controller advanced a frame");
 }
 
 /*
@@ -1338,6 +1426,8 @@ static void test_clcd_interrupt_reaches_the_cpu_on_line_13(void) {
     m.bus.write32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_INTSTATUS, CLCD_INT_FRAME);
     m.bus.write32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_INTMASK,
                   CLCD_INT_UNDERRUN | CLCD_INT_FRAME);
+    m.bus.write32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_CTRL, CLCD_CTRL_ENABLE);
+    m.bus.write32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_GATE, 1u);
     m.bus.write32(m.bus.ctx, S5L8900_CLCD_BASE + CLCD_ENABLE, 1);
 
     /* One guest frame of instructions at the real CPU:timebase ratio. */
@@ -1527,6 +1617,7 @@ int main(void) {
     test_clcd_seed_is_visible_to_the_guest();
     test_clcd_seed_rejects_invalid_layouts_atomically();
     test_clcd_active_window_follows_the_drivers_order();
+    test_clcd_running_requires_every_scanout_gate();
     test_clcd_scanout_reads_guest_memory();
     test_clcd_scanout_565_reaches_full_white();
     test_clcd_interrupt_reaches_the_cpu_on_line_13();

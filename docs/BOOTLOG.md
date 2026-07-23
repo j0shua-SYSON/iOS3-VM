@@ -1068,6 +1068,42 @@ CLCD status, interrupt mask, and scanning were all zero. Therefore run07 is
 absolutely not evidence that SpringBoard started or that the real display path
 works.
 
+### 2026-07-23: corrected the CLCD handoff before a display run
+
+The model had assigned the wrong meaning to one saved-register range.
+`0x0d8..0x0ec` was labeled as panel timing, but openiBoot's S5L8900 LCD setup
+uses those words as per-window auxiliary configuration pairs; `0x0e8` is also
+the update word used by `AppleH1CLCD`. The actual timing registers are
+`VIDTCON0..3` at `0x20c..0x218`.
+
+The N82 seed now represents an iBoot-compatible 320x480 handoff:
+
+```text
+VIDCON0   00000441
+VIDCON1   00000008
+VIDTCON0  00030303
+VIDTCON1  000e0e0f
+VIDTCON2  013f01df
+VIDTCON3  00000001
+```
+
+Those production values select the 54 MHz display clock divided by five,
+enable scanout, preserve inverted-VCLK polarity, encode the N82 porch/sync
+timing and 320x480 active area, and supply the final handoff word. `VIDTCON2`
+is not globally fixed: it is derived from the requested geometry, and the
+production 320x480 request yields `0x013f01df`. The initial `0x0d8`, `0x0e0`,
+and `0x0e8` window-configuration words are `0x00001000`, with their paired
+auxiliary words zero.
+
+The model also no longer equates an enabled window with a running controller.
+Frames and CLCD-derived wake events advance only when start state, `CLCD_CTRL`
+global enable, and `VIDCON0` bit 0 are all active; host publication observes
+the same invariant.
+
+This is pre-run correctness work. It has not produced a new firmware display
+trace, and it does not change run07's zero-CLCD result. There is still no
+SpringBoard frame and no proof that the real display path works.
+
 This chain is stronger evidence for sustained userspace and snapshot
 repeatability. It is **not** evidence that SpringBoard rendered. The bounded
 continuations either reached their configured caps or, for the one diagnostic
@@ -1144,8 +1180,10 @@ To be precise about *why*, since an earlier draft of this section got it wrong:
 the CLCD was already modelled — `core/src/soc/clcd.c` has tests — but this trace
 left `CLCD_CTRL == 0`. `AppleH1CLCD` is not the component that programs a display
 window; it adopts the first enabled window and wraps its pitch, base and geometry
-in the IOSurface that becomes the screen. The current CLI can seed window 0,
-patch the Merlot panel ID and capture the controller's active window. The app's
+in the IOSurface that becomes the screen. The current model can seed window 0
+with the corrected iBoot-compatible N82 timing and capture it only while all
+live-scanout gates remain active. It can also supply the Merlot panel identity.
+No real-firmware run has yet validated that combined handoff. The app's
 CoreGraphics view can display its synthetic guest's CLCD buffer, but it is not
 wired to a shared real-guest session. Touch remains separate M5 work.
 

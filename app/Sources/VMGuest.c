@@ -222,9 +222,7 @@ const uint8_t *vm_guest_display(const s5l8900_t *m,
      */
     uint32_t fb_phys = 0, w = 0, h = 0, st = 0, fmt = 0;
     uint32_t active = s5l_clcd_active_window(&m->clcd);
-    bool running = m->clcd.scanning
-                && (m->clcd.ctrl & CLCD_CTRL_ENABLE) != 0u
-                && (m->clcd.gate & 1u) != 0u;
+    bool running = s5l_clcd_running(&m->clcd);
     if (running && active != CLCD_WIN_NONE
         && s5l_clcd_window(&m->clcd, active,
                            &fb_phys, &w, &h, &st, &fmt, NULL)

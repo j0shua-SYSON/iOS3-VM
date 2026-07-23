@@ -70,7 +70,7 @@ core portable across hosts. Today the evidence is split deliberately:
 |---|---|---|
 | ARM1176 and S5L8900 execution | Real-kernel path recorded | Synthetic demo guest |
 | Apple kernel and root filesystem | Host-backed cold path reached `launchd`; run07 passed fsck, mounted `/dev/md0`, retained `mDNSResponder`, and reached a clean 2 B cap | Not integrated |
-| Display | Kernel console and CLCD capture | CoreGraphics demo bridge |
+| Display | Historical kernel-console capture; corrected CLCD register/timing and live-scanout model, but no fresh real-firmware display run | CoreGraphics demo bridge |
 | Touch, audio, guest networking | Not implemented | Not implemented |
 | Dynamic recompiler | Translator tested off-device; inactive in boot | Excluded from target |
 
@@ -234,6 +234,21 @@ firmware hashes were unchanged.
 The run07 framebuffer was disabled, and CLCD status, mask, and scanning were
 all zero. Therefore none of its additional userspace execution is evidence
 that SpringBoard started or that the real display path works.
+
+The current CLCD correctness work fixes a separate pre-run prerequisite. The
+words at offsets `0x0d8..0x0ec`, previously mislabeled as panel timings, are
+per-window auxiliary configuration; the real `VIDTCON0..3` timing registers are
+at `0x20c..0x218`. The N82 handoff now seeds the iBoot-compatible 54 MHz
+display clock divided by five, inverted-VCLK polarity, and porch/sync state.
+Active timing derives from the requested geometry; the production request is
+320x480. The initial `0x0d8`, `0x0e0`, and `0x0e8` window words are `0x1000`.
+Live scanout is reported only while all three controller gates agree:
+start/stop state, the `CLCD_CTRL` global enable, and `VIDCON0` bit 0. A
+remembered enabled window by itself is not a running display.
+
+This correction prepares a valid display experiment; it is not such an
+experiment. No fresh real-firmware run has exercised the corrected handoff, and
+it adds no SpringBoard or display-path proof to run07.
 
 That is sustained real userspace, not a completed boot. There is still no
 captured SpringBoard frame, no proof that the current userland reached the home

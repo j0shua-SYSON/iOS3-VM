@@ -407,17 +407,34 @@ void     s5l_power_write(s5l_power_t *p, uint32_t off, uint32_t val);
 #define CLCD_WIN_STRIDE  0x018u
 #define CLCD_WIN_COUNT   4u
 #define CLCD_UPDATE      0x0d4u  /* write 2 at the head of every window update */
-#define CLCD_TIMING0     0x0d8u  /* panel timing: 0x0d8,0x0dc,0x0e0,0x0e4,0x0ec */
-#define CLCD_UPDATE2     0x0e8u  /* constant 0x50001000 per update             */
-#define CLCD_TIMING4     0x0ecu
+/*
+ * Per-window auxiliary configuration pairs. openiBoot's S5L8900 LCD code
+ * writes window k at 0x0d8 + k*8 and clears the following word. 0x0e8 is also
+ * AppleH1CLCD's update word, so it is represented separately as CLCD_UPDATE2.
+ * These were once mislabeled as panel timings; the actual timing registers are
+ * VIDTCON0..3 at 0x20c..0x218.
+ */
+#define CLCD_WINCFG0     0x0d8u
+#define CLCD_UPDATE2     0x0e8u  /* 0x50001000 on AppleH1CLCD window updates  */
+#define CLCD_WINCFG2_AUX 0x0ecu
 #define CLCD_CSC_FIRST   0x1c8u  /* 8 YUV->RGB matrix regs, 0x1c8..0x1e8       */
 #define CLCD_CSC_LAST    0x1e8u
-#define CLCD_GATE        0x200u  /* clock/scanout gate, bit0                   */
-#define CLCD_STATUS      0x204u  /* read-only; see clcd.c, bits[7:6] matter    */
-#define CLCD_OPAQUE_FIRST 0x208u /* 0x208..0x218, saved/restored across sleep  */
-#define CLCD_OPAQUE_LAST  0x218u
+#define CLCD_GATE        0x200u  /* VIDCON0 clock/divisor + scanout bit 0      */
+#define CLCD_STATUS      0x204u  /* VIDCON1 polarity; bits[7:6] are live state */
+#define CLCD_UNKNOWN208  0x208u
+#define CLCD_VIDTCON0    0x20cu  /* vertical porch/sync timing                 */
+#define CLCD_VIDTCON1    0x210u  /* horizontal porch/sync timing               */
+#define CLCD_VIDTCON2    0x214u  /* active width/height minus one              */
+#define CLCD_VIDTCON3    0x218u  /* openiBoot writes 1                         */
+#define CLCD_OPAQUE_FIRST CLCD_UNKNOWN208
+#define CLCD_OPAQUE_LAST  CLCD_VIDTCON3
 #define CLCD_GAMMA0      0x400u  /* three 256-entry u32 LUTs, 0x400/0x800/0xc00 */
 #define CLCD_GAMMA_SIZE  0x400u
+
+/* openiBoot's N82 optC selects the 54 MHz display clock, divides it by five
+ * for a 10.8 MHz pixel clock, inverts VCLK, and later sets ENVID_F. */
+#define CLCD_N82_VIDCON0 0x00000441u
+#define CLCD_N82_VIDCON1 0x00000008u
 
 /*
  * Window register sub-offsets, from CLCD_WIN_FIRST + k*CLCD_WIN_STRIDE.
@@ -504,7 +521,7 @@ typedef struct {
     uint32_t video[(CLCD_VIDEO_LAST - CLCD_VIDEO_FIRST) / 4u + 1u];
     s5l_clcd_window_t win[CLCD_WIN_COUNT];
     uint32_t update, update2;
-    uint32_t timing[5];                      /* 0x0d8,0x0dc,0x0e0,0x0e4,0x0ec */
+    uint32_t wincfg_aux[5];                  /* 0x0d8,0x0dc,0x0e0,0x0e4,0x0ec */
     uint32_t csc[(CLCD_CSC_LAST - CLCD_CSC_FIRST) / 4u + 1u];
     uint32_t gate;
     uint32_t opaque[(CLCD_OPAQUE_LAST - CLCD_OPAQUE_FIRST) / 4u + 1u];
@@ -523,10 +540,18 @@ void     s5l_clcd_write(s5l_clcd_t *c, uint32_t off, uint32_t val);
  * interrupt output is asserted (status AND mask, as the hardware ANDs them). */
 bool     s5l_clcd_tick(s5l_clcd_t *c, uint32_t ticks);
 
+/* True only while pixels can actually be scanned: start has been written,
+ * CLCD_CTRL's global enable is set, and VIDCON0/gate bit 0 is set. Window
+ * enable bits are intentionally separate because callers may need to diagnose
+ * a running controller with no adoptable RGB window. */
+bool     s5l_clcd_running(const s5l_clcd_t *c);
+
 /*
- * Pre-seed the controller the way iBoot leaves it: window 0 programmed and
- * enabled over an already-running scanout. IOMobileFramebuffer::start then
- * adopts the framebuffer verbatim instead of having to invent one.
+ * Pre-seed the controller with an iBoot-compatible N82 display handoff:
+ * window 0 programmed and enabled over an already-running scanout, plus the
+ * clock and 320x480 porch/sync registers that openiBoot records for this panel.
+ * IOMobileFramebuffer::start then adopts the framebuffer verbatim instead of
+ * having to invent one.
  *
  * `format` is a CLCD_FMT_* value and `order` a CLCD_ORDER_* value; `stride` is
  * in bytes. This is a host-side call, not a guest-visible register: a boot stub

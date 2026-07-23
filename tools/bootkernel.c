@@ -342,7 +342,7 @@ static bool boot_option_takes_value(const char *option) {
     static const char *const options[] = {
         "-D", "-W", "-Z", "-p", "--restore", "-V", "-n", "-T",
         "-d", "-c", "-b", "-w", "-r", "--fstab", "--grow", "-R",
-        "-X"
+        "-X", "-H"
     };
 
     if (!option) return false;
@@ -1129,6 +1129,41 @@ static bool dt_set_u32(uint8_t *b, size_t len, const char *path,
     return true;
 }
 
+/*
+ * A path lookup alone is not enough for /arm-io/spi0/lcd0: the 7E18 tree has
+ * two siblings with the same name.  dtn_path() deliberately returns the first,
+ * which is the Merlot panel in the stock tree, but silently writing whichever
+ * duplicate happens to come first would corrupt a different device if the
+ * template order ever changed.  Require one exact, bounded C string before the
+ * panel-specific patch.  A compatible string list, missing terminator, prefix,
+ * or trailing bytes all fail closed.
+ */
+static bool dt_node_compatible_exact(uint8_t *b, size_t len, const char *path,
+                                     const char *expected) {
+    size_t node = dtn_path(b, len, path);
+    if (node == DT_NONE) {
+        printf("  dt: node /%-22s NOT FOUND (checking compatible)\n", path);
+        return false;
+    }
+
+    uint32_t vl = 0;
+    const uint8_t *p = dtn_prop(b, len, node, "compatible", &vl);
+    size_t expected_n = strlen(expected) + 1u;
+    if (!p) {
+        printf("  dt: /%s:compatible NOT FOUND\n", path);
+        return false;
+    }
+    if ((size_t)vl != expected_n || p[expected_n - 1u] != '\0' ||
+        memchr(p, '\0', expected_n - 1u) != NULL ||
+        memcmp(p, expected, expected_n - 1u) != 0) {
+        printf("  dt: /%s:compatible is not exact \"%s\" "
+               "(length %u; refusing panel-specific patch)\n",
+               path, expected, vl);
+        return false;
+    }
+    return true;
+}
+
 /* Overwrite two consecutive 32-bit cells (an 8-byte "reg" entry) in place. */
 static bool dt_set_reg(uint8_t *b, size_t len, const char *path,
                        const char *prop, uint32_t base, uint32_t size) {
@@ -1374,6 +1409,95 @@ static bool guest_fetch_bytes(uint32_t va, uint8_t *out, size_t n,
         out[i] = g_mach->ram[(size_t)off];
     }
     return true;
+}
+
+/*
+ * A lifecycle pathname is a USER virtual address, not a physical address and
+ * not part of the kernel's fixed linear window.  Copy it while the caller's
+ * TTBR0 is still live at _fleh_swi entry. Translate every byte: ARMv6 small
+ * pages can apply different access permissions to their four 1 KiB subpages,
+ * so one translation per 4 KiB page would not be fail-closed. The copy is
+ * bounded to 256 bytes, making the extra diagnostic work negligible.
+ *
+ * The result is fail-closed: PATH_OK means a NUL was actually observed inside
+ * the fixed bound.  Every other status leaves a terminated diagnostic prefix
+ * but that prefix must never be treated as a pathname or used for detection.
+ */
+#define LIFECYCLE_PATH_MAX 256u
+
+typedef enum {
+    LIFECYCLE_PATH_NONE = 0,
+    LIFECYCLE_PATH_OK,
+    LIFECYCLE_PATH_NULL,
+    LIFECYCLE_PATH_UNMAPPED,
+    LIFECYCLE_PATH_NON_RAM,
+    LIFECYCLE_PATH_WRAP,
+    LIFECYCLE_PATH_NO_NUL,
+    LIFECYCLE_PATH_INTERNAL
+} lifecycle_path_status_t;
+
+static lifecycle_path_status_t
+guest_copy_user_cstr(arm_cpu_t *cpu, uint32_t va,
+                     char out[LIFECYCLE_PATH_MAX + 1u],
+                     uint16_t *length, uint32_t *failure_va,
+                     uint32_t *failure_fsr) {
+    size_t copied = 0;
+
+    if (length) *length = 0;
+    if (failure_va) *failure_va = 0;
+    if (failure_fsr) *failure_fsr = 0;
+    if (!out) return LIFECYCLE_PATH_INTERNAL;
+    out[0] = '\0';
+    if (!cpu || !g_mach || !g_mach->ram) return LIFECYCLE_PATH_INTERNAL;
+    if (!va) return LIFECYCLE_PATH_NULL;
+
+    while (copied < LIFECYCLE_PATH_MAX) {
+        uint64_t current64 = (uint64_t)va + copied;
+        if (current64 > UINT32_MAX) {
+            if (failure_va) *failure_va = UINT32_MAX;
+            out[copied] = '\0';
+            if (length) *length = (uint16_t)copied;
+            return LIFECYCLE_PATH_WRAP;
+        }
+
+        uint32_t current = (uint32_t)current64;
+        uint32_t pa = 0;
+        uint32_t fsr = arm_mmu_translate(cpu, current, ARM_ACCESS_READ,
+                                         false, &pa);
+        if (fsr) {
+            if (failure_va) *failure_va = current;
+            if (failure_fsr) *failure_fsr = fsr;
+            out[copied] = '\0';
+            if (length) *length = (uint16_t)copied;
+            return LIFECYCLE_PATH_UNMAPPED;
+        }
+        if (pa < g_mach->ram_base) {
+            if (failure_va) *failure_va = current;
+            out[copied] = '\0';
+            if (length) *length = (uint16_t)copied;
+            return LIFECYCLE_PATH_NON_RAM;
+        }
+
+        uint64_t off = (uint64_t)pa - g_mach->ram_base;
+        if (off >= g_mach->ram_size) {
+            if (failure_va) *failure_va = current;
+            out[copied] = '\0';
+            if (length) *length = (uint16_t)copied;
+            return LIFECYCLE_PATH_NON_RAM;
+        }
+
+        uint8_t byte = g_mach->ram[(size_t)off];
+        if (!byte) {
+            out[copied] = '\0';
+            if (length) *length = (uint16_t)copied;
+            return LIFECYCLE_PATH_OK;
+        }
+        out[copied++] = (char)byte;
+    }
+
+    out[copied] = '\0';
+    if (length) *length = (uint16_t)copied;
+    return LIFECYCLE_PATH_NO_NUL;
 }
 
 /* Print the C string at a guest address, escaped, or say why we cannot. */
@@ -1651,6 +1775,41 @@ static const char *MILE_BYNAME[] = {
 static milestone_t MILE[NMILE_MAX];
 static unsigned    NM;
 
+#define LIFECYCLE_CAP 256u
+#define DEFAULT_HOT_PAGE UINT32_C(0x39a00000)
+
+#define H1_DISPLAY_VM_BASE UINT32_C(0xc0703000)
+#define H1_DISPLAY_VM_SIZE UINT32_C(0x0000a000)
+#define MERLOT_LCD_VM_BASE UINT32_C(0xc0650000)
+#define MERLOT_LCD_VM_SIZE UINT32_C(0x00004000)
+
+typedef enum {
+    LIFECYCLE_SYSCALL = 1,
+    LIFECYCLE_EXIT1,
+    LIFECYCLE_PSIGNAL
+} lifecycle_kind_t;
+
+typedef struct {
+    uint64_t at;
+    uint32_t kind;
+    uint32_t syscall_number;
+    uint32_t raw_r12;
+    uint32_t user_pc;
+    uint32_t user_lr;
+    uint32_t spsr;
+    uint32_t args[4];             /* logical args; indirect SYS_syscall shifted */
+    uint32_t arg_count;
+    uint32_t path_va;
+    uint32_t path_failure_va;
+    uint32_t path_failure_fsr;
+    uint16_t path_length;
+    uint8_t  path_status;
+    bool     springboard_exact;
+    bool     indirect;
+    bool     user_pc_valid;
+    char     path[LIFECYCLE_PATH_MAX + 1u];
+} lifecycle_event_t;
+
 static struct {
     /* bus interposition */
     arm_bus_t   inner;              /* the machine's original callbacks */
@@ -1698,6 +1857,25 @@ static struct {
     unsigned    sc_n;
     uint64_t    sc_dropped;
     struct { uint64_t at; uint32_t r12, r[4], lr, spsr; } sc[512];
+
+    /* --- PROCESS LIFECYCLE, NEVER A SATURATING FIRST-N TABLE ---------------
+     * The generic syscall list above intentionally preserves its historical
+     * first-512 semantics.  Exec/spawn/exit/fork/wait/signal evidence needs the
+     * opposite property during a long boot: retain the newest events forever.
+     * This ring overwrites only its oldest slot and reports the overwrite count.
+     * User pathnames are copied through the live MMU at SWI entry; no retained
+     * user VA is dereferenced after its address space may have disappeared. */
+    uint64_t    lifecycle_total;
+    uint64_t    lifecycle_path_failures;
+    lifecycle_event_t lifecycle[LIFECYCLE_CAP];
+    uint64_t    springboard_attempts;
+    uint64_t    springboard_first_at;
+    uint64_t    springboard_last_at;
+
+    /* Exact, every-instruction-entry display-driver coverage. Physical pre-MMU
+     * PCs are folded through the selected phys/virt bases before two checks. */
+    struct { uint64_t hits, first_at, last_at; } h1_display_exec;
+    struct { uint64_t hits, first_at, last_at; } merlot_exec;
 
     /* IRQ entries, for the same reason FIQ entries are counted. */
     uint64_t    irq_n;
@@ -1771,9 +1949,106 @@ static struct {
     struct { uint64_t at; uint32_t pc, lr, addr, val; bool wr; } hot_tail[64];
     uint64_t    hot_bucket[40];          /* when, over the whole run */
     uint64_t    hot_steps;               /* run length, for bucket scaling */
+    uint32_t    hot_page;                /* selected physical page; -H */
 } G;
 
-#define HOTPG 0x39a00000u
+static lifecycle_event_t *lifecycle_begin(uint64_t at,
+                                          lifecycle_kind_t kind) {
+    unsigned slot = (unsigned)(G.lifecycle_total % LIFECYCLE_CAP);
+    lifecycle_event_t *event = &G.lifecycle[slot];
+    memset(event, 0, sizeof *event);
+    G.lifecycle_total++;
+    event->at = at;
+    event->kind = (uint32_t)kind;
+    return event;
+}
+
+static bool lifecycle_syscall_tracked(uint32_t number) {
+    switch (number) {
+    case 1:                         /* exit */
+    case 2:                         /* fork */
+    case 7:                         /* wait4 */
+    case 37:                        /* kill */
+    case 59:                        /* execve */
+    case 66:                        /* vfork */
+    case 173:                       /* waitid */
+    case 244:                       /* posix_spawn */
+    case 380:                       /* __mac_execve in xnu-1456.1.26 */
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * xnu-1456.1.26 bsd/kern/syscalls.master defines execve's pathname as arg 0,
+ * posix_spawn's pathname as arg 1 (arg 0 is pid_t *), and __mac_execve's as
+ * arg 0.  For SYS_syscall (r12 == 0), r0 is the real number and the logical
+ * argument array begins at r1.
+ */
+static void lifecycle_note_syscall(arm_cpu_t *cpu, uint64_t at) {
+    if (!cpu) return;
+
+    int32_t raw = (int32_t)cpu->r[12];
+    if (raw < 0) return;                  /* Mach trap, not a BSD lifecycle call */
+    bool indirect = raw == 0;
+    uint32_t number = indirect ? cpu->r[0] : (uint32_t)raw;
+    if (!lifecycle_syscall_tracked(number)) return;
+
+    lifecycle_event_t *event = lifecycle_begin(at, LIFECYCLE_SYSCALL);
+    event->syscall_number = number;
+    event->raw_r12 = cpu->r[12];
+    event->spsr = cpu->spsr[ARM_BANK_SVC];
+    event->user_lr = cpu->r[14];
+    event->indirect = indirect;
+    unsigned shift = indirect ? 1u : 0u;
+    event->arg_count = 4u - shift;
+    for (unsigned i = 0; i < event->arg_count; i++)
+        event->args[i] = cpu->r[i + shift];
+
+    uint32_t return_bytes = (event->spsr & ARM_CPSR_T) ? 2u : 4u;
+    event->user_pc_valid = cpu->r[14] >= return_bytes;
+    if (event->user_pc_valid) event->user_pc = cpu->r[14] - return_bytes;
+
+    int path_arg = -1;
+    if (number == 59u || number == 380u) path_arg = 0;
+    else if (number == 244u) path_arg = 1;
+    if (path_arg < 0) return;
+
+    if ((unsigned)path_arg >= event->arg_count) {
+        event->path_status = LIFECYCLE_PATH_INTERNAL;
+        G.lifecycle_path_failures++;
+        return;
+    }
+    event->path_va = event->args[path_arg];
+    event->path_status = (uint8_t)guest_copy_user_cstr(
+        cpu, event->path_va, event->path, &event->path_length,
+        &event->path_failure_va, &event->path_failure_fsr);
+    if (event->path_status != LIFECYCLE_PATH_OK) {
+        G.lifecycle_path_failures++;
+        return;
+    }
+
+    static const char springboard[] =
+        "/System/Library/CoreServices/SpringBoard.app/SpringBoard";
+    if (event->path_length == sizeof(springboard) - 1u &&
+        !memcmp(event->path, springboard, sizeof(springboard) - 1u)) {
+        event->springboard_exact = true;
+        if (!G.springboard_attempts) G.springboard_first_at = at;
+        G.springboard_last_at = at;
+        G.springboard_attempts++;
+    }
+}
+
+/* xnu-1456.1.26 kern_exit.c: exit1(proc_t, int rv, int *retval).
+ * kern_sig.c: psignal(proc_t, int signum). */
+static void lifecycle_note_kernel_entry(arm_cpu_t *cpu, uint64_t at,
+                                        lifecycle_kind_t kind) {
+    if (!cpu || (kind != LIFECYCLE_EXIT1 && kind != LIFECYCLE_PSIGNAL)) return;
+    lifecycle_event_t *event = lifecycle_begin(at, kind);
+    event->arg_count = kind == LIFECYCLE_EXIT1 ? 3u : 2u;
+    for (unsigned i = 0; i < event->arg_count; i++) event->args[i] = cpu->r[i];
+}
 
 /* Attribute one sample to an exact PC. Cheap: no name is resolved here, only
  * at report time. */
@@ -1892,7 +2167,7 @@ static void spy(uint32_t addr, uint32_t val, unsigned bytes, bool wr) {
     if (is_ram(addr, bytes)) return;
     uint32_t pc = G.mach->cpu.r[15];
     note_dev_page(addr, pc, wr);
-    if ((addr & ~0xfffu) == HOTPG) note_hot(addr, val, bytes, wr);
+    if ((addr & ~0xfffu) == G.hot_page) note_hot(addr, val, bytes, wr);
     if ((addr & ~0xfffu) == UARTPG) {
         G.uart_hits++;
         if (G.uart_log_n < 64) {
@@ -1919,10 +2194,12 @@ static void sw32(void *c, uint32_t a, uint32_t v) {
 static void sw16(void *c, uint32_t a, uint16_t v) { spy(a, v, 2, true); G.inner.write16(c, a, v); }
 static void sw8 (void *c, uint32_t a, uint8_t  v) { spy(a, v, 1, true); G.inner.write8 (c, a, v); }
 
-static void spy_install(s5l8900_t *m, uint32_t virt_base, uint32_t phys_base) {
+static void spy_install(s5l8900_t *m, uint32_t virt_base, uint32_t phys_base,
+                        uint32_t hot_page) {
     memset(&G, 0, sizeof G);
     G.mach  = m;
     G.inner = m->bus;
+    G.hot_page = hot_page;
     m->bus.read32 = sr32; m->bus.read16 = sr16; m->bus.read8 = sr8;
     m->bus.write32 = sw32; m->bus.write16 = sw16; m->bus.write8 = sw8;
     for (unsigned i = 0; i < NM; i++)
@@ -2039,7 +2316,9 @@ static const trapname_t BSD_SYSCALL[] = {
     {360,"bsdthread_create"},{361,"bsdthread_terminate"},{362,"kqueue"},
     {363,"kevent"},{364,"lchown"},{365,"stack_snapshot"},
     {366,"bsdthread_register"},{367,"workq_open"},{368,"workq_ops"},
-    {371,"__mac_execve"},{372,"__mac_syscall"},{380,"__mac_execve"},
+    {369,"kevent64"},{370,"__old_semwait_signal"},
+    {371,"__old_semwait_signal_nocancel"},{372,"thread_selfid"},
+    {380,"__mac_execve"},{381,"__mac_syscall"},
     {396,"read_nocancel"},{397,"write_nocancel"},{398,"open_nocancel"},
     {399,"close_nocancel"},{407,"fcntl_nocancel"},{408,"select_nocancel"},
     {409,"fsync_nocancel"},{412,"sigsuspend_nocancel"},
@@ -2108,20 +2387,223 @@ static void syscall_report(uint32_t virt_base, uint32_t phys_base) {
                i, G.sc[i].at, num, nm,
                G.sc[i].r[0], G.sc[i].r[1], G.sc[i].r[2], G.sc[i].r[3],
                upc, thumb ? "Thumb" : "ARM", G.sc[i].spsr);
-        /* An argument that points at a readable string is almost always the
-         * path/name the call is about, and is the single most useful field. */
-        for (unsigned a = 0; a < 4; a++) {
-            const uint8_t *p = guest_ptr(G.sc[i].r[a], 4);
-            if (!p) continue;
-            unsigned printable = 0;
-            for (unsigned q = 0; q < 8 && p[q]; q++)
-                printable += (p[q] >= 0x20 && p[q] < 0x7f);
-            if (printable >= 4) {
-                char lbl[24]; snprintf(lbl, sizeof lbl, "       arg%u", a);
-                print_guest_str(lbl, G.sc[i].r[a]);
+    }
+    printf("    User pathname arguments are decoded only in the lifecycle ring below,\n"
+           "    through the live caller MMU at SWI entry. Raw user VAs are never\n"
+           "    dereferenced here after their address space may have changed.\n");
+}
+
+static const char *lifecycle_path_status_name(unsigned status) {
+    switch ((lifecycle_path_status_t)status) {
+    case LIFECYCLE_PATH_NONE:       return "not-applicable";
+    case LIFECYCLE_PATH_OK:         return "complete";
+    case LIFECYCLE_PATH_NULL:       return "null-pointer";
+    case LIFECYCLE_PATH_UNMAPPED:   return "unmapped-or-denied";
+    case LIFECYCLE_PATH_NON_RAM:    return "maps-outside-guest-ram";
+    case LIFECYCLE_PATH_WRAP:       return "address-wrap";
+    case LIFECYCLE_PATH_NO_NUL:     return "no-nul-within-256-bytes";
+    case LIFECYCLE_PATH_INTERNAL:   return "diagnostic-internal-error";
+    default:                        return "unknown";
+    }
+}
+
+static void lifecycle_print_escaped(const char *bytes, size_t length) {
+    putchar('"');
+    for (size_t i = 0; i < length; i++) {
+        uint8_t c = (uint8_t)bytes[i];
+        if (c == '\\') printf("\\\\");
+        else if (c == '"') printf("\\\"");
+        else if (c == '\n') printf("\\n");
+        else if (c == '\r') printf("\\r");
+        else if (c == '\t') printf("\\t");
+        else if (c >= 0x20 && c < 0x7f) putchar((char)c);
+        else printf("\\x%02x", c);
+    }
+    putchar('"');
+}
+
+static void lifecycle_report(void) {
+    uint64_t retained = G.lifecycle_total < LIFECYCLE_CAP
+                      ? G.lifecycle_total : LIFECYCLE_CAP;
+    uint64_t first_sequence = G.lifecycle_total - retained;
+
+    printf("\n=== PROCESS LIFECYCLE (circular, live-entry evidence) ===\n");
+    printf("    total events: %" PRIu64 "; retained newest: %" PRIu64,
+           G.lifecycle_total, retained);
+    if (first_sequence)
+        printf("; overwritten oldest: %" PRIu64, first_sequence);
+    printf("\n");
+    printf("    pathname copy failures: %" PRIu64
+           " (bounded prefixes below are never treated as paths)\n",
+           G.lifecycle_path_failures);
+
+    if (!retained) {
+        printf("    NONE - no tracked lifecycle syscall, _exit1, or _psignal "
+               "entry was observed\n");
+    }
+
+    for (uint64_t sequence = first_sequence;
+         sequence < G.lifecycle_total; sequence++) {
+        const lifecycle_event_t *event =
+            &G.lifecycle[(unsigned)(sequence % LIFECYCLE_CAP)];
+
+        if (event->kind == LIFECYCLE_SYSCALL) {
+            char unknown[48];
+            const char *name = trapname(
+                BSD_SYSCALL,
+                (unsigned)(sizeof BSD_SYSCALL / sizeof BSD_SYSCALL[0]),
+                event->syscall_number);
+            if (!name) {
+                snprintf(unknown, sizeof unknown, "bsd_syscall #%u",
+                         event->syscall_number);
+                name = unknown;
             }
+            printf("    #%-6" PRIu64 " @%-11" PRIu64
+                   " syscall %-3u %-20s (raw r12 %d%s)\n",
+                   sequence, event->at, event->syscall_number, name,
+                   (int32_t)event->raw_r12,
+                   event->indirect ? ", indirect" : "");
+            printf("             args");
+            for (unsigned i = 0; i < event->arg_count; i++)
+                printf(" a%u=%08x", i, event->args[i]);
+            printf("\n");
+            if (event->user_pc_valid)
+                printf("             user pc %08x (%s, spsr %08x)\n",
+                       event->user_pc,
+                       (event->spsr & ARM_CPSR_T) ? "Thumb" : "ARM",
+                       event->spsr);
+            else
+                printf("             user pc INVALID (lr %08x, %s, spsr %08x)\n",
+                       event->user_lr,
+                       (event->spsr & ARM_CPSR_T) ? "Thumb" : "ARM",
+                       event->spsr);
+
+            if (event->path_status != LIFECYCLE_PATH_NONE) {
+                printf("             path va %08x: %s; %s ",
+                       event->path_va,
+                       lifecycle_path_status_name(event->path_status),
+                       event->path_status == LIFECYCLE_PATH_OK
+                           ? "path" : "bounded prefix");
+                lifecycle_print_escaped(event->path, event->path_length);
+                if (event->path_status == LIFECYCLE_PATH_UNMAPPED)
+                    printf(" (failed va %08x fsr %08x)",
+                           event->path_failure_va, event->path_failure_fsr);
+                else if (event->path_status == LIFECYCLE_PATH_NON_RAM ||
+                         event->path_status == LIFECYCLE_PATH_WRAP)
+                    printf(" (failed va %08x)", event->path_failure_va);
+                printf("\n");
+            }
+            if (event->springboard_exact)
+                printf("             EXACT SPRINGBOARD PATHNAME AT SYSCALL "
+                       "ENTRY: ATTEMPT ONLY; success is NOT inferred\n");
+        } else if (event->kind == LIFECYCLE_EXIT1) {
+            printf("    #%-6" PRIu64 " @%-11" PRIu64
+                   " _exit1 proc=%08x rv/status=%08x retval*=%08x\n",
+                   sequence, event->at, event->args[0], event->args[1],
+                   event->args[2]);
+        } else if (event->kind == LIFECYCLE_PSIGNAL) {
+            printf("    #%-6" PRIu64 " @%-11" PRIu64
+                   " _psignal proc=%08x signal=%u (0x%08x)\n",
+                   sequence, event->at, event->args[0], event->args[1],
+                   event->args[1]);
+        } else {
+            printf("    #%-6" PRIu64 " @%-11" PRIu64
+                   " UNKNOWN lifecycle event kind %u\n",
+                   sequence, event->at, event->kind);
         }
     }
+
+    if (G.springboard_attempts) {
+        printf("    SpringBoard exact-path attempts: %" PRIu64
+               " (first @%" PRIu64 ", last @%" PRIu64 ")\n",
+               G.springboard_attempts, G.springboard_first_at,
+               G.springboard_last_at);
+        printf("    IMPORTANT: this proves only that exec/spawn was attempted "
+               "with the exact stock pathname.\n"
+               "               It does NOT prove syscall success, process "
+               "execution, rendering, or SpringBoard reach.\n");
+    } else {
+        printf("    SpringBoard exact-path attempts: 0\n");
+    }
+}
+
+static bool display_physical_alias(uint32_t vm_base, uint32_t vm_size,
+                                   uint32_t virt_base, uint32_t phys_base,
+                                   uint32_t ram_size, uint32_t *pa_out) {
+    if (vm_base < virt_base) return false;
+    uint64_t offset = (uint64_t)vm_base - virt_base;
+    uint64_t pa = (uint64_t)phys_base + offset;
+    if (offset + vm_size > ram_size ||
+        pa + vm_size > (uint64_t)UINT32_MAX + 1u) return false;
+    if (pa_out) *pa_out = (uint32_t)pa;
+    return true;
+}
+
+/*
+ * A low numeric PC is not automatically the physical alias of a high kernel
+ * address: once the MMU is enabled, userspace can legitimately execute anywhere
+ * in the same numeric aperture as DRAM. Only accept a physical alias before the
+ * MMU is on; otherwise diagnostics could turn an unrelated user PC into a false
+ * kernel, kext, lifecycle, or SpringBoard milestone.
+ */
+static bool pc_matches_vm_or_pre_mmu_alias(const arm_cpu_t *cpu, uint32_t pc,
+                                           uint32_t vm_pc, uint32_t pa_pc) {
+    pc &= ~1u;
+    if (pc == (vm_pc & ~1u)) return true;
+    return cpu && !(cpu->cp15.sctlr & ARM_SCTLR_M) &&
+           pc == (pa_pc & ~1u);
+}
+
+static bool pc_in_vm_or_pre_mmu_alias(const arm_cpu_t *cpu, uint32_t pc,
+                                      uint32_t vm_base, uint32_t size,
+                                      bool pa_valid, uint32_t pa_base) {
+    pc &= ~1u;
+    if ((uint32_t)(pc - vm_base) < size) return true;
+    return cpu && !(cpu->cp15.sctlr & ARM_SCTLR_M) && pa_valid &&
+           (uint32_t)(pc - pa_base) < size;
+}
+
+static void display_exec_report(uint32_t virt_base, uint32_t phys_base,
+                                uint32_t ram_size) {
+    uint32_t h1_pa = 0, merlot_pa = 0;
+    bool h1_alias = display_physical_alias(
+        H1_DISPLAY_VM_BASE, H1_DISPLAY_VM_SIZE,
+        virt_base, phys_base, ram_size, &h1_pa);
+    bool merlot_alias = display_physical_alias(
+        MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_SIZE,
+        virt_base, phys_base, ram_size, &merlot_pa);
+
+    printf("\n=== DISPLAY DRIVER EXECUTION "
+           "(exact observed instruction-entry PCs) ===\n");
+    printf("    AppleH1DisplayDrivers vm %08x..%08x",
+           H1_DISPLAY_VM_BASE, H1_DISPLAY_VM_BASE + H1_DISPLAY_VM_SIZE);
+    if (h1_alias)
+        printf(", physical alias %08x..%08x\n",
+               h1_pa, h1_pa + H1_DISPLAY_VM_SIZE);
+    else
+        printf(", no valid physical alias in the selected DRAM mapping\n");
+    if (G.h1_display_exec.hits)
+        printf("        hits %" PRIu64 " first @%" PRIu64 " last @%" PRIu64 "\n",
+               G.h1_display_exec.hits, G.h1_display_exec.first_at,
+               G.h1_display_exec.last_at);
+    else
+        printf("        hits 0 (no observed instruction-entry PC in the "
+               "applicable range%s)\n", h1_alias ? "s" : "");
+
+    printf("    AppleMerlotLCD       vm %08x..%08x",
+           MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_BASE + MERLOT_LCD_VM_SIZE);
+    if (merlot_alias)
+        printf(", physical alias %08x..%08x\n",
+               merlot_pa, merlot_pa + MERLOT_LCD_VM_SIZE);
+    else
+        printf(", no valid physical alias in the selected DRAM mapping\n");
+    if (G.merlot_exec.hits)
+        printf("        hits %" PRIu64 " first @%" PRIu64 " last @%" PRIu64 "\n",
+               G.merlot_exec.hits, G.merlot_exec.first_at,
+               G.merlot_exec.last_at);
+    else
+        printf("        hits 0 (no observed instruction-entry PC in the "
+               "applicable range%s)\n", merlot_alias ? "s" : "");
 }
 
 /*
@@ -2243,12 +2725,28 @@ static arm_svc_result_t external_md_svc_handler(void *context,
     return result;
 }
 
+static bool framebuffer_invalidate_output(const char *why) {
+    static const char path[] = "firmware/screen.ppm";
+    FILE *output = fopen(path, "wb");
+    if (!output) {
+        perror("framebuffer: cannot invalidate firmware/screen.ppm");
+        return false;
+    }
+    if (fclose(output) != 0) {
+        perror("framebuffer: cannot close invalidated firmware/screen.ppm");
+        return false;
+    }
+    printf("framebuffer: %s; %s is now intentionally empty\n", why, path);
+    return true;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
             "usage: %s <kernel.macho> [-p <physbase>] [-V <virtbase>] [-n <steps>]\n"
             "          [-d <devicetree.bin>] [-c <cmdline>] [-a] [-M] [-F] [-g]\n"
             "          [-r <ramdisk.img>] [-R <ram-MB>] [-X phys|virt|<addr>]\n"
+            "          [-H <4-KiB-aligned-physical-page>]\n"
             "          [--external-md <immutable-source.img> <new-work.img>]\n"
             "          [-D <node/path>:<prop>=<value>] ...\n"
             "          [--snapshot-at <insn> <file>] ... [--restore <file>]\n"
@@ -2326,8 +2824,8 @@ int main(int argc, char **argv) {
             "      the default), or a literal address to use as a sentinel\n"
             "  -b  boot_args Revision field (default 1)\n"
             "  -M  do not synthesise /memory reg from the RAM layout\n"
-            "  -F  reserve a 320x480x32 Boot_Video buffer, seed CLCD window 0\n"
-            "      exactly as iBoot leaves it, and patch the N82 Merlot panel\n"
+            "  -F  reserve a 320x480x32 Boot_Video buffer, seed an iBoot-\n"
+            "      compatible N82 CLCD handoff, and patch the Merlot panel\n"
             "      ID when -d is present. v_display stays 0 so the kernel can\n"
             "      draw boot text; remove serial=1 from -c to route it there.\n"
             "  -g  graphics experiment: implies -F, sets v_display=1, and\n"
@@ -2338,6 +2836,8 @@ int main(int argc, char **argv) {
             "      stall; a window that starts after the last milestone\n"
             "      characterises what is actually spinning.\n"
             "  -Z  <n> print pc/mode/symbol every n instructions\n"
+            "  -H  select the 4 KiB-aligned physical page traced by the bounded\n"
+            "      hot-page diagnostics (default 0x39a00000)\n"
             "  -T  how many trace lines to print at the first data abort\n"
             "  -K  disable the post-load kernel patches (see the kpatch table)\n",
             stderr);
@@ -2345,6 +2845,7 @@ int main(int argc, char **argv) {
     }
     uint32_t phys_base = S5L8900_SDRAM_BASE;
     uint32_t virt_base = 0xc0000000u;
+    uint32_t hot_page = DEFAULT_HOT_PAGE;
     uint64_t steps = UINT64_C(2000000);
     const char *dtpath = NULL;
     const char *cmdline = "debug=0x8 serial=1";
@@ -2478,8 +2979,11 @@ int main(int argc, char **argv) {
     /* -W <lo>[:<hi>] profile window, -Z <n> heartbeat. Defaults are "the whole
      * run" and "silent", so neither changes an existing invocation. */
     uint64_t win_lo = 0, win_hi = UINT64_MAX, heartbeat = 0;
-    /* Filled once the symbol table is loaded; 0 disables syscall capture. */
+    /* Filled once the symbol table is loaded; 0 disables the corresponding
+     * live-entry capture. */
     uint32_t fleh_swi_va = 0, fleh_swi_pa = 0;
+    uint32_t exit1_va = 0, exit1_pa = 0;
+    uint32_t psignal_va = 0, psignal_pa = 0;
 
     /* -D <path>:<prop>=<value> overrides / adds a device-tree patch, so the
      * frequencies can be probed from the shell instead of by rebuilding. */
@@ -2607,6 +3111,15 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "-p")) {
             if (!parse_u32_arg("-p", argv[++i], &phys_base)) return 1;
+        }
+        else if (!strcmp(argv[i], "-H")) {
+            if (!parse_u32_arg("-H", argv[++i], &hot_page)) return 1;
+            if (hot_page & 0xfffu) {
+                fprintf(stderr,
+                        "-H: physical page must be 4 KiB aligned "
+                        "(low 12 bits zero)\n");
+                return 1;
+            }
         }
         else if (!strcmp(argv[i], "--restore")) restore_path = argv[++i];
         else if (!strcmp(argv[i], "-V")) {
@@ -2809,7 +3322,11 @@ int main(int argc, char **argv) {
      * symbol table rather than the transcribed milestone so a different kernel
      * build cannot silently point the probe at the wrong code. */
     fleh_swi_va = ksym_value("_fleh_swi") & ~1u;
-    fleh_swi_pa = fleh_swi_va - virt_base + phys_base;
+    if (fleh_swi_va) fleh_swi_pa = fleh_swi_va - virt_base + phys_base;
+    exit1_va = ksym_value("_exit1") & ~1u;
+    if (exit1_va) exit1_pa = exit1_va - virt_base + phys_base;
+    psignal_va = ksym_value("_psignal") & ~1u;
+    if (psignal_va) psignal_pa = psignal_va - virt_base + phys_base;
     if (want_kextmap) {
         printf("\n");
         dump_kext_map();
@@ -3441,10 +3958,14 @@ int main(int argc, char **argv) {
             dt_set_u32(dt, dt_n, DT_PATCH[i].path, DT_PATCH[i].prop, DT_PATCH[i].val);
         /* The IPSW tree carries zero here because iBoot replaces it with the
          * three-byte ID read from the Syrah panel. Merlot rejects zero before
-         * it reaches the target-specific calibration path. */
+         * it reaches the target-specific calibration path. The parent has two
+         * lcd0 children, so never trust the duplicate name without checking the
+         * resolved node's exact compatible string first. */
         if (want_fb &&
-            !dt_set_u32(dt, dt_n, "arm-io/spi0/lcd0", "lcd-panel-id",
-                        N82_LCD_PANEL_ID)) {
+            (!dt_node_compatible_exact(dt, dt_n, "arm-io/spi0/lcd0",
+                                       "lcd,merlot") ||
+             !dt_set_u32(dt, dt_n, "arm-io/spi0/lcd0", "lcd-panel-id",
+                         N82_LCD_PANEL_ID))) {
             fprintf(stderr,
                     "framebuffer: cannot patch the N82 lcd-panel-id; "
                     "refusing a half-configured display\n");
@@ -3689,7 +4210,7 @@ int main(int argc, char **argv) {
     mach.cpu.r[0]  = ba_pa;            /* XNU takes boot_args in r0 */
 
     /* Interpose on the bus so every non-RAM access is attributed to a PC. */
-    spy_install(&mach, virt_base, phys_base);
+    spy_install(&mach, virt_base, phys_base, hot_page);
 
     if (external_md) {
         external_block_adapter = file_block_create();
@@ -3829,6 +4350,12 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    /* A failed or stopped run must not leave the prior run's valid PPM looking
+     * like fresh evidence.  Truncate only after setup/restore preflight has
+     * succeeded, but before the first guest instruction can retire. */
+    if (want_fb &&
+        !framebuffer_invalidate_output("invalidated before guest execution"))
+        return 1;
     if (!save_due_snapshots(&mach, snaps, nsnaps)) return 4;
 
     /*
@@ -3886,6 +4413,13 @@ int main(int argc, char **argv) {
     bool have_first_abort = false, have_first_exc = false;
     bool guest_fatal_entry_seen = false;
     uint32_t abort_dfar = 0, abort_dfsr = 0;
+    uint32_t h1_display_pa = 0, merlot_display_pa = 0;
+    bool h1_display_pa_valid = display_physical_alias(
+        H1_DISPLAY_VM_BASE, H1_DISPLAY_VM_SIZE,
+        virt_base, phys_base, ram_size, &h1_display_pa);
+    bool merlot_display_pa_valid = display_physical_alias(
+        MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_SIZE,
+        virt_base, phys_base, ram_size, &merlot_display_pa);
 
     G.hot_steps = steps;
     for (; n < steps; n++) {
@@ -3903,10 +4437,32 @@ int main(int argc, char **argv) {
         {
             uint32_t p = last_pc & ~1u;
             for (unsigned i = 0; i < NM; i++) {
-                if (p != (MILE[i].va & ~1u) && p != (G.mile_pa[i] & ~1u)) continue;
+                if (!pc_matches_vm_or_pre_mmu_alias(
+                        &mach.cpu, p, MILE[i].va, G.mile_pa[i])) continue;
                 if (!G.mile_hits[i]) G.mile_first[i] = n;
                 G.mile_hits[i]++;
                 break;
+            }
+
+            /*
+             * Exact instruction-entry display-driver coverage, not the 1/1024
+             * profile below. A physical alias counts only before the MMU is on:
+             * with translation active, a low PC can be unrelated userspace in
+             * the same numeric aperture and must not become false kext proof.
+             */
+            if (pc_in_vm_or_pre_mmu_alias(
+                    &mach.cpu, p, H1_DISPLAY_VM_BASE, H1_DISPLAY_VM_SIZE,
+                    h1_display_pa_valid, h1_display_pa)) {
+                if (!G.h1_display_exec.hits) G.h1_display_exec.first_at = n;
+                G.h1_display_exec.last_at = n;
+                G.h1_display_exec.hits++;
+            }
+            if (pc_in_vm_or_pre_mmu_alias(
+                    &mach.cpu, p, MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_SIZE,
+                    merlot_display_pa_valid, merlot_display_pa)) {
+                if (!G.merlot_exec.hits) G.merlot_exec.first_at = n;
+                G.merlot_exec.last_at = n;
+                G.merlot_exec.hits++;
             }
         }
 
@@ -3931,6 +4487,20 @@ int main(int argc, char **argv) {
             if (md == ARM_MODE_USR) upc_sample(last_pc);
         }
 
+        /* Process-death/signal kernel entries complement the syscall boundary:
+         * a process can be killed by another process or by the kernel without
+         * issuing exit itself.  xnu-1456.1.26 passes proc/rv/retval to exit1
+         * and proc/signum to psignal in r0/r1/r2 at these entry instructions. */
+        {
+            uint32_t p = last_pc & ~1u;
+            if (exit1_va && pc_matches_vm_or_pre_mmu_alias(
+                                &mach.cpu, p, exit1_va, exit1_pa))
+                lifecycle_note_kernel_entry(&mach.cpu, n, LIFECYCLE_EXIT1);
+            if (psignal_va && pc_matches_vm_or_pre_mmu_alias(
+                                  &mach.cpu, p, psignal_va, psignal_pa))
+                lifecycle_note_kernel_entry(&mach.cpu, n, LIFECYCLE_PSIGNAL);
+        }
+
         /*
          * SYSTEM CALLS. Caught at _fleh_swi, before it has touched anything:
          * r12 is the trap number and r0..r3 the arguments, still the user's
@@ -3938,8 +4508,9 @@ int main(int argc, char **argv) {
          * the user PC that issued the SWI is lr-4 (ARM) or lr-2 (Thumb), and
          * SPSR.T says which.
          */
-        if (fleh_swi_va &&
-            ((last_pc & ~1u) == fleh_swi_va || (last_pc & ~1u) == fleh_swi_pa)) {
+        if (fleh_swi_va && pc_matches_vm_or_pre_mmu_alias(
+                                &mach.cpu, last_pc, fleh_swi_va, fleh_swi_pa)) {
+            lifecycle_note_syscall(&mach.cpu, n);
             if (G.sc_n < 512) {
                 unsigned k = G.sc_n++;
                 G.sc[k].at   = n;
@@ -3966,7 +4537,8 @@ int main(int argc, char **argv) {
             uint32_t va = wps[w].va;
             if (!va) continue;
             uint32_t pa = va - virt_base + phys_base;
-            if ((last_pc & ~1u) != (va & ~1u) && (last_pc & ~1u) != (pa & ~1u)) continue;
+            if (!pc_matches_vm_or_pre_mmu_alias(
+                    &mach.cpu, last_pc, va, pa)) continue;
             if (wps[w].hits >= 3u) continue;     /* first few calls only */
             wps[w].hits++;
             printf("=== %s entered (call #%" PRIu64
@@ -4367,8 +4939,17 @@ int main(int argc, char **argv) {
                v, mach.vic[v].raw, mach.vic[v].soft, mach.vic[v].enable,
                mach.vic[v].select,
                s5l_vic_irq(&mach.vic[v]), s5l_vic_fiq(&mach.vic[v]));
-    printf("  CLCD           : status=%08x mask=%08x scanning=%d\n",
-           mach.clcd.intstatus, mach.clcd.intmask, mach.clcd.scanning);
+    {
+        uint32_t active_window = s5l_clcd_active_window(&mach.clcd);
+        uint32_t vidcon1 = s5l_clcd_read(&mach.clcd, CLCD_STATUS);
+        printf("  CLCD           : irq-status=%08x mask=%08x scanning=%u "
+               "ctrl=%08x VIDCON0=%08x VIDCON1=%08x active-window=%08x "
+               "running=%u frames=%" PRIu64 "\n",
+               mach.clcd.intstatus, mach.clcd.intmask,
+               mach.clcd.scanning ? 1u : 0u, mach.clcd.ctrl, mach.clcd.gate,
+               vidcon1, active_window,
+               s5l_clcd_running(&mach.clcd) ? 1u : 0u, mach.clcd.frames);
+    }
     printf("  CPU lines      : irq=%d fiq=%d\n", mach.cpu.irq_line, mach.cpu.fiq_line);
 
     if (mach.unmapped_addr_count) {
@@ -4398,7 +4979,7 @@ int main(int argc, char **argv) {
                        : G.dev_page[i].first_pc));
 
     /* ------------------------------------------------ the hot MMIO page --- */
-    printf("\n=== HOT PAGE 0x%08x: PER-REGISTER ===\n", HOTPG);
+    printf("\n=== HOT PAGE 0x%08x: PER-REGISTER ===\n", G.hot_page);
     printf("    off    reads      writes     lastval    firstwrite\n");
     for (unsigned i = 0; i < 1024; i++) {
         char fw[16];
@@ -4410,7 +4991,7 @@ int main(int argc, char **argv) {
                G.hot_last[i], fw);
     }
 
-    printf("\n=== HOT PAGE 0x%08x: ACCESS SITES (pc/lr/off) ===\n", HOTPG);
+    printf("\n=== HOT PAGE 0x%08x: ACCESS SITES (pc/lr/off) ===\n", G.hot_page);
     for (unsigned i = 0; i < G.hot_site_n; i++)
         printf("    %s off 0x%03x  n=%-10llu pc 0x%08x  lr 0x%08x  instr %llu..%llu\n",
                G.hot_site[i].wr ? "W" : "R", G.hot_site[i].off,
@@ -4418,7 +4999,8 @@ int main(int argc, char **argv) {
                (unsigned long long)G.hot_site[i].first_at,
                (unsigned long long)G.hot_site[i].last_at);
 
-    printf("\n=== HOT PAGE 0x%08x: FIRST %u ACCESSES ===\n", HOTPG, G.hot_log_n);
+    printf("\n=== HOT PAGE 0x%08x: FIRST %u ACCESSES ===\n",
+           G.hot_page, G.hot_log_n);
     for (unsigned i = 0; i < G.hot_log_n; i++)
         printf("    @%-10llu %s%u 0x%08x (off 0x%03x) val 0x%08x  pc 0x%08x lr 0x%08x"
                "  r0-5 %08x %08x %08x %08x %08x %08x\n",
@@ -4429,7 +5011,7 @@ int main(int argc, char **argv) {
                G.hot_log[i].r[0], G.hot_log[i].r[1], G.hot_log[i].r[2],
                G.hot_log[i].r[3], G.hot_log[i].r[4], G.hot_log[i].r[5]);
 
-    printf("\n=== HOT PAGE 0x%08x: LAST ACCESSES (of %llu) ===\n", HOTPG,
+    printf("\n=== HOT PAGE 0x%08x: LAST ACCESSES (of %llu) ===\n", G.hot_page,
            (unsigned long long)G.hot_tail_n);
     {
         unsigned cnt = G.hot_tail_n < 64 ? (unsigned)G.hot_tail_n : 64;
@@ -4443,7 +5025,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("\n=== HOT PAGE 0x%08x: ACCESSES OVER TIME (40 buckets) ===\n", HOTPG);
+    printf("\n=== HOT PAGE 0x%08x: ACCESSES OVER TIME (40 buckets) ===\n",
+           G.hot_page);
     for (unsigned i = 0; i < 40; i++)
         if (G.hot_bucket[i])
             printf("    instr %10llu..%-10llu  %llu\n",
@@ -4513,8 +5096,10 @@ int main(int argc, char **argv) {
             printf("    %-28s hits %-10llu first @ instr %" PRIu64 "\n", MILE[i].name,
                    (unsigned long long)G.mile_hits[i], G.mile_first[i]);
 
+    display_exec_report(virt_base, phys_base, ram_size);
     mode_report(win_lo, win_hi);
     syscall_report(virt_base, phys_base);
+    lifecycle_report();
 
     printf("\n=== WHERE THE TIME WENT (sampled every 1024 instructions%s) ===\n",
            (win_lo || win_hi != UINT64_MAX) ? ", WINDOWED" : "");
@@ -4661,20 +5246,34 @@ int main(int argc, char **argv) {
     else
         printf("\n(no UART output yet)\n");
 
-    /* Did the kernel actually draw? Read the controller's CURRENT active
-     * window, not merely the original Boot_Video address: IOMFB is allowed to
-     * swap FBADDR after adopting iBoot's surface. The core scanout helper owns
-     * all source-range and destination-size checks. */
+    /* Capture the controller's CURRENT live scanout, not merely the original
+     * Boot_Video address: IOMFB is allowed to swap FBADDR after adopting the
+     * handoff surface. A live/nonblack frame is useful evidence but is not, by
+     * itself, proof that the kernel drew it. The core running predicate owns
+     * the three hardware gates, and the scanout helper owns all source-range
+     * and destination-size checks. */
     if (want_fb) {
         const size_t rgb_n = (size_t)FB_W * FB_H * 3u;
-        uint8_t *rgb = calloc(rgb_n, 1);
+        uint8_t *rgb = NULL;
         unsigned active = s5l_clcd_active_window(&mach.clcd);
+        bool running = s5l_clcd_running(&mach.clcd);
+        bool ctrl_enabled = (mach.clcd.ctrl & CLCD_CTRL_ENABLE) != 0u;
+        bool gate_enabled = (mach.clcd.gate & 1u) != 0u;
         uint32_t out_w = 0, out_h = 0;
-        if (!rgb) {
+        if (!running) {
+            fprintf(stderr,
+                    "framebuffer: CLCD scanout is stopped/non-running "
+                    "(scanning=%u ctrl-enable=%u gate-bit0=%u; "
+                    "ctrl=0x%08x gate=0x%08x active-window=0x%08x); "
+                    "refusing stale scanout\n",
+                    mach.clcd.scanning ? 1u : 0u, ctrl_enabled ? 1u : 0u,
+                    gate_enabled ? 1u : 0u, mach.clcd.ctrl, mach.clcd.gate,
+                    active);
+        } else if (active == CLCD_WIN_NONE) {
+            fprintf(stderr, "framebuffer: running CLCD has no active RGB window\n");
+        } else if (!(rgb = calloc(rgb_n, 1))) {
             fprintf(stderr, "framebuffer: cannot allocate %zu-byte RGB capture\n",
                     rgb_n);
-        } else if (active == CLCD_WIN_NONE) {
-            fprintf(stderr, "framebuffer: CLCD has no active RGB window\n");
         } else if (!s5l_clcd_scanout(&mach.clcd, active,
                                      mach.ram, mach.ram_base, mach.ram_size,
                                      rgb, rgb_n, &out_w, &out_h)) {
@@ -4689,20 +5288,26 @@ int main(int argc, char **argv) {
             printf("\nframebuffer: CLCD window %u, %ux%u, "
                    "%zu of %zu RGB bytes non-zero\n",
                    active, out_w, out_h, nonzero, out_n);
-            if (nonzero) {
-                FILE *o = fopen("firmware/screen.ppm", "wb");
-                if (o) {
-                    bool wrote = fprintf(o, "P6\n%u %u\n255\n", out_w, out_h) > 0 &&
-                                 fwrite(rgb, 1, out_n, o) == out_n;
-                    if (fclose(o) != 0) wrote = false;
-                    if (wrote)
-                        printf("wrote firmware/screen.ppm - THE KERNEL DREW SOMETHING\n");
-                    else
-                        fprintf(stderr,
-                                "framebuffer: firmware/screen.ppm write failed\n");
+            FILE *o = fopen("firmware/screen.ppm", "wb");
+            if (o) {
+                bool wrote = fprintf(o, "P6\n%u %u\n255\n", out_w, out_h) > 0 &&
+                             fwrite(rgb, 1, out_n, o) == out_n;
+                if (fclose(o) != 0) wrote = false;
+                if (wrote) {
+                    printf("wrote firmware/screen.ppm - live CLCD frame is %s\n",
+                           nonzero ? "NONBLACK" : "ALL BLACK");
                 } else {
-                    perror("framebuffer: open firmware/screen.ppm");
+                    fprintf(stderr,
+                            "framebuffer: firmware/screen.ppm write failed; "
+                            "invalidating the partial file\n");
+                    if (!framebuffer_invalidate_output(
+                            "invalidated after an incomplete final capture"))
+                        fprintf(stderr,
+                                "framebuffer: WARNING: could not invalidate "
+                                "the incomplete PPM\n");
                 }
+            } else {
+                perror("framebuffer: open firmware/screen.ppm for final capture");
             }
         }
         free(rgb);
