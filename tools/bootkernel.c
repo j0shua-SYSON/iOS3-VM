@@ -933,6 +933,10 @@ static bool rd_grow_volume(uint8_t *img, size_t *rd_np, size_t capacity,
 static ksyms_t  KS;
 static uint32_t g_virt_base, g_phys_base;
 
+static uint16_t ld16(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
 static uint32_t ld32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -1436,6 +1440,32 @@ static uint32_t discover_thread_exception_return_gate(void) {
     return found;
 }
 
+static bool decode_thumb_bl_target(uint32_t pc, uint16_t first,
+                                   uint16_t second, uint32_t *target) {
+    /* ARMv6 Thumb-1 BL: signed high 11 bits followed by low 11 bits. */
+    if ((first & 0xf800u) != 0xf000u ||
+        (second & 0xf800u) != 0xf800u || !target) return false;
+    uint32_t encoded = ((uint32_t)(first & 0x07ffu) << 12) |
+                       ((uint32_t)(second & 0x07ffu) << 1);
+    int64_t displacement = (encoded & UINT32_C(0x00400000))
+                         ? (int64_t)encoded - INT64_C(0x00800000)
+                         : (int64_t)encoded;
+    int64_t destination = (int64_t)pc + 4 + displacement;
+    if (destination < 0 || destination > UINT32_MAX) return false;
+    *target = (uint32_t)destination;
+    return true;
+}
+
+static bool kernel_symbol_bytes(const char *name, const uint8_t *expected,
+                                size_t length, uint32_t *address) {
+    uint32_t va = ksym_value(name) & ~1u;
+    if (!va || !expected || !length || length > UINT32_MAX) return false;
+    const uint8_t *actual = guest_ptr(va, (uint32_t)length);
+    if (!actual || memcmp(actual, expected, length) != 0) return false;
+    if (address) *address = va;
+    return true;
+}
+
 /* Fetch bytes through the guest's current translation tables. guest_ptr()
  * intentionally handles only the kernel's fixed linear window, but the most
  * valuable undefined instructions now occur in user processes. Re-walk the
@@ -1836,7 +1866,7 @@ static unsigned    NM;
 #define DISPLAY_PC_CAP 1024u
 #define DISPLAY_PC_HASH_CAP 2048u
 #define DISPLAY_ENTRY_EDGE_CAP 1024u
-#define SPRINGBOARD_RETURN_CAP 8u
+#define SPRINGBOARD_RETURN_CAP 32u
 
 typedef enum {
     LIFECYCLE_SYSCALL = 1,
@@ -1919,6 +1949,65 @@ typedef struct {
     bool restarted;
     bool superseded;
 } springboard_return_probe_t;
+
+typedef enum {
+    SPRINGBOARD_CHILD_MAP_NONE = 0,
+    SPRINGBOARD_CHILD_MAP_THREAD_TO_TASK,
+    SPRINGBOARD_CHILD_MAP_TASK_TO_PROC,
+    SPRINGBOARD_CHILD_MAP_PROC_TO_PID,
+    SPRINGBOARD_CHILD_MAP_COMPLETE
+} springboard_child_map_stage_t;
+
+typedef struct {
+    bool enabled;
+    uint32_t spawn_start;
+    uint32_t spawn_end;
+    uint32_t thread_resume;
+    uint32_t callsite;
+    uint32_t return_pc;
+    uint32_t thread_task_offset;
+    uint32_t task_proc_offset;
+    uint32_t proc_pid_offset;
+    char reason[192];
+} springboard_child_config_t;
+
+/*
+ * Runtime evidence paired one-to-one with springboard_return_probe_t.  The
+ * _posix_spawn -> _thread_resume call occurs only after image activation has
+ * succeeded.  Capturing its r0 child thread under the exact parent thread lets
+ * us follow that child by object identity instead of guessing from a later PID,
+ * reusable proc pointer, or unrelated _exit1.
+ */
+typedef struct {
+    uint64_t entry_at;
+    uint64_t success_call_at;
+    uint64_t resume_return_at;
+    uint64_t first_user_at;
+    uint64_t first_signal_at;
+    uint64_t first_exit_at;
+    uint64_t signal_count;
+    uint64_t exit_count;
+    uint32_t parent_thread;
+    uint32_t child_thread;
+    uint32_t child_task;
+    uint32_t child_proc;
+    uint32_t child_pid;
+    uint32_t mapping_failure_va;
+    uint32_t mapping_failure_fsr;
+    uint32_t thread_resume_result;
+    uint32_t first_user_pc;
+    uint32_t first_user_cpsr;
+    uint32_t first_user_ttbr0;
+    uint32_t first_user_context_id;
+    uint32_t first_signal;
+    uint32_t first_exit_status;
+    uint8_t map_stage;
+    bool success_call_seen;
+    bool resume_return_seen;
+    bool first_user_seen;
+    bool identity_invalidated;
+    bool exited;
+} springboard_child_probe_t;
 
 typedef struct {
     uint32_t vm_pc;
@@ -2009,6 +2098,9 @@ static struct {
     uint64_t    springboard_return_dropped;
     springboard_return_probe_t
                 springboard_return[SPRINGBOARD_RETURN_CAP];
+    springboard_child_config_t springboard_child_config;
+    springboard_child_probe_t
+                springboard_child[SPRINGBOARD_RETURN_CAP];
 
     /* Exact, every-instruction-entry display-driver coverage. Physical pre-MMU
      * PCs are normalized only after the alias-aware range check accepts them. */
@@ -2090,6 +2182,134 @@ static struct {
     uint32_t    hot_page;                /* selected physical page; -H */
 } G;
 
+/*
+ * Derive every firmware-specific child hook from this loaded kernel and refuse
+ * the entire probe if any symbol, callsite, accessor shape, or uniqueness
+ * condition differs.  No guessed object offset is ever used at runtime.
+ */
+static void discover_springboard_child_probe(void) {
+    springboard_child_config_t *config = &G.springboard_child_config;
+    memset(config, 0, sizeof *config);
+
+    static const uint8_t current_thread_shape[] = {
+        0x90, 0x0f, 0x1d, 0xee, 0x1e, 0xff, 0x2f, 0xe1
+    };
+    static const uint8_t get_bsdtask_shape[] = {
+        0xe2, 0x23, 0x5b, 0x00, 0xc0, 0x58, 0x70, 0x47
+    };
+    static const uint8_t get_bsdthreadtask_shape[] = {
+        0xd3, 0x23, 0x9b, 0x00, 0xc3, 0x58, 0x00, 0x2b,
+        0x03, 0xd0, 0xe2, 0x20, 0x40, 0x00, 0x18, 0x58,
+        0x70, 0x47, 0x00, 0x20, 0x70, 0x47
+    };
+    static const uint8_t proc_pid_shape[] = {
+        0x80, 0x68, 0x70, 0x47
+    };
+    static const uint8_t spawn_success_window[] = {
+        0x00, 0x2c, 0x24, 0xd1, 0x03, 0x98,
+        0x00, 0x28, 0x1c, 0xd1, 0x01, 0x9b, 0x40, 0x46,
+        0x00, 0x21, 0x1c, 0x60, 0x22, 0x1c, 0x02, 0xf0,
+        0xb3, 0xff, 0x9e, 0x98, 0x0c, 0xf7, 0x69, 0xfc
+    };
+
+    if (!kernel_symbol_bytes("_current_thread", current_thread_shape,
+                             sizeof current_thread_shape, NULL) ||
+        !kernel_symbol_bytes("_get_bsdtask_info", get_bsdtask_shape,
+                             sizeof get_bsdtask_shape, NULL) ||
+        !kernel_symbol_bytes("_get_bsdthreadtask_info",
+                             get_bsdthreadtask_shape,
+                             sizeof get_bsdthreadtask_shape, NULL) ||
+        !kernel_symbol_bytes("_proc_pid", proc_pid_shape,
+                             sizeof proc_pid_shape, NULL)) {
+        snprintf(config->reason, sizeof config->reason,
+                 "thread/task/proc accessor shape mismatch");
+        printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
+        return;
+    }
+
+    config->spawn_start = ksym_value("_posix_spawn") & ~1u;
+    config->thread_resume = ksym_value("_thread_resume") & ~1u;
+    config->spawn_end = ksym_next_value(config->spawn_start);
+    if (!config->spawn_start || !config->thread_resume ||
+        !config->spawn_end || config->spawn_end <= config->spawn_start ||
+        config->spawn_end - config->spawn_start < 4u ||
+        config->spawn_end - config->spawn_start > KSYMS_MAX_SYM_SPAN) {
+        snprintf(config->reason, sizeof config->reason,
+                 "posix_spawn/thread_resume symbol range unresolved");
+        printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
+        return;
+    }
+
+    unsigned matches = 0;
+    for (uint32_t pc = config->spawn_start;
+         pc <= config->spawn_end - 4u; pc += 2u) {
+        const uint8_t *p = guest_ptr(pc, 4u);
+        uint32_t target = 0;
+        if (!p || !decode_thumb_bl_target(
+                      pc, ld16(p), ld16(p + 2u), &target) ||
+            target != config->thread_resume) continue;
+        config->callsite = pc;
+        matches++;
+    }
+    if (matches != 1u || config->callsite > UINT32_MAX - 4u) {
+        snprintf(config->reason, sizeof config->reason,
+                 "expected one posix_spawn->thread_resume BL, found %u",
+                 matches);
+        printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
+        return;
+    }
+    config->return_pc = config->callsite + 4u;
+    const uint32_t success_prefix =
+        (uint32_t)sizeof spawn_success_window - 4u;
+    if (config->callsite < success_prefix) {
+        snprintf(config->reason, sizeof config->reason,
+                 "posix_spawn success window address underflow");
+        printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
+        return;
+    }
+    const uint8_t *success_window = guest_ptr(
+        config->callsite - success_prefix,
+        (uint32_t)sizeof spawn_success_window);
+    if (!success_window ||
+        memcmp(success_window, spawn_success_window,
+               sizeof spawn_success_window) != 0) {
+        snprintf(config->reason, sizeof config->reason,
+                 "posix_spawn success-only callsite window mismatch");
+        printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
+        return;
+    }
+
+    /*
+     * These are decoded from the already exact-gated Thumb accessor shapes:
+     *   d3 23; 9b 00  -> 0xd3 << 2 = thread->task offset 0x34c
+     *   e2 20; 40 00  -> 0xe2 << 1 = task->bsd_info offset 0x1c4
+     *   80 68          -> LDR r0,[r0,#(2 << 2)] = proc->pid offset 8
+     */
+    config->thread_task_offset =
+        (uint32_t)get_bsdthreadtask_shape[0] << 2;
+    config->task_proc_offset =
+        (uint32_t)get_bsdthreadtask_shape[10] << 1;
+    config->proc_pid_offset =
+        (uint32_t)((ld16(proc_pid_shape) >> 6) & 0x1fu) << 2;
+    if (config->thread_task_offset != UINT32_C(0x34c) ||
+        config->task_proc_offset != UINT32_C(0x1c4) ||
+        config->proc_pid_offset != UINT32_C(8)) {
+        snprintf(config->reason, sizeof config->reason,
+                 "decoded object offsets failed consistency check");
+        printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
+        return;
+    }
+
+    config->enabled = true;
+    snprintf(config->reason, sizeof config->reason, "validated");
+    printf("SpringBoard child probe: %08x -> _thread_resume %08x,"
+           " return %08x; offsets thread/task/proc/pid"
+           " +%x/+%x/+%x\n",
+           config->callsite, config->thread_resume, config->return_pc,
+           config->thread_task_offset, config->task_proc_offset,
+           config->proc_pid_offset);
+}
+
 static lifecycle_event_t *lifecycle_begin(uint64_t at,
                                           lifecycle_kind_t kind) {
     unsigned slot = (unsigned)(G.lifecycle_total % LIFECYCLE_CAP);
@@ -2147,8 +2367,9 @@ static void springboard_return_arm(const arm_cpu_t *cpu, uint64_t at,
         return;
     }
 
+    unsigned index = G.springboard_return_n++;
     springboard_return_probe_t *probe =
-        &G.springboard_return[G.springboard_return_n++];
+        &G.springboard_return[index];
     memset(probe, 0, sizeof *probe);
     probe->entry_at          = at;
     probe->syscall_number    = syscall_number;
@@ -2166,6 +2387,12 @@ static void springboard_return_arm(const arm_cpu_t *cpu, uint64_t at,
     probe->entry_tpidruro    = cpu->cp15.tpidruro;
     probe->entry_user_sp     = diagnostic_user_reg(cpu, 13u);
     probe->entry_user_lr     = diagnostic_user_reg(cpu, 14u);
+
+    springboard_child_probe_t *child =
+        &G.springboard_child[index];
+    memset(child, 0, sizeof *child);
+    child->entry_at = at;
+    child->parent_thread = cpu->cp15.tpidrprw;
 }
 
 static bool springboard_return_parent_matches(
@@ -2277,6 +2504,221 @@ static void springboard_return_note_transition(const arm_cpu_t *cpu,
         probe->return_user_sp    = diagnostic_user_reg(cpu, 13u);
         probe->return_user_lr    = diagnostic_user_reg(cpu, 14u);
         break;
+    }
+}
+
+static bool springboard_child_read_field(arm_cpu_t *cpu,
+                                         uint32_t object, uint32_t offset,
+                                         uint32_t *value,
+                                         uint32_t *failure_va,
+                                         uint32_t *failure_fsr) {
+    if (failure_fsr) *failure_fsr = 0;
+    uint64_t field64 = (uint64_t)object + offset;
+    if (!object || (object & 3u) || object < g_virt_base ||
+        field64 + 3u > UINT32_MAX) {
+        if (failure_va) *failure_va = object;
+        return false;
+    }
+    uint32_t va = (uint32_t)field64;
+    uint8_t bytes[4];
+    if (!cpu || !g_mach || !g_mach->ram) return false;
+    for (unsigned i = 0; i < sizeof bytes; i++) {
+        uint32_t current = va + i;
+        uint32_t pa = 0;
+        uint32_t fsr = arm_mmu_translate(
+            cpu, current, ARM_ACCESS_READ, true, &pa);
+        if (fsr) {
+            if (failure_va) *failure_va = current;
+            if (failure_fsr) *failure_fsr = fsr;
+            return false;
+        }
+        if (pa < g_mach->ram_base ||
+            (uint64_t)pa - g_mach->ram_base >= g_mach->ram_size) {
+            if (failure_va) *failure_va = current;
+            return false;
+        }
+        bytes[i] = g_mach->ram[pa - g_mach->ram_base];
+    }
+    if (value) *value = ld32(bytes);
+    return true;
+}
+
+static void springboard_child_capture_mapping(
+        springboard_child_probe_t *child, arm_cpu_t *cpu, uint64_t at) {
+    if (!child || !cpu) return;
+    const springboard_child_config_t *config =
+        &G.springboard_child_config;
+
+    child->success_call_seen = true;
+    child->success_call_at = at;
+    child->child_thread = cpu->r[0];
+    child->map_stage = SPRINGBOARD_CHILD_MAP_THREAD_TO_TASK;
+    if (!child->child_thread ||
+        child->child_thread == child->parent_thread) {
+        child->mapping_failure_va = child->child_thread;
+        return;
+    }
+    if (!springboard_child_read_field(
+            cpu, child->child_thread, config->thread_task_offset,
+            &child->child_task, &child->mapping_failure_va,
+            &child->mapping_failure_fsr)) return;
+
+    child->map_stage = SPRINGBOARD_CHILD_MAP_TASK_TO_PROC;
+    if (!springboard_child_read_field(
+            cpu, child->child_task, config->task_proc_offset,
+            &child->child_proc, &child->mapping_failure_va,
+            &child->mapping_failure_fsr)) return;
+
+    child->map_stage = SPRINGBOARD_CHILD_MAP_PROC_TO_PID;
+    if (!springboard_child_read_field(
+            cpu, child->child_proc, config->proc_pid_offset,
+            &child->child_pid, &child->mapping_failure_va,
+            &child->mapping_failure_fsr)) return;
+    if (child->child_pid <= 1u || child->child_pid > INT32_MAX) {
+        child->mapping_failure_va =
+            child->child_proc + config->proc_pid_offset;
+        return;
+    }
+    child->map_stage = SPRINGBOARD_CHILD_MAP_COMPLETE;
+}
+
+static bool springboard_child_mapping_matches(
+        springboard_child_probe_t *child, arm_cpu_t *cpu) {
+    if (!child || !cpu ||
+        child->map_stage != SPRINGBOARD_CHILD_MAP_COMPLETE) return false;
+    const springboard_child_config_t *config =
+        &G.springboard_child_config;
+    uint32_t task = 0, proc = 0, pid = 0;
+    uint32_t failure_va = 0, failure_fsr = 0;
+    bool matches =
+        springboard_child_read_field(
+            cpu, child->child_thread, config->thread_task_offset,
+            &task, &failure_va, &failure_fsr) &&
+        springboard_child_read_field(
+            cpu, task, config->task_proc_offset,
+            &proc, &failure_va, &failure_fsr) &&
+        springboard_child_read_field(
+            cpu, proc, config->proc_pid_offset,
+            &pid, &failure_va, &failure_fsr) &&
+        task == child->child_task && proc == child->child_proc &&
+        pid == child->child_pid;
+    if (!matches) {
+        child->identity_invalidated = true;
+        child->mapping_failure_va =
+            failure_va ? failure_va : child->child_thread;
+        child->mapping_failure_fsr = failure_fsr;
+    }
+    return matches;
+}
+
+static bool springboard_probe_is_active(unsigned index) {
+    if (index >= G.springboard_return_n) return false;
+    const springboard_return_probe_t *probe =
+        &G.springboard_return[index];
+    return !probe->returned && !probe->redirected &&
+           !probe->restarted && !probe->superseded;
+}
+
+/*
+ * Called at instruction entry.  The two kernel-PC comparisons are cheap and
+ * inactive until the exact firmware validates; user-thread matching is only
+ * attempted after the uniquely validated success-only call has actually
+ * entered _thread_resume with its exact Thumb return address.
+ */
+static void springboard_child_note_instruction(arm_cpu_t *cpu,
+                                               uint64_t at, uint32_t pc) {
+    const springboard_child_config_t *config =
+        &G.springboard_child_config;
+    if (!cpu || !config->enabled || !G.springboard_return_n) return;
+
+    bool thumb = (cpu->cpsr & ARM_CPSR_T) != 0;
+    bool svc = (cpu->cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC;
+    uint32_t aligned_pc = pc & ~1u;
+    if (thumb && svc && aligned_pc == config->thread_resume &&
+        cpu->r[14] == (config->return_pc | 1u)) {
+        for (unsigned next = G.springboard_return_n; next > 0; next--) {
+            unsigned index = next - 1u;
+            springboard_child_probe_t *child =
+                &G.springboard_child[index];
+            if (!springboard_probe_is_active(index) ||
+                child->success_call_seen || at <= child->entry_at ||
+                cpu->cp15.tpidrprw != child->parent_thread) continue;
+            springboard_child_capture_mapping(child, cpu, at);
+            break;
+        }
+        return;
+    }
+
+    if (thumb && svc && aligned_pc == config->return_pc) {
+        for (unsigned next = G.springboard_return_n; next > 0; next--) {
+            unsigned index = next - 1u;
+            springboard_child_probe_t *child = &G.springboard_child[index];
+            if (!springboard_probe_is_active(index) ||
+                !child->success_call_seen || child->resume_return_seen ||
+                at <= child->success_call_at ||
+                cpu->cp15.tpidrprw != child->parent_thread) continue;
+            child->resume_return_seen = true;
+            child->resume_return_at = at;
+            child->thread_resume_result = cpu->r[0];
+            break;
+        }
+        return;
+    }
+
+    if ((cpu->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR) return;
+    for (unsigned i = 0; i < G.springboard_return_n; i++) {
+        springboard_child_probe_t *child = &G.springboard_child[i];
+        if (child->map_stage != SPRINGBOARD_CHILD_MAP_COMPLETE ||
+            child->first_user_seen || child->identity_invalidated ||
+            child->exited ||
+            cpu->cp15.tpidrprw != child->child_thread) continue;
+        if (!springboard_child_mapping_matches(child, cpu)) continue;
+        child->first_user_seen = true;
+        child->first_user_at = at;
+        child->first_user_pc = pc;
+        child->first_user_cpsr = cpu->cpsr;
+        child->first_user_ttbr0 = cpu->cp15.ttbr0;
+        child->first_user_context_id = cpu->cp15.context_id;
+    }
+}
+
+static void springboard_child_note_kernel_lifecycle(
+        arm_cpu_t *cpu, uint64_t at, lifecycle_kind_t kind) {
+    if (!cpu || (kind != LIFECYCLE_EXIT1 && kind != LIFECYCLE_PSIGNAL))
+        return;
+    const springboard_child_config_t *config =
+        &G.springboard_child_config;
+    for (unsigned i = 0; i < G.springboard_return_n; i++) {
+        springboard_child_probe_t *child = &G.springboard_child[i];
+        if (child->map_stage != SPRINGBOARD_CHILD_MAP_COMPLETE ||
+            child->identity_invalidated || child->exited ||
+            cpu->r[0] != child->child_proc) continue;
+        uint32_t pid = 0, failure_va = 0, failure_fsr = 0;
+        if (!springboard_child_read_field(
+                cpu, cpu->r[0], config->proc_pid_offset, &pid,
+                &failure_va, &failure_fsr) ||
+            pid != child->child_pid) {
+            child->identity_invalidated = true;
+            child->mapping_failure_va =
+                failure_va ? failure_va :
+                child->child_proc + config->proc_pid_offset;
+            child->mapping_failure_fsr = failure_fsr;
+            continue;
+        }
+        if (kind == LIFECYCLE_PSIGNAL) {
+            if (!child->signal_count) {
+                child->first_signal_at = at;
+                child->first_signal = cpu->r[1];
+            }
+            child->signal_count++;
+        } else {
+            if (!child->exit_count) {
+                child->first_exit_at = at;
+                child->first_exit_status = cpu->r[1];
+            }
+            child->exit_count++;
+            child->exited = true;
+        }
     }
 }
 
@@ -2815,6 +3257,97 @@ static void springboard_return_report(void) {
     }
 }
 
+static const char *springboard_child_map_stage_name(unsigned stage) {
+    switch ((springboard_child_map_stage_t)stage) {
+    case SPRINGBOARD_CHILD_MAP_NONE:           return "not-attempted";
+    case SPRINGBOARD_CHILD_MAP_THREAD_TO_TASK: return "thread-to-task";
+    case SPRINGBOARD_CHILD_MAP_TASK_TO_PROC:   return "task-to-proc";
+    case SPRINGBOARD_CHILD_MAP_PROC_TO_PID:    return "proc-to-pid";
+    case SPRINGBOARD_CHILD_MAP_COMPLETE:       return "complete";
+    default:                                   return "unknown";
+    }
+}
+
+static void springboard_child_report(void) {
+    const springboard_child_config_t *config =
+        &G.springboard_child_config;
+    if (!config->enabled) {
+        printf("    SpringBoard child probe: DISABLED (%s)\n",
+               config->reason[0] ? config->reason : "not discovered");
+        return;
+    }
+
+    printf("    SpringBoard child probe: validated success-only BL %08x"
+           " -> _thread_resume %08x (return %08x)\n",
+           config->callsite, config->thread_resume, config->return_pc);
+    printf("      decoded object offsets: thread->task +%x,"
+           " task->proc +%x, proc->pid +%x\n",
+           config->thread_task_offset, config->task_proc_offset,
+           config->proc_pid_offset);
+
+    for (unsigned i = 0; i < G.springboard_return_n; i++) {
+        const springboard_child_probe_t *child =
+            &G.springboard_child[i];
+        printf("      attempt #%u entry @%" PRIu64
+               " parent thread %08x\n",
+               i, child->entry_at, child->parent_thread);
+        if (!child->success_call_seen) {
+            printf("        no matching success-only _thread_resume call"
+                   " observed before stop\n");
+            continue;
+        }
+
+        printf("        success-only call @%" PRIu64
+               " child thread/task/proc/pid"
+               " %08x/%08x/%08x/%u; map %s",
+               child->success_call_at, child->child_thread,
+               child->child_task, child->child_proc, child->child_pid,
+               springboard_child_map_stage_name(child->map_stage));
+        if (child->map_stage != SPRINGBOARD_CHILD_MAP_COMPLETE)
+            printf(" (failed va %08x fsr %08x)",
+                   child->mapping_failure_va, child->mapping_failure_fsr);
+        printf("\n");
+
+        if (child->resume_return_seen)
+            printf("        thread_resume returned @%" PRIu64
+                   " raw r0=%08x\n",
+                   child->resume_return_at, child->thread_resume_result);
+        else
+            printf("        thread_resume return not observed before stop\n");
+
+        if (child->first_user_seen)
+            printf("        FIRST CHILD USER INSTRUCTION ENTRY @%" PRIu64
+                   " pc=%08x cpsr=%08x TTBR0/context=%08x/%08x\n",
+                   child->first_user_at, child->first_user_pc,
+                   child->first_user_cpsr, child->first_user_ttbr0,
+                   child->first_user_context_id);
+        else
+            printf("        no user instruction observed for the exact"
+                   " child thread before stop\n");
+        if (child->identity_invalidated)
+            printf("        later/current object identity revalidation failed"
+                   " (va %08x fsr %08x); no subsequent event accepted\n",
+                   child->mapping_failure_va, child->mapping_failure_fsr);
+
+        printf("        exact-proc _psignal/_exit1 entries: %" PRIu64
+               "/%" PRIu64,
+               child->signal_count, child->exit_count);
+        if (child->signal_count)
+            printf("; first signal %u @%" PRIu64,
+                   child->first_signal, child->first_signal_at);
+        if (child->exit_count)
+            printf("; first exit status %08x @%" PRIu64,
+                   child->first_exit_status, child->first_exit_at);
+        printf("\n");
+        if (child->map_stage == SPRINGBOARD_CHILD_MAP_COMPLETE &&
+            (child->first_user_seen || child->signal_count ||
+             child->exit_count))
+            printf("        IMPORTANT: revalidated object identity ties these"
+                   " entries to the exact-path child; rendering still requires"
+                   " framebuffer/display evidence.\n");
+    }
+}
+
 static void lifecycle_report(void) {
     uint64_t retained = G.lifecycle_total < LIFECYCLE_CAP
                       ? G.lifecycle_total : LIFECYCLE_CAP;
@@ -2919,6 +3452,7 @@ static void lifecycle_report(void) {
         printf("    SpringBoard exact-path attempts: 0\n");
     }
     springboard_return_report();
+    springboard_child_report();
 }
 
 static bool display_physical_alias(uint32_t vm_base, uint32_t vm_size,
@@ -4733,8 +5267,6 @@ int main(int argc, char **argv) {
 
     /* Interpose on the bus so every non-RAM access is attributed to a PC. */
     spy_install(&mach, virt_base, phys_base, hot_page);
-    thread_exception_return_gate_va =
-        discover_thread_exception_return_gate();
 
     if (external_md) {
         external_block_adapter = file_block_create();
@@ -4860,6 +5392,15 @@ int main(int argc, char **argv) {
         }
     }
 
+    /*
+     * A restore replaces guest RAM, including the kernel text used to derive
+     * these exact-path hooks.  Discover only after that replacement so every
+     * byte-shape gate describes the image that will actually execute.
+     */
+    thread_exception_return_gate_va =
+        discover_thread_exception_return_gate();
+    discover_springboard_child_probe();
+
     /* Snapshot positions are absolute. Reject requests that the selected
      * starting state has already passed or that the selected run limit cannot
      * reach; silently accepting either makes a long unattended run appear to
@@ -4958,6 +5499,7 @@ int main(int argc, char **argv) {
         tw = (tw + 1) % KTRACE;
         if (tcount < KTRACE) tcount++;
         trace_last_at = n;
+        springboard_child_note_instruction(&mach.cpu, n, last_pc);
 
         /* How far down the console-init chain did we get? Each milestone is
          * matched at its virtual address and at its pre-MMU physical alias. */
@@ -5031,11 +5573,17 @@ int main(int argc, char **argv) {
         {
             uint32_t p = last_pc & ~1u;
             if (exit1_va && pc_matches_vm_or_pre_mmu_alias(
-                                &mach.cpu, p, exit1_va, exit1_pa))
+                                &mach.cpu, p, exit1_va, exit1_pa)) {
                 lifecycle_note_kernel_entry(&mach.cpu, n, LIFECYCLE_EXIT1);
+                springboard_child_note_kernel_lifecycle(
+                    &mach.cpu, n, LIFECYCLE_EXIT1);
+            }
             if (psignal_va && pc_matches_vm_or_pre_mmu_alias(
-                                  &mach.cpu, p, psignal_va, psignal_pa))
+                                  &mach.cpu, p, psignal_va, psignal_pa)) {
                 lifecycle_note_kernel_entry(&mach.cpu, n, LIFECYCLE_PSIGNAL);
+                springboard_child_note_kernel_lifecycle(
+                    &mach.cpu, n, LIFECYCLE_PSIGNAL);
+            }
         }
 
         /*

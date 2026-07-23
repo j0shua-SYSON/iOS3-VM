@@ -454,6 +454,21 @@ raw `r0`, `r1`, `CPSR.C`, and separate transition/resume instruction indices.
 Run09 predates this probe; a new real-firmware run is required before it can
 answer whether the recorded spawn returned success or an errno.
 
+A second bounded probe now derives the exact success-only
+`_posix_spawn` → `_thread_resume` Thumb callsite from the loaded kernel. It
+enables only when that call is unique and the shipped `_current_thread`,
+thread-to-task, task-to-proc, and proc-to-PID accessor instruction shapes all
+match. For the accepted 7E18 kernel it decodes `thread+0x34c → task`,
+`task+0x1c4 → proc`, and `proc+8 → PID`. It follows a new child only when the
+validated call actually enters `_thread_resume` with the exact Thumb return
+address and the SpringBoard SWI's parent thread. It then records
+`_thread_resume`'s return, the child's first USR instruction entry, and
+exact-proc `_psignal`/`_exit1` entries. The PID field is re-read at each proc
+event, so a PID or reused proc pointer alone is never accepted. `_psignal`
+proves a kernel call entry, not completed delivery. This is passive
+instrumentation: it does not change the syscall, resume the child itself, or
+turn lifecycle evidence into rendering proof.
+
 ### WFI changes elapsed device time, not the instruction coordinate
 
 XNU spends substantial time in the ARM1176 CP15 wait-for-interrupt form. The
