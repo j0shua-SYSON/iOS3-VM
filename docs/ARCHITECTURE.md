@@ -274,10 +274,25 @@ selection, and host frame publication use that same invariant, so a powered-down
 controller cannot emit stale frames or interrupts merely because a window is
 still configured.
 
-This is correctness preparation for the next display-enabled firmware run. It
-does not retroactively validate the display path: run07 had no framebuffer and
-all reported CLCD activity was zero, and no corrected-handoff run has captured
-SpringBoard.
+Run08 exercised this handoff in a fresh display-enabled 128 MiB external-md
+boot through a 600,000,000-instruction cap. Exact instruction-entry coverage
+observed PCs inside both display-driver bundle ranges:
+`AppleH1DisplayDrivers` recorded 675 observations and `AppleMerlotLCD` 409.
+These observations do not prove retirement or that either driver's `start()`
+succeeded. The CLCD MMIO page recorded zero accesses, while seeded
+configuration remained live and guest-time ticking advanced IRQ status and the
+frame counter: status 1, mask 0, scanning 1, `CLCD_CTRL = 0x41`,
+`VIDCON0 = 0x441`, `VIDCON1 = 0x8`, window 0 active, and 386 frames.
+
+That distinction matters. The published RGB frame was technically nonblack but
+contained only 128 white pixels in one 8x16 block at the top-left; every other
+pixel was black. The lifecycle ring recorded 70 events, zero pathname-copy
+failures, service spawns through `notifyd`, and zero exact SpringBoard path
+attempts. Thus run08 proves that the CPU reached PCs in both bundle ranges and
+the corrected seed survived; it does not prove a successful `AppleH1CLCD`
+start, guest CLCD programming, SpringBoard, or a useful display. The zero-MMIO
+observation narrows the investigation but does not identify the exact blocker
+without a longer run and more lifecycle evidence.
 
 In the planned shared-session design, host services cross explicit non-blocking
 seams: frame descriptors out; bounded touch, PCM and network queues in/out;

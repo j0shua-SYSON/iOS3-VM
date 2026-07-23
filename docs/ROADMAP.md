@@ -28,7 +28,7 @@ proof that no private or unindexed implementation exists.
 | **M2** | SoC bring-up | A bare-metal payload prints over the emulated UART; a timer IRQ is taken and returned from | ✅ done and covered by host tests |
 | **M3** | Firmware containers + LLB execution | Real IMG3s parse and decrypt; an extracted real Apple LLB payload executes; the kernelcache is extracted | ✅ done; SecureROM/iBoot execution remains future full-chain work |
 | **M4** | XNU boots and logs | The kernel reaches `bsd_init`, prints, and Apple's own kexts match and start | ✅ **done** — plus the real root filesystem mounts |
-| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress.** The historical direct-RAM chain reached a clean 2.98 B cap. The fresh 128 MiB external-md run07 path retains `launchd`, fsck, the `/dev/md0` root mount, `mDNSResponder`, and `systemShutdown false`, then exits cleanly at 2 B with a 50.71 MiB free-page low. Its framebuffer was disabled and CLCD status/mask/scanning were zero, so there is no SpringBoard, framebuffer, or tap proof. The app is still a demo host. |
+| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress.** Run07 remains the longest fresh 128 MiB external-md path at 2 B. Display-enabled run08 reached 600 M with launchd, fsck/root mount, service spawns through `notifyd`, observed entry PCs in both Apple display-driver bundle ranges, and retained corrected seeded scanout. It recorded zero SpringBoard path attempts, zero CLCD MMIO, and only one 8x16 white block on black. This is not successful `AppleH1CLCD` start, SpringBoard, or tap proof. The app is still a demo host. |
 | **D** | Dynarec (parallel) | SpringBoard at interactive frame rates on the phone | 🔵 emitter + ARM/Thumb translator and host execution tests exist (off by default); no code cache or dispatcher calls them |
 | **N** | Guest networking (parallel) | The guest resolves a name and fetches a URL | ⚪ designed, not built |
 | **A** | Guest audio (first-device track) | Guest PCM reaches the host speaker without blocking the CPU thread | ⚪ priority, not designed or built |
@@ -247,12 +247,13 @@ memory we handed it. It proves console rendering, not that Apple's display
 driver started; the current tree has a tested CLCD model, but the run below did
 not reach that kext's code.
 
-The current CLCD correction does not change that historical result. It prepares
-the controller handoff for a new run by treating `0x0d8..0x0ec` as window
+The CLCD correction does not change that historical result. It prepared
+the controller handoff by treating `0x0d8..0x0ec` as window
 configuration rather than panel timing, seeding the actual `VIDTCON0..3`
 registers at `0x20c..0x218` with iBoot-compatible N82 320x480 timing, and
 requiring every hardware scanout gate before frames or wake edges are produced.
-No real-firmware display run has validated that preparation yet.
+Run08 later exercised the seed, but produced only one 8x16 white block and no
+guest CLCD MMIO; it did not validate SpringBoard or successful driver start.
 
 ### The five bugs that got us here
 
@@ -462,8 +463,9 @@ later.
   `/device-tree/arm-io/spi0/lcd0` was
   `compatible = "lcd,merlot"` with `lcd-panel-id = 0x00000000`. Real iBoot reads
   the panel's ID over SPI. The current CLI can patch a non-zero value, seed CLCD
-  window 0 and capture the active buffer, but there is no fresh private-firmware
-  trace proving how far the Apple display kexts proceed with those changes.
+  window 0 and capture the active buffer. Run08 later proved exact instruction
+  entries within this bundle's code range, but no CLCD MMIO or successful
+  display-driver start.
 - **The CLCD seed needed real timing, not mislabeled window words.**
   Offsets `0x0d8..0x0ec` are per-window auxiliary configuration pairs; actual
   `VIDTCON0..3` lives at `0x20c..0x218`. The corrected N82 handoff seeds
@@ -472,8 +474,8 @@ later.
   N82, while `VIDTCON2` derives from the requested geometry; production 320x480
   yields `0x013f01df`. Initial `0x0d8`, `0x0e0`, and `0x0e8` window words are
   `0x1000`. Live scanout additionally requires start state, `CLCD_CTRL` global
-  enable, and `VIDCON0` bit 0. This is host-side correctness preparation, not
-  evidence that either Apple display kext ran or that SpringBoard rendered.
+  enable, and `VIDCON0` bit 0. These values make the seed internally coherent;
+  they do not themselves prove driver start or SpringBoard.
 - **The same audit recorded three fault-path gaps** (`e2d6c44`). Two have since
   been closed and regression-tested: instruction fetches enforce `XN`, and
   unaligned accesses that cross a page boundary translate both pages. The third
@@ -575,6 +577,41 @@ Run07 deliberately had the framebuffer disabled. CLCD status, interrupt mask,
 and scanning were all zero. It therefore provides no evidence that SpringBoard
 started and no validation of the real display path.
 
+Run08 was the first fresh corrected-handoff display diagnostic. It used
+external-md, a 128 MiB guest, and `-F -H 0x38900000` for framebuffer seeding
+plus exact CLCD-page tracing, then reached its 600,000,000-instruction cap with
+`stopped ... OK`. The final PC was `0xc017056c` (`_SHA1Init+0xc4`) and stderr
+was empty. The host wrapper accidentally left its exit-marker file empty, so no
+OS process exit status was captured.
+
+Exact instruction-entry coverage recorded 675 hits in
+`AppleH1DisplayDrivers`, first at 126,211,220 and last at 201,032,245, plus 409
+hits in `AppleMerlotLCD`, first at 209,372,737 and last at 211,410,011. The
+CLCD MMIO page nevertheless recorded zero accesses. The final controller state
+was still the host seed: IRQ status 1, mask 0, scanning 1,
+`CLCD_CTRL = 0x41`, `VIDCON0 = 0x441`, `VIDCON1 = 0x8`, window 0 active,
+running 1, and 386 frames.
+
+The captured frame was nonblack only technically: 128 white pixels formed one
+8x16 block at the top-left, every other pixel was black, and only 384 RGB bytes
+were nonzero. The lifecycle ring retained 70 events with zero pathname-copy
+failures, launchd/fsck/root mount, and service spawns through
+`/usr/sbin/notifyd` at instruction 586,776,479. Exact SpringBoard path attempts
+were zero. User mode retired 44,274,420 instructions (7.4%), and the free-page
+low was 19,260 pages (75.23 MiB).
+
+The external bridge completed 8,059 reads (33,034,752 bytes), 16 writes
+(61,952 bytes), and zero failures. Both raw requests completed through two
+redirects and two completions, with zero pending continuations or guest errors.
+The source kernel, device-tree, and rootfs hashes remained unchanged.
+
+This proves that the CPU reached PCs inside both bundle code ranges and that the
+corrected seeded scanout survived. It does not prove instruction retirement, a
+successful `AppleH1CLCD` start, guest CLCD programming, SpringBoard, or a useful
+frame. The lack of MMIO is an important observation, not by itself an
+identification of the exact blocker; the next evidence must come from a longer
+run and lifecycle/display tracing.
+
 For chronology, this is the much earlier pre-VFP measurement from
 `bootkernel`'s milestone probes:
 
@@ -669,8 +706,10 @@ still runs only a synthetic guest and has no touch or audio path.
   the `0x0d8..0x0ec` window configuration, seeds an iBoot-compatible N82
   handoff, and gates frame publication and WFI edges on genuinely live scanout.
   The app's CoreGraphics bridge follows a validated active window only while
-  those gates are live. This still needs a display-enabled real-firmware run and
-  the shared real-guest session; Metal is optional and not implemented.
+  those gates are live. Run08 exercised that seed but observed no CLCD MMIO and
+  only an 8x16 white block, so the next step is a longer lifecycle/display run,
+  not a SpringBoard claim. The app still needs the shared real-guest session;
+  Metal is optional and not implemented.
 - **Multitouch**, mapped from the host touchscreen to the guest's controller.
   `AppleMultitouchZ2SPI` already starts and reports "using DMA for bootloading",
   which proves that the recorded boot reached that request. Device, DMA and
@@ -742,11 +781,12 @@ still runs only a synthetic guest and has no touch or audio path.
   errors, zero pending continuations, and zero external failures. Run06 retained
   those results to a clean 1 B cap. Run07 then retained them to a clean 2 B cap,
   after fsck, the `/dev/md0` root mount, `mDNSResponder` Seatbelt setup, and
-  `systemShutdown false`. Across the latest run the external path completed
+  `systemShutdown false`. Across that longest run the external path completed
   12,782 reads and 82 writes with zero failures, while the work image retained
   its exact 466,825,216-byte length and the firmware hashes remained unchanged.
-  The latest serial run disabled the framebuffer and had zero CLCD
-  status/mask/scanning, so it is not display evidence.
+  Display-enabled run08 independently completed 8,059 reads and 16 writes with
+  zero failures, plus two raw redirects/completions with no pending request or
+  guest error; the firmware hashes again remained unchanged.
   Snapshot backing identity/overlay state follows, and global `_bcopy_phys`
   replacement remains forbidden. Historical
   older-source experiments reported 312 MiB and

@@ -1782,6 +1782,9 @@ static unsigned    NM;
 #define H1_DISPLAY_VM_SIZE UINT32_C(0x0000a000)
 #define MERLOT_LCD_VM_BASE UINT32_C(0xc0650000)
 #define MERLOT_LCD_VM_SIZE UINT32_C(0x00004000)
+#define DISPLAY_PC_CAP 1024u
+#define DISPLAY_PC_HASH_CAP 2048u
+#define DISPLAY_ENTRY_EDGE_CAP 1024u
 
 typedef enum {
     LIFECYCLE_SYSCALL = 1,
@@ -1809,6 +1812,30 @@ typedef struct {
     bool     user_pc_valid;
     char     path[LIFECYCLE_PATH_MAX + 1u];
 } lifecycle_event_t;
+
+typedef struct {
+    uint32_t vm_pc;
+    uint64_t hits;
+} display_pc_hit_t;
+
+typedef struct {
+    uint64_t at;
+    uint32_t vm_pc;
+    uint32_t lr;
+    uint32_t cpsr;
+} display_entry_edge_t;
+
+typedef struct {
+    uint64_t hits;
+    uint64_t first_at;
+    uint64_t last_at;
+    unsigned pc_n;
+    uint64_t pc_dropped;
+    display_pc_hit_t pc_hist[DISPLAY_PC_HASH_CAP];
+    unsigned edge_n;
+    uint64_t edge_dropped;
+    display_entry_edge_t edges[DISPLAY_ENTRY_EDGE_CAP];
+} display_exec_diag_t;
 
 static struct {
     /* bus interposition */
@@ -1873,9 +1900,9 @@ static struct {
     uint64_t    springboard_last_at;
 
     /* Exact, every-instruction-entry display-driver coverage. Physical pre-MMU
-     * PCs are folded through the selected phys/virt bases before two checks. */
-    struct { uint64_t hits, first_at, last_at; } h1_display_exec;
-    struct { uint64_t hits, first_at, last_at; } merlot_exec;
+     * PCs are normalized only after the alias-aware range check accepts them. */
+    display_exec_diag_t h1_display_exec;
+    display_exec_diag_t merlot_exec;
 
     /* IRQ entries, for the same reason FIQ entries are counted. */
     uint64_t    irq_n;
@@ -2563,6 +2590,149 @@ static bool pc_in_vm_or_pre_mmu_alias(const arm_cpu_t *cpu, uint32_t pc,
            (uint32_t)(pc - pa_base) < size;
 }
 
+static bool display_observed_vm_pc(const arm_cpu_t *cpu, uint32_t pc,
+                                   uint32_t vm_base, uint32_t size,
+                                   bool pa_valid, uint32_t pa_base,
+                                   uint32_t *vm_pc_out) {
+    pc &= ~1u;
+    if (!pc_in_vm_or_pre_mmu_alias(
+            cpu, pc, vm_base, size, pa_valid, pa_base))
+        return false;
+
+    if ((uint32_t)(pc - vm_base) < size) {
+        *vm_pc_out = pc;
+    } else {
+        /*
+         * The range helper accepts this branch only for a valid physical alias
+         * while the MMU is off. In particular, never fold a low userspace PC
+         * merely because its numeric value lies in DRAM.
+         */
+        *vm_pc_out = vm_base + (pc - pa_base);
+    }
+    return true;
+}
+
+static uint32_t display_observed_lr(const arm_cpu_t *cpu, uint32_t lr,
+                                    uint32_t virt_base, uint32_t phys_base,
+                                    uint32_t ram_size) {
+    uint32_t state = lr & 1u;
+    uint32_t address = lr & ~1u;
+
+    /*
+     * Preserve an MMU-on LR verbatim: it may legitimately be a low userspace
+     * address. A physical-to-VM fold is valid only in the pre-MMU mapping.
+     */
+    if (!cpu || (cpu->cp15.sctlr & ARM_SCTLR_M) ||
+        (uint32_t)(address - phys_base) >= ram_size)
+        return lr;
+
+    return virt_base + (address - phys_base) + state;
+}
+
+static unsigned display_pc_hash(uint32_t vm_pc) {
+    uint32_t key = vm_pc >> 1;
+    key ^= key >> 16;
+    key *= UINT32_C(0x7feb352d);
+    key ^= key >> 15;
+    return key & (DISPLAY_PC_HASH_CAP - 1u);
+}
+
+static void display_exec_note(display_exec_diag_t *diag, uint64_t at,
+                              uint32_t vm_pc, uint32_t lr, uint32_t cpsr,
+                              bool entry_edge) {
+    unsigned slot = display_pc_hash(vm_pc);
+
+    if (!diag->hits) diag->first_at = at;
+    diag->last_at = at;
+    diag->hits++;
+
+    for (unsigned probe = 0; probe < DISPLAY_PC_HASH_CAP; probe++) {
+        display_pc_hit_t *hit = &diag->pc_hist[slot];
+        if (hit->hits) {
+            if (hit->vm_pc == vm_pc) {
+                hit->hits++;
+                break;
+            }
+        } else {
+            if (diag->pc_n >= DISPLAY_PC_CAP) {
+                diag->pc_dropped++;
+                break;
+            }
+            hit->vm_pc = vm_pc;
+            hit->hits = 1;
+            diag->pc_n++;
+            break;
+        }
+        slot = (slot + 1u) & (DISPLAY_PC_HASH_CAP - 1u);
+        if (probe + 1u == DISPLAY_PC_HASH_CAP)
+            diag->pc_dropped++;
+    }
+
+    if (!entry_edge) return;
+    if (diag->edge_n < DISPLAY_ENTRY_EDGE_CAP) {
+        display_entry_edge_t *edge = &diag->edges[diag->edge_n++];
+        edge->at = at;
+        edge->vm_pc = vm_pc;
+        edge->lr = lr;
+        edge->cpsr = cpsr;
+    } else {
+        diag->edge_dropped++;
+    }
+}
+
+static int display_pc_compare(const void *a, const void *b) {
+    const display_pc_hit_t *left = a;
+    const display_pc_hit_t *right = b;
+    if (left->vm_pc < right->vm_pc) return -1;
+    if (left->vm_pc > right->vm_pc) return 1;
+    return 0;
+}
+
+static void display_driver_exec_report(const char *name, uint32_t vm_base,
+                                       uint32_t vm_size, bool alias_valid,
+                                       uint32_t alias_base,
+                                       const display_exec_diag_t *diag) {
+    display_pc_hit_t ordered[DISPLAY_PC_CAP];
+    unsigned ordered_n = 0;
+
+    printf("    %s vm [%08x,%08x)", name, vm_base, vm_base + vm_size);
+    if (alias_valid)
+        printf(", pre-MMU physical alias [%08x,%08x)\n",
+               alias_base, alias_base + vm_size);
+    else
+        printf(", no valid physical alias in the selected DRAM mapping\n");
+
+    if (diag->hits)
+        printf("        aggregate observations %" PRIu64
+               " first @%" PRIu64 " last @%" PRIu64 "\n",
+               diag->hits, diag->first_at, diag->last_at);
+    else
+        printf("        aggregate observations 0\n");
+
+    for (unsigned i = 0; i < DISPLAY_PC_HASH_CAP; i++)
+        if (diag->pc_hist[i].hits)
+            ordered[ordered_n++] = diag->pc_hist[i];
+    qsort(ordered, ordered_n, sizeof ordered[0], display_pc_compare);
+
+    printf("        exact PCs: %u retained (capacity %u), dropped %" PRIu64
+           " unretained instruction-entry observations\n",
+           ordered_n, DISPLAY_PC_CAP, diag->pc_dropped);
+    for (unsigned i = 0; i < ordered_n; i++)
+        printf("          pc %08x hits %-10" PRIu64 " %s\n",
+               ordered[i].vm_pc, ordered[i].hits,
+               ksym_at(ordered[i].vm_pc));
+
+    printf("        outside->inside entry edges: %u retained (capacity %u), "
+           "dropped %" PRIu64 "\n",
+           diag->edge_n, DISPLAY_ENTRY_EDGE_CAP, diag->edge_dropped);
+    for (unsigned i = 0; i < diag->edge_n; i++) {
+        const display_entry_edge_t *edge = &diag->edges[i];
+        printf("          @%-11" PRIu64 " pc=%08x lr=%08x cpsr=%08x %s\n",
+               edge->at, edge->vm_pc, edge->lr, edge->cpsr,
+               ksym_at(edge->vm_pc));
+    }
+}
+
 static void display_exec_report(uint32_t virt_base, uint32_t phys_base,
                                 uint32_t ram_size) {
     uint32_t h1_pa = 0, merlot_pa = 0;
@@ -2573,37 +2743,21 @@ static void display_exec_report(uint32_t virt_base, uint32_t phys_base,
         MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_SIZE,
         virt_base, phys_base, ram_size, &merlot_pa);
 
-    printf("\n=== DISPLAY DRIVER EXECUTION "
-           "(exact observed instruction-entry PCs) ===\n");
-    printf("    AppleH1DisplayDrivers vm %08x..%08x",
-           H1_DISPLAY_VM_BASE, H1_DISPLAY_VM_BASE + H1_DISPLAY_VM_SIZE);
-    if (h1_alias)
-        printf(", physical alias %08x..%08x\n",
-               h1_pa, h1_pa + H1_DISPLAY_VM_SIZE);
-    else
-        printf(", no valid physical alias in the selected DRAM mapping\n");
-    if (G.h1_display_exec.hits)
-        printf("        hits %" PRIu64 " first @%" PRIu64 " last @%" PRIu64 "\n",
-               G.h1_display_exec.hits, G.h1_display_exec.first_at,
-               G.h1_display_exec.last_at);
-    else
-        printf("        hits 0 (no observed instruction-entry PC in the "
-               "applicable range%s)\n", h1_alias ? "s" : "");
-
-    printf("    AppleMerlotLCD       vm %08x..%08x",
-           MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_BASE + MERLOT_LCD_VM_SIZE);
-    if (merlot_alias)
-        printf(", physical alias %08x..%08x\n",
-               merlot_pa, merlot_pa + MERLOT_LCD_VM_SIZE);
-    else
-        printf(", no valid physical alias in the selected DRAM mapping\n");
-    if (G.merlot_exec.hits)
-        printf("        hits %" PRIu64 " first @%" PRIu64 " last @%" PRIu64 "\n",
-               G.merlot_exec.hits, G.merlot_exec.first_at,
-               G.merlot_exec.last_at);
-    else
-        printf("        hits 0 (no observed instruction-entry PC in the "
-               "applicable range%s)\n", merlot_alias ? "s" : "");
+    printf("\n=== DISPLAY DRIVER INSTRUCTION-ENTRY OBSERVATIONS ===\n");
+    printf("    PCs are reported in VM form. A physical alias is normalized "
+           "only while the MMU is off;\n"
+           "    an MMU-on low userspace PC is never folded into a driver "
+           "range. LR is normalized only pre-MMU.\n");
+    display_driver_exec_report(
+        "AppleH1DisplayDrivers", H1_DISPLAY_VM_BASE, H1_DISPLAY_VM_SIZE,
+        h1_alias, h1_pa, &G.h1_display_exec);
+    display_driver_exec_report(
+        "AppleMerlotLCD      ", MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_SIZE,
+        merlot_alias, merlot_pa, &G.merlot_exec);
+    printf("    IMPORTANT: these are instruction-entry observations only; "
+           "they do not prove retirement,\n"
+           "               successful driver start, framebuffer rendering, "
+           "or SpringBoard reach.\n");
 }
 
 /*
@@ -4420,6 +4574,9 @@ int main(int argc, char **argv) {
     bool merlot_display_pa_valid = display_physical_alias(
         MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_SIZE,
         virt_base, phys_base, ram_size, &merlot_display_pa);
+    bool display_prev_valid = false;
+    bool h1_display_prev_inside = false;
+    bool merlot_display_prev_inside = false;
 
     G.hot_steps = steps;
     for (; n < steps; n++) {
@@ -4450,20 +4607,30 @@ int main(int argc, char **argv) {
              * with translation active, a low PC can be unrelated userspace in
              * the same numeric aperture and must not become false kext proof.
              */
-            if (pc_in_vm_or_pre_mmu_alias(
-                    &mach.cpu, p, H1_DISPLAY_VM_BASE, H1_DISPLAY_VM_SIZE,
-                    h1_display_pa_valid, h1_display_pa)) {
-                if (!G.h1_display_exec.hits) G.h1_display_exec.first_at = n;
-                G.h1_display_exec.last_at = n;
-                G.h1_display_exec.hits++;
-            }
-            if (pc_in_vm_or_pre_mmu_alias(
-                    &mach.cpu, p, MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_SIZE,
-                    merlot_display_pa_valid, merlot_display_pa)) {
-                if (!G.merlot_exec.hits) G.merlot_exec.first_at = n;
-                G.merlot_exec.last_at = n;
-                G.merlot_exec.hits++;
-            }
+            uint32_t h1_vm_pc = 0, merlot_vm_pc = 0;
+            bool h1_inside = display_observed_vm_pc(
+                &mach.cpu, p, H1_DISPLAY_VM_BASE, H1_DISPLAY_VM_SIZE,
+                h1_display_pa_valid, h1_display_pa, &h1_vm_pc);
+            bool merlot_inside = display_observed_vm_pc(
+                &mach.cpu, p, MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_SIZE,
+                merlot_display_pa_valid, merlot_display_pa, &merlot_vm_pc);
+            uint32_t observed_lr = display_observed_lr(
+                &mach.cpu, mach.cpu.r[14], virt_base, phys_base, ram_size);
+
+            if (h1_inside)
+                display_exec_note(
+                    &G.h1_display_exec, n, h1_vm_pc, observed_lr,
+                    mach.cpu.cpsr,
+                    display_prev_valid && !h1_display_prev_inside);
+            if (merlot_inside)
+                display_exec_note(
+                    &G.merlot_exec, n, merlot_vm_pc, observed_lr,
+                    mach.cpu.cpsr,
+                    display_prev_valid && !merlot_display_prev_inside);
+
+            h1_display_prev_inside = h1_inside;
+            merlot_display_prev_inside = merlot_inside;
+            display_prev_valid = true;
         }
 
         /*

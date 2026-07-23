@@ -13,13 +13,15 @@ device behind each stage.
 > (`0xe6cf3073`) in user mode. The complete paired-extend implementation then
 > replayed through that stop, wrote a 2.97 B checkpoint and reached a clean
 > 2.98 B cap. Free pages dipped to 97 and ended at 214 against a target of 250.
-> The current memory-safe external-md evidence is run07: a fresh 128 MiB cold
+> The longest current memory-safe external-md evidence is run07: a fresh 128 MiB cold
 > boot reached a clean 2 B cap after launchd, fsck, the root mount,
 > `mDNSResponder` Seatbelt setup, and `systemShutdown false`, with 12,983 pages
-> (50.71 MiB) at its low-water sample. Its framebuffer was disabled and CLCD
-> status/mask/scanning were zero. Neither path proves a SpringBoard frame. The
-> installable app runs a synthetic guest through CoreGraphics and has no
-> real-boot session, touch, audio or guest networking.
+> (50.71 MiB) at its low-water sample. Display-enabled run08 then reached a
+> 600 M cap with entry PCs observed in both Apple display-driver bundle ranges
+> and corrected seeded scanout still live, but zero CLCD MMIO, zero SpringBoard
+> path attempts, and only one 8x16 white block on black. None of these paths proves a
+> SpringBoard frame. The installable app runs a synthetic guest through
+> CoreGraphics and has no real-boot session, touch, audio or guest networking.
 
 Everything here is from actual historical runs. The command below is the recipe,
 not a promise of byte-identical current output: the stopping point and log are
@@ -1000,11 +1002,11 @@ tree, and rootfs hashes were unchanged: exact kernel patches still touched only
 the loaded guest-RAM copy, and filesystem edits remained confined to the
 separate work image.
 
-The matching hosted checks at `df9dc7b` also completed successfully:
-[`core-tests` run 30004015881](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30004015881)
+The latest matching hosted checks at `ea92fca` also completed successfully:
+[`core-tests` run 30009684129](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30009684129)
 and
-[`ios-build` run 30004015807](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30004015807).
-Those workflows validate the public build and tests; run05 through run07 are
+[`ios-build` run 30009684054](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30009684054).
+Those workflows validate the public build and tests; run05 through run08 are
 the separate private-firmware runtime evidence.
 
 ### 2026-07-23: run06 sustained the cold path to 1 B
@@ -1100,9 +1102,57 @@ Frames and CLCD-derived wake events advance only when start state, `CLCD_CTRL`
 global enable, and `VIDCON0` bit 0 are all active; host publication observes
 the same invariant.
 
-This is pre-run correctness work. It has not produced a new firmware display
-trace, and it does not change run07's zero-CLCD result. There is still no
-SpringBoard frame and no proof that the real display path works.
+Run08 subsequently exercised this corrected seed. The result below is a
+display-path diagnostic, not SpringBoard proof.
+
+### 2026-07-23: run08 executed display bundles without CLCD MMIO
+
+Run08 used a fresh external-md work image, 128 MiB of guest RAM, and
+`-F -H 0x38900000` for framebuffer seeding plus exact CLCD-page tracing. The harness reached its
+**600,000,000** retired-instruction cap and reported `stopped ... OK`. Final PC
+was `0xc017056c` (`_SHA1Init+0xc4`) and stderr was empty. The host wrapper's
+exit-marker file was accidentally empty, so this run has no captured OS process
+exit status.
+
+Exact instruction-entry PC coverage reported:
+
+```text
+AppleH1DisplayDrivers  hits 675  first 126211220  last 201032245
+AppleMerlotLCD         hits 409  first 209372737  last 211410011
+CLCD MMIO page         0 accesses
+```
+
+The first two lines prove only that the CPU reached PCs inside both executable
+bundle ranges. They do not prove retirement or that `AppleH1CLCD::start`
+completed. With no guest access to the CLCD page, seeded configuration remained
+intact while guest-time ticking advanced IRQ status and the frame counter:
+
+```text
+irq-status 1  mask 0  scanning 1  CLCD_CTRL 0x41
+VIDCON0 0x441  VIDCON1 0x8  active window 0  running 1  frames 386
+```
+
+The capture was nonblack only technically: 128 white pixels formed one 8x16
+block at the top-left, every other pixel was black, and only 384 RGB bytes were
+nonzero. This is neither recognizable UI nor evidence of guest-driven scanout.
+
+The lifecycle ring retained 70 events with zero pathname-copy failures.
+`launchd`, fsck, and the `/dev/md0` root mount were present; service spawns
+progressed through `/usr/sbin/notifyd` at instruction 586,776,479. Exact
+SpringBoard path attempts were zero. User mode retired 44,274,420 instructions
+(7.4%), and free pages reached a low of 19,260 (75.23 MiB).
+
+The external bridge completed 8,059 reads (33,034,752 bytes), 16 writes
+(61,952 bytes), and zero failures. Raw I/O completed two redirects and two
+completions with zero pending continuations and zero guest errors. The source
+kernel, device-tree, and rootfs hashes remained unchanged.
+
+The correct conclusion is narrow: the CPU reached PCs inside both bundle ranges
+and the corrected seed survived. There is no proof of instruction retirement,
+a successful `AppleH1CLCD` start, SpringBoard, or a useful display path. Zero
+MMIO is important evidence, but it does not alone identify the exact blocker.
+The next step is a longer bounded run with lifecycle and display evidence
+retained.
 
 This chain is stronger evidence for sustained userspace and snapshot
 repeatability. It is **not** evidence that SpringBoard rendered. The bounded
@@ -1183,9 +1233,11 @@ window; it adopts the first enabled window and wraps its pitch, base and geometr
 in the IOSurface that becomes the screen. The current model can seed window 0
 with the corrected iBoot-compatible N82 timing and capture it only while all
 live-scanout gates remain active. It can also supply the Merlot panel identity.
-No real-firmware run has yet validated that combined handoff. The app's
-CoreGraphics view can display its synthetic guest's CLCD buffer, but it is not
-wired to a shared real-guest session. Touch remains separate M5 work.
+Run08 exercised that combined seed and reached PCs in both bundle code ranges,
+but observed no CLCD MMIO and no useful frame; it did not validate successful
+driver start. The app's CoreGraphics view can display its synthetic guest's
+CLCD buffer, but it is not wired to a shared real-guest session. Touch remains
+separate M5 work.
 
 ---
 

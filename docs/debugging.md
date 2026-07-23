@@ -339,9 +339,8 @@ one of those gates is off. This prevents a stale window from masquerading as a
 live panel.
 
 These checks describe the corrected model, not a successful display boot.
-Run07 disabled the framebuffer and reported zero CLCD activity, and no later
-real-firmware display run has yet exercised this handoff or captured
-SpringBoard.
+Run07 disabled the framebuffer and reported zero CLCD activity. Run08 later
+exercised the corrected seed but did not capture SpringBoard.
 
 For a display-focused CLI run, `-H 0x38900000` moves the bounded hot-page
 register trace to the CLCD page; `-H` rejects unaligned or out-of-range physical
@@ -349,7 +348,11 @@ pages. The final report also counts every observed instruction-entry PC in the
 `AppleH1DisplayDrivers` and `AppleMerlotLCD` executable ranges rather than
 relying on the one-in-1,024 profiler. Low physical aliases count only before the
 MMU is enabled, so a userspace PC in the DRAM-sized numeric aperture cannot
-become false display-driver evidence.
+become false display-driver evidence. The report retains a bounded exact-PC
+histogram and every observed outside-to-inside entry edge with instruction
+index, LR, and CPSR; any unretained observations or edges are counted
+explicitly. These remain observations at instruction entry, not proof of
+retirement or successful driver startup.
 
 The process-lifecycle section retains the newest 256 fork, exec, spawn, wait,
 kill, exit, `_exit1`, and `_psignal` entries. Exec/spawn pathnames are copied
@@ -362,6 +365,48 @@ PPM is published only from a currently running CLCD and active, valid RGB
 window, and the report labels it `ALL BLACK` or `NONBLACK`. Either result is
 scanout evidence only. A recognizable SpringBoard frame, together with
 lifecycle and driver evidence, is still required for boot-completion proof.
+
+### Run08 display diagnostic
+
+Run08 used a fresh 128 MiB external-md work image with
+`-F -H 0x38900000`. The harness reached its 600,000,000-instruction
+cap with `stopped ... OK`; final PC was `0xc017056c` (`_SHA1Init+0xc4`) and
+stderr was empty. The wrapper's exit-marker file was accidentally empty, so do
+not report an OS process exit status for this run.
+
+The exact code-range counters were:
+
+```text
+AppleH1DisplayDrivers  675 hits  first 126211220  last 201032245
+AppleMerlotLCD         409 hits  first 209372737  last 211410011
+CLCD page accesses      0
+```
+
+Those PC observations prove only that the CPU reached addresses in both bundle
+ranges. They do not prove retirement or that `AppleH1CLCD::start` completed.
+With no guest CLCD MMIO, seeded configuration remained intact while guest-time
+ticking advanced IRQ status and the frame counter: status 1, mask 0, scanning
+1, `CLCD_CTRL = 0x41`, `VIDCON0 = 0x441`, `VIDCON1 = 0x8`, window 0 active,
+running 1, and 386 frames.
+
+The resulting frame was `NONBLACK` only in the literal counter sense. It had
+384 nonzero RGB bytes: 128 white pixels in one 8x16 block at the top-left, with
+every other pixel black. Do not treat that block as a SpringBoard frame or as
+evidence of Apple-display-driver-driven output.
+
+The lifecycle ring retained 70 events with zero pathname-copy failures.
+Launchd, fsck, and the root mount were present; service spawns progressed
+through `/usr/sbin/notifyd` at instruction 586,776,479. Exact SpringBoard path
+attempts were zero. User mode retired 44,274,420 instructions (7.4%), and free
+pages reached a low of 19,260 (75.23 MiB).
+
+Storage remained clean: 8,059 reads (33,034,752 bytes), 16 writes (61,952
+bytes), zero failures, two raw redirects, two completions, zero pending
+continuations, and zero raw guest errors. The source hashes were unchanged.
+
+The correct next move is a longer bounded run with lifecycle and display
+evidence retained. Zero MMIO is important, but alone it does not identify the
+exact blocker.
 
 ### WFI changes elapsed device time, not the instruction coordinate
 
