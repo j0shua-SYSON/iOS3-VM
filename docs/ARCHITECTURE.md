@@ -241,6 +241,14 @@ was 13,000 pages (50.78 MiB); the low was 12,983 pages (50.71 MiB) at
 1,836,056,576 instructions. The work image and source hashes remained exact,
 and stderr was empty.
 
+Run09 repeated that full cap with the corrected display handoff enabled. The
+harness stopped `OK` with empty stderr, although its host wrapper did not
+provide an OS process exit marker. It retired 729,934,906 instructions in USR
+mode (36.5%) and completed 12,798 reads (52,438,528 bytes) plus 82 writes
+(325,120 bytes), with zero external-bridge failures. Its free-page low was
+12,976 pages (50.69 MiB) at instruction 1,829,371,904. Source firmware hashes
+remained unchanged.
+
 This validates the compatibility seam at the reached path, but it does not
 prove that SpringBoard rendered. Run07 disabled the framebuffer, and its CLCD
 status, mask, and scanning values were all zero; it provides no display-path
@@ -293,6 +301,20 @@ the corrected seed survived; it does not prove a successful `AppleH1CLCD`
 start, guest CLCD programming, SpringBoard, or a useful display. The zero-MMIO
 observation narrows the investigation but does not identify the exact blocker
 without a longer run and more lifecycle evidence.
+
+Run09 supplied that longer evidence through a fresh 2,000,000,000-instruction
+cap. Its lifecycle ring retained 120 events and one exact stock SpringBoard
+`posix_spawn` pathname attempt at instruction 635,280,837; one unrelated later
+pathname copy failed. The entry event does not prove syscall success, a child
+process, or execution of SpringBoard. `AppleH1DisplayDrivers` accumulated 687
+entry observations, first at 126,211,220 and last at 1,571,737,384, with the
+late extension consisting of only six two-instruction callbacks.
+`AppleMerlotLCD` remained frozen at 409 observations, last at 211,410,011.
+SPI0 saw only 13 early platform writes, and the guest still made no recorded
+CLCD MMIO access. Seeded scanout advanced to 589 frames, but its final PPM was
+byte-identical to run08: one 8x16 white block, exactly 128 white pixels, on
+black. The architecture has therefore reached the SpringBoard launch request,
+not a proved SpringBoard process or display handoff.
 
 In the planned shared-session design, host services cross explicit non-blocking
 seams: frame descriptors out; bounded touch, PCM and network queues in/out;

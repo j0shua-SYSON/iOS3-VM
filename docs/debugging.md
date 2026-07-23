@@ -339,8 +339,9 @@ one of those gates is off. This prevents a stale window from masquerading as a
 live panel.
 
 These checks describe the corrected model, not a successful display boot.
-Run07 disabled the framebuffer and reported zero CLCD activity. Run08 later
-exercised the corrected seed but did not capture SpringBoard.
+Run07 disabled the framebuffer and reported zero CLCD activity. Run09 later
+retained the corrected seed and captured a SpringBoard launch request, but not
+spawn success, SpringBoard execution, or rendering.
 
 For a display-focused CLI run, `-H 0x38900000` moves the bounded hot-page
 register trace to the CLCD page; `-H` rejects unaligned or out-of-range physical
@@ -404,9 +405,54 @@ Storage remained clean: 8,059 reads (33,034,752 bytes), 16 writes (61,952
 bytes), zero failures, two raw redirects, two completions, zero pending
 continuations, and zero raw guest errors. The source hashes were unchanged.
 
-The correct next move is a longer bounded run with lifecycle and display
-evidence retained. Zero MMIO is important, but alone it does not identify the
-exact blocker.
+Run09 supplied the longer bounded run described next. Zero MMIO remained
+important, but alone it did not identify the exact blocker.
+
+### Run09 SpringBoard launch-request diagnostic
+
+Run09 used a fresh display-enabled 128 MiB external-md work image and a
+2,000,000,000-instruction cap. The harness reported `stopped ... OK` and stderr
+was empty. The wrapper's OS process exit marker was unavailable, so do not
+report a host exit code. User mode retired 729,934,906 instructions (36.5%).
+The free-page low was 12,976 pages (50.69 MiB) at instruction 1,829,371,904.
+
+The lifecycle ring retained 120 events. It captured one exact stock
+SpringBoard pathname in a `posix_spawn` attempt at instruction 635,280,837.
+That event proves only that the caller requested the path. It does not prove
+the syscall returned successfully, that a child existed, that SpringBoard
+retired an instruction, or that it rendered. The one pathname-copy failure was
+a separate later event.
+
+The exact display diagnostics were:
+
+```text
+AppleH1DisplayDrivers  687 hits  first 126211220  last 1571737384
+AppleMerlotLCD         409 hits  first 209372737  last 211410011
+SPI0                    13 early platform writes
+CLCD page accesses       0
+```
+
+The only late H1 activity was six two-instruction callbacks.
+`AppleMerlotLCD` did not advance beyond run08, SPI0 never progressed beyond
+early platform writes, and no CLCD MMIO was recorded. Seeded scanout reached
+589 frames, but the final PPM was byte-identical to run08: exactly 128 white
+pixels in an 8x16 top-left block and every other pixel black.
+
+Storage and memory remained stable: 12,798 reads (52,438,528 bytes), 82 writes
+(325,120 bytes), zero bridge failures, and unchanged source-firmware hashes.
+The next diagnostic should capture the `posix_spawn` return/outcome and child
+lifetime while retaining the lifecycle, SPI0, CLCD, and frame checks.
+
+The harness now arms a bounded raw-return probe only when that exact stock
+pathname is copied successfully. It discovers and validates the unique
+`MOVS pc,lr` gate in `_thread_exception_return`, then accepts only the matching
+SVC-to-USR transition with the same TTBR/FCSE/context identity, kernel and user
+thread-ID registers, SVC stack, user stack/link register, ARM/Thumb state, and
+resume PC. A later same-thread SWI closes an unresolved generation so another
+call through the same libc wrapper cannot be misattributed. The report retains
+raw `r0`, `r1`, `CPSR.C`, and separate transition/resume instruction indices.
+Run09 predates this probe; a new real-firmware run is required before it can
+answer whether the recorded spawn returned success or an errno.
 
 ### WFI changes elapsed device time, not the instruction coordinate
 

@@ -28,7 +28,7 @@ proof that no private or unindexed implementation exists.
 | **M2** | SoC bring-up | A bare-metal payload prints over the emulated UART; a timer IRQ is taken and returned from | ✅ done and covered by host tests |
 | **M3** | Firmware containers + LLB execution | Real IMG3s parse and decrypt; an extracted real Apple LLB payload executes; the kernelcache is extracted | ✅ done; SecureROM/iBoot execution remains future full-chain work |
 | **M4** | XNU boots and logs | The kernel reaches `bsd_init`, prints, and Apple's own kexts match and start | ✅ **done** — plus the real root filesystem mounts |
-| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress.** Run07 remains the longest fresh 128 MiB external-md path at 2 B. Display-enabled run08 reached 600 M with launchd, fsck/root mount, service spawns through `notifyd`, observed entry PCs in both Apple display-driver bundle ranges, and retained corrected seeded scanout. It recorded zero SpringBoard path attempts, zero CLCD MMIO, and only one 8x16 white block on black. This is not successful `AppleH1CLCD` start, SpringBoard, or tap proof. The app is still a demo host. |
+| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress.** Display-enabled run09 reached a stable 2 B cap with 36.5% USR execution and one exact stock SpringBoard `posix_spawn` pathname attempt at 635,280,837. Spawn success, a running SpringBoard process, and rendering remain unproved: no CLCD MMIO was recorded and the frame stayed one 8x16 white block on black. The app is still a demo host. |
 | **D** | Dynarec (parallel) | SpringBoard at interactive frame rates on the phone | 🔵 emitter + ARM/Thumb translator and host execution tests exist (off by default); no code cache or dispatcher calls them |
 | **N** | Guest networking (parallel) | The guest resolves a name and fetches a URL | ⚪ designed, not built |
 | **A** | Guest audio (first-device track) | Guest PCM reaches the host speaker without blocking the CPU thread | ⚪ priority, not designed or built |
@@ -500,8 +500,10 @@ later.
 
 **Last demonstrated boundary:** criterion 1 is met and criterion 2 is partially
 observable in the CLI harness. The real HFSX root filesystem mounted as `md0`,
-`launchd` executed user-mode code, and `mDNSResponder` ran as pid 14. A current
-checkpoint chain restored at 2.2 B retired instructions, crossed the former
+`launchd` executed user-mode code, `mDNSResponder` ran as pid 14, and run09
+recorded one exact stock SpringBoard `posix_spawn` pathname attempt at
+635,280,837. The attempt does not prove syscall success or a child process. A
+current checkpoint chain restored at 2.2 B retired instructions, crossed the former
 `SMULBB` stop and wrote a 2.4 B checkpoint. The 2.4 B → 2.8 B interval wrote a
 2.7 B checkpoint, observed one new `_execve` first at 2,605,595,575, and ended
 with `systemShutdown false`. Restoring 2.7 B wrote a 2.85 B checkpoint and
@@ -612,6 +614,31 @@ frame. The lack of MMIO is an important observation, not by itself an
 identification of the exact blocker; the next evidence must come from a longer
 run and lifecycle/display tracing.
 
+Run09 supplied that longer fresh display-enabled run through a
+2,000,000,000-instruction cap. The harness stopped `OK`, stderr was empty, and
+the wrapper's OS process exit marker was unavailable. User mode retired
+729,934,906 instructions (36.5%); free pages reached a low of 12,976
+(50.69 MiB) at 1,829,371,904. The bridge completed 12,798 reads
+(52,438,528 bytes), 82 writes (325,120 bytes), and zero failures, while source
+firmware hashes remained unchanged.
+
+The lifecycle ring retained 120 events and one exact stock SpringBoard
+`posix_spawn` pathname attempt at 635,280,837. One unrelated later pathname
+copy failed. The probe does not yet capture the spawn outcome, a child process,
+or SpringBoard execution. `AppleH1DisplayDrivers` rose to 687 entry
+observations, first at 126,211,220 and last at 1,571,737,384, but the extension
+was only six late two-instruction callbacks. `AppleMerlotLCD` remained frozen
+at 409 observations, last at 211,410,011. SPI0 saw only 13 early platform
+writes, and no CLCD MMIO was recorded. Seeded scanout advanced to 589 frames,
+yet the PPM was byte-identical to run08: exactly 128 white pixels in one 8x16
+top-left block on black.
+
+Run09 therefore advances the verified frontier from “no SpringBoard pathname
+attempt observed” to “launchd requested the exact stock SpringBoard path.” It
+does not meet criterion 3. The immediate blocker is now instrumenting the
+spawn return and child lifetime, then explaining why no panel/CLCD transaction
+or meaningful frame follows.
+
 For chronology, this is the much earlier pre-VFP measurement from
 `bootkernel`'s milestone probes:
 
@@ -706,10 +733,11 @@ still runs only a synthetic guest and has no touch or audio path.
   the `0x0d8..0x0ec` window configuration, seeds an iBoot-compatible N82
   handoff, and gates frame publication and WFI edges on genuinely live scanout.
   The app's CoreGraphics bridge follows a validated active window only while
-  those gates are live. Run08 exercised that seed but observed no CLCD MMIO and
-  only an 8x16 white block, so the next step is a longer lifecycle/display run,
-  not a SpringBoard claim. The app still needs the shared real-guest session;
-  Metal is optional and not implemented.
+  those gates are live. Run09 retained the seed through 2 B and captured one
+  exact SpringBoard spawn-path attempt, but observed no CLCD MMIO and only an
+  8x16 white block. The next step is spawn-outcome/child-lifetime tracing and
+  the missing display transaction, not a SpringBoard claim. The app still needs
+  the shared real-guest session; Metal is optional and not implemented.
 - **Multitouch**, mapped from the host touchscreen to the guest's controller.
   `AppleMultitouchZ2SPI` already starts and reports "using DMA for bootloading",
   which proves that the recorded boot reached that request. Device, DMA and
@@ -784,9 +812,9 @@ still runs only a synthetic guest and has no touch or audio path.
   `systemShutdown false`. Across that longest run the external path completed
   12,782 reads and 82 writes with zero failures, while the work image retained
   its exact 466,825,216-byte length and the firmware hashes remained unchanged.
-  Display-enabled run08 independently completed 8,059 reads and 16 writes with
-  zero failures, plus two raw redirects/completions with no pending request or
-  guest error; the firmware hashes again remained unchanged.
+  Display-enabled run09 independently completed 12,798 reads and 82 writes with
+  zero failures through its 2 B cap; the firmware hashes again remained
+  unchanged.
   Snapshot backing identity/overlay state follows, and global `_bcopy_phys`
   replacement remains forbidden. Historical
   older-source experiments reported 312 MiB and

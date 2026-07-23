@@ -956,6 +956,12 @@ static const char *ksym_at(uint32_t addr) {
 
 static uint32_t ksym_value(const char *name) { return ksyms_value(&KS, name); }
 
+static uint32_t ksym_next_value(uint32_t value) {
+    for (unsigned i = 0; i < KS.nsym; i++)
+        if (KS.sym[i].value > value) return KS.sym[i].value;
+    return 0;
+}
+
 /* The load map, printed by -L and by machoinfo -k. */
 static void dump_kext_map(void) {
     printf("=== PRELINKED KEXT LOAD MAP (__PRELINK_TEXT 0x%08x..0x%08x) ===\n",
@@ -1385,6 +1391,51 @@ static const uint8_t *guest_ptr(uint32_t va, uint32_t need) {
     return g_mach->ram + o;
 }
 
+/*
+ * Find the exact ARM exception-return instruction used by this kernel instead
+ * of assuming a transcribed offset.  A raw syscall result is trustworthy only
+ * on the SVC->USR transition executed by MOVS pc,lr in
+ * _thread_exception_return.  Refuse the probe unless that instruction is
+ * unique inside the symbol's exact range.
+ */
+static uint32_t discover_thread_exception_return_gate(void) {
+    const uint32_t movs_pc_lr = UINT32_C(0xe1b0f00e);
+    const uint32_t scan_bytes = UINT32_C(0x100);
+    uint32_t start = ksym_value("_thread_exception_return") & ~1u;
+    uint32_t end = ksym_next_value(start);
+    if (!start || start > UINT32_MAX - scan_bytes) {
+        printf("SpringBoard return gate: DISABLED"
+               " (_thread_exception_return address unresolved)\n");
+        return 0;
+    }
+    uint32_t scan_limit = start + scan_bytes;
+    if (!end || end > scan_limit) end = scan_limit;
+    if (end <= start || end - start < 4u) {
+        printf("SpringBoard return gate: DISABLED"
+               " (_thread_exception_return scan range invalid)\n");
+        return 0;
+    }
+
+    uint32_t found = 0;
+    unsigned matches = 0;
+    for (uint32_t pc = start; pc <= end - 4u; pc += 4u) {
+        const uint8_t *p = guest_ptr(pc, 4u);
+        if (!p || ld32(p) != movs_pc_lr) continue;
+        found = pc;
+        matches++;
+    }
+    if (matches != 1u) {
+        printf("SpringBoard return gate: DISABLED"
+               " (expected one MOVS pc,lr in %08x..%08x, found %u)\n",
+               start, end, matches);
+        return 0;
+    }
+
+    printf("SpringBoard return gate: %08x"
+           " (unique MOVS pc,lr in _thread_exception_return)\n", found);
+    return found;
+}
+
 /* Fetch bytes through the guest's current translation tables. guest_ptr()
  * intentionally handles only the kernel's fixed linear window, but the most
  * valuable undefined instructions now occur in user processes. Re-walk the
@@ -1785,6 +1836,7 @@ static unsigned    NM;
 #define DISPLAY_PC_CAP 1024u
 #define DISPLAY_PC_HASH_CAP 2048u
 #define DISPLAY_ENTRY_EDGE_CAP 1024u
+#define SPRINGBOARD_RETURN_CAP 8u
 
 typedef enum {
     LIFECYCLE_SYSCALL = 1,
@@ -1812,6 +1864,61 @@ typedef struct {
     bool     user_pc_valid;
     char     path[LIFECYCLE_PATH_MAX + 1u];
 } lifecycle_event_t;
+
+/*
+ * An exact pathname at SWI entry is only an attempt.  To distinguish a
+ * successful posix_spawn from an errno return without confusing another
+ * task/thread for launchd, retain the complete user-return identity that is
+ * live at _fleh_swi and accept only the matching privileged->USR transition.
+ *
+ * This table is deliberately tiny and bounded: it is armed only for the exact
+ * stock SpringBoard pathname, not for every syscall in a multi-billion-step
+ * run.  Raw TTBR0 is retained for evidence while the architecture-defined
+ * table-base mask is used for matching.
+ */
+typedef struct {
+    uint64_t entry_at;
+    uint64_t return_transition_at;
+    uint64_t return_at;
+    uint64_t redirected_at;
+    uint64_t superseded_at;
+    uint64_t resume_pc_candidates;
+    uint64_t identity_mismatches;
+    uint64_t same_identity_redirects;
+    uint32_t syscall_number;
+    uint32_t issuing_pc;
+    uint32_t resume_pc;
+    uint32_t entry_spsr;
+    uint32_t entry_svc_sp;
+    uint32_t entry_ttbr0;
+    uint32_t entry_ttbr0_base;
+    uint32_t entry_ttbcr;
+    uint32_t entry_fcse_pid;
+    uint32_t entry_context_id;
+    uint32_t entry_tpidrprw;
+    uint32_t entry_tpidrurw;
+    uint32_t entry_tpidruro;
+    uint32_t entry_user_sp;
+    uint32_t entry_user_lr;
+    uint32_t superseding_r12;
+    uint32_t last_redirect_pc;
+    uint32_t return_r0;
+    uint32_t return_r1;
+    uint32_t return_cpsr;
+    uint32_t return_from_svc_sp;
+    uint32_t return_ttbr0;
+    uint32_t return_fcse_pid;
+    uint32_t return_context_id;
+    uint32_t return_tpidrprw;
+    uint32_t return_tpidrurw;
+    uint32_t return_tpidruro;
+    uint32_t return_user_sp;
+    uint32_t return_user_lr;
+    bool returned;
+    bool redirected;
+    bool restarted;
+    bool superseded;
+} springboard_return_probe_t;
 
 typedef struct {
     uint32_t vm_pc;
@@ -1898,6 +2005,10 @@ static struct {
     uint64_t    springboard_attempts;
     uint64_t    springboard_first_at;
     uint64_t    springboard_last_at;
+    unsigned    springboard_return_n;
+    uint64_t    springboard_return_dropped;
+    springboard_return_probe_t
+                springboard_return[SPRINGBOARD_RETURN_CAP];
 
     /* Exact, every-instruction-entry display-driver coverage. Physical pre-MMU
      * PCs are normalized only after the alias-aware range check accepts them. */
@@ -2007,6 +2118,168 @@ static bool lifecycle_syscall_tracked(uint32_t number) {
     }
 }
 
+static uint32_t diagnostic_user_reg(const arm_cpu_t *cpu, unsigned reg) {
+    if (!cpu || reg > 14u) return 0;
+    if (arm_bank_of_mode(cpu->cpsr) == ARM_BANK_USR) return cpu->r[reg];
+    if (reg == 13u) return cpu->bank_r13[ARM_BANK_USR];
+    if (reg == 14u) return cpu->bank_r14[ARM_BANK_USR];
+    return cpu->r[reg];             /* r0-r12 are not banked outside FIQ */
+}
+
+/*
+ * ARMv6 TTBR0[31:14-N] is the translation-table base when TTBCR.N is N.
+ * The low bits carry cache/share attributes and are reported but must not turn
+ * a stable address space into a false mismatch.
+ */
+static uint32_t diagnostic_ttbr0_base(const arm_cpu_t *cpu) {
+    if (!cpu) return 0;
+    unsigned n = cpu->cp15.ttbcr & 7u;
+    return cpu->cp15.ttbr0 & (UINT32_MAX << (14u - n));
+}
+
+static void springboard_return_arm(const arm_cpu_t *cpu, uint64_t at,
+                                   uint32_t syscall_number,
+                                   uint32_t issuing_pc, uint32_t resume_pc,
+                                   uint32_t entry_spsr) {
+    if (!cpu) return;
+    if (G.springboard_return_n >= SPRINGBOARD_RETURN_CAP) {
+        G.springboard_return_dropped++;
+        return;
+    }
+
+    springboard_return_probe_t *probe =
+        &G.springboard_return[G.springboard_return_n++];
+    memset(probe, 0, sizeof *probe);
+    probe->entry_at          = at;
+    probe->syscall_number    = syscall_number;
+    probe->issuing_pc        = issuing_pc;
+    probe->resume_pc         = resume_pc;
+    probe->entry_spsr        = entry_spsr;
+    probe->entry_svc_sp      = cpu->r[13];
+    probe->entry_ttbr0       = cpu->cp15.ttbr0;
+    probe->entry_ttbr0_base  = diagnostic_ttbr0_base(cpu);
+    probe->entry_ttbcr       = cpu->cp15.ttbcr;
+    probe->entry_fcse_pid    = cpu->cp15.fcse_pid;
+    probe->entry_context_id  = cpu->cp15.context_id;
+    probe->entry_tpidrprw    = cpu->cp15.tpidrprw;
+    probe->entry_tpidrurw    = cpu->cp15.tpidrurw;
+    probe->entry_tpidruro    = cpu->cp15.tpidruro;
+    probe->entry_user_sp     = diagnostic_user_reg(cpu, 13u);
+    probe->entry_user_lr     = diagnostic_user_reg(cpu, 14u);
+}
+
+static bool springboard_return_parent_matches(
+        const springboard_return_probe_t *probe, const arm_cpu_t *cpu) {
+    if (!probe || !cpu) return false;
+    return diagnostic_ttbr0_base(cpu) == probe->entry_ttbr0_base &&
+           (cpu->cp15.ttbcr & 7u) == (probe->entry_ttbcr & 7u) &&
+           cpu->cp15.fcse_pid == probe->entry_fcse_pid &&
+           cpu->cp15.context_id == probe->entry_context_id &&
+           cpu->cp15.tpidrprw == probe->entry_tpidrprw &&
+           cpu->cp15.tpidrurw == probe->entry_tpidrurw &&
+           cpu->cp15.tpidruro == probe->entry_tpidruro;
+}
+
+static bool springboard_return_identity_matches(
+        const springboard_return_probe_t *probe, const arm_cpu_t *cpu) {
+    return springboard_return_parent_matches(probe, cpu) &&
+           diagnostic_user_reg(cpu, 13u) == probe->entry_user_sp &&
+           diagnostic_user_reg(cpu, 14u) == probe->entry_user_lr;
+}
+
+/*
+ * A synchronous caller cannot issue a second SWI before the first one returns.
+ * If the exact return transition was redirected (for example by signal
+ * delivery) and the same thread later enters another SWI, the old raw result
+ * is no longer attributable. Close that generation instead of allowing a
+ * later call through the same libc wrapper to satisfy it.
+ */
+static void springboard_return_note_swi_entry(const arm_cpu_t *cpu,
+                                              uint64_t at) {
+    if (!cpu) return;
+    for (unsigned i = 0; i < G.springboard_return_n; i++) {
+        springboard_return_probe_t *probe = &G.springboard_return[i];
+        if (probe->returned || probe->redirected || probe->restarted ||
+            probe->superseded ||
+            at <= probe->entry_at ||
+            !springboard_return_parent_matches(probe, cpu) ||
+            cpu->r[13] != probe->entry_svc_sp) continue;
+        probe->superseded = true;
+        probe->superseded_at = at;
+        probe->superseding_r12 = cpu->r[12];
+    }
+}
+
+/*
+ * Called immediately after one instruction changes processor mode.  At this
+ * point r0/r1 and CPSR are the raw syscall result, before the first user
+ * instruction can translate it into libc's public return convention.
+ */
+static void springboard_return_note_transition(const arm_cpu_t *cpu,
+                                               uint64_t transition_at,
+                                               uint64_t resume_at,
+                                               uint32_t mode_before,
+                                               uint32_t from_pc,
+                                               uint32_t return_gate_pc,
+                                               uint32_t svc_sp_before) {
+    if (!cpu || mode_before != ARM_MODE_SVC || !return_gate_pc ||
+        (from_pc & ~1u) != return_gate_pc ||
+        (cpu->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR) return;
+
+    bool thumb = (cpu->cpsr & ARM_CPSR_T) != 0;
+    for (unsigned next = G.springboard_return_n; next > 0; next--) {
+        springboard_return_probe_t *probe =
+            &G.springboard_return[next - 1u];
+        if (probe->returned || probe->redirected || probe->restarted ||
+            probe->superseded)
+            continue;
+
+        bool expected_thumb = (probe->entry_spsr & ARM_CPSR_T) != 0;
+        bool at_resume = cpu->r[15] == probe->resume_pc &&
+                         thumb == expected_thumb;
+        bool same_thread =
+            springboard_return_parent_matches(probe, cpu) &&
+            svc_sp_before == probe->entry_svc_sp;
+        bool same_frame =
+            same_thread && springboard_return_identity_matches(probe, cpu);
+
+        if (at_resume) probe->resume_pc_candidates++;
+        if (!same_thread) {
+            if (at_resume) probe->identity_mismatches++;
+            continue;
+        }
+
+        if (!at_resume || !same_frame) {
+            if (at_resume) probe->identity_mismatches++;
+            probe->same_identity_redirects++;
+            probe->redirected_at = transition_at;
+            probe->last_redirect_pc = cpu->r[15];
+            if (cpu->r[15] == probe->issuing_pc)
+                probe->restarted = true;
+            else
+                probe->redirected = true;
+            break;
+        }
+
+        probe->returned          = true;
+        probe->return_transition_at = transition_at;
+        probe->return_at         = resume_at;
+        probe->return_r0         = cpu->r[0];
+        probe->return_r1         = cpu->r[1];
+        probe->return_cpsr       = cpu->cpsr;
+        probe->return_from_svc_sp = svc_sp_before;
+        probe->return_ttbr0      = cpu->cp15.ttbr0;
+        probe->return_fcse_pid   = cpu->cp15.fcse_pid;
+        probe->return_context_id = cpu->cp15.context_id;
+        probe->return_tpidrprw   = cpu->cp15.tpidrprw;
+        probe->return_tpidrurw   = cpu->cp15.tpidrurw;
+        probe->return_tpidruro   = cpu->cp15.tpidruro;
+        probe->return_user_sp    = diagnostic_user_reg(cpu, 13u);
+        probe->return_user_lr    = diagnostic_user_reg(cpu, 14u);
+        break;
+    }
+}
+
 /*
  * xnu-1456.1.26 bsd/kern/syscalls.master defines execve's pathname as arg 0,
  * posix_spawn's pathname as arg 1 (arg 0 is pid_t *), and __mac_execve's as
@@ -2015,6 +2288,7 @@ static bool lifecycle_syscall_tracked(uint32_t number) {
  */
 static void lifecycle_note_syscall(arm_cpu_t *cpu, uint64_t at) {
     if (!cpu) return;
+    springboard_return_note_swi_entry(cpu, at);
 
     int32_t raw = (int32_t)cpu->r[12];
     if (raw < 0) return;                  /* Mach trap, not a BSD lifecycle call */
@@ -2064,6 +2338,8 @@ static void lifecycle_note_syscall(arm_cpu_t *cpu, uint64_t at) {
         if (!G.springboard_attempts) G.springboard_first_at = at;
         G.springboard_last_at = at;
         G.springboard_attempts++;
+        springboard_return_arm(cpu, at, number, event->user_pc,
+                               event->user_lr, event->spsr);
     }
 }
 
@@ -2449,6 +2725,96 @@ static void lifecycle_print_escaped(const char *bytes, size_t length) {
     putchar('"');
 }
 
+static void springboard_return_report(void) {
+    printf("    SpringBoard syscall-return probes: %u retained"
+           " (capacity %u), dropped %" PRIu64 "\n",
+           G.springboard_return_n, SPRINGBOARD_RETURN_CAP,
+           G.springboard_return_dropped);
+
+    for (unsigned i = 0; i < G.springboard_return_n; i++) {
+        const springboard_return_probe_t *probe =
+            &G.springboard_return[i];
+        printf("      probe #%u entry @%" PRIu64
+               " syscall %u; issuing/resume pc %08x/%08x (%s)\n",
+               i, probe->entry_at, probe->syscall_number, probe->issuing_pc,
+               probe->resume_pc,
+               (probe->entry_spsr & ARM_CPSR_T) ? "Thumb" : "ARM");
+        printf("        identity: TTBR0 %08x (base %08x, TTBCR %08x),"
+               " FCSE/context %08x/%08x, TPIDR PRW/URW/URO"
+               " %08x/%08x/%08x, SVC/user sp %08x/%08x,"
+               " user lr %08x\n",
+               probe->entry_ttbr0, probe->entry_ttbr0_base,
+               probe->entry_ttbcr, probe->entry_fcse_pid,
+               probe->entry_context_id, probe->entry_tpidrprw,
+               probe->entry_tpidrurw, probe->entry_tpidruro,
+               probe->entry_svc_sp, probe->entry_user_sp,
+               probe->entry_user_lr);
+
+        if (probe->restarted) {
+            printf("        RESTARTED @%" PRIu64
+                   ": the exact SVC return redirected to issuing pc %08x;"
+                   " this generation has no result.\n",
+                   probe->redirected_at, probe->issuing_pc);
+            continue;
+        }
+        if (probe->redirected) {
+            printf("        REDIRECTED/UNATTRIBUTABLE @%" PRIu64
+                   " to pc %08x: same thread but not the exact saved frame;"
+                   " no later return may satisfy this generation.\n",
+                   probe->redirected_at, probe->last_redirect_pc);
+            continue;
+        }
+        if (probe->superseded) {
+            printf("        SUPERSEDED @%" PRIu64
+                   " by same-thread SWI r12=%d; no later wrapper return"
+                   " may satisfy this generation.\n",
+                   probe->superseded_at, (int32_t)probe->superseding_r12);
+            continue;
+        }
+        if (!probe->returned) {
+            printf("        PENDING AT STOP: no matching direct user return;"
+                   " resume-pc candidates %" PRIu64
+                   ", identity mismatches %" PRIu64
+                   ", same-identity redirects %" PRIu64,
+                   probe->resume_pc_candidates, probe->identity_mismatches,
+                   probe->same_identity_redirects);
+            if (probe->same_identity_redirects)
+                printf(" (last pc %08x)", probe->last_redirect_pc);
+            printf("\n");
+            continue;
+        }
+
+        bool carry = (probe->return_cpsr & ARM_CPSR_C) != 0;
+        printf("        RETURN TRANSITION @%" PRIu64
+               "; first user resume @%" PRIu64
+               " r0=%08x r1=%08x cpsr=%08x (C=%u)\n",
+               probe->return_transition_at, probe->return_at,
+               probe->return_r0, probe->return_r1, probe->return_cpsr,
+               carry ? 1u : 0u);
+        printf("        matched: TTBR0 %08x, FCSE/context %08x/%08x,"
+               " TPIDR PRW/URW/URO %08x/%08x/%08x,"
+               " SVC/user sp %08x/%08x, user lr %08x;"
+               " candidates %" PRIu64
+               ", identity mismatches %" PRIu64 "\n",
+               probe->return_ttbr0, probe->return_fcse_pid,
+               probe->return_context_id, probe->return_tpidrprw,
+               probe->return_tpidrurw, probe->return_tpidruro,
+               probe->return_from_svc_sp, probe->return_user_sp,
+               probe->return_user_lr, probe->resume_pc_candidates,
+               probe->identity_mismatches);
+        if (carry)
+            printf("        RESULT: raw Darwin syscall error; errno candidate"
+                   " r0=%u (0x%08x).\n",
+                   probe->return_r0, probe->return_r0);
+        else
+            printf("        RESULT: raw Darwin syscall success (carry clear);"
+                   " r0=%u (0x%08x).\n",
+                   probe->return_r0, probe->return_r0);
+        printf("        IMPORTANT: even a successful spawn return does not"
+               " prove that the child executed, stayed alive, or rendered.\n");
+    }
+}
+
 static void lifecycle_report(void) {
     uint64_t retained = G.lifecycle_total < LIFECYCLE_CAP
                       ? G.lifecycle_total : LIFECYCLE_CAP;
@@ -2552,6 +2918,7 @@ static void lifecycle_report(void) {
     } else {
         printf("    SpringBoard exact-path attempts: 0\n");
     }
+    springboard_return_report();
 }
 
 static bool display_physical_alias(uint32_t vm_base, uint32_t vm_size,
@@ -3138,6 +3505,7 @@ int main(int argc, char **argv) {
     uint32_t fleh_swi_va = 0, fleh_swi_pa = 0;
     uint32_t exit1_va = 0, exit1_pa = 0;
     uint32_t psignal_va = 0, psignal_pa = 0;
+    uint32_t thread_exception_return_gate_va = 0;
 
     /* -D <path>:<prop>=<value> overrides / adds a device-tree patch, so the
      * frequencies can be probed from the shell instead of by rebuilding. */
@@ -4365,6 +4733,8 @@ int main(int argc, char **argv) {
 
     /* Interpose on the bus so every non-RAM access is attributed to a PC. */
     spy_install(&mach, virt_base, phys_base, hot_page);
+    thread_exception_return_gate_va =
+        discover_thread_exception_return_gate();
 
     if (external_md) {
         external_block_adapter = file_block_create();
@@ -4768,6 +5138,7 @@ int main(int argc, char **argv) {
         uint32_t mode_before = mach.cpu.cpsr & ARM_CPSR_MODE_MASK;
         uint32_t t_before    = mach.cpu.cpsr & ARM_CPSR_T;
         uint32_t lr_before   = mach.cpu.r[14];
+        uint32_t sp_before   = mach.cpu.r[13];
 
         /* Pre-decode an ARM STREX* so its success/failure can be read out of
          * Rd after the step. Rd == 15 is unpredictable and never emitted. */
@@ -4810,6 +5181,9 @@ int main(int argc, char **argv) {
             if (!save_due_snapshots(&mach, snaps, nsnaps)) return 4;
             break;
         }
+        springboard_return_note_transition(
+            &mach.cpu, n, mach.cpu.cycles, mode_before, last_pc,
+            thread_exception_return_gate_va, sp_before);
         s5l8900_tick(&mach, 1);
         if (!save_due_snapshots(&mach, snaps, nsnaps)) return 4;
 

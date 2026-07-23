@@ -13,15 +13,16 @@ device behind each stage.
 > (`0xe6cf3073`) in user mode. The complete paired-extend implementation then
 > replayed through that stop, wrote a 2.97 B checkpoint and reached a clean
 > 2.98 B cap. Free pages dipped to 97 and ended at 214 against a target of 250.
-> The longest current memory-safe external-md evidence is run07: a fresh 128 MiB cold
-> boot reached a clean 2 B cap after launchd, fsck, the root mount,
-> `mDNSResponder` Seatbelt setup, and `systemShutdown false`, with 12,983 pages
-> (50.71 MiB) at its low-water sample. Display-enabled run08 then reached a
-> 600 M cap with entry PCs observed in both Apple display-driver bundle ranges
-> and corrected seeded scanout still live, but zero CLCD MMIO, zero SpringBoard
-> path attempts, and only one 8x16 white block on black. None of these paths proves a
-> SpringBoard frame. The installable app runs a synthetic guest through
-> CoreGraphics and has no real-boot session, touch, audio or guest networking.
+> The longest current memory-safe display-enabled external-md evidence is run09:
+> a fresh 128 MiB cold boot reached a 2 B cap after launchd, fsck, the root
+> mount, `mDNSResponder` Seatbelt setup, and `systemShutdown false`, with a
+> 12,976-page free-memory low (50.69 MiB). It recorded one exact stock
+> SpringBoard `posix_spawn` pathname attempt at instruction 635,280,837, but no
+> syscall outcome, running SpringBoard process, or rendered frame. No CLCD MMIO
+> was recorded, SPI0 saw only 13 early platform writes, and the frame remained
+> one 8x16 white block on black. The installable app runs a synthetic guest
+> through CoreGraphics and has no real-boot session, touch, audio or guest
+> networking.
 
 Everything here is from actual historical runs. The command below is the recipe,
 not a promise of byte-identical current output: the stopping point and log are
@@ -1151,8 +1152,47 @@ The correct conclusion is narrow: the CPU reached PCs inside both bundle ranges
 and the corrected seed survived. There is no proof of instruction retirement,
 a successful `AppleH1CLCD` start, SpringBoard, or a useful display path. Zero
 MMIO is important evidence, but it does not alone identify the exact blocker.
-The next step is a longer bounded run with lifecycle and display evidence
-retained.
+Run09 supplied the longer bounded lifecycle/display run described next.
+
+### 2026-07-23: run09 reached the SpringBoard launch request, not SpringBoard
+
+Run09 used a fresh display-enabled 128 MiB external-md work image and ran to a
+**2,000,000,000** retired-instruction cap. The harness reported
+`stopped ... OK` and stderr was empty. Its wrapper did not provide an OS process
+exit marker, so this record does not claim a host exit code. User mode retired
+729,934,906 instructions (36.5%). The free-page low was 12,976 pages
+(50.69 MiB) at instruction 1,829,371,904.
+
+The process-lifecycle ring retained 120 events. At instruction 635,280,837 it
+recorded one exact stock SpringBoard pathname in a `posix_spawn` attempt. This
+is a launch request only: the current probe does not establish the syscall
+return value, a child process, SpringBoard instruction execution, or a frame.
+One separate, later pathname-copy operation failed; it was unrelated to the
+captured SpringBoard pathname.
+
+The longer interval did not establish a guest-driven display path:
+
+```text
+AppleH1DisplayDrivers  hits 687  first 126211220  last 1571737384
+AppleMerlotLCD         hits 409  first 209372737  last 211410011
+SPI0                   13 early platform writes
+CLCD MMIO page         0 recorded accesses
+```
+
+Only six late two-instruction callbacks account for the H1 range's extension
+past run08. Merlot made no later entry observation. SPI0 traffic never advanced
+beyond its 13 early platform writes, so there is no observed Merlot panel
+transaction. Seeded scanout remained live and reached 589 frames, but the final
+PPM was byte-identical to run08: exactly 128 white pixels in one 8x16 block at
+the top-left and every other pixel black.
+
+The external bridge completed 12,798 reads (52,438,528 bytes), 82 writes
+(325,120 bytes), and zero failures. The source kernel, device-tree, and rootfs
+hashes remained unchanged. Run09 is therefore a meaningful move from “no
+SpringBoard pathname seen” to “launchd requested the exact stock pathname.”
+It is not evidence that SpringBoard reached user mode or rendered. The next
+diagnostic must capture the spawn return/outcome and any child lifetime while
+retaining display evidence.
 
 This chain is stronger evidence for sustained userspace and snapshot
 repeatability. It is **not** evidence that SpringBoard rendered. The bounded

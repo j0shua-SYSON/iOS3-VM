@@ -24,8 +24,8 @@
 > and rootfs, then serves a create-only writable work image from the host instead
 > of pinning roughly 445 MiB in guest RAM. A guarded cold run first reached raw
 > `/dev/rmd0` fsck I/O at **402,741,536** retired instructions after `BSD root:
-> md0` and `launchd[1] has started up`. The longest fresh 128 MiB real-firmware
-> cold run, run07, extended the completed faultable native-`uiomove64` path
+> md0` and `launchd[1] has started up`. The first fresh 128 MiB real-firmware
+> 2 B cold run, run07, extended the completed faultable native-`uiomove64` path
 > through its **2,000,000,000**-instruction cap with exit status 0. It retained
 > the fsck/root-mount, `mDNSResponder[14]` Seatbelt, and `systemShutdown false`
 > evidence, and completed 12,782 external reads plus 82 writes with zero
@@ -36,11 +36,15 @@
 > hashes remained unchanged. This serial run explicitly disabled the framebuffer:
 > CLCD status, mask, and scanning were all zero, so it provides absolutely no
 > SpringBoard or display-path proof.
-> The newer display-enabled run08 reached its 600,000,000-instruction cap with
-> harness status `OK`. It observed instruction-entry PCs in both Apple
-> display-driver bundle ranges and showed that corrected seeded scanout
-> survived, but recorded no CLCD MMIO, no SpringBoard launch attempt, and only
-> an 8x16 white block at the top-left of an otherwise black frame.
+> Display-enabled run09 then extended the same 128 MiB external-md path through
+> its **2,000,000,000**-instruction cap with harness status `OK` and empty
+> stderr. It recorded one exact stock SpringBoard `posix_spawn` pathname attempt
+> at instruction **635,280,837**. That is materially later lifecycle evidence,
+> but the diagnostic does not yet prove that the syscall succeeded, that a
+> SpringBoard process ran, or that it rendered. The guest still made no recorded
+> CLCD MMIO access; SPI0 saw only 13 early platform writes, and the final frame
+> remained the same 8x16 white block at the top-left of an otherwise black
+> screen.
 > The installable iOS app
 > does **not** run it yet: it runs a small
 > synthetic ARM guest to exercise the CPU, UART and framebuffer bridge. The app
@@ -74,8 +78,8 @@ core portable across hosts. Today the evidence is split deliberately:
 | Capability | CLI / portable core | Installable iOS app |
 |---|---|---|
 | ARM1176 and S5L8900 execution | Real-kernel path recorded | Synthetic demo guest |
-| Apple kernel and root filesystem | Host-backed cold path reached `launchd`; run07 passed fsck, mounted `/dev/md0`, retained `mDNSResponder`, and reached a clean 2 B cap | Not integrated |
-| Display | Run08 exercised corrected seeded scanout and reached PCs in both Apple display-driver code ranges, but CLCD MMIO stayed untouched and the frame was only one 8x16 white block | CoreGraphics demo bridge |
+| Apple kernel and root filesystem | Host-backed cold path reached `launchd`; run09 passed fsck, mounted `/dev/md0`, retained `mDNSResponder`, and reached a stable 2 B cap | Not integrated |
+| Display | Run09 reached one exact SpringBoard spawn-path attempt and PCs in both Apple display-driver code ranges, but syscall success is unproved, CLCD MMIO stayed untouched, and the frame was only one 8x16 white block | CoreGraphics demo bridge |
 | Touch, audio, guest networking | Not implemented | Not implemented |
 | Dynamic recompiler | Translator tested off-device; inactive in boot | Excluded from target |
 
@@ -91,7 +95,7 @@ can see.** No months in the dark.
 | **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, CLCD and NOR are integrated; standalone raw-NAND/storage primitives are host-tested, with no NAND controller/VFL/FTL |
 | **M3** | Firmware containers + LLB execution | ✅ **done** — parses/decrypts real IMG3 firmware, runs a real LLB payload and extracts the kernel; SecureROM and iBoot execution remain future full-chain work |
 | **M4** | The real **XNU kernel** boots and logs | ✅ **done** — a broad set of prelinked drivers matched or started in a recorded CLI run; the real 413 MiB root filesystem mounted, and that run did not reach `_panic` |
-| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** Run07 remains the longest memory-safe cold path at 2 B. Display-enabled run08 reached 600 M with launchd, fsck/root mount, 70 lifecycle events through `notifyd`, observed entry PCs in both Apple display-driver bundle ranges, and retained corrected seeded scanout. It recorded zero SpringBoard path attempts, zero CLCD MMIO, and only an 8x16 white block—not SpringBoard or successful `AppleH1CLCD` start. The iOS app remains a demo host. |
+| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** Display-enabled run09 reached a stable 2 B cap with 36.5% USR execution and one exact stock SpringBoard `posix_spawn` pathname attempt at 635,280,837. It does **not** yet prove spawn success, process execution, or rendering: no CLCD MMIO was recorded and the frame remained an 8x16 white block. The iOS app remains a demo host. |
 
 At `ea92fca`, hosted
 [`core-tests` run 30009684129](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30009684129)
@@ -99,8 +103,8 @@ and
 [`ios-build` run 30009684054](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30009684054)
 both completed successfully with the faultable raw bridge and corrected display
 handoff. Hosted CI cannot contain private firmware or prove a SpringBoard boot;
-that runtime evidence comes from the separately recorded run07 and run08 cold
-boots.
+that runtime evidence comes from the separately recorded run07 through run09
+cold boots.
 
 ### What it actually does today
 
@@ -281,6 +285,31 @@ Run08 therefore proves that the CPU reached PCs inside both driver-bundle code
 ranges and that seeded scanout survived. It does not prove successful
 `AppleH1CLCD` start, SpringBoard, or an Apple-display-driver-driven frame. Zero
 MMIO narrows the next investigation but does not by itself identify the blocker.
+
+Run09 extended the corrected display-enabled configuration to a fresh
+**2,000,000,000**-instruction cap. The harness reported `stopped ... OK` and
+stderr was empty; the wrapper could not provide an OS process exit marker, so
+no host exit code is claimed. User mode retired 729,934,906 instructions
+(36.5%). Free pages reached a low of 12,976 (50.69 MiB) at instruction
+1,829,371,904. The bridge completed 12,798 reads (52,438,528 bytes), 82 writes
+(325,120 bytes), and zero failures. The source kernel, device tree, and rootfs
+hashes remained unchanged.
+
+The lifecycle ring retained 120 events and observed the exact stock
+SpringBoard pathname once, in a `posix_spawn` attempt at instruction
+635,280,837. Its single pathname-copy failure was a separate later event. The
+attempt is the strongest current SpringBoard-frontier evidence, but entry to
+`posix_spawn` alone does not establish its return value, a child process, or a
+rendered frame.
+
+Display evidence did not advance with that pathname attempt.
+`AppleH1DisplayDrivers` recorded 687 instruction-entry observations (first
+126,211,220; last 1,571,737,384); only six late two-instruction callbacks
+extended the run08 range. `AppleMerlotLCD` remained at 409 observations, last
+at 211,410,011. SPI0 recorded only 13 early platform writes and no panel
+transaction, and no CLCD MMIO was recorded. Seeded scanout reached 589 frames,
+but the final PPM was byte-identical to run08: exactly 128 white pixels in an
+8x16 top-left block, with every other pixel black.
 
 That is sustained real userspace, not a completed boot. There is still no
 captured SpringBoard frame, no proof that the current userland reached the home
