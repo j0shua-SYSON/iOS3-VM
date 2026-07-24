@@ -56,9 +56,40 @@
 > executable entry and subsequent SpringBoard application-code execution. It
 > does **not** yet prove UI readiness or rendering.
 >
-> Display evidence remains the hard boundary. The guest made zero exact-process
-> or live-scanout framebuffer mutations, CLCD retained only the host seed, and
-> the final frame was still one 8x16 white block on black.
+> Run16-pmu-smoke then advanced the separate kernel display bring-up. The
+> bounded 250,000,000-instruction cold run exited 0 with empty stderr: the PMU's
+> interrupt-controller property lookup returned non-null, PMU start succeeded,
+> I2C0 recorded 57 starts, and all 44 observed controller waits completed. Both
+> observed Merlot `start` calls and H1 `start_hardware` returned true. CLCD activity
+> rose from run15's zero accesses to 795 reads and 32 writes, ending with
+> control `0x01110041` and mask `0x00003f01`.
+>
+> That is real progress through the display-driver chain, but the evidence
+> boundary remains strict. Run16 stopped before any user-mode instruction, and
+> its frame stayed byte-identical to the seed-only frame. Its panel-ID message
+> comes from the `-F` handoff, not an emulated panel.
+>
+> Run17 then joined the two paths in a fresh display-enabled **2,000,000,000**
+> instruction cold run of `0bc18ea`. It exited 0 with harness status `OK` and
+> empty stderr, repeated exact SpringBoard SETEXEC success, and attributed
+> **36,379,165** user instructions to the revalidated process without an
+> exact-process `_exit1`. Exact control flow now directly proves the stock
+> `UIApplicationMain` call. UIKit subsequently asked SpringBoard to
+> `registerForSystemEvents` and whether it `rendersLocally`, then entered its
+> local CAWindowServer, QuartzCore, and IOMobileFramebuffer setup path.
+>
+> That path still did not render. SpringBoard's
+> `applicationDidFinishLaunching:` was not reached, the exact tether call was
+> therefore not the current blocker, and no live-scanout mutation occurred. A
+> late exception in `IOMobileFramebufferGetDisplaySize` was the ordinary lazy
+> VFP-enable trap and returned normally. The target thread finally switched out
+> in an unresolved IOKit `io_service_close` request while H1 code was also
+> active during the episode. The task-local port does not establish a server
+> identity, and an open request at the cap does not by itself prove deadlock.
+> The captured frame remained byte-identical to the seed. The next proof must
+> trace the IOMobileFramebuffer open/selector/close results, port provenance,
+> H1 reply path, and IOSurface allocation fields before changing device
+> semantics.
 > The installable iOS app
 > does **not** run it yet: it runs a small
 > synthetic ARM guest to exercise the CPU, UART and framebuffer bridge. The app
@@ -92,8 +123,8 @@ core portable across hosts. Today the evidence is split deliberately:
 | Capability | CLI / portable core | Installable iOS app |
 |---|---|---|
 | ARM1176 and S5L8900 execution | Real-kernel path recorded | Synthetic demo guest |
-| Apple kernel and root filesystem | Host-backed cold path reached `launchd`, mounted `/dev/md0`, retained `mDNSResponder`, and run15 proved successful SETEXEC replacement plus stock SpringBoard executable/application-code execution | Not integrated |
-| Display | Run15 kept the exact SpringBoard process alive through 37.1 M attributed user instructions, but observed zero guest-driven live-scanout mutations; CLCD remained the seed-only 8x16 block | CoreGraphics demo bridge |
+| Apple kernel and root filesystem | Host-backed cold path reached `launchd`, mounted `/dev/md0`, retained `mDNSResponder`, and run17 repeated successful SETEXEC replacement plus stock SpringBoard entry and `UIApplicationMain` | Not integrated |
+| Display | Run17 joined the PMU/Merlot/H1 model to SpringBoard and reached UIKit's local CAWindowServer/QuartzCore/IOMobileFramebuffer path, but never reached the application delegate or a live-scanout mutation; the frame remained seed-only | CoreGraphics demo bridge |
 | Touch, audio, guest networking | Not implemented | Not implemented |
 | Dynamic recompiler | Translator tested off-device; inactive in boot | Excluded from target |
 
@@ -106,16 +137,18 @@ can see.** No months in the dark.
 |---|---|---|
 | **M0** | Toolchain online: core builds + tests in CI, iOS `.ipa` builds on a macOS runner, and the app has historically run its ARM self-test on-device | ✅ **done** — current CI proves build/package, not device launch |
 | **M1** | ARMv6 (ARM1176) interpreter; unsupported encodings trap | ✅ **done for the reached boot path** — ARM, Thumb, VFPv2, ARM1176 WFI, and the reached ARMv5TE DSP multiply families, with explicit gaps |
-| **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, CLCD and NOR are integrated; standalone raw-NAND/storage primitives are host-tested, with no NAND controller/VFL/FTL |
+| **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, CLCD, two S5L I2C controllers, the PCF50635 PMU endpoint, and NOR are integrated; standalone raw-NAND/storage primitives are host-tested, with no NAND controller/VFL/FTL |
 | **M3** | Firmware containers + LLB execution | ✅ **done** — parses/decrypts real IMG3 firmware, runs a real LLB payload and extracts the kernel; SecureROM and iBoot execution remain future full-chain work |
 | **M4** | The real **XNU kernel** boots and logs | ✅ **done** — a broad set of prelinked drivers matched or started in a recorded CLI run; the real 413 MiB root filesystem mounted, and that run did not reach `_panic` |
-| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** Run15 proves exact `POSIX_SPAWN_SETEXEC` success, stock SpringBoard's exported `start`, and later SpringBoard Objective-C method execution with no exact-process `_exit1`. It still produced no guest-driven framebuffer mutation or recognizable frame, and the iOS app remains a demo host. |
+| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** Run17 joins exact SpringBoard SETEXEC/`UIApplicationMain` execution to the PMU/Merlot/H1 model and reaches UIKit's CAWindowServer/IOMobileFramebuffer setup. It stops before `applicationDidFinishLaunching:`, with the main thread waiting in an unresolved H1-adjacent `io_service_close`, no live-scanout mutation, and only the seed frame. This is not a crash or deadlock proof, and the iOS app remains a demo host. |
 
-At `9e2bc3f`, hosted
-[`core-tests` run 30067686376](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30067686376)
+At `3963d22`, hosted
+[`core-tests` run 30073161392](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30073161392)
 and
-[`ios-build` run 30067686404](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30067686404)
-both completed successfully with the hardened exact-target trace. Hosted CI
+[`ios-build` run 30073161386](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30073161386)
+both completed successfully with the S5L I2C/PCF50635 model. These green runs
+validate `3963d22`; the later `0bc18ea` diagnostic instrumentation was exercised
+by real-firmware run17 but is not covered by those earlier green runs. Hosted CI
 cannot contain private firmware or prove a SpringBoard boot; that runtime
 evidence comes from the separately recorded real-firmware cold runs.
 
@@ -337,6 +370,73 @@ Run15 recorded zero exact-process or live-scanout mutations and the frame stayed
 seed-only. There is still no captured SpringBoard home screen and no touch,
 audio, or guest-network path in the app. The CLI evidence must not be read as an
 on-device result.
+
+Run16-pmu-smoke tested the new S5L I2C/PCF50635 model from `3963d22` in a
+fresh display-enabled cold boot. It reached its deliberately bounded
+250,000,000-instruction cap with exit status 0 and empty stderr. Exact
+checkpoints showed the PMU interrupt-controller property lookup returning a
+non-null object, the PMU failure branch remaining unvisited, and PMU start
+completing. I2C0 recorded 57 starts, and all 44 observed entries into the
+controller wait condition also reached the post-wait checkpoint.
+
+The display chain advanced materially. Both observed Merlot starts returned
+true, as did H1 `start_hardware`. H1 instruction-entry observations increased
+from run15's 687 to 10,803, while Merlot increased from 409 to 948. The CLCD
+page changed from run15's zero accesses to 795 reads and 32 writes; its final
+control and interrupt-mask registers were `0x01110041` and `0x00003f01`.
+
+The PMU voltage log is path evidence, not analog-model fidelity: 13 of the 17
+PCF50635 register reads targeted currently unknown registers, whose deterministic
+zero values produced the three reported 625 mV readings.
+
+Run16 is not SpringBoard rendering evidence. Its short cap occurred before any
+user-mode instruction, and the captured frame remained byte-identical to the
+seed-only frame. The logged Merlot panel ID was supplied by the `-F` handoff;
+the emulator does not model that panel ID.
+
+Run17 exercised the `0bc18ea` diagnostics in a fresh display-enabled 128 MiB
+external-md cold boot through 2,000,000,000 instructions. The harness reported
+`OK`, the process exited 0 with empty stderr, and the exact SpringBoard SETEXEC
+result again returned `r0=0`. The revalidated PID 20 address space retired
+36,379,165 attributed user instructions without entering exact-process
+`_exit1`: 10,021,910 in dyld, 26,356,193 in the shared cache, and 1,062 in the
+low image.
+
+The lower low-image count is not a SpringBoard stall. Static Mach-O and import
+resolution maps the stock instruction at `0x381e` to the
+`UIApplicationMain` stub, and run17 retained the exact transition into that
+stub. `UIApplicationMain` normally remains in UIKit, so subsequent work belongs
+mostly to the shared cache. The two later callbacks into the SpringBoard image
+were `+[SpringBoard registerForSystemEvents]` and
+`+[SpringBoard rendersLocally]`; both returned true.
+
+UIKit then entered `+[UIApplication _startWindowServerIfNecessary]`, obtained
+the local CAWindowServer display path, and reached QuartzCore's
+`CA::WindowServer::IOMFBDisplay::update_framebuffer` and
+`IOMobileFramebufferGetDisplaySize`. The exception retained at the latter's
+first VFP load was the normal lazy VFP-enable trap, not a crash, and it returned
+to the same instruction. Several following IOKit messages completed at the
+Mach transport layer. The final exact-target message, ID 2816, resolves to
+`io_service_close`; the target switched out while it remained unresolved, and
+H1 driver code executed during that episode. The port number is task-local, so
+the trace does not prove which service owned it or that the request deadlocked.
+
+Run17 never reached SpringBoard's `applicationDidFinishLaunching:`. The exact
+SBTetherController call and its continuation both had zero hits, which rules
+the tether request out as the blocker reached by this run rather than showing
+that it failed. CLCD activity rose to 797 reads and 34 writes, but the live
+SpringBoard scanout mutation counters remained zero and the PPM was
+byte-identical to run16's seed-only frame. The earlier
+`IOSurface: buffer allocation size is zero` warning also appears in run16 before
+userspace, making it a display-startup clue rather than proof of a late
+SpringBoard failure.
+
+The next diagnostic boundary is the IOMobileFramebuffer lifecycle: map each
+`io_service_open`/selector/close request to its task-local port, retain the
+actual IOReturn values, trace H1 client-close and reply control flow, and capture
+the IOSurface width, height, stride, allocation size, caller, and return. A
+device-model fix is justified only after that distinguishes a missing reply or
+bad surface contract from an ordinary process wait.
 
 Getting this far needed one more emulator-shaped bug worth naming, because it
 looked exactly like a corrupt disk. launchd's first text page was failing its

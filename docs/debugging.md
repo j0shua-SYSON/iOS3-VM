@@ -64,7 +64,10 @@ Three more workarounds are applied automatically and printed in the header: the
 IORTC wait is patched from 30 seconds to 0, and the `mbx` and `sha1` nodes are
 unmatched so the unmodelled PowerVR and hardware SHA-1 paths do not run. `-g` and
 `-S` deliberately re-enable those known-broken paths for diagnostics;
-external-md rejects `-K`.
+external-md rejects `-K`. Run16 proves that the new I2C/PCF50635 model lets PMU
+start succeed with live slave traffic, but it retained this IORTC patch. Direct
+`IORTC` publication needs a one-patch diagnostic option or clearly identified
+targeted build; the existing `-K` switch is not that experiment.
 
 Large-input memory is part of the preflight. External mode copies and hashes the
 source through a buffer capped at 1 MiB; the media never occupies guest DRAM.
@@ -521,8 +524,169 @@ Keep the evidence contracts separate:
 
 Run15 retained the lifecycle, SPI0, CLCD, exact-process mutation, and PPM checks.
 All framebuffer mutation counts were zero and the PPM remained the seed-only
-8x16 white block. The next trace must localize the message/service wait and
-display-driver/window-server handoff, not re-prove the spawn request.
+8x16 white block. Run17 supplies the next localization step below; it does not
+change the run15 SETEXEC proof.
+
+### Run16 PMU/I2C and display-start diagnostic
+
+Run16 was a fresh display-enabled external-md smoke run capped at 250,000,000
+instructions. It exited with status 0 and empty stderr. No userspace instruction
+retired by the cap, so it cannot say whether SpringBoard rendered or even
+started in this run.
+
+The machine now maps i2c0 and i2c1 at their real S5L8900 MMIO windows and drives
+VIC0 IRQ21 and IRQ22. A PCF50635 PMU/RTC slave is attached to i2c0 at seven-bit
+address `0x73`; controller, in-flight transaction, and PMU state are snapshot state and
+have focused transfer, IRQ/NAK/W1C, RTC, malformed-state, and restore coverage.
+The live diagnostic reported:
+
+```text
+i2c0 START events                 57
+i2c wait-condition hits          44
+i2c post-wait hits               44
+PMU start-failure hits             0
+AppleH1DisplayDrivers entries  10803
+AppleMerlotLCD entries            948
+CLCD page accesses              795r / 32w
+```
+
+The first-PMU-I2C-call entry and controller post-wait checkpoints were both
+observed, but those aggregate counters do not associate a particular call with
+a particular wait. The PMU's pre-I2C-parent and first-I2C checkpoints were hit,
+while its start-failure checkpoint was not. Combined with the driver log and
+exact/static control flow, this proves PMU start success and live PCF50635 bus
+traffic. It does not prove `IORTC` publication because the ordinary 7E18
+zero-timeout patch was still active. A one-patch diagnostic option or clearly
+identified targeted build is needed; `-K` disables the whole patch table and is
+rejected by external-md.
+
+For display diagnosis, run09's “Merlot remained frozen at 409” is now historical
+evidence, not the current blocker. Run16's control-flow audit proves both
+observed Merlot start calls and H1 `start_hardware` returned success. The guest
+also changed CLCD control and interrupt-mask state. However, the final PPM was
+still the seed-only 8x16 white block. Successful observed Merlot `start` and H1
+`start_hardware` returns are not equivalent to a userspace surface or a
+SpringBoard frame.
+
+The driver also accessed display-adjacent physical pages `0x39100000`,
+`0x39200000`, and `0x39300000`. They remain unmodelled fidelity risks. Do not
+promote them to blockers merely because they appear in the bus report: only a
+targeted semantic experiment or the longer trace can establish causality.
+
+Run17 kept this model and performed the full 2,000,000,000-instruction
+experiment. Its later userspace/display boundary is recorded below. Run the
+IORTC publication check separately once a diagnostic that disables only its
+zero-timeout patch exists.
+
+### Run17 local CAWindowServer/IOMobileFramebuffer diagnostic
+
+Run17 completed a fresh display-enabled external-md cold boot through the
+2,000,000,000-instruction cap with status `OK`. Exact SETEXEC activation
+succeeded again and exact-process `_exit1` was not reached. The CLCD was active
+at 320x480, but the PPM was byte-identical to the run15/run16 seed-only capture:
+384 of 460,800 RGB bytes were non-zero.
+
+The retained exact-target low flow establishes this ordering:
+
+```text
+SpringBoard UIApplicationMain call                 0x0000381e
+UIKit registerForSystemEvents call / return        0x324a5098 / 0x324a509c
+UIKit _startWindowServerIfNecessary call           0x324a50c8
+UIKit [SpringBoard rendersLocally] call / return   0x324a5b84 / 0x324a5b88
+SpringBoard applicationDidFinishLaunching:         0x0000a6f4  NOT OBSERVED
+```
+
+The return from `rendersLocally` carried `r0=1`. Run17 also reached
+`_IOMobileFramebufferGetDisplaySize+0x18` at `0x3110d024`, with
+`r0=0x0021c8c0` and LR `0x3123ef50`. Static disassembly resolves that LR to
+`CA::WindowServer::IOMFBDisplay::update_framebuffer+0xbc`; the containing
+constructor had advanced through its accepted `IOMobileFramebufferOpen` path.
+This places the current observed interval after local-window-server selection
+and inside IOMobileFramebuffer setup, but before SpringBoard's launch callback.
+Run15 reached the callback while run17 did not; the evidence does not yet
+distinguish timing from a model defect.
+
+The most recent exact-process Mach episode carried request message ID 2816,
+the IOKit `io_service_close` routine ID. The target switched out while the
+receive path waited. H1 display-driver instruction entries were observed within
+that same episode through instruction 1,873,360,702, followed by
+`_wait_queue_assert_wait` at 1,873,361,179. Keep the attribution boundary
+strict:
+
+- message ID 2816 identifies the routine shape, not the task-local destination
+  port, connection object, or service;
+- the H1 code-range observation does not distinguish CLCD from TV-out or prove
+  which userspace call initiated the episode;
+- IOMobileFramebuffer's finalizer calls `IOServiceClose` at `0x3110dc1c`, but
+  that is a static candidate correlation until an exact run observes its
+  call/return ladder around the Mach episode.
+
+The exact 7E18 userspace map for that next split is:
+
+- UIKit `+[UIApplication _startWindowServerIfNecessary]` starts at
+  `0x324a5b70`. After `rendersLocally`, it calls
+  `[CAWindowServer server]` (`0x324a5ba0/0x324a5ba4`), sets renderer flags
+  (`0x324a5bb4/0x324a5bb8`), obtains `displays`
+  (`0x324a5bc4/0x324a5bc8`), counts them
+  (`0x324a5bd4/0x324a5bd8`), selects index zero
+  (`0x324a5bf0/0x324a5bf4`), obtains its bounds
+  (`0x324a5c04/0x324a5c08`), and calls `_GSSetMainScreenInfo`
+  (`0x324a5c40/0x324a5c44`).
+- QuartzCore `-[CAWindowServer _detectDisplays]` spans
+  `0x3125408c`-`0x312541c8`. Its indirect display-open call/return is
+  `0x312540ec/0x312540f0`, and its `new_server` call/return is
+  `0x3125411c/0x31254120`. The H1CLCD opener matches `AppleH1CLCD`, obtains
+  the IOKit service, and constructs the H1 display.
+- The IOMFB display constructor starts at `0x3123f5a0`. Its
+  `IOMobileFramebufferOpen` call/return is
+  `0x3123f6b8/0x3123f6bc`; `update_framebuffer` is
+  `0x3123f6c8/0x3123f6cc`; and layer zero's default-surface call/return is
+  `0x3123f6e0/0x3123f6e4`.
+- Inside IOMobileFramebuffer, selector 8's display-size call/return is
+  `0x3110d05c/0x3110d060`; its two raw outputs occupy `SP+8` and `SP+0x10`
+  before conversion to cached floats at object offsets `0xa8` and `0xac`.
+  Selector 3's layer-surface call/return is `0x3110d8e4/0x3110d8e8`,
+  followed by `CoreSurfaceBufferLookup` at `0x3110d900/0x3110d904`.
+  There is no separate string-backed `GetDisplayArea` routine in this
+  framework image; `GetDisplaySize` is the observed geometry API.
+- The IOMobileFramebuffer finalizer spans
+  `0x3110dbcc`-`0x3110dc20`; it loads the connection at `0x3110dc18` and
+  calls `IOServiceClose` at `0x3110dc1c`.
+
+The console line `IOSurface: buffer allocation size is zero` occurs in generic
+IOSurface initialization before the H1 path fills its descriptor. In this path
+the surface remains non-null and H1 assigns width 320, height 480, row bytes
+1280, pixel format `ARGB`, and allocation size `0x96000`. Do not suppress the
+warning or promote it to the boundary without a failing return or an exact
+caller correlation.
+
+The three display-adjacent pages are no longer anonymous: `0x39100000` is the
+H1 TV-out control/coefficient/DAC block, `0x39200000` is its mixer, and
+`0x39300000` is its SDO block. They remain unmodelled fidelity risks, but that
+mapping gives no evidence that one blocks the internal CLCD path.
+
+#### Instrumentation implemented for the next run
+
+This instrumentation has not produced a run result yet:
+
+1. Exact UI checkpoints are recorded only after an `ARM_OK` step retires in
+   User mode with the SETEXEC target thread still on CPU and its identity still
+   valid. Each checkpoint retains first/last `r0`-`r12`, SP, LR, CPSR, thread,
+   and 32 bytes from the live user stack. This avoids counting a demand-fault
+   retry as a completed call/return and preserves the bounds/result stack slots
+   listed above.
+2. A 256-entry newest-retaining exact-target Mach ring captures the live
+   `mach_msg` arguments, request header, entry translation state, selected
+   receive/wait kernel milestones, resolution and authoritative raw result when
+   observed, and at most 64 bytes from the receive buffer after a validated
+   return. It records the most recent UI checkpoint for chronology; it does not
+   translate task-local names into service identities.
+3. The old display-driver edge list retains the first 1,024 outside-to-inside
+   entries. Run17 filled it and dropped 44 later H1 edges; its exact-PC table
+   also dropped 11,849 unretained H1 instruction-entry observations after
+   saturation. A separate 128-entry newest-retaining H1/Merlot edge ring is
+   therefore implemented alongside the historical list. Until a run exercises
+   it, absence from the old late-edge or PC tables is not negative evidence.
 
 ### WFI changes elapsed device time, not the instruction coordinate
 

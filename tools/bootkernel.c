@@ -2020,6 +2020,7 @@ static unsigned    NM;
 #define DISPLAY_PC_CAP 1024u
 #define DISPLAY_PC_HASH_CAP 2048u
 #define DISPLAY_ENTRY_EDGE_CAP 1024u
+#define DISPLAY_RECENT_EDGE_CAP 128u
 #define SPRINGBOARD_RETURN_CAP 32u
 #define SPRINGBOARD_PHASE_COUNT 6u
 #define SPRINGBOARD_TRAP_CAP 128u
@@ -2030,6 +2031,10 @@ static unsigned    NM;
 #define SPRINGBOARD_TARGET_USER_RETRY_CAP 4u
 #define SPRINGBOARD_MACH_HEADER_SIZE 24u
 #define SPRINGBOARD_MACH_PATH_COUNT 6u
+#define SPRINGBOARD_MACH_EVENT_CAP 256u
+#define SPRINGBOARD_MACH_RECEIVE_CAP 64u
+#define SPRINGBOARD_MACH_REPORT_CAP 96u
+#define SPRINGBOARD_UI_STACK_CAP 32u
 #define SPRINGBOARD_TETHER_CALL_PC UINT32_C(0x0009679a)
 #define SPRINGBOARD_TETHER_CONTINUATION_PC UINT32_C(0x0009679e)
 #define DIAGNOSTIC_MACH_SEND_MSG UINT32_C(0x00000001)
@@ -2050,6 +2055,111 @@ static const char *const SPRINGBOARD_PHASE_NAMES[SPRINGBOARD_PHASE_COUNT] = {
     "_vfork_return",
     "_thread_resume"
 };
+
+/*
+ * Exact checkpoints in the stock 7E18 SpringBoard image and its fixed shared
+ * cache.  These are diagnostics, not emulation policy.  They turn a generic
+ * "UIApplicationMain is still in shared-cache code" observation into a
+ * call/return ladder through UIKit's local CAWindowServer and the first
+ * IOMobileFramebuffer display-size query.
+ */
+static const milestone_t
+SPRINGBOARD_UI_CHECKPOINTS[] = {
+    { "SpringBoard:UIApplicationMain-call",       UINT32_C(0x0000381e) },
+    { "SpringBoard:UIApplicationMain-return",     UINT32_C(0x00003822) },
+    { "SpringBoard:registerForSystemEvents",      UINT32_C(0x00003940) },
+    { "SpringBoard:rendersLocally",               UINT32_C(0x00003944) },
+    { "SpringBoard:applicationDidFinishLaunching",UINT32_C(0x0000a6f4) },
+    { "SpringBoard:tether-sharedInstance-call",   UINT32_C(0x0000a714) },
+    { "SpringBoard:updatePreferences-call",       UINT32_C(0x0000a71e) },
+    { "SpringBoard:isTethered-call",              UINT32_C(0x0000a728) },
+    { "SpringBoard:UIController-call",            UINT32_C(0x0000a7ba) },
+    { "UIKit:registerForSystemEvents-call",       UINT32_C(0x324a5098) },
+    { "UIKit:registerForSystemEvents-return",     UINT32_C(0x324a509c) },
+    { "UIKit:startWindowServer-call",             UINT32_C(0x324a50c8) },
+    { "UIKit:startWindowServer-return",           UINT32_C(0x324a50cc) },
+    { "UIKit:instantiateSingleton-call",          UINT32_C(0x324a50d0) },
+    { "UIKit:instantiateSingleton-return",        UINT32_C(0x324a50d4) },
+    { "UIKit:startWindowServer",                  UINT32_C(0x324a5b70) },
+    { "UIKit:rendersLocally-call",                UINT32_C(0x324a5b84) },
+    { "UIKit:rendersLocally-return",              UINT32_C(0x324a5b88) },
+    { "UIKit:CAWindowServer-server-call",         UINT32_C(0x324a5ba0) },
+    { "UIKit:CAWindowServer-server-return",       UINT32_C(0x324a5ba4) },
+    { "UIKit:setRendererFlags-call",              UINT32_C(0x324a5bb4) },
+    { "UIKit:setRendererFlags-return",            UINT32_C(0x324a5bb8) },
+    { "UIKit:displays-call",                      UINT32_C(0x324a5bc4) },
+    { "UIKit:displays-return",                    UINT32_C(0x324a5bc8) },
+    { "UIKit:display-count-call",                 UINT32_C(0x324a5bd4) },
+    { "UIKit:display-count-return",               UINT32_C(0x324a5bd8) },
+    { "UIKit:first-display-call",                 UINT32_C(0x324a5bf0) },
+    { "UIKit:first-display-return",               UINT32_C(0x324a5bf4) },
+    { "UIKit:display-bounds-call",                UINT32_C(0x324a5c04) },
+    { "UIKit:display-bounds-return",              UINT32_C(0x324a5c08) },
+    { "UIKit:GSSetMainScreenInfo-call",           UINT32_C(0x324a5c40) },
+    { "UIKit:GSSetMainScreenInfo-return",         UINT32_C(0x324a5c44) },
+    { "UIKit:startWindowServer-late",             UINT32_C(0x324a5c70) },
+    { "UIKit:post-window-server-6a00",             UINT32_C(0x324a6a00) },
+    { "UIKit:post-window-server-7820",             UINT32_C(0x324a7820) },
+    { "UIKit:post-window-server-7c6c",             UINT32_C(0x324a7c6c) },
+
+    { "QuartzCore:detectDisplays-entry",           UINT32_C(0x3125408c) },
+    { "QuartzCore:display-open-indirect-call",     UINT32_C(0x312540ec) },
+    { "QuartzCore:display-open-indirect-return",   UINT32_C(0x312540f0) },
+    { "QuartzCore:new-server-call",                UINT32_C(0x3125411c) },
+    { "QuartzCore:new-server-return",              UINT32_C(0x31254120) },
+    { "QuartzCore:detectDisplays-return",          UINT32_C(0x312541c8) },
+    { "QuartzCore:H1CLCD-matching-call",           UINT32_C(0x3123eba4) },
+    { "QuartzCore:H1CLCD-matching-return",         UINT32_C(0x3123eba8) },
+    { "QuartzCore:H1CLCD-service-call",            UINT32_C(0x3123ebb0) },
+    { "QuartzCore:H1CLCD-service-return",          UINT32_C(0x3123ebb4) },
+    { "QuartzCore:H1Display-ctor-call",            UINT32_C(0x3123ebdc) },
+    { "QuartzCore:H1Display-ctor-return",          UINT32_C(0x3123ebe0) },
+    { "QuartzCore:H1CLCD-open-return",             UINT32_C(0x3123ebf4) },
+    { "QuartzCore:IOMFBDisplay-ctor-entry",        UINT32_C(0x3123f5a0) },
+    { "QuartzCore:IOMFB-open-call",                UINT32_C(0x3123f6b8) },
+    { "QuartzCore:IOMFB-open-return",              UINT32_C(0x3123f6bc) },
+    { "QuartzCore:update-framebuffer-call",        UINT32_C(0x3123f6c8) },
+    { "QuartzCore:ctor-update-framebuffer-return", UINT32_C(0x3123f6cc) },
+    { "QuartzCore:GetLayerSurface-call",           UINT32_C(0x3123f6e0) },
+    { "QuartzCore:GetLayerSurface-return",         UINT32_C(0x3123f6e4) },
+    { "QuartzCore:IOMFBDisplay-ctor-return",       UINT32_C(0x3123f778) },
+    { "QuartzCore:IOMFBDisplay-update-entry",     UINT32_C(0x3123ee94) },
+    { "QuartzCore:GetID-call",                     UINT32_C(0x3123eeb4) },
+    { "QuartzCore:GetID-return",                   UINT32_C(0x3123eeb8) },
+    { "QuartzCore:SetWhiteOnBlack-call",           UINT32_C(0x3123eedc) },
+    { "QuartzCore:SetWhiteOnBlack-return",         UINT32_C(0x3123eee0) },
+    { "QuartzCore:SetTVOutMode-call",              UINT32_C(0x3123eef4) },
+    { "QuartzCore:SetTVOutMode-return",            UINT32_C(0x3123eef8) },
+    { "QuartzCore:SetTVOutSignal-call",            UINT32_C(0x3123ef00) },
+    { "QuartzCore:SetTVOutSignal-return",          UINT32_C(0x3123ef04) },
+    { "QuartzCore:SetFlags-call",                  UINT32_C(0x3123ef1c) },
+    { "QuartzCore:SetFlags-return",                UINT32_C(0x3123ef20) },
+    { "QuartzCore:SetDebugFlags-call",             UINT32_C(0x3123ef40) },
+    { "QuartzCore:SetDebugFlags-return",           UINT32_C(0x3123ef44) },
+    { "QuartzCore:GetDisplaySize-call",            UINT32_C(0x3123ef4c) },
+    { "QuartzCore:GetDisplaySize-return",          UINT32_C(0x3123ef50) },
+    { "QuartzCore:display-update-return",          UINT32_C(0x3123ef88) },
+    { "IOMFB:IOServiceOpen-call",                  UINT32_C(0x3110d9f8) },
+    { "IOMFB:IOServiceOpen-return",                UINT32_C(0x3110d9fc) },
+    { "IOMFB:GetID-selector7-call",                UINT32_C(0x3110cfe8) },
+    { "IOMFB:GetID-selector7-return",              UINT32_C(0x3110cfec) },
+    { "IOMFB:GetDisplaySize-entry",               UINT32_C(0x3110d00c) },
+    { "IOMFB:GetDisplaySize-vfp-load",            UINT32_C(0x3110d024) },
+    { "IOMFB:GetDisplaySize-selector8-call",       UINT32_C(0x3110d05c) },
+    { "IOMFB:GetDisplaySize-selector8-return",     UINT32_C(0x3110d060) },
+    { "IOMFB:GetLayerSurface-selector3-call",      UINT32_C(0x3110d8e4) },
+    { "IOMFB:GetLayerSurface-selector3-return",    UINT32_C(0x3110d8e8) },
+    { "IOMFB:CoreSurfaceLookup-call",              UINT32_C(0x3110d900) },
+    { "IOMFB:CoreSurfaceLookup-return",            UINT32_C(0x3110d904) },
+    { "IOMFB:GetLayerSurface-return",              UINT32_C(0x3110d918) },
+    { "IOMFB:finalizer-entry",                     UINT32_C(0x3110dbcc) },
+    { "IOMFB:finalizer-load-connection",           UINT32_C(0x3110dc18) },
+    { "IOMFB:IOServiceClose-call",                 UINT32_C(0x3110dc1c) },
+    { "IOMFB:IOServiceClose-return",               UINT32_C(0x3110dc20) },
+};
+#define SPRINGBOARD_UI_CHECKPOINT_COUNT \
+    ((unsigned)(sizeof SPRINGBOARD_UI_CHECKPOINTS / \
+                sizeof SPRINGBOARD_UI_CHECKPOINTS[0]))
 
 typedef enum {
     LIFECYCLE_SYSCALL = 1,
@@ -2339,6 +2449,30 @@ typedef struct {
     bool size_within_send;
 } springboard_mach_header_t;
 
+typedef struct {
+    uint64_t hits;
+    uint64_t first_at;
+    uint64_t last_at;
+    uint32_t first_r[13];
+    uint32_t last_r[13];
+    uint32_t first_sp;
+    uint32_t first_lr;
+    uint32_t first_cpsr;
+    uint32_t first_thread;
+    uint32_t last_sp;
+    uint32_t last_lr;
+    uint32_t last_cpsr;
+    uint32_t last_thread;
+    uint32_t first_stack_failure_va;
+    uint32_t first_stack_failure_fsr;
+    uint32_t last_stack_failure_va;
+    uint32_t last_stack_failure_fsr;
+    uint8_t first_stack[SPRINGBOARD_UI_STACK_CAP];
+    uint8_t last_stack[SPRINGBOARD_UI_STACK_CAP];
+    bool first_stack_readable;
+    bool last_stack_readable;
+} springboard_ui_checkpoint_observation_t;
+
 typedef enum {
     SPRINGBOARD_MACH_PATH_MACH_MSG_TRAP = 0,
     SPRINGBOARD_MACH_PATH_MACH_MSG_OVERWRITE_TRAP,
@@ -2347,6 +2481,61 @@ typedef enum {
     SPRINGBOARD_MACH_PATH_WAIT_QUEUE_ASSERT_WAIT,
     SPRINGBOARD_MACH_PATH_THREAD_BLOCK_REASON
 } springboard_mach_path_t;
+
+typedef enum {
+    SPRINGBOARD_MACH_RESOLUTION_NONE = 0,
+    SPRINGBOARD_MACH_RESOLUTION_EXPLICIT_RETURN,
+    SPRINGBOARD_MACH_RESOLUTION_IMPLICIT_USER,
+    SPRINGBOARD_MACH_RESOLUTION_ATTRIBUTION_LOST,
+    SPRINGBOARD_MACH_RESOLUTION_PROCESS_EXIT
+} springboard_mach_resolution_t;
+
+/*
+ * Newest-retaining exact-target Mach evidence.  Request state is copied while
+ * the caller's user translation is live.  A receive buffer is copied only at
+ * a validated return (or a later exact-target user observation), never from
+ * whatever task happens to own TTBR0 when the final report runs.
+ */
+typedef struct {
+    uint64_t sequence;
+    uint64_t episode;
+    uint64_t entry_at;
+    uint64_t resolution_at;
+    uint64_t ui_checkpoint_at;
+    uint64_t path_first_at[SPRINGBOARD_MACH_PATH_COUNT];
+    uint32_t origin_pc;
+    uint32_t origin_cpsr;
+    uint32_t user_sp;
+    uint32_t user_lr;
+    uint32_t thread;
+    uint32_t args[7];
+    uint32_t entry_ttbr0;
+    uint32_t entry_ttbcr;
+    uint32_t entry_fcse_pid;
+    uint32_t entry_context_id;
+    uint32_t path_bits;
+    springboard_mach_header_t request_header;
+    springboard_mach_header_t receive_header;
+    uint32_t raw_result;
+    uint32_t receive_va;
+    uint32_t receive_bound;
+    uint32_t receive_failure_va;
+    uint32_t receive_failure_fsr;
+    uint8_t receive_bytes[SPRINGBOARD_MACH_RECEIVE_CAP];
+    uint8_t receive_length;
+    uint8_t outcome;
+    uint8_t resolution_kind;
+    uint8_t ui_checkpoint;
+    bool valid;
+    bool open;
+    bool resolution_seen;
+    bool result_observed;
+    bool result_authoritative;
+    bool receive_attempted;
+    bool receive_readable;
+    bool receive_size_within_limit;
+    bool receive_snapshot_delayed;
+} springboard_mach_event_t;
 
 typedef struct {
     uint64_t generation;
@@ -2508,6 +2697,11 @@ typedef struct {
     uint8_t last_region;
     bool last_region_valid;
     springboard_pending_user_t pending_user;
+    springboard_ui_checkpoint_observation_t
+        ui_checkpoints[SPRINGBOARD_UI_CHECKPOINT_COUNT];
+    uint64_t ui_checkpoint_last_at;
+    uint8_t ui_checkpoint_last;
+    bool ui_checkpoint_last_valid;
     uint32_t target_thread;
     uint32_t target_uthread;
     uint32_t target_episode_mode;
@@ -2525,6 +2719,11 @@ typedef struct {
     uint64_t
         target_episode_mach_path_first_at[SPRINGBOARD_MACH_PATH_COUNT];
     springboard_mach_header_t target_episode_mach_header;
+    uint64_t target_mach_total;
+    uint64_t target_mach_active_sequence;
+    bool target_mach_active;
+    springboard_mach_event_t
+        target_mach[SPRINGBOARD_MACH_EVENT_CAP];
     uint64_t target_event_total;
     uint64_t target_episode_total;
     uint64_t target_episode;
@@ -2646,9 +2845,13 @@ typedef struct {
 
 typedef struct {
     uint64_t at;
+    uint32_t from_pc;
+    uint32_t from_cpsr;
     uint32_t vm_pc;
     uint32_t lr;
     uint32_t cpsr;
+    uint32_t thread;
+    bool from_mmu_enabled;
 } display_entry_edge_t;
 
 typedef struct {
@@ -2661,7 +2864,72 @@ typedef struct {
     unsigned edge_n;
     uint64_t edge_dropped;
     display_entry_edge_t edges[DISPLAY_ENTRY_EDGE_CAP];
+    uint64_t recent_edge_total;
+    display_entry_edge_t recent_edges[DISPLAY_RECENT_EDGE_CAP];
 } display_exec_diag_t;
+
+typedef struct {
+    const char *name;
+    uint32_t va;
+    uint8_t object_reg;
+    bool outer_lr_from_stack;
+} display_checkpoint_t;
+
+static const display_checkpoint_t DISPLAY_CHECKPOINTS[] = {
+    { "H1:createSurface-null-test",UINT32_C(0xc0705ff0), 5u, false },
+    { "H1:createSurface-nonnull",  UINT32_C(0xc0705ff8), 5u, false },
+    { "H1:surface-field24-store",  UINT32_C(0xc070607c), 5u, false },
+    { "H1:descriptor-return",      UINT32_C(0xc0706218), 5u, false },
+    { "H1:createSurface-return",   UINT32_C(0xc0706264), 5u, false },
+    { "H1:window-update",          UINT32_C(0xc0704940), UINT8_MAX, false },
+    { "H1:swap-path-arm",          UINT32_C(0xc0705d38), UINT8_MAX, false },
+    { "H1:swap-handler",           UINT32_C(0xc0705d7c), UINT8_MAX, false },
+    { "IOSurface:create-entry",    UINT32_C(0xc0524614), UINT8_MAX, false },
+    { "IOSurface:size-load",       UINT32_C(0xc0525084), 8u, true },
+    { "IOSurface:size-zero-log",   UINT32_C(0xc0525090), 8u, true },
+    { "IOSurface:create-failure",  UINT32_C(0xc052531c), 8u, false },
+    { "IOSurface:create-success",  UINT32_C(0xc0525324), 8u, false },
+    { "IOSurface:create-epilogue", UINT32_C(0xc0525328), UINT8_MAX, false },
+};
+#define DISPLAY_CHECKPOINT_COUNT \
+    ((unsigned)(sizeof DISPLAY_CHECKPOINTS / \
+                sizeof DISPLAY_CHECKPOINTS[0]))
+#define DISPLAY_SURFACE_FIELD_COUNT 7u
+
+static const uint32_t
+DISPLAY_SURFACE_FIELD_OFFSETS[DISPLAY_SURFACE_FIELD_COUNT] = {
+    UINT32_C(0x20), UINT32_C(0x24), UINT32_C(0x58),
+    UINT32_C(0x5c), UINT32_C(0x60), UINT32_C(0x6c),
+    UINT32_C(0x74)
+};
+
+typedef struct {
+    uint32_t object;
+    uint32_t fields[DISPLAY_SURFACE_FIELD_COUNT];
+    uint32_t failure_va;
+    uint32_t failure_fsr;
+    uint32_t outer_lr;
+    uint8_t readable_mask;
+    bool outer_lr_readable;
+} display_surface_snapshot_t;
+
+typedef struct {
+    uint64_t hits;
+    uint64_t first_at;
+    uint64_t last_at;
+    uint32_t first_r[13];
+    uint32_t last_r[13];
+    uint32_t first_sp;
+    uint32_t first_lr;
+    uint32_t first_cpsr;
+    uint32_t first_thread;
+    uint32_t last_sp;
+    uint32_t last_lr;
+    uint32_t last_cpsr;
+    uint32_t last_thread;
+    display_surface_snapshot_t first_surface;
+    display_surface_snapshot_t last_surface;
+} display_checkpoint_observation_t;
 
 /*
  * Exact iPhone OS 3.1.3 PMU/I2C instruction-entry checkpoints.  These
@@ -2837,6 +3105,8 @@ static struct {
      * PCs are normalized only after the alias-aware range check accepts them. */
     display_exec_diag_t h1_display_exec;
     display_exec_diag_t merlot_exec;
+    display_checkpoint_observation_t
+                display_checkpoint[DISPLAY_CHECKPOINT_COUNT];
     pmu_checkpoint_observation_t
                 pmu_checkpoint[PMU_CHECKPOINT_COUNT];
 
@@ -3866,6 +4136,160 @@ static inline void springboard_target_low_flow_note(
     }
 }
 
+static int springboard_ui_checkpoint_index(uint32_t pc) {
+    pc &= ~1u;
+    switch (pc) {
+        case UINT32_C(0x0000381e): return 0;
+        case UINT32_C(0x00003822): return 1;
+        case UINT32_C(0x00003940): return 2;
+        case UINT32_C(0x00003944): return 3;
+        case UINT32_C(0x0000a6f4): return 4;
+        case UINT32_C(0x0000a714): return 5;
+        case UINT32_C(0x0000a71e): return 6;
+        case UINT32_C(0x0000a728): return 7;
+        case UINT32_C(0x0000a7ba): return 8;
+        case UINT32_C(0x324a5098): return 9;
+        case UINT32_C(0x324a509c): return 10;
+        case UINT32_C(0x324a50c8): return 11;
+        case UINT32_C(0x324a50cc): return 12;
+        case UINT32_C(0x324a50d0): return 13;
+        case UINT32_C(0x324a50d4): return 14;
+        case UINT32_C(0x324a5b70): return 15;
+        case UINT32_C(0x324a5b84): return 16;
+        case UINT32_C(0x324a5b88): return 17;
+        case UINT32_C(0x324a5ba0): return 18;
+        case UINT32_C(0x324a5ba4): return 19;
+        case UINT32_C(0x324a5bb4): return 20;
+        case UINT32_C(0x324a5bb8): return 21;
+        case UINT32_C(0x324a5bc4): return 22;
+        case UINT32_C(0x324a5bc8): return 23;
+        case UINT32_C(0x324a5bd4): return 24;
+        case UINT32_C(0x324a5bd8): return 25;
+        case UINT32_C(0x324a5bf0): return 26;
+        case UINT32_C(0x324a5bf4): return 27;
+        case UINT32_C(0x324a5c04): return 28;
+        case UINT32_C(0x324a5c08): return 29;
+        case UINT32_C(0x324a5c40): return 30;
+        case UINT32_C(0x324a5c44): return 31;
+        case UINT32_C(0x324a5c70): return 32;
+        case UINT32_C(0x324a6a00): return 33;
+        case UINT32_C(0x324a7820): return 34;
+        case UINT32_C(0x324a7c6c): return 35;
+        case UINT32_C(0x3125408c): return 36;
+        case UINT32_C(0x312540ec): return 37;
+        case UINT32_C(0x312540f0): return 38;
+        case UINT32_C(0x3125411c): return 39;
+        case UINT32_C(0x31254120): return 40;
+        case UINT32_C(0x312541c8): return 41;
+        case UINT32_C(0x3123eba4): return 42;
+        case UINT32_C(0x3123eba8): return 43;
+        case UINT32_C(0x3123ebb0): return 44;
+        case UINT32_C(0x3123ebb4): return 45;
+        case UINT32_C(0x3123ebdc): return 46;
+        case UINT32_C(0x3123ebe0): return 47;
+        case UINT32_C(0x3123ebf4): return 48;
+        case UINT32_C(0x3123f5a0): return 49;
+        case UINT32_C(0x3123f6b8): return 50;
+        case UINT32_C(0x3123f6bc): return 51;
+        case UINT32_C(0x3123f6c8): return 52;
+        case UINT32_C(0x3123f6cc): return 53;
+        case UINT32_C(0x3123f6e0): return 54;
+        case UINT32_C(0x3123f6e4): return 55;
+        case UINT32_C(0x3123f778): return 56;
+        case UINT32_C(0x3123ee94): return 57;
+        case UINT32_C(0x3123eeb4): return 58;
+        case UINT32_C(0x3123eeb8): return 59;
+        case UINT32_C(0x3123eedc): return 60;
+        case UINT32_C(0x3123eee0): return 61;
+        case UINT32_C(0x3123eef4): return 62;
+        case UINT32_C(0x3123eef8): return 63;
+        case UINT32_C(0x3123ef00): return 64;
+        case UINT32_C(0x3123ef04): return 65;
+        case UINT32_C(0x3123ef1c): return 66;
+        case UINT32_C(0x3123ef20): return 67;
+        case UINT32_C(0x3123ef40): return 68;
+        case UINT32_C(0x3123ef44): return 69;
+        case UINT32_C(0x3123ef4c): return 70;
+        case UINT32_C(0x3123ef50): return 71;
+        case UINT32_C(0x3123ef88): return 72;
+        case UINT32_C(0x3110d9f8): return 73;
+        case UINT32_C(0x3110d9fc): return 74;
+        case UINT32_C(0x3110cfe8): return 75;
+        case UINT32_C(0x3110cfec): return 76;
+        case UINT32_C(0x3110d00c): return 77;
+        case UINT32_C(0x3110d024): return 78;
+        case UINT32_C(0x3110d05c): return 79;
+        case UINT32_C(0x3110d060): return 80;
+        case UINT32_C(0x3110d8e4): return 81;
+        case UINT32_C(0x3110d8e8): return 82;
+        case UINT32_C(0x3110d900): return 83;
+        case UINT32_C(0x3110d904): return 84;
+        case UINT32_C(0x3110d918): return 85;
+        case UINT32_C(0x3110dbcc): return 86;
+        case UINT32_C(0x3110dc18): return 87;
+        case UINT32_C(0x3110dc1c): return 88;
+        case UINT32_C(0x3110dc20): return 89;
+        default: break;
+    }
+    return -1;
+}
+
+static void springboard_ui_checkpoint_note(
+        springboard_exec_trace_t *trace,
+        const springboard_pending_user_t *pending,
+        arm_cpu_t *cpu) {
+    if (!trace || !pending || !cpu ||
+        !pending->target_registers_valid ||
+        !trace->target_on_cpu ||
+        pending->thread != trace->target_thread)
+        return;
+    int index = springboard_ui_checkpoint_index(pending->pc);
+    if (index < 0) return;
+
+    springboard_ui_checkpoint_observation_t *observation =
+        &trace->ui_checkpoints[(unsigned)index];
+    memset(observation->last_stack, 0,
+           sizeof observation->last_stack);
+    observation->last_stack_failure_va = 0;
+    observation->last_stack_failure_fsr = 0;
+    observation->last_stack_readable =
+        guest_read_user_bytes(
+            cpu, pending->user_sp,
+            observation->last_stack,
+            sizeof observation->last_stack,
+            &observation->last_stack_failure_va,
+            &observation->last_stack_failure_fsr);
+    if (!observation->hits) {
+        observation->first_at = pending->at;
+        memcpy(observation->first_r, pending->r,
+               sizeof observation->first_r);
+        observation->first_sp = pending->user_sp;
+        observation->first_lr = pending->user_lr;
+        observation->first_cpsr = pending->cpsr;
+        observation->first_thread = pending->thread;
+        memcpy(observation->first_stack,
+               observation->last_stack,
+               sizeof observation->first_stack);
+        observation->first_stack_failure_va =
+            observation->last_stack_failure_va;
+        observation->first_stack_failure_fsr =
+            observation->last_stack_failure_fsr;
+        observation->first_stack_readable =
+            observation->last_stack_readable;
+    }
+    observation->hits++;
+    observation->last_at = pending->at;
+    memcpy(observation->last_r, pending->r,
+           sizeof observation->last_r);
+    observation->last_sp = pending->user_sp;
+    observation->last_lr = pending->user_lr;
+    observation->last_cpsr = pending->cpsr;
+    observation->last_thread = pending->thread;
+    trace->ui_checkpoint_last = (uint8_t)index;
+    trace->ui_checkpoint_last_at = pending->at;
+    trace->ui_checkpoint_last_valid = true;
+}
+
 static bool springboard_mach_header_decode(
         const uint8_t *bytes, size_t length,
         uint32_t options, uint32_t send_size,
@@ -3891,6 +4315,128 @@ static bool springboard_mach_header_decode(
         header->size >= SPRINGBOARD_MACH_HEADER_SIZE &&
         header->size <= send_size;
     return true;
+}
+
+static size_t springboard_mach_receive_capture_length(uint32_t bound) {
+    return bound < SPRINGBOARD_MACH_RECEIVE_CAP
+        ? (size_t)bound : SPRINGBOARD_MACH_RECEIVE_CAP;
+}
+
+static springboard_mach_event_t *springboard_target_mach_active(
+        springboard_exec_trace_t *trace) {
+    if (!trace || !trace->target_mach_active) return NULL;
+    springboard_mach_event_t *event =
+        &trace->target_mach[
+            trace->target_mach_active_sequence %
+                SPRINGBOARD_MACH_EVENT_CAP];
+    if (!event->valid || !event->open ||
+        event->sequence != trace->target_mach_active_sequence ||
+        event->episode != trace->target_episode) {
+        trace->target_mach_active = false;
+        return NULL;
+    }
+    return event;
+}
+
+static void springboard_target_mach_begin(
+        springboard_exec_trace_t *trace,
+        const springboard_pending_user_t *pending,
+        const arm_cpu_t *cpu, uint64_t at) {
+    if (!trace || !pending || !cpu ||
+        !trace->target_episode_open ||
+        !trace->target_episode_mach_msg)
+        return;
+
+    uint64_t sequence = trace->target_mach_total++;
+    springboard_mach_event_t *event =
+        &trace->target_mach[
+            sequence % SPRINGBOARD_MACH_EVENT_CAP];
+    memset(event, 0, sizeof *event);
+    event->sequence = sequence;
+    event->episode = trace->target_episode;
+    event->entry_at = at;
+    event->origin_pc = pending->pc;
+    event->origin_cpsr = pending->cpsr;
+    event->user_sp = pending->user_sp;
+    event->user_lr = pending->user_lr;
+    event->thread = pending->thread;
+    memcpy(event->args, trace->target_episode_mach_args,
+           sizeof event->args);
+    event->entry_ttbr0 = cpu->cp15.ttbr0;
+    event->entry_ttbcr = cpu->cp15.ttbcr;
+    event->entry_fcse_pid = cpu->cp15.fcse_pid;
+    event->entry_context_id = cpu->cp15.context_id;
+    event->request_header = trace->target_episode_mach_header;
+    event->ui_checkpoint = UINT8_MAX;
+    if (trace->ui_checkpoint_last_valid) {
+        event->ui_checkpoint = trace->ui_checkpoint_last;
+        event->ui_checkpoint_at = trace->ui_checkpoint_last_at;
+    }
+    event->valid = true;
+    event->open = true;
+    trace->target_mach_active_sequence = sequence;
+    trace->target_mach_active = true;
+}
+
+static void springboard_target_mach_resolve(
+        springboard_exec_trace_t *trace, arm_cpu_t *cpu,
+        uint64_t at, springboard_mach_resolution_t resolution,
+        springboard_target_outcome_t outcome,
+        bool result_observed, bool result_authoritative,
+        uint32_t raw_result, bool capture_receive,
+        bool delayed_snapshot) {
+    springboard_mach_event_t *event =
+        springboard_target_mach_active(trace);
+    if (!event) return;
+
+    event->resolution_seen = true;
+    event->resolution_at = at;
+    event->resolution_kind = (uint8_t)resolution;
+    event->outcome = (uint8_t)outcome;
+    event->result_observed = result_observed;
+    event->result_authoritative =
+        result_observed && result_authoritative;
+    event->raw_result = raw_result;
+    event->path_bits = trace->target_episode_mach_path_bits;
+    memcpy(event->path_first_at,
+           trace->target_episode_mach_path_first_at,
+           sizeof event->path_first_at);
+
+    if (capture_receive &&
+        (event->args[1] & DIAGNOSTIC_MACH_RCV_MSG)) {
+        event->receive_attempted = true;
+        event->receive_va = event->args[0];
+        event->receive_bound = event->args[3];
+        event->receive_snapshot_delayed = delayed_snapshot;
+        size_t length = springboard_mach_receive_capture_length(
+            event->receive_bound);
+        if (!length) {
+            event->receive_readable = true;
+        } else if (guest_read_user_bytes(
+                cpu, event->receive_va,
+                event->receive_bytes, length,
+                &event->receive_failure_va,
+                &event->receive_failure_fsr)) {
+            event->receive_readable = true;
+            event->receive_length = (uint8_t)length;
+            if (length >= SPRINGBOARD_MACH_HEADER_SIZE) {
+                (void)springboard_mach_header_decode(
+                    event->receive_bytes,
+                    SPRINGBOARD_MACH_HEADER_SIZE,
+                    0, 0, &event->receive_header);
+                event->receive_size_within_limit =
+                    event->receive_header.size >=
+                        SPRINGBOARD_MACH_HEADER_SIZE &&
+                    event->receive_header.size <=
+                        event->receive_bound;
+            }
+        } else if (!event->receive_failure_va) {
+            event->receive_failure_va = event->receive_va;
+        }
+    }
+
+    event->open = false;
+    trace->target_mach_active = false;
 }
 
 static const char *const
@@ -3921,6 +4467,13 @@ springboard_target_note_mach_milestone(
         if (!(trace->target_episode_mach_path_bits & bit))
             trace->target_episode_mach_path_first_at[i] = at;
         trace->target_episode_mach_path_bits |= bit;
+        springboard_mach_event_t *event =
+            springboard_target_mach_active(trace);
+        if (event) {
+            if (!(event->path_bits & bit))
+                event->path_first_at[i] = at;
+            event->path_bits |= bit;
+        }
         return;
     }
 }
@@ -4072,6 +4625,11 @@ static void springboard_target_note_identity_failure(
     trace->target_unreadable_user_capped = false;
     trace->target_on_cpu = false;
     if (trace->target_episode_open) {
+        springboard_target_mach_resolve(
+            trace, NULL, at,
+            SPRINGBOARD_MACH_RESOLUTION_ATTRIBUTION_LOST,
+            SPRINGBOARD_TARGET_OUTCOME_ATTRIBUTION_LOST,
+            false, false, 0, false, false);
         trace->target_episode_open = false;
         trace->target_episode_resolved_at = at;
         trace->target_episode_last_outcome =
@@ -4092,7 +4650,7 @@ static void springboard_target_note_identity_failure(
 
 static void springboard_target_note_process_exit_entry(
         springboard_exec_trace_t *trace,
-        const arm_cpu_t *cpu, uint64_t at) {
+        arm_cpu_t *cpu, uint64_t at) {
     if (!trace || !cpu || trace->exited) return;
     springboard_target_event_t *event =
         springboard_target_event_begin(
@@ -4115,6 +4673,11 @@ static void springboard_target_note_process_exit_entry(
     springboard_target_event_note_context(event, cpu);
 
     if (trace->target_episode_open) {
+        springboard_target_mach_resolve(
+            trace, cpu, at,
+            SPRINGBOARD_MACH_RESOLUTION_PROCESS_EXIT,
+            SPRINGBOARD_TARGET_OUTCOME_PROCESS_EXIT_ENTRY,
+            false, false, 0, false, false);
         trace->target_episode_open = false;
         trace->target_episode_resolved_at = at;
         trace->target_episode_last_outcome =
@@ -4291,6 +4854,21 @@ static bool springboard_target_trace_selfcheck(void) {
             mach_header_bytes, sizeof mach_header_bytes - 1u,
             DIAGNOSTIC_MACH_SEND_MSG, UINT32_C(0x4c),
             &mach_header);
+    ok = ok &&
+        springboard_mach_receive_capture_length(0u) == 0u &&
+        springboard_mach_receive_capture_length(23u) == 23u &&
+        springboard_mach_receive_capture_length(24u) == 24u &&
+        springboard_mach_receive_capture_length(64u) == 64u &&
+        springboard_mach_receive_capture_length(4096u) == 64u;
+    ok = ok &&
+        springboard_ui_checkpoint_index(UINT32_C(0x0000381e)) >= 0 &&
+        springboard_ui_checkpoint_index(UINT32_C(0x324a5b88)) >= 0 &&
+        springboard_ui_checkpoint_index(UINT32_C(0x3110d024)) >= 0 &&
+        springboard_ui_checkpoint_index(UINT32_C(0x20000000)) < 0;
+    for (unsigned i = 0;
+         i < SPRINGBOARD_UI_CHECKPOINT_COUNT; i++)
+        ok = ok && springboard_ui_checkpoint_index(
+                SPRINGBOARD_UI_CHECKPOINTS[i].va) == (int)i;
 
     /*
      * This trace now contains a 4,096-event diagnostic ring. Keep the
@@ -4331,6 +4909,107 @@ static bool springboard_target_trace_selfcheck(void) {
         closed->raw_r12 == 0u &&
         closed->trap_number == 0u;
 
+    springboard_pending_user_t mach_pending;
+    arm_cpu_t mach_cpu;
+    memset(&ring, 0, sizeof ring);
+    memset(&mach_pending, 0, sizeof mach_pending);
+    memset(&mach_cpu, 0, sizeof mach_cpu);
+    mach_pending.pc = UINT32_C(0x33aae484);
+    mach_pending.cpsr = ARM_MODE_USR;
+    mach_pending.thread = UINT32_C(0x10101010);
+    mach_pending.user_sp = UINT32_C(0x2ffff000);
+    mach_pending.user_lr = UINT32_C(0x33ab106c);
+    ring.target_episode_open = true;
+    ring.target_episode_mach_msg = true;
+    ring.target_episode_mach_args[1] =
+        DIAGNOSTIC_MACH_SEND_MSG | DIAGNOSTIC_MACH_RCV_MSG;
+    for (uint64_t sequence = 0;
+         sequence <= SPRINGBOARD_MACH_EVENT_CAP; sequence++) {
+        ring.target_episode = sequence + 1u;
+        springboard_target_mach_begin(
+            &ring, &mach_pending, &mach_cpu, sequence);
+    }
+    ok = ok &&
+        ring.target_mach_total == SPRINGBOARD_MACH_EVENT_CAP + 1u &&
+        ring.target_mach[0].sequence == SPRINGBOARD_MACH_EVENT_CAP &&
+        ring.target_mach[0].episode ==
+            SPRINGBOARD_MACH_EVENT_CAP + 1u &&
+        ring.target_mach[1].sequence == UINT64_C(1) &&
+        springboard_target_mach_active(&ring) ==
+            &ring.target_mach[0];
+    ring.target_episode++;
+    ok = ok && springboard_target_mach_active(&ring) == NULL &&
+        !ring.target_mach_active;
+
+    memset(&ring, 0, sizeof ring);
+    ring.target_episode = UINT64_C(11);
+    ring.target_episode_open = true;
+    ring.target_mach_total = UINT64_C(1);
+    ring.target_mach_active = true;
+    ring.target_mach[0].valid = true;
+    ring.target_mach[0].open = true;
+    ring.target_mach[0].sequence = 0;
+    ring.target_mach[0].episode = ring.target_episode;
+    springboard_target_mach_resolve(
+        &ring, NULL, UINT64_C(101),
+        SPRINGBOARD_MACH_RESOLUTION_EXPLICIT_RETURN,
+        SPRINGBOARD_TARGET_OUTCOME_NORMAL,
+        true, true, UINT32_C(0x12345678),
+        false, false);
+    ok = ok && !ring.target_mach_active &&
+        !ring.target_mach[0].open &&
+        ring.target_mach[0].resolution_seen &&
+        ring.target_mach[0].result_observed &&
+        ring.target_mach[0].result_authoritative &&
+        ring.target_mach[0].raw_result ==
+            UINT32_C(0x12345678) &&
+        ring.target_mach[0].resolution_kind ==
+            SPRINGBOARD_MACH_RESOLUTION_EXPLICIT_RETURN;
+
+    memset(&ring, 0, sizeof ring);
+    ring.target_episode = UINT64_C(12);
+    ring.target_episode_open = true;
+    ring.target_mach_total = UINT64_C(1);
+    ring.target_mach_active = true;
+    ring.target_mach[0].valid = true;
+    ring.target_mach[0].open = true;
+    ring.target_mach[0].sequence = 0;
+    ring.target_mach[0].episode = ring.target_episode;
+    springboard_target_mach_resolve(
+        &ring, NULL, UINT64_C(102),
+        SPRINGBOARD_MACH_RESOLUTION_IMPLICIT_USER,
+        SPRINGBOARD_TARGET_OUTCOME_USER_OBSERVED,
+        false, false, UINT32_C(0xffffffff),
+        false, true);
+    ok = ok && !ring.target_mach_active &&
+        !ring.target_mach[0].open &&
+        ring.target_mach[0].resolution_seen &&
+        !ring.target_mach[0].result_observed &&
+        !ring.target_mach[0].result_authoritative &&
+        ring.target_mach[0].resolution_kind ==
+            SPRINGBOARD_MACH_RESOLUTION_IMPLICIT_USER;
+
+    memset(&ring, 0, sizeof ring);
+    ring.target_episode = UINT64_C(13);
+    ring.target_episode_open = true;
+    ring.target_mach_total = UINT64_C(1);
+    ring.target_mach_active = true;
+    ring.target_mach[0].valid = true;
+    ring.target_mach[0].open = true;
+    ring.target_mach[0].sequence = 0;
+    ring.target_mach[0].episode = ring.target_episode;
+    springboard_target_note_identity_failure(
+        &ring, SPRINGBOARD_TARGET_IDENTITY_THREAD_MISMATCH,
+        UINT64_C(103), UINT32_C(0xabcdef00));
+    ok = ok && !ring.target_mach_active &&
+        !ring.target_mach[0].open &&
+        !ring.target_mach[0].receive_attempted &&
+        ring.target_mach[0].resolution_kind ==
+            SPRINGBOARD_MACH_RESOLUTION_ATTRIBUTION_LOST &&
+        ring.target_mach[0].outcome ==
+            SPRINGBOARD_TARGET_OUTCOME_ATTRIBUTION_LOST;
+
+    memset(&ring, 0, sizeof ring);
     for (uint64_t sequence = 0;
          sequence <= SPRINGBOARD_LOW_FLOW_CAP; sequence++) {
         uint32_t destination =
@@ -4366,6 +5045,13 @@ static bool springboard_target_trace_selfcheck(void) {
     ring.target_episode_open = true;
     ring.target_episode = UINT64_C(3);
     ring.target_episode_total = UINT64_C(3);
+    ring.target_mach_total = UINT64_C(1);
+    ring.target_mach_active_sequence = 0;
+    ring.target_mach_active = true;
+    ring.target_mach[0].valid = true;
+    ring.target_mach[0].open = true;
+    ring.target_mach[0].sequence = 0;
+    ring.target_mach[0].episode = UINT64_C(3);
     cpu.cpsr = ARM_MODE_SVC;
     cpu.r[0] = UINT32_C(0x11110000);
     cpu.r[1] = UINT32_C(0x22);
@@ -4378,6 +5064,11 @@ static bool springboard_target_trace_selfcheck(void) {
         !ring.target_episode_open &&
         ring.target_episode_last_outcome ==
             SPRINGBOARD_TARGET_OUTCOME_PROCESS_EXIT_ENTRY &&
+        !ring.target_mach_active &&
+        !ring.target_mach[0].open &&
+        ring.target_mach[0].resolution_kind ==
+            SPRINGBOARD_MACH_RESOLUTION_PROCESS_EXIT &&
+        !ring.target_mach[0].receive_attempted &&
         ring.target_event_total == UINT64_C(1) &&
         ring.target_events[0].kind ==
             SPRINGBOARD_TARGET_PROCESS_EXIT_ENTRY &&
@@ -4756,7 +5447,7 @@ static void springboard_exec_trace_prepare_user(
 static void springboard_target_close_implicit_return(
         springboard_exec_trace_t *trace,
         const springboard_pending_user_t *pending,
-        const arm_cpu_t *cpu, uint64_t at,
+        arm_cpu_t *cpu, uint64_t at,
         springboard_target_identity_t identity) {
     if (!trace || !pending || !trace->target_episode_open) return;
     springboard_target_event_t *event =
@@ -4777,6 +5468,11 @@ static void springboard_target_close_implicit_return(
     event->identity = (uint8_t)identity;
     event->outcome = SPRINGBOARD_TARGET_OUTCOME_USER_OBSERVED;
     springboard_target_event_note_context(event, cpu);
+    springboard_target_mach_resolve(
+        trace, cpu, at,
+        SPRINGBOARD_MACH_RESOLUTION_IMPLICIT_USER,
+        SPRINGBOARD_TARGET_OUTCOME_USER_OBSERVED,
+        false, false, 0, true, true);
     trace->target_episode_open = false;
     trace->target_episode_resolved_at = at;
     trace->target_episode_last_outcome = event->outcome;
@@ -5016,6 +5712,9 @@ static BOOTKERNEL_NOINLINE void springboard_target_note_user_exception(
             }
         }
     }
+    if (trace->target_episode_mach_msg)
+        springboard_target_mach_begin(
+            trace, pending, cpu, at);
 
     springboard_target_event_t *event =
         springboard_target_event_begin(
@@ -5104,11 +5803,13 @@ static void springboard_exec_trace_note_user_post_step(
             pending.user_lr, cpu->r[15], cpu->cpsr,
             cpu->r[14]);
 
-    if (pending.process_commit_eligible)
+    if (pending.process_commit_eligible) {
+        springboard_ui_checkpoint_note(trace, &pending, cpu);
         springboard_exec_trace_commit_user(
             trace, pending.at, pending.pc, pending.thread,
             (springboard_user_region_t)pending.region,
             pending.first_identity_valid);
+    }
 }
 
 /*
@@ -5306,6 +6007,13 @@ springboard_exec_trace_note_target_transition_cold(
         event->raw_result_authoritative =
             event->outcome == SPRINGBOARD_TARGET_OUTCOME_NORMAL &&
             event->svc_return_frame_valid;
+        if (episode_open)
+            springboard_target_mach_resolve(
+                trace, cpu, at,
+                SPRINGBOARD_MACH_RESOLUTION_EXPLICIT_RETURN,
+                (springboard_target_outcome_t)event->outcome,
+                true, event->raw_result_authoritative,
+                cpu->r[0], true, false);
         springboard_target_refresh_address_space(trace, cpu);
         trace->target_on_cpu = true;
         trace->target_resume_unverified = false;
@@ -6734,6 +7442,212 @@ static const char *springboard_target_outcome_name(unsigned outcome) {
     return "unknown";
 }
 
+static const char *springboard_mach_resolution_name(unsigned resolution) {
+    switch ((springboard_mach_resolution_t)resolution) {
+        case SPRINGBOARD_MACH_RESOLUTION_NONE:
+            return "open";
+        case SPRINGBOARD_MACH_RESOLUTION_EXPLICIT_RETURN:
+            return "validated SVC-to-user return";
+        case SPRINGBOARD_MACH_RESOLUTION_IMPLICIT_USER:
+            return "later exact-target user observation";
+        case SPRINGBOARD_MACH_RESOLUTION_ATTRIBUTION_LOST:
+            return "identity attribution lost";
+        case SPRINGBOARD_MACH_RESOLUTION_PROCESS_EXIT:
+            return "exact-process _exit1 entry";
+    }
+    return "unknown";
+}
+
+static void springboard_ui_checkpoint_report(
+        const springboard_exec_trace_t *trace) {
+    printf("    exact SETEXEC-thread UIKit/window-server checkpoints:\n");
+    for (unsigned i = 0; i < SPRINGBOARD_UI_CHECKPOINT_COUNT; i++) {
+        const springboard_ui_checkpoint_observation_t *observation =
+            &trace->ui_checkpoints[i];
+        printf("      %-44s pc=%08x hits=%" PRIu64,
+               SPRINGBOARD_UI_CHECKPOINTS[i].name,
+               SPRINGBOARD_UI_CHECKPOINTS[i].va,
+               observation->hits);
+        if (!observation->hits) {
+            printf("\n");
+            continue;
+        }
+        printf(" first/last @%" PRIu64 "/%" PRIu64 "\n"
+               "        first r0-r3=%08x/%08x/%08x/%08x"
+               " r4-r7=%08x/%08x/%08x/%08x\n"
+               "              r8-r12=%08x/%08x/%08x/%08x/%08x"
+               " sp/lr=%08x/%08x cpsr=%08x thread=%08x\n"
+               "        last  r0-r3=%08x/%08x/%08x/%08x"
+               " r4-r7=%08x/%08x/%08x/%08x\n"
+               "              r8-r12=%08x/%08x/%08x/%08x/%08x"
+               " sp/lr=%08x/%08x cpsr=%08x thread=%08x\n",
+               observation->first_at, observation->last_at,
+               observation->first_r[0], observation->first_r[1],
+               observation->first_r[2], observation->first_r[3],
+               observation->first_r[4], observation->first_r[5],
+               observation->first_r[6], observation->first_r[7],
+               observation->first_r[8], observation->first_r[9],
+               observation->first_r[10], observation->first_r[11],
+               observation->first_r[12],
+               observation->first_sp, observation->first_lr,
+               observation->first_cpsr, observation->first_thread,
+               observation->last_r[0], observation->last_r[1],
+               observation->last_r[2], observation->last_r[3],
+               observation->last_r[4], observation->last_r[5],
+               observation->last_r[6], observation->last_r[7],
+               observation->last_r[8], observation->last_r[9],
+               observation->last_r[10], observation->last_r[11],
+               observation->last_r[12],
+               observation->last_sp, observation->last_lr,
+               observation->last_cpsr, observation->last_thread);
+        if (observation->first_stack_readable) {
+            printf("        first stack +00..+1c:");
+            for (unsigned word = 0;
+                 word < SPRINGBOARD_UI_STACK_CAP / 4u; word++)
+                printf(" %08x",
+                       ld32(observation->first_stack + word * 4u));
+            printf("\n");
+        } else {
+            printf("        first stack unreadable"
+                   " failure-va/fsr=%08x/%08x\n",
+                   observation->first_stack_failure_va,
+                   observation->first_stack_failure_fsr);
+        }
+        if (observation->last_stack_readable) {
+            printf("        last  stack +00..+1c:");
+            for (unsigned word = 0;
+                 word < SPRINGBOARD_UI_STACK_CAP / 4u; word++)
+                printf(" %08x",
+                       ld32(observation->last_stack + word * 4u));
+            printf("\n");
+        } else {
+            printf("        last stack unreadable"
+                   " failure-va/fsr=%08x/%08x\n",
+                   observation->last_stack_failure_va,
+                   observation->last_stack_failure_fsr);
+        }
+    }
+}
+
+static void springboard_mach_event_report(
+        const springboard_mach_event_t *event) {
+    if (!event || !event->valid) return;
+    const char *ui_name =
+        event->ui_checkpoint < SPRINGBOARD_UI_CHECKPOINT_COUNT
+            ? SPRINGBOARD_UI_CHECKPOINTS[event->ui_checkpoint].name
+            : "none observed";
+    printf("      #%-4" PRIu64 " episode=%" PRIu64
+           " entry @%" PRIu64 " pc=%08x thread=%08x"
+           " UI=%s",
+           event->sequence, event->episode, event->entry_at,
+           event->origin_pc, event->thread, ui_name);
+    if (event->ui_checkpoint <
+            SPRINGBOARD_UI_CHECKPOINT_COUNT)
+        printf(" pc=%08x @%" PRIu64,
+               SPRINGBOARD_UI_CHECKPOINTS[
+                   event->ui_checkpoint].va,
+               event->ui_checkpoint_at);
+    printf("\n"
+           "        msg=%08x options=%08x%s%s"
+           " send=%u rcv=%u rcv_name=%08x timeout=%u notify=%08x"
+           " user-sp/lr=%08x/%08x\n",
+           event->args[0], event->args[1],
+           (event->args[1] & DIAGNOSTIC_MACH_SEND_MSG)
+               ? " SEND" : "",
+           (event->args[1] & DIAGNOSTIC_MACH_RCV_MSG)
+               ? " RCV" : "",
+           event->args[2], event->args[3], event->args[4],
+           event->args[5], event->args[6],
+           event->user_sp, event->user_lr);
+    if (event->request_header.readable) {
+        printf("        request header bits/size=%08x/%u"
+               " task-local remote/local=%08x/%08x"
+               " id=%d (0x%08x), size %s send bound\n",
+               event->request_header.bits,
+               event->request_header.size,
+               event->request_header.remote_port,
+               event->request_header.local_port,
+               event->request_header.id,
+               (uint32_t)event->request_header.id,
+               event->request_header.size_within_send
+                   ? "within" : "outside");
+    } else if (event->request_header.read_attempted) {
+        printf("        request header unreadable"
+               " failure-va/fsr=%08x/%08x\n",
+               event->request_header.failure_va,
+               event->request_header.failure_fsr);
+    } else {
+        printf("        request header not captured"
+               " (SEND option absent)\n");
+    }
+    printf("        kernel path:");
+    if (!event->path_bits) {
+        printf(" no selected entry hit\n");
+    } else {
+        for (unsigned i = 0;
+             i < SPRINGBOARD_MACH_PATH_COUNT; i++) {
+            uint32_t bit = UINT32_C(1) << i;
+            if (event->path_bits & bit)
+                printf(" %s@%" PRIu64,
+                       SPRINGBOARD_MACH_PATH_NAMES[i],
+                       event->path_first_at[i]);
+        }
+        printf("\n");
+    }
+    if (event->open) {
+        printf("        OPEN/UNRESOLVED; receive buffer was not read\n");
+        return;
+    }
+    printf("        resolution @%" PRIu64 ": %s; outcome=%s",
+           event->resolution_at,
+           springboard_mach_resolution_name(
+               event->resolution_kind),
+           springboard_target_outcome_name(event->outcome));
+    if (event->result_observed)
+        printf("; r0=%d (0x%08x) %s",
+               (int32_t)event->raw_result, event->raw_result,
+               event->result_authoritative
+                   ? "authoritative" : "non-authoritative");
+    else
+        printf("; raw r0 unavailable");
+    printf("\n");
+    if (!event->receive_attempted) {
+        printf("        post-return receive-buffer snapshot:"
+               " not attempted\n");
+    } else if (!event->receive_readable) {
+        printf("        post-return receive-buffer snapshot:"
+               " unreadable va/bound=%08x/%u"
+               " failure-va/fsr=%08x/%08x\n",
+               event->receive_va, event->receive_bound,
+               event->receive_failure_va,
+               event->receive_failure_fsr);
+    } else {
+        printf("        post-return receive-buffer snapshot%s:"
+               " va/bound/captured=%08x/%u/%u",
+               event->receive_snapshot_delayed
+                   ? " (delayed)" : "",
+               event->receive_va, event->receive_bound,
+               event->receive_length);
+        if (event->receive_header.readable)
+            printf(" header bits/size=%08x/%u"
+                   " remote/local=%08x/%08x id=%d (0x%08x)"
+                   " size %s receive bound",
+                   event->receive_header.bits,
+                   event->receive_header.size,
+                   event->receive_header.remote_port,
+                   event->receive_header.local_port,
+                   event->receive_header.id,
+                   (uint32_t)event->receive_header.id,
+                   event->receive_size_within_limit
+                       ? "within" : "outside");
+        printf("\n        bytes:");
+        for (unsigned i = 0; i < event->receive_length; i++)
+            printf("%s%02x", (i % 16u) ? " " : "\n          ",
+                   event->receive_bytes[i]);
+        printf("\n");
+    }
+}
+
 static const char *springboard_target_trap_name(
         const springboard_target_event_t *event,
         char unknown[48]) {
@@ -7043,6 +7957,7 @@ static void springboard_exec_trace_report(void) {
            " re-walks task/proc/PID; later hits use the validated"
            " TTBR0/TTBCR/FCSE/ASID key. They are address-space activity,"
            " not a full identity proof on every instruction.\n");
+    springboard_ui_checkpoint_report(trace);
 
     uint64_t edge_retained =
         trace->region_edge_total < SPRINGBOARD_REGION_EDGE_CAP
@@ -7189,6 +8104,37 @@ static void springboard_exec_trace_report(void) {
             &trace->target_events[
                 sequence % SPRINGBOARD_TARGET_EVENT_CAP];
         springboard_target_event_report(sequence, event);
+    }
+
+    uint64_t mach_retained =
+        trace->target_mach_total < SPRINGBOARD_MACH_EVENT_CAP
+            ? trace->target_mach_total
+            : SPRINGBOARD_MACH_EVENT_CAP;
+    uint64_t mach_first =
+        trace->target_mach_total - mach_retained;
+    uint64_t mach_show_first = trace->target_mach_total >
+            SPRINGBOARD_MACH_REPORT_CAP
+        ? trace->target_mach_total - SPRINGBOARD_MACH_REPORT_CAP
+        : 0;
+    if (mach_show_first < mach_first)
+        mach_show_first = mach_first;
+    printf("    exact SETEXEC-target Mach request/receive ring:"
+           " %" PRIu64 " total, %" PRIu64 " retained,"
+           " %" PRIu64 " overwritten; showing newest %" PRIu64 "\n",
+           trace->target_mach_total, mach_retained, mach_first,
+           trace->target_mach_total - mach_show_first);
+    printf("    contract: task-local port names and raw bytes are evidence,"
+           " not server identity. A post-return buffer may be a reply,"
+           " an error, or reused request storage; only an exact validated"
+           " return makes r0 authoritative.\n");
+    for (uint64_t sequence = mach_show_first;
+         sequence < trace->target_mach_total; sequence++) {
+        const springboard_mach_event_t *event =
+            &trace->target_mach[
+                sequence % SPRINGBOARD_MACH_EVENT_CAP];
+        if (!event->valid || event->sequence != sequence)
+            continue;
+        springboard_mach_event_report(event);
     }
 
     const char *target_state;
@@ -8149,7 +9095,9 @@ static unsigned display_pc_hash(uint32_t vm_pc) {
 
 static void display_exec_note(display_exec_diag_t *diag, uint64_t at,
                               uint32_t vm_pc, uint32_t lr, uint32_t cpsr,
-                              bool entry_edge) {
+                              bool entry_edge, uint32_t from_pc,
+                              uint32_t from_cpsr, uint32_t thread,
+                              bool from_mmu_enabled) {
     unsigned slot = display_pc_hash(vm_pc);
 
     if (!diag->hits) diag->first_at = at;
@@ -8179,12 +9127,21 @@ static void display_exec_note(display_exec_diag_t *diag, uint64_t at,
     }
 
     if (!entry_edge) return;
+    uint64_t recent_sequence = diag->recent_edge_total++;
+    display_entry_edge_t *recent =
+        &diag->recent_edges[
+            recent_sequence % DISPLAY_RECENT_EDGE_CAP];
+    recent->at = at;
+    recent->from_pc = from_pc;
+    recent->from_cpsr = from_cpsr;
+    recent->vm_pc = vm_pc;
+    recent->lr = lr;
+    recent->cpsr = cpsr;
+    recent->thread = thread;
+    recent->from_mmu_enabled = from_mmu_enabled;
     if (diag->edge_n < DISPLAY_ENTRY_EDGE_CAP) {
         display_entry_edge_t *edge = &diag->edges[diag->edge_n++];
-        edge->at = at;
-        edge->vm_pc = vm_pc;
-        edge->lr = lr;
-        edge->cpsr = cpsr;
+        *edge = *recent;
     } else {
         diag->edge_dropped++;
     }
@@ -8237,11 +9194,42 @@ static void display_driver_exec_report(const char *name, uint32_t vm_base,
            diag->edge_n, DISPLAY_ENTRY_EDGE_CAP, diag->edge_dropped);
     for (unsigned i = 0; i < diag->edge_n; i++) {
         const display_entry_edge_t *edge = &diag->edges[i];
-        printf("          @%-11" PRIu64 " pc=%08x lr=%08x cpsr=%08x %s\n",
-               edge->at, edge->vm_pc, edge->lr, edge->cpsr,
+        printf("          @%-11" PRIu64
+               " from=%08x/m%02x%s -> pc=%08x"
+               " lr=%08x cpsr=%08x thread=%08x %s\n",
+               edge->at, edge->from_pc,
+               edge->from_cpsr & ARM_CPSR_MODE_MASK,
+               edge->from_mmu_enabled ? "/mmu" : "/physical",
+               edge->vm_pc, edge->lr, edge->cpsr, edge->thread,
                ksym_at(edge->vm_pc));
     }
+    uint64_t recent_retained =
+        diag->recent_edge_total < DISPLAY_RECENT_EDGE_CAP
+            ? diag->recent_edge_total
+            : DISPLAY_RECENT_EDGE_CAP;
+    uint64_t recent_first =
+        diag->recent_edge_total - recent_retained;
+    printf("        newest outside->inside edge ring: %" PRIu64
+           " total, %" PRIu64 " retained, %" PRIu64
+           " overwritten\n",
+           diag->recent_edge_total, recent_retained, recent_first);
+    for (uint64_t sequence = recent_first;
+         sequence < diag->recent_edge_total; sequence++) {
+        const display_entry_edge_t *edge =
+            &diag->recent_edges[
+                sequence % DISPLAY_RECENT_EDGE_CAP];
+        printf("          #%-4" PRIu64 " @%-11" PRIu64
+               " from=%08x/m%02x%s -> pc=%08x"
+               " lr=%08x cpsr=%08x thread=%08x %s\n",
+               sequence, edge->at, edge->from_pc,
+               edge->from_cpsr & ARM_CPSR_MODE_MASK,
+               edge->from_mmu_enabled ? "/mmu" : "/physical",
+               edge->vm_pc, edge->lr, edge->cpsr,
+               edge->thread, ksym_at(edge->vm_pc));
+    }
 }
+
+static void display_checkpoint_report(void);
 
 static void display_exec_report(uint32_t virt_base, uint32_t phys_base,
                                 uint32_t ram_size) {
@@ -8264,10 +9252,222 @@ static void display_exec_report(uint32_t virt_base, uint32_t phys_base,
     display_driver_exec_report(
         "AppleMerlotLCD      ", MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_SIZE,
         merlot_alias, merlot_pa, &G.merlot_exec);
+    display_checkpoint_report();
     printf("    IMPORTANT: these are instruction-entry observations only; "
            "they do not prove retirement,\n"
            "               successful driver start, framebuffer rendering, "
-           "or SpringBoard reach.\n");
+               "or SpringBoard reach.\n");
+}
+
+static inline unsigned display_checkpoint_index(uint32_t pc) {
+    if (pc >= UINT32_C(0xc0704940) &&
+        pc <= UINT32_C(0xc0706264)) {
+        switch (pc) {
+            case UINT32_C(0xc0705ff0): return 0u;
+            case UINT32_C(0xc0705ff8): return 1u;
+            case UINT32_C(0xc070607c): return 2u;
+            case UINT32_C(0xc0706218): return 3u;
+            case UINT32_C(0xc0706264): return 4u;
+            case UINT32_C(0xc0704940): return 5u;
+            case UINT32_C(0xc0705d38): return 6u;
+            case UINT32_C(0xc0705d7c): return 7u;
+            default: break;
+        }
+    } else if (pc >= UINT32_C(0xc0524614) &&
+               pc <= UINT32_C(0xc0525328)) {
+        switch (pc) {
+            case UINT32_C(0xc0524614): return 8u;
+            case UINT32_C(0xc0525084): return 9u;
+            case UINT32_C(0xc0525090): return 10u;
+            case UINT32_C(0xc052531c): return 11u;
+            case UINT32_C(0xc0525324): return 12u;
+            case UINT32_C(0xc0525328): return 13u;
+            default: break;
+        }
+    }
+    return DISPLAY_CHECKPOINT_COUNT;
+}
+
+static void display_surface_snapshot_capture(
+        display_surface_snapshot_t *snapshot,
+        const display_checkpoint_t *checkpoint,
+        arm_cpu_t *cpu) {
+    if (!snapshot || !checkpoint || !cpu) return;
+    memset(snapshot, 0, sizeof *snapshot);
+    if (checkpoint->object_reg < 13u) {
+        snapshot->object = cpu->r[checkpoint->object_reg];
+        for (unsigned i = 0;
+             i < DISPLAY_SURFACE_FIELD_COUNT; i++) {
+            uint32_t failure_va = 0, failure_fsr = 0;
+            if (springboard_child_read_field(
+                    cpu, snapshot->object,
+                    DISPLAY_SURFACE_FIELD_OFFSETS[i],
+                    &snapshot->fields[i],
+                    &failure_va, &failure_fsr)) {
+                snapshot->readable_mask |=
+                    (uint8_t)(UINT8_C(1) << i);
+            } else if (!snapshot->failure_va) {
+                snapshot->failure_va =
+                    failure_va ? failure_va : snapshot->object;
+                snapshot->failure_fsr = failure_fsr;
+            }
+        }
+    }
+    if (checkpoint->outer_lr_from_stack) {
+        uint32_t failure_va = 0, failure_fsr = 0;
+        snapshot->outer_lr_readable =
+            springboard_child_read_field(
+                cpu, cpu->r[13], UINT32_C(0x3c),
+                &snapshot->outer_lr,
+                &failure_va, &failure_fsr);
+        if (!snapshot->outer_lr_readable &&
+            !snapshot->failure_va) {
+            snapshot->failure_va =
+                failure_va ? failure_va : cpu->r[13];
+            snapshot->failure_fsr = failure_fsr;
+        }
+    }
+}
+
+static void display_checkpoint_note(
+        unsigned index, uint64_t at, arm_cpu_t *cpu) {
+    if (index >= DISPLAY_CHECKPOINT_COUNT || !cpu) return;
+    display_checkpoint_observation_t *observation =
+        &G.display_checkpoint[index];
+    display_surface_snapshot_t surface;
+    display_surface_snapshot_capture(
+        &surface, &DISPLAY_CHECKPOINTS[index], cpu);
+
+    if (!observation->hits) {
+        observation->first_at = at;
+        memcpy(observation->first_r, cpu->r,
+               sizeof observation->first_r);
+        observation->first_sp = cpu->r[13];
+        observation->first_lr = cpu->r[14];
+        observation->first_cpsr = cpu->cpsr;
+        observation->first_thread = cpu->cp15.tpidrprw;
+        observation->first_surface = surface;
+    }
+    observation->hits++;
+    observation->last_at = at;
+    memcpy(observation->last_r, cpu->r,
+           sizeof observation->last_r);
+    observation->last_sp = cpu->r[13];
+    observation->last_lr = cpu->r[14];
+    observation->last_cpsr = cpu->cpsr;
+    observation->last_thread = cpu->cp15.tpidrprw;
+    observation->last_surface = surface;
+}
+
+static inline void display_checkpoint_observe(
+        uint32_t pc, uint64_t at, arm_cpu_t *cpu) {
+    unsigned index = display_checkpoint_index(pc);
+    if (index < DISPLAY_CHECKPOINT_COUNT)
+        display_checkpoint_note(index, at, cpu);
+}
+
+static bool display_checkpoint_classifier_selfcheck(void) {
+    for (unsigned i = 0; i < DISPLAY_CHECKPOINT_COUNT; i++) {
+        uint32_t pc = DISPLAY_CHECKPOINTS[i].va;
+        if (display_checkpoint_index(pc) != i ||
+            display_checkpoint_index(pc - 2u) !=
+                DISPLAY_CHECKPOINT_COUNT ||
+            display_checkpoint_index(pc + 2u) !=
+                DISPLAY_CHECKPOINT_COUNT)
+            return false;
+    }
+    return display_checkpoint_index(0u) ==
+               DISPLAY_CHECKPOINT_COUNT &&
+           display_checkpoint_index(UINT32_MAX) ==
+               DISPLAY_CHECKPOINT_COUNT;
+}
+
+static void display_surface_snapshot_report(
+        const char *label,
+        const display_surface_snapshot_t *snapshot) {
+    if (!label || !snapshot) return;
+    if (!snapshot->object && !snapshot->outer_lr_readable) return;
+    printf("          %s object=%08x fields", label, snapshot->object);
+    for (unsigned i = 0; i < DISPLAY_SURFACE_FIELD_COUNT; i++)
+        if (snapshot->readable_mask &
+                (uint8_t)(UINT8_C(1) << i))
+            printf(" +%02x=%08x",
+                   DISPLAY_SURFACE_FIELD_OFFSETS[i],
+                   snapshot->fields[i]);
+    if (snapshot->outer_lr_readable)
+        printf(" outer-lr[sp+3c]=%08x", snapshot->outer_lr);
+    if (snapshot->failure_va)
+        printf(" first-unreadable-va/fsr=%08x/%08x",
+               snapshot->failure_va, snapshot->failure_fsr);
+    printf("\n");
+}
+
+static void display_checkpoint_report(void) {
+    printf("        exact H1/IOSurface checkpoints"
+           " (registers are pre-instruction):\n");
+    for (unsigned i = 0; i < DISPLAY_CHECKPOINT_COUNT; i++) {
+        const display_checkpoint_observation_t *observation =
+            &G.display_checkpoint[i];
+        printf("          %-27s pc=%08x hits=%" PRIu64,
+               DISPLAY_CHECKPOINTS[i].name,
+               DISPLAY_CHECKPOINTS[i].va,
+               observation->hits);
+        if (!observation->hits) {
+            printf("\n");
+            continue;
+        }
+        printf(" first/last @%" PRIu64 "/%" PRIu64 "\n"
+               "            first r0-r3=%08x/%08x/%08x/%08x"
+               " r4/r5/r8/r12=%08x/%08x/%08x/%08x"
+               " sp/lr=%08x/%08x cpsr=%08x thread=%08x\n"
+               "            last  r0-r3=%08x/%08x/%08x/%08x"
+               " r4/r5/r8/r12=%08x/%08x/%08x/%08x"
+               " sp/lr=%08x/%08x cpsr=%08x thread=%08x\n",
+               observation->first_at, observation->last_at,
+               observation->first_r[0], observation->first_r[1],
+               observation->first_r[2], observation->first_r[3],
+               observation->first_r[4], observation->first_r[5],
+               observation->first_r[8], observation->first_r[12],
+               observation->first_sp, observation->first_lr,
+               observation->first_cpsr, observation->first_thread,
+               observation->last_r[0], observation->last_r[1],
+               observation->last_r[2], observation->last_r[3],
+               observation->last_r[4], observation->last_r[5],
+               observation->last_r[8], observation->last_r[12],
+               observation->last_sp, observation->last_lr,
+               observation->last_cpsr, observation->last_thread);
+        display_surface_snapshot_report(
+            "first", &observation->first_surface);
+        display_surface_snapshot_report(
+            "last ", &observation->last_surface);
+    }
+}
+
+static bool display_exec_trace_selfcheck(void) {
+    static display_exec_diag_t diag;
+    memset(&diag, 0, sizeof diag);
+    for (uint64_t sequence = 0;
+         sequence <= DISPLAY_ENTRY_EDGE_CAP; sequence++)
+        display_exec_note(
+            &diag, sequence, H1_DISPLAY_VM_BASE,
+            UINT32_C(0xc0100001), ARM_MODE_SVC, true,
+            UINT32_C(0xc0200000), ARM_MODE_SVC,
+            UINT32_C(0xe0001000), true);
+    return diag.hits == DISPLAY_ENTRY_EDGE_CAP + 1u &&
+           diag.edge_n == DISPLAY_ENTRY_EDGE_CAP &&
+           diag.edge_dropped == UINT64_C(1) &&
+           diag.recent_edge_total ==
+               DISPLAY_ENTRY_EDGE_CAP + 1u &&
+           diag.recent_edges[
+               DISPLAY_ENTRY_EDGE_CAP %
+                   DISPLAY_RECENT_EDGE_CAP].at ==
+               DISPLAY_ENTRY_EDGE_CAP &&
+           diag.recent_edges[1].at == UINT64_C(897) &&
+           diag.recent_edges[0].from_pc ==
+               UINT32_C(0xc0200000) &&
+           diag.recent_edges[0].thread ==
+               UINT32_C(0xe0001000) &&
+           diag.recent_edges[0].from_mmu_enabled;
 }
 
 static void pmu_checkpoint_note(unsigned index, uint64_t at,
@@ -8399,12 +9599,13 @@ static void pmu_checkpoint_report(void) {
         printf("    observed path: PMU start-failure entry preceded any "
                "observed first-I2C-call entry.\n");
     else if (first_i2c->hits && wait_state->hits && !wait_complete->hits)
-        printf("    observed path: first I2C call and wait-loop entry were "
-               "reached, but the instruction after that loop was not "
+        printf("    observed path: first-I2C-call and controller wait-loop "
+               "entries were observed, but no post-wait checkpoint was "
                "observed.\n");
     else if (first_i2c->hits && wait_complete->hits)
-        printf("    observed path: the first I2C call reached the instruction "
-               "after the controller wait loop.\n");
+        printf("    observed path: first-I2C-call and controller post-wait "
+               "checkpoints were both observed; these aggregate counters do "
+               "not associate a particular call with a particular wait.\n");
     else
         printf("    observed path: insufficient checkpoint coverage to choose "
                "the early-provider or I2C branch.\n");
@@ -9221,6 +10422,18 @@ int main(int argc, char **argv) {
     if (!springboard_target_trace_selfcheck()) {
         fprintf(stderr,
                 "internal error: SpringBoard target trace self-check failed\n");
+        return 2;
+    }
+    if (!display_checkpoint_classifier_selfcheck()) {
+        fprintf(stderr,
+                "internal error: display checkpoint classifier"
+                " self-check failed\n");
+        return 2;
+    }
+    if (!display_exec_trace_selfcheck()) {
+        fprintf(stderr,
+                "internal error: display execution trace"
+                " self-check failed\n");
         return 2;
     }
     if (!pmu_checkpoint_classifier_selfcheck()) {
@@ -10368,6 +11581,10 @@ int main(int argc, char **argv) {
     bool display_prev_valid = false;
     bool h1_display_prev_inside = false;
     bool merlot_display_prev_inside = false;
+    uint32_t display_prev_pc = 0;
+    uint32_t display_prev_cpsr = 0;
+    uint32_t display_prev_thread = 0;
+    bool display_prev_mmu_enabled = false;
 
     G.hot_steps = steps;
     for (; n < steps; n++) {
@@ -10392,6 +11609,7 @@ int main(int argc, char **argv) {
         {
             uint32_t p = last_pc & ~1u;
             pmu_checkpoint_observe(p, n, &mach.cpu);
+            display_checkpoint_observe(p, n, &mach.cpu);
             for (unsigned i = 0; i < NM; i++) {
                 if (!pc_matches_vm_or_pre_mmu_alias(
                         &mach.cpu, p, MILE[i].va, G.mile_pa[i])) continue;
@@ -10425,15 +11643,25 @@ int main(int argc, char **argv) {
                 display_exec_note(
                     &G.h1_display_exec, n, h1_vm_pc, observed_lr,
                     mach.cpu.cpsr,
-                    display_prev_valid && !h1_display_prev_inside);
+                    display_prev_valid && !h1_display_prev_inside,
+                    display_prev_pc, display_prev_cpsr,
+                    display_prev_thread,
+                    display_prev_mmu_enabled);
             if (merlot_inside)
                 display_exec_note(
                     &G.merlot_exec, n, merlot_vm_pc, observed_lr,
                     mach.cpu.cpsr,
-                    display_prev_valid && !merlot_display_prev_inside);
+                    display_prev_valid && !merlot_display_prev_inside,
+                    display_prev_pc, display_prev_cpsr,
+                    display_prev_thread,
+                    display_prev_mmu_enabled);
 
             h1_display_prev_inside = h1_inside;
             merlot_display_prev_inside = merlot_inside;
+            display_prev_pc = last_pc;
+            display_prev_cpsr = last_cpsr;
+            display_prev_thread = mach.cpu.cp15.tpidrprw;
+            display_prev_mmu_enabled = last_mmu_enabled;
             display_prev_valid = true;
         }
 

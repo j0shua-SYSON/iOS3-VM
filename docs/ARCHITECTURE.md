@@ -282,6 +282,19 @@ selection, and host frame publication use that same invariant, so a powered-down
 controller cannot emit stale frames or interrupts merely because a window is
 still configured.
 
+The machine now also models both S5L8900 I2C controllers: i2c0 and i2c1 use
+their real `0x3c600000` and `0x3c900000` MMIO windows and drive VIC0 lines 21
+and 22. The controller model implements the reached start/resume/stop,
+byte-event, NAK, selective write-one-to-clear, and level-IRQ behavior. A
+PCF50635 PMU/RTC slave is attached to i2c0 at seven-bit address `0x73`, with
+deterministic clock advancement and a bounded register bank. Controller,
+transaction, and PMU state are part of snapshot v3; focused tests cover normal
+transfers, NAK and IRQ semantics, RTC rollover, malformed state, and callback
+rebinding after restore. This is not yet a cycle-accurate bus: byte events
+complete immediately without bus-clock, clock-stretching, or arbitration timing.
+The production RTC starts at the fixed 2010-01-01 epoch and is not synchronized
+to the host; guest RTC writes remain unsupported.
+
 Run08 exercised this handoff in a fresh display-enabled 128 MiB external-md
 boot through a 600,000,000-instruction cap. Exact instruction-entry coverage
 observed PCs inside both display-driver bundle ranges:
@@ -325,11 +338,70 @@ instructions, including the untouched stock SpringBoard executable's
 Objective-C methods. It took 882 exact traps, never entered exact-process
 `_exit1`, and ended merely scheduled out in a validated `mach_msg` episode.
 
+Run16 is the first real-firmware display smoke run with the I2C/PCF50635 model.
+It reached its 250,000,000-instruction cap with host exit status 0 and empty
+stderr. I2C0 recorded 57 START events, and all 44 observed controller wait-loop
+conditions reached the exact post-wait checkpoint. The PMU start-failure path
+was not taken; the pre-I2C parent and first-I2C call checkpoints were reached.
+Together with the PMU console output and exact control flow, this proves PMU
+start success and live PCF50635 bus traffic. The run still used the existing
+zero-timeout IORTC patch, however, so direct `IORTC` resource publication
+requires a one-patch diagnostic option or clearly identified targeted build
+before that patch can be removed. The existing `-K` switch is not that
+experiment: it disables the whole patch table and external-md rejects it.
+
+Run16 also supersedes run09's “Merlot remained frozen” observation as a
+historical stopping point. Both observed `AppleMerlotLCD` start calls returned
+success, and `AppleH1CLCD::start_hardware` returned success. Exact
+instruction-entry coverage rose to 10,803 observations in
+`AppleH1DisplayDrivers` and 948 in `AppleMerlotLCD`. The CLCD page received 795
+reads and 32 writes, including guest changes to the control and interrupt-mask
+state. The display-adjacent pages at `0x39100000`, `0x39200000`, and
+`0x39300000` also received traffic but remain unmodelled fidelity risks; their
+use is not evidence that any one of them is the current blocker.
+
 The process and display contracts remain separate. Run15 recorded zero
 exact-process or live-scanout framebuffer mutations; the CLCD state and PPM
-remained seed-only. The architecture therefore supports a running SpringBoard
-process but has not demonstrated the display-driver/window-server handoff or a
-rendered home screen.
+remained seed-only. Run16 ended before any userspace instruction and its PPM
+was still the seed-only 8x16 block, so the successful observed Merlot `start`
+and H1 `start_hardware` returns are not a rendering claim.
+
+Run17 performed the full 2,000,000,000-instruction display-enabled cold boot
+with the I2C/PMU model and stopped normally at the configured cap with `OK`.
+The exact SETEXEC activation succeeded again, the replacement process did not
+enter exact-process `_exit1`, and the CLCD remained active at 320x480. The PPM
+was byte-identical to the run15/run16 seed-only capture: 384 of 460,800 RGB
+bytes were non-zero. The low-flow evidence reached SpringBoard's
+`UIApplicationMain` call at `0x381e`, returned from
+`registerForSystemEvents` to UIKit at `0x324a509c`, and returned `YES` from
+`+[SpringBoard rendersLocally]` at `0x324a5b88`. It did not reach
+`-[SpringBoard applicationDidFinishLaunching:]` at `0xa6f4`.
+
+That narrows the current boundary to UIKit's local CAWindowServer/display
+startup before SpringBoard's launch callback. Run17 reached
+`_IOMobileFramebufferGetDisplaySize+0x18` at `0x3110d024` with LR
+`0x3123ef50`, inside
+`CA::WindowServer::IOMFBDisplay::update_framebuffer`, so the path advanced into
+the framebuffer geometry query. The most recent exact-process Mach episode
+retained by run17 carried message ID 2816, the `io_service_close` routine ID,
+and switched the target out while its receive path waited. H1 display-driver
+instruction entries were observed during that episode through instruction
+1,873,360,702, before `_wait_queue_assert_wait` at 1,873,361,179. These facts
+do not identify the task-local port or connection, the userspace caller, or a
+particular CLCD versus TV-out object. They also do not distinguish additional
+latency from an emulation defect.
+
+The next-run instrumentation is implemented but has not produced a long-run
+result yet. It adds exact, post-retirement SETEXEC-thread checkpoints across
+UIKit, CAWindowServer, and IOMobileFramebuffer with register and bounded stack
+snapshots; a newest-retaining Mach-message ring with live request headers,
+selected kernel-path milestones, resolved returns, and bounded receive
+snapshots; and a newest-retaining H1/Merlot outside-to-inside edge ring so late
+driver activity is not hidden by the older first-N list. Exact
+IOMobileFramebuffer finalizer and `IOServiceClose` call/return checkpoints are
+included to test the candidate correlation without assigning a port identity
+in advance. The separate targeted unpatched-IORTC experiment also remains
+open.
 
 In the planned shared-session design, host services cross explicit non-blocking
 seams: frame descriptors out; bounded touch, PCM and network queues in/out;
@@ -348,7 +420,7 @@ larger direct aperture; older `-R 768` measurements are retained only as history
 The loader proves the active kernel, device tree, boot arguments, optional
 direct RAM disk, external-md bounce reservation, and framebuffer ranges are
 contained and pairwise disjoint before execution. Firmware-specific edits are
-made only to the loaded kernel and device-tree copies; the authenticated source
+made only to the loaded kernel and device-tree copies; the exact-gated source
 files remain original and immutable.
 
 ARM1176 idle is modelled as a device-time operation rather than a fake CPU loop.
