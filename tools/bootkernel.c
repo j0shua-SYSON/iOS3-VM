@@ -2025,7 +2025,12 @@ static unsigned    NM;
 #define SPRINGBOARD_REGION_EDGE_CAP 64u
 #define SPRINGBOARD_REGION_IDENTITY_ATTEMPT_CAP 4u
 #define SPRINGBOARD_TARGET_EVENT_CAP 64u
+#define SPRINGBOARD_LOW_FLOW_CAP 4096u
 #define SPRINGBOARD_TARGET_USER_RETRY_CAP 4u
+#define SPRINGBOARD_MACH_HEADER_SIZE 24u
+#define SPRINGBOARD_MACH_PATH_COUNT 6u
+#define DIAGNOSTIC_MACH_SEND_MSG UINT32_C(0x00000001)
+#define DIAGNOSTIC_MACH_RCV_MSG  UINT32_C(0x00000002)
 #define FRAMEBUFFER_WRITE_LOG_CAP 64u
 #define DIAGNOSTIC_POSIX_SPAWN_SETEXEC UINT16_C(0x0040)
 #define SETEXEC_IMAGE_REJECT_WRAPPER UINT32_C(0x01)
@@ -2297,6 +2302,49 @@ typedef struct {
     uint8_t to_region;
 } springboard_region_edge_t;
 
+enum {
+    SPRINGBOARD_LOW_FLOW_ENTRY       = UINT8_C(0x01),
+    SPRINGBOARD_LOW_FLOW_EXIT        = UINT8_C(0x02),
+    SPRINGBOARD_LOW_FLOW_CALL_LIKE   = UINT8_C(0x04),
+    SPRINGBOARD_LOW_FLOW_RETURN_LIKE = UINT8_C(0x08),
+    SPRINGBOARD_LOW_FLOW_BRANCH      = UINT8_C(0x10),
+    SPRINGBOARD_LOW_FLOW_STATE       = UINT8_C(0x20)
+};
+
+typedef struct {
+    uint64_t at;
+    uint32_t from_pc;
+    uint32_t to_pc;
+    uint32_t from_cpsr;
+    uint32_t to_cpsr;
+    uint32_t lr_before;
+    uint32_t lr_after;
+    uint8_t flags;
+} springboard_low_flow_event_t;
+
+typedef struct {
+    uint32_t bits;
+    uint32_t size;
+    uint32_t remote_port;
+    uint32_t local_port;
+    uint32_t reserved;
+    int32_t id;
+    uint32_t failure_va;
+    uint32_t failure_fsr;
+    bool read_attempted;
+    bool readable;
+    bool size_within_send;
+} springboard_mach_header_t;
+
+typedef enum {
+    SPRINGBOARD_MACH_PATH_MACH_MSG_TRAP = 0,
+    SPRINGBOARD_MACH_PATH_MACH_MSG_OVERWRITE_TRAP,
+    SPRINGBOARD_MACH_PATH_IPC_MQUEUE_RECEIVE,
+    SPRINGBOARD_MACH_PATH_IPC_MQUEUE_RECEIVE_CONTINUE,
+    SPRINGBOARD_MACH_PATH_WAIT_QUEUE_ASSERT_WAIT,
+    SPRINGBOARD_MACH_PATH_THREAD_BLOCK_REASON
+} springboard_mach_path_t;
+
 typedef struct {
     uint64_t generation;
     uint64_t at;
@@ -2434,6 +2482,11 @@ typedef struct {
     uint64_t region_edge_total;
     springboard_region_edge_t
         region_edges[SPRINGBOARD_REGION_EDGE_CAP];
+    uint64_t target_low_flow_total;
+    bool target_low_flow_first_valid;
+    springboard_low_flow_event_t target_low_flow_first;
+    springboard_low_flow_event_t
+        target_low_flow[SPRINGBOARD_LOW_FLOW_CAP];
     uint64_t first_low_user_at;
     uint64_t first_outside_dyld_at;
     uint64_t user_nonretired_deferrals;
@@ -2458,6 +2511,11 @@ typedef struct {
     uint32_t target_episode_entry_svc_sp;
     uint32_t target_episode_entry_user_sp;
     uint32_t target_episode_entry_user_lr;
+    uint32_t target_episode_mach_args[7];
+    uint32_t target_episode_mach_path_bits;
+    uint64_t
+        target_episode_mach_path_first_at[SPRINGBOARD_MACH_PATH_COUNT];
+    springboard_mach_header_t target_episode_mach_header;
     uint64_t target_event_total;
     uint64_t target_episode_total;
     uint64_t target_episode;
@@ -2474,6 +2532,7 @@ typedef struct {
     bool target_initial_exception_reconstructed;
     bool target_episode_expected_valid;
     bool target_episode_svc_frame_valid;
+    bool target_episode_mach_msg;
     uint8_t target_episode_last_outcome;
     uint8_t target_unreadable_user_attempts;
     bool target_first_fault_valid;
@@ -3681,6 +3740,140 @@ static bool springboard_target_trace_active(
            !trace->target_tracker_invalidated;
 }
 
+static bool springboard_low_flow_classify(
+        uint32_t from_pc, uint32_t from_cpsr, uint32_t lr_before,
+        uint32_t to_pc, uint32_t to_cpsr, uint32_t lr_after,
+        uint8_t *flags_out) {
+    const bool from_low = from_pc < UINT32_C(0x10000000);
+    const bool to_low = to_pc < UINT32_C(0x10000000);
+    uint8_t flags = 0;
+    if (!from_low && !to_low) {
+        if (flags_out) *flags_out = 0;
+        return false;
+    }
+
+    const uint32_t width =
+        (from_cpsr & ARM_CPSR_T) ? UINT32_C(2) : UINT32_C(4);
+    const bool fallthrough_valid = from_pc <= UINT32_MAX - width;
+    const uint32_t fallthrough =
+        fallthrough_valid ? from_pc + width : 0;
+    const bool state_changed =
+        ((from_cpsr ^ to_cpsr) & ARM_CPSR_T) != 0;
+    const bool sequential =
+        fallthrough_valid && !state_changed && to_pc == fallthrough;
+
+    if (!from_low && to_low) flags |= SPRINGBOARD_LOW_FLOW_ENTRY;
+    if (from_low && !to_low) flags |= SPRINGBOARD_LOW_FLOW_EXIT;
+    if (state_changed) flags |= SPRINGBOARD_LOW_FLOW_STATE;
+    if (!sequential) flags |= SPRINGBOARD_LOW_FLOW_BRANCH;
+    if (fallthrough_valid && lr_after != lr_before &&
+        (lr_after & ~UINT32_C(1)) ==
+            (fallthrough & ~UINT32_C(1)))
+        flags |= SPRINGBOARD_LOW_FLOW_CALL_LIKE;
+    if (!sequential &&
+        !(flags & SPRINGBOARD_LOW_FLOW_CALL_LIKE) &&
+        (to_pc & ~UINT32_C(1)) ==
+            (lr_before & ~UINT32_C(1)))
+        flags |= SPRINGBOARD_LOW_FLOW_RETURN_LIKE;
+
+    if (flags_out) *flags_out = flags;
+    return !sequential || from_low != to_low;
+}
+
+/*
+ * This runs for every exact-target low-image instruction.  Keep the common
+ * sequential path inline so long SpringBoard traces do not pay a host call
+ * per guest instruction.
+ */
+static inline void springboard_target_low_flow_note(
+        springboard_exec_trace_t *trace, uint64_t at,
+        uint32_t from_pc, uint32_t from_cpsr, uint32_t lr_before,
+        uint32_t to_pc, uint32_t to_cpsr, uint32_t lr_after) {
+    if (!trace) return;
+    uint8_t flags = 0;
+    if (!springboard_low_flow_classify(
+            from_pc, from_cpsr, lr_before,
+            to_pc, to_cpsr, lr_after, &flags))
+        return;
+
+    uint64_t sequence = trace->target_low_flow_total++;
+    springboard_low_flow_event_t *event =
+        &trace->target_low_flow[
+            sequence % SPRINGBOARD_LOW_FLOW_CAP];
+    memset(event, 0, sizeof *event);
+    event->at = at;
+    event->from_pc = from_pc;
+    event->to_pc = to_pc;
+    event->from_cpsr = from_cpsr;
+    event->to_cpsr = to_cpsr;
+    event->lr_before = lr_before;
+    event->lr_after = lr_after;
+    event->flags = flags;
+    if (!trace->target_low_flow_first_valid) {
+        trace->target_low_flow_first = *event;
+        trace->target_low_flow_first_valid = true;
+    }
+}
+
+static bool springboard_mach_header_decode(
+        const uint8_t *bytes, size_t length,
+        uint32_t options, uint32_t send_size,
+        springboard_mach_header_t *header) {
+    if (!bytes || !header ||
+        length != SPRINGBOARD_MACH_HEADER_SIZE)
+        return false;
+    header->bits = ld32(bytes);
+    header->size = ld32(bytes + 4u);
+    header->remote_port = ld32(bytes + 8u);
+    header->local_port = ld32(bytes + 12u);
+    header->reserved = ld32(bytes + 16u);
+    header->id = (int32_t)ld32(bytes + 20u);
+    header->readable = true;
+    /*
+     * This is a descriptive buffer-consistency check only. XNU validates the
+     * syscall's send_size and Mach dispositions along deeper paths; these six
+     * words alone cannot establish that the message is semantically valid or
+     * that the kernel accepted it.
+     */
+    header->size_within_send =
+        (options & DIAGNOSTIC_MACH_SEND_MSG) != 0u &&
+        header->size >= SPRINGBOARD_MACH_HEADER_SIZE &&
+        header->size <= send_size;
+    return true;
+}
+
+static const char *const
+SPRINGBOARD_MACH_PATH_NAMES[SPRINGBOARD_MACH_PATH_COUNT] = {
+    "_mach_msg_trap",
+    "_mach_msg_overwrite_trap",
+    "_ipc_mqueue_receive",
+    "_ipc_mqueue_receive_continue",
+    "_wait_queue_assert_wait",
+    "_thread_block_reason"
+};
+
+static BOOTKERNEL_NOINLINE void
+springboard_target_note_mach_milestone(
+        springboard_exec_trace_t *trace, const arm_cpu_t *cpu,
+        uint64_t at, const char *name) {
+    if (!springboard_target_trace_active(trace) || !cpu || !name ||
+        !trace->target_episode_open ||
+        !trace->target_episode_mach_msg ||
+        !trace->target_on_cpu ||
+        cpu->cp15.tpidrprw != trace->target_thread)
+        return;
+
+    for (unsigned i = 0; i < SPRINGBOARD_MACH_PATH_COUNT; i++) {
+        if (strcmp(name, SPRINGBOARD_MACH_PATH_NAMES[i]) != 0)
+            continue;
+        uint32_t bit = UINT32_C(1) << i;
+        if (!(trace->target_episode_mach_path_bits & bit))
+            trace->target_episode_mach_path_first_at[i] = at;
+        trace->target_episode_mach_path_bits |= bit;
+        return;
+    }
+}
+
 static springboard_target_event_t *springboard_target_event_begin(
         springboard_exec_trace_t *trace, uint64_t at,
         springboard_target_event_kind_t kind) {
@@ -3956,7 +4149,104 @@ static bool springboard_target_trace_selfcheck(void) {
     ok = ok && !springboard_target_identity_is_mismatch(
             SPRINGBOARD_TARGET_IDENTITY_UNREADABLE);
 
-    springboard_exec_trace_t ring;
+    uint8_t low_flags = UINT8_MAX;
+    ok = ok && !springboard_low_flow_classify(
+            UINT32_C(0x4000), ARM_MODE_USR, UINT32_C(0x8000),
+            UINT32_C(0x4004), ARM_MODE_USR, UINT32_C(0x8000),
+            &low_flags) &&
+        low_flags == 0u;
+    ok = ok && !springboard_low_flow_classify(
+            UINT32_C(0x5000), ARM_MODE_USR | ARM_CPSR_T,
+            UINT32_C(0x8001), UINT32_C(0x5002),
+            ARM_MODE_USR | ARM_CPSR_T, UINT32_C(0x8001),
+            &low_flags) &&
+        low_flags == 0u;
+    ok = ok && springboard_low_flow_classify(
+            UINT32_C(0x3138cea8), ARM_MODE_USR,
+            UINT32_C(0x7000), UINT32_C(0x000965dc),
+            ARM_MODE_USR | ARM_CPSR_T, UINT32_C(0x3138ceac),
+            &low_flags) &&
+        (low_flags & (SPRINGBOARD_LOW_FLOW_ENTRY |
+                      SPRINGBOARD_LOW_FLOW_CALL_LIKE |
+                      SPRINGBOARD_LOW_FLOW_BRANCH |
+                      SPRINGBOARD_LOW_FLOW_STATE)) ==
+            (SPRINGBOARD_LOW_FLOW_ENTRY |
+             SPRINGBOARD_LOW_FLOW_CALL_LIKE |
+             SPRINGBOARD_LOW_FLOW_BRANCH |
+             SPRINGBOARD_LOW_FLOW_STATE);
+    ok = ok && springboard_low_flow_classify(
+            UINT32_C(0x000966bc), ARM_MODE_USR | ARM_CPSR_T,
+            UINT32_C(0x33b67a59), UINT32_C(0x33b67a58),
+            ARM_MODE_USR, UINT32_C(0x33b67a59),
+            &low_flags) &&
+        (low_flags & (SPRINGBOARD_LOW_FLOW_EXIT |
+                      SPRINGBOARD_LOW_FLOW_RETURN_LIKE |
+                      SPRINGBOARD_LOW_FLOW_BRANCH |
+                      SPRINGBOARD_LOW_FLOW_STATE)) ==
+            (SPRINGBOARD_LOW_FLOW_EXIT |
+             SPRINGBOARD_LOW_FLOW_RETURN_LIKE |
+             SPRINGBOARD_LOW_FLOW_BRANCH |
+             SPRINGBOARD_LOW_FLOW_STATE);
+    /*
+     * The second half of an ARMv6 Thumb BL can branch to the old LR while
+     * simultaneously committing a new link register.  It is one call-like
+     * transition, not both a call and a return.
+     */
+    ok = ok && springboard_low_flow_classify(
+            UINT32_C(0x00065caa), ARM_MODE_USR | ARM_CPSR_T,
+            UINT32_C(0x00011cac), UINT32_C(0x00011cac),
+            ARM_MODE_USR | ARM_CPSR_T, UINT32_C(0x00065cad),
+            &low_flags) &&
+        (low_flags & (SPRINGBOARD_LOW_FLOW_CALL_LIKE |
+                      SPRINGBOARD_LOW_FLOW_BRANCH)) ==
+            (SPRINGBOARD_LOW_FLOW_CALL_LIKE |
+             SPRINGBOARD_LOW_FLOW_BRANCH) &&
+        !(low_flags & SPRINGBOARD_LOW_FLOW_RETURN_LIKE);
+
+    static const uint8_t mach_header_bytes[SPRINGBOARD_MACH_HEADER_SIZE] = {
+        0x13, 0x00, 0x00, 0x00,
+        0x4c, 0x00, 0x00, 0x00,
+        0x34, 0x12, 0x00, 0x00,
+        0x03, 0x0e, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x44, 0x33, 0x22, 0x11
+    };
+    springboard_mach_header_t mach_header;
+    memset(&mach_header, 0, sizeof mach_header);
+    ok = ok && springboard_mach_header_decode(
+            mach_header_bytes, sizeof mach_header_bytes,
+            DIAGNOSTIC_MACH_SEND_MSG | DIAGNOSTIC_MACH_RCV_MSG,
+            UINT32_C(0x4c), &mach_header) &&
+        mach_header.readable && mach_header.size_within_send &&
+        mach_header.bits == UINT32_C(0x13) &&
+        mach_header.size == UINT32_C(0x4c) &&
+        mach_header.remote_port == UINT32_C(0x1234) &&
+        mach_header.local_port == UINT32_C(0x0e03) &&
+        mach_header.reserved == 0u &&
+        mach_header.id == (int32_t)UINT32_C(0x11223344);
+    memset(&mach_header, 0, sizeof mach_header);
+    ok = ok && springboard_mach_header_decode(
+            mach_header_bytes, sizeof mach_header_bytes,
+            DIAGNOSTIC_MACH_SEND_MSG, UINT32_C(0x20),
+            &mach_header) &&
+        mach_header.readable && !mach_header.size_within_send;
+    memset(&mach_header, 0, sizeof mach_header);
+    ok = ok && springboard_mach_header_decode(
+            mach_header_bytes, sizeof mach_header_bytes,
+            DIAGNOSTIC_MACH_RCV_MSG, UINT32_C(0x4c),
+            &mach_header) &&
+        mach_header.readable && !mach_header.size_within_send;
+    ok = ok && !springboard_mach_header_decode(
+            mach_header_bytes, sizeof mach_header_bytes - 1u,
+            DIAGNOSTIC_MACH_SEND_MSG, UINT32_C(0x4c),
+            &mach_header);
+
+    /*
+     * This trace now contains a 4,096-event diagnostic ring. Keep the
+     * startup-only, non-reentrant selfcheck scratch in zero-fill storage rather
+     * than consuming a large fraction of a constrained host thread's stack.
+     */
+    static springboard_exec_trace_t ring;
     memset(&ring, 0, sizeof ring);
     ring.target_episode_open = true;
     ring.target_episode = UINT64_C(7);
@@ -3990,9 +4280,29 @@ static bool springboard_target_trace_selfcheck(void) {
         closed->raw_r12 == 0u &&
         closed->trap_number == 0u;
 
-    springboard_exec_trace_t exiting;
+    for (uint64_t sequence = 0;
+         sequence <= SPRINGBOARD_LOW_FLOW_CAP; sequence++) {
+        uint32_t destination =
+            UINT32_C(0x30000000) + (uint32_t)sequence * 4u;
+        springboard_target_low_flow_note(
+            &ring, sequence, UINT32_C(0x1000),
+            ARM_MODE_USR, destination | UINT32_C(1),
+            destination, ARM_MODE_USR, destination | UINT32_C(1));
+    }
+    ok = ok &&
+        ring.target_low_flow_total == SPRINGBOARD_LOW_FLOW_CAP + 1u &&
+        ring.target_low_flow[0].at == SPRINGBOARD_LOW_FLOW_CAP &&
+        ring.target_low_flow[1].at == UINT64_C(1) &&
+        ring.target_low_flow_first_valid &&
+        ring.target_low_flow_first.at == 0u;
+
     arm_cpu_t cpu;
-    memset(&exiting, 0, sizeof exiting);
+    /*
+     * Reuse the large trace scratch instead of putting a second 180+ KiB
+     * instance in this startup selfcheck's stack frame. The ring assertions
+     * above are complete, and this keeps constrained-host startup bounded.
+     */
+    memset(&ring, 0, sizeof ring);
     memset(&cpu, 0, sizeof cpu);
     cpu.cpsr = ARM_MODE_FIQ;
     cpu.r[8] = UINT32_C(0xf1f1f1f1);
@@ -4002,25 +4312,25 @@ static bool springboard_target_trace_selfcheck(void) {
         diagnostic_user_reg(&cpu, 8u) == UINT32_C(0x81818181) &&
         diagnostic_user_reg(&cpu, 13u) == UINT32_C(0x13131313);
     memset(&cpu, 0, sizeof cpu);
-    exiting.target_episode_open = true;
-    exiting.target_episode = UINT64_C(3);
-    exiting.target_episode_total = UINT64_C(3);
+    ring.target_episode_open = true;
+    ring.target_episode = UINT64_C(3);
+    ring.target_episode_total = UINT64_C(3);
     cpu.cpsr = ARM_MODE_SVC;
     cpu.r[0] = UINT32_C(0x11110000);
     cpu.r[1] = UINT32_C(0x22);
     cpu.r[15] = UINT32_C(0xc011f63c);
     cpu.cp15.tpidrprw = UINT32_C(0x33330000);
     springboard_target_note_process_exit_entry(
-        &exiting, &cpu, UINT64_C(55));
-    ok = ok && exiting.exited &&
-        exiting.exited_at == UINT64_C(55) &&
-        !exiting.target_episode_open &&
-        exiting.target_episode_last_outcome ==
+        &ring, &cpu, UINT64_C(55));
+    ok = ok && ring.exited &&
+        ring.exited_at == UINT64_C(55) &&
+        !ring.target_episode_open &&
+        ring.target_episode_last_outcome ==
             SPRINGBOARD_TARGET_OUTCOME_PROCESS_EXIT_ENTRY &&
-        exiting.target_event_total == UINT64_C(1) &&
-        exiting.target_events[0].kind ==
+        ring.target_event_total == UINT64_C(1) &&
+        ring.target_events[0].kind ==
             SPRINGBOARD_TARGET_PROCESS_EXIT_ENTRY &&
-        exiting.target_events[0].identity ==
+        ring.target_events[0].identity ==
             SPRINGBOARD_TARGET_IDENTITY_PROCESS_REVALIDATED;
     return ok;
 }
@@ -4582,7 +4892,15 @@ static BOOTKERNEL_NOINLINE void springboard_target_note_user_exception(
     trace->target_episode_entry_svc_sp = 0;
     trace->target_episode_entry_user_sp = 0;
     trace->target_episode_entry_user_lr = 0;
+    memset(trace->target_episode_mach_args, 0,
+           sizeof trace->target_episode_mach_args);
+    trace->target_episode_mach_path_bits = 0;
+    memset(trace->target_episode_mach_path_first_at, 0,
+           sizeof trace->target_episode_mach_path_first_at);
+    memset(&trace->target_episode_mach_header, 0,
+           sizeof trace->target_episode_mach_header);
     trace->target_episode_svc_frame_valid = false;
+    trace->target_episode_mach_msg = false;
     trace->target_episode_last_outcome =
         SPRINGBOARD_TARGET_OUTCOME_NONE;
 
@@ -4611,6 +4929,30 @@ static BOOTKERNEL_NOINLINE void springboard_target_note_user_exception(
             cpu->r[15] == vector_base + ARM_VEC_SWI &&
             cpu->r[14] == trace->target_episode_expected_pc &&
             cpu->spsr[ARM_BANK_SVC] == pending->cpsr;
+        if (raw < 0 &&
+            trace->target_episode_number == 31u &&
+            trace->target_episode_svc_frame_valid &&
+            pending->target_registers_valid) {
+            trace->target_episode_mach_msg = true;
+            memcpy(trace->target_episode_mach_args, pending->r,
+                   sizeof trace->target_episode_mach_args);
+
+            springboard_mach_header_t *header =
+                &trace->target_episode_mach_header;
+            if (pending->r[1] & DIAGNOSTIC_MACH_SEND_MSG) {
+                header->read_attempted = true;
+                uint8_t bytes[SPRINGBOARD_MACH_HEADER_SIZE];
+                if (guest_read_user_bytes(
+                        cpu, pending->r[0], bytes, sizeof bytes,
+                        &header->failure_va, &header->failure_fsr)) {
+                    (void)springboard_mach_header_decode(
+                        bytes, sizeof bytes, pending->r[1],
+                        pending->r[2], header);
+                } else if (!header->failure_va) {
+                    header->failure_va = pending->r[0];
+                }
+            }
+        }
     }
 
     springboard_target_event_t *event =
@@ -4682,6 +5024,23 @@ static void springboard_exec_trace_note_user_post_step(
         trace->user_last_nonretired_mode = post_mode;
         return;
     }
+
+    /*
+     * This is exact SETEXEC-thread control flow, not process-wide scheduling
+     * order. Keep the common path to comparisons only; the cold recorder runs
+     * solely for a retired user step whose source or destination is low image.
+     */
+    if (post_mode == ARM_MODE_USR &&
+        pending.target_registers_valid &&
+        trace->target_on_cpu &&
+        pending.thread == trace->target_thread &&
+        cpu->cp15.tpidrprw == trace->target_thread &&
+        (pending.pc < UINT32_C(0x10000000) ||
+         cpu->r[15] < UINT32_C(0x10000000)))
+        springboard_target_low_flow_note(
+            trace, at, pending.pc, pending.cpsr,
+            pending.user_lr, cpu->r[15], cpu->cpsr,
+            cpu->r[14]);
 
     if (pending.process_commit_eligible)
         springboard_exec_trace_commit_user(
@@ -6198,6 +6557,36 @@ static const char *springboard_user_region_name(unsigned region) {
         ? names[region] : "none";
 }
 
+static void springboard_low_flow_event_report(
+        const char *label, uint64_t sequence,
+        const springboard_low_flow_event_t *event) {
+    if (!label || !event) return;
+    printf("      %s", label);
+    if (sequence != UINT64_MAX)
+        printf("#%-4" PRIu64, sequence);
+    printf(" @%-11" PRIu64 " %08x(%c) -> %08x(%c)"
+           " cpsr=%08x/%08x lr=%08x/%08x"
+           " flags=%s%s%s%s%s%s\n",
+           event->at, event->from_pc,
+           (event->from_cpsr & ARM_CPSR_T) ? 'T' : 'A',
+           event->to_pc,
+           (event->to_cpsr & ARM_CPSR_T) ? 'T' : 'A',
+           event->from_cpsr, event->to_cpsr,
+           event->lr_before, event->lr_after,
+           (event->flags & SPRINGBOARD_LOW_FLOW_ENTRY)
+               ? "entry," : "",
+           (event->flags & SPRINGBOARD_LOW_FLOW_EXIT)
+               ? "exit," : "",
+           (event->flags & SPRINGBOARD_LOW_FLOW_CALL_LIKE)
+               ? "call-like," : "",
+           (event->flags & SPRINGBOARD_LOW_FLOW_RETURN_LIKE)
+               ? "return-like," : "",
+           (event->flags & SPRINGBOARD_LOW_FLOW_BRANCH)
+               ? "nonsequential," : "",
+           (event->flags & SPRINGBOARD_LOW_FLOW_STATE)
+               ? "state-change" : "");
+}
+
 static void springboard_framebuffer_event_report(
         const char *label, const framebuffer_write_event_t *event) {
     if (!label || !event) return;
@@ -6601,6 +6990,35 @@ static void springboard_exec_trace_report(void) {
                edge->pc, edge->thread);
     }
 
+    uint64_t low_flow_retained =
+        trace->target_low_flow_total < SPRINGBOARD_LOW_FLOW_CAP
+            ? trace->target_low_flow_total
+            : SPRINGBOARD_LOW_FLOW_CAP;
+    uint64_t low_flow_first =
+        trace->target_low_flow_total - low_flow_retained;
+    printf("    exact SETEXEC-target low-image control-flow changes:"
+           " %" PRIu64 " total, %" PRIu64 " newest retained,"
+           " %" PRIu64 " overwritten\n",
+           trace->target_low_flow_total, low_flow_retained,
+           low_flow_first);
+    printf("    contract: one validated target thread only; events are"
+           " retired non-sequential or low-image boundary steps."
+           " call/return labels are LR-based heuristics; raw ARM/Thumb"
+           " CPSR and LR values are authoritative.\n");
+    if (trace->target_low_flow_first_valid)
+        springboard_low_flow_event_report(
+            "sticky-first ", UINT64_MAX,
+            &trace->target_low_flow_first);
+    else
+        printf("      sticky-first low-image flow event: NOT OBSERVED\n");
+    for (uint64_t sequence = low_flow_first;
+         sequence < trace->target_low_flow_total; sequence++) {
+        const springboard_low_flow_event_t *event =
+            &trace->target_low_flow[
+                sequence % SPRINGBOARD_LOW_FLOW_CAP];
+        springboard_low_flow_event_report("", sequence, event);
+    }
+
     uint64_t trap_retained =
         trace->trap_total < SPRINGBOARD_TRAP_CAP
             ? trace->trap_total : SPRINGBOARD_TRAP_CAP;
@@ -6758,6 +7176,64 @@ static void springboard_exec_trace_report(void) {
                        ? " indirect" : "",
                    trace->target_episode_number);
         printf("\n");
+        if (trace->target_episode_mach_msg) {
+            const uint32_t *args =
+                trace->target_episode_mach_args;
+            const springboard_mach_header_t *header =
+                &trace->target_episode_mach_header;
+            printf("      exact-target mach_msg args:"
+                   " msg=%08x options=%08x%s%s"
+                   " send=%08x rcv=%08x rcv_name=%08x"
+                   " timeout=%08x notify=%08x\n",
+                   args[0], args[1],
+                   (args[1] & DIAGNOSTIC_MACH_SEND_MSG)
+                       ? " SEND" : "",
+                   (args[1] & DIAGNOSTIC_MACH_RCV_MSG)
+                       ? " RCV" : "",
+                   args[2], args[3], args[4],
+                   args[5], args[6]);
+            if (header->readable) {
+                printf("      outbound header: READABLE;"
+                       " header-size=%s-send-argument"
+                       " bits=%08x size=%08x"
+                       " task-local remote/local=%08x/%08x"
+                       " reserved=%08x id=%d (0x%08x)\n",
+                       header->size_within_send
+                           ? "within" : "outside",
+                       header->bits, header->size,
+                       header->remote_port, header->local_port,
+                       header->reserved, header->id,
+                       (uint32_t)header->id);
+            } else if (header->read_attempted) {
+                printf("      outbound header: UNREADABLE"
+                       " failure-va/fsr=%08x/%08x\n",
+                       header->failure_va, header->failure_fsr);
+            } else if (!(args[1] & DIAGNOSTIC_MACH_SEND_MSG)) {
+                printf("      outbound header: NOT APPLICABLE"
+                       " (SEND option absent)\n");
+            } else {
+                printf("      outbound header: NOT CAPTURED\n");
+            }
+            printf("      exact-target mach_msg kernel path:");
+            if (!trace->target_episode_mach_path_bits) {
+                printf(" no selected entry hit before stop\n");
+            } else {
+                printf("\n");
+                for (unsigned i = 0;
+                     i < SPRINGBOARD_MACH_PATH_COUNT; i++) {
+                    uint32_t bit = UINT32_C(1) << i;
+                    if (!(trace->target_episode_mach_path_bits & bit))
+                        continue;
+                    printf("        %-32s first @%" PRIu64 "\n",
+                           SPRINGBOARD_MACH_PATH_NAMES[i],
+                           trace->target_episode_mach_path_first_at[i]);
+                }
+            }
+            printf("      Mach port names above are task-local;"
+                   " header readability/size relation does not prove kernel"
+                   " acceptance, and no server identity is inferred by this"
+                   " trace.\n");
+        }
     }
 
     printf("    live CLCD scanout after trace arm: %" PRIu64
@@ -9590,6 +10066,11 @@ int main(int argc, char **argv) {
                         &mach.cpu, p, MILE[i].va, G.mile_pa[i])) continue;
                 if (!G.mile_hits[i]) G.mile_first[i] = n;
                 G.mile_hits[i]++;
+                if (G.springboard_exec_trace
+                        .target_episode_mach_msg)
+                    springboard_target_note_mach_milestone(
+                        &G.springboard_exec_trace, &mach.cpu,
+                        n, MILE[i].name);
                 break;
             }
 
