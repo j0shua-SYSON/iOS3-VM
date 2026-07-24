@@ -163,6 +163,27 @@ by real-firmware runs 17 and 18 but are not covered by those earlier green runs.
 Hosted CI cannot contain private firmware or prove a SpringBoard boot; that
 runtime evidence comes from the separately recorded real-firmware cold runs.
 
+### Validation of the current post-run18 hardening
+
+At `afa650e`, the complete Release build succeeded locally and all **23/23**
+CTest tests were green on the final tree. The affected final binaries reported
+**5,498 passed, 0 failed** for the SoC tests and **468 passed, 0 failed** for
+snapshots; a post-commit targeted gate including the external-md CLI preflight
+passed **3/3**. Strict GCC warning checks, targeted format/conversion checks,
+GCC analysis of the new diagnostics, and zero-step `bootkernel`/`snapboot`
+smokes also passed.
+
+Those local checks are reinforced by green hosted workflows for the exact
+commit `afa650e284c2b27b6a4a2a2b2d772e0f68e5dac9`: the
+[core matrix](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30088519878)
+passed Linux, macOS, Windows, warnings-as-errors, ASan+UBSan, and JIT jobs, and
+the [unsigned iOS build](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30088519892)
+passed. These are engineering checks, not a boot result. Run19 still has to
+prove the real firmware's IRQ 30 filter/action, swap wake, close return, later
+SpringBoard progress, and live scanout. See the exact test chronology, edge
+coverage, and remaining promotion gates in
+[`docs/QUALITY.md`](docs/QUALITY.md).
+
 ### What it actually does today
 
 In the `bootkernel` CLI harness, Apple's real `xnu-1357.5.30`, decrypted from a
