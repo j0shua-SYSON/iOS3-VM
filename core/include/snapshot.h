@@ -53,7 +53,8 @@
  *     the CPU section when real VFPv2 arithmetic was implemented. */
 /* v3: both I2C controllers and the PCF50635 PMU/RTC joined MACH. Old
  *     checkpoints cannot safely invent an in-flight transfer or RTC state. */
-#define SNAPSHOT_VERSION   3u
+/* v4: the three-bank TV-out controller and its VSYNC phase joined MACH. */
+#define SNAPSHOT_VERSION   4u
 
 typedef enum {
     SNAP_OK = 0,

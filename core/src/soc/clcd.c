@@ -390,9 +390,25 @@ bool s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
 
     uint32_t bytes_per_pixel = CLCD_FMT_IS_32BPP(format) ? 4u : 2u;
     uint64_t row_bytes = (uint64_t)width * bytes_per_pixel;
-    uint64_t span = (uint64_t)(height - 1u) * stride + row_bytes;
+
+    /*
+     * AppleH1CLCD does not describe only the bytes touched by visible pixels.
+     * It passes round_up(stride * height, 0x1000) to
+     * IOMemoryDescriptor::withPhysicalAddress.  Validate exactly that mapping:
+     * the multiply and round-up must remain representable by the driver's
+     * 32-bit size argument, and the complete page-rounded physical span must
+     * stay in the 32-bit guest address space.
+     */
+    const uint64_t page_mask = UINT64_C(0x0fff);
+    uint64_t allocation_bytes = (uint64_t)stride * height;
     if ((uint64_t)stride < row_bytes ||
-        (uint64_t)fb_phys + span > UINT64_C(0x100000000)) {
+        allocation_bytes > UINT32_MAX) {
+        return false;
+    }
+    uint64_t allocation_span =
+        (allocation_bytes + page_mask) & ~page_mask;
+    if (allocation_span == 0u || allocation_span > UINT32_MAX ||
+        (uint64_t)fb_phys + allocation_span > UINT64_C(0x100000000)) {
         return false;
     }
 

@@ -285,6 +285,24 @@ static void test_device_state_round_trips(void) {
     a->clcd.frame_accum = 12345u;
     a->clcd.frames      = 0x00000000cafebabeull;
 
+    /* TV-out, including every byte-backed register in all three pages. */
+    for (unsigned bank = 0; bank < S5L_TVOUT_BANK_COUNT; bank++)
+        for (unsigned i = 0; i < S5L_TVOUT_BANK_WORDS; i++)
+            a->tvout.regs[bank][i] =
+                0xa0000000u | (bank << 20) | i;
+    for (unsigned bank = 0; bank < S5L_TVOUT_BANK_COUNT; bank++) {
+        a->tvout.regs[bank][0] &= ~TVOUT_READY;
+        a->tvout.regs[bank][0] |= TVOUT_RUN;
+    }
+    /* Status words obey their hardware invariants: SDO can hold VSYNC, while
+     * the deliberately nonasserting mixer source stays clear. */
+    a->tvout.regs[S5L_TVOUT_BANK_SDO][TVOUT_SDO_IRQ / 4u] =
+        TVOUT_SDO_VSYNC;
+    a->tvout.regs[S5L_TVOUT_BANK_MIXER][TVOUT_MIXER_STATUS / 4u] = 0u;
+    a->tvout.frame_ticks = 100000u;
+    a->tvout.frame_accum = 54321u;
+    a->tvout.frames = 0x0000000012345678ull;
+
     /* Machine-level diagnostics — guest-visible only indirectly, but state all
      * the same: a restored run that re-reports a device page it already logged
      * has diverged from the run it claims to continue. */
@@ -375,6 +393,10 @@ static void test_device_state_round_trips(void) {
     SAME(clcd.scanning); SAME(clcd.frame_ticks); SAME(clcd.frame_accum);
     SAME(clcd.frames);
 
+    CHECK(memcmp(a->tvout.regs, b->tvout.regs, sizeof a->tvout.regs) == 0,
+          "TV-out register banks did not survive");
+    SAME(tvout.frame_ticks); SAME(tvout.frame_accum); SAME(tvout.frames);
+
     SAME(unmapped_reads); SAME(unmapped_writes); SAME(unmapped_addr_count);
     for (unsigned i = 0; i < 3; i++) SAME(unmapped_addr[i]);
     SAME(trace_devices); SAME(dev_count);
@@ -385,6 +407,59 @@ static void test_device_state_round_trips(void) {
     SAME(stub_declare_failures);
 
     s5l8900_free(a); s5l8900_free(b);
+}
+
+static void test_tvout_snapshot_invariants(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, RAMSZ), "init");
+    uint8_t *buf = (uint8_t *)(uintptr_t)1u;
+    size_t len = 1u;
+
+    m.tvout.frame_accum = m.tvout.frame_ticks;
+    CHECK(snapshot_save_mem(&m, &buf, &len) == SNAP_ERR_CORRUPT &&
+          buf == NULL && len == 0u,
+          "out-of-range TV-out phase was serialised");
+
+    s5l_tvout_reset(&m.tvout, m.tb_hz);
+    m.tvout.regs[S5L_TVOUT_BANK_CTRL][0] |= TVOUT_READY;
+    buf = (uint8_t *)(uintptr_t)1u; len = 1u;
+    CHECK(snapshot_save_mem(&m, &buf, &len) == SNAP_ERR_CORRUPT &&
+          buf == NULL && len == 0u,
+          "stored hardware-derived ready bit was serialised");
+
+    s5l_tvout_reset(&m.tvout, m.tb_hz);
+    m.tvout.regs[S5L_TVOUT_BANK_MIXER][TVOUT_MIXER_STATUS / 4u] = 1u;
+    buf = (uint8_t *)(uintptr_t)1u; len = 1u;
+    CHECK(snapshot_save_mem(&m, &buf, &len) == SNAP_ERR_CORRUPT &&
+          buf == NULL && len == 0u,
+          "fabricated mixer interrupt status was serialised");
+
+    s5l_tvout_reset(&m.tvout, m.tb_hz);
+    m.tvout.regs[S5L_TVOUT_BANK_SDO][TVOUT_SDO_IRQ / 4u] = 2u;
+    buf = (uint8_t *)(uintptr_t)1u; len = 1u;
+    CHECK(snapshot_save_mem(&m, &buf, &len) == SNAP_ERR_CORRUPT &&
+          buf == NULL && len == 0u,
+          "unknown SDO interrupt status bits were serialised");
+
+    s5l_tvout_reset(&m.tvout, m.tb_hz);
+    m.tvout.frame_accum = 1u;
+    buf = (uint8_t *)(uintptr_t)1u; len = 1u;
+    CHECK(snapshot_save_mem(&m, &buf, &len) == SNAP_ERR_CORRUPT &&
+          buf == NULL && len == 0u,
+          "impossible stopped TV-out phase was serialised");
+
+    /* A real VSYNC latch may survive a stop until the driver's explicit W1C
+     * ACK.  That is valid state and must not be confused with corruption. */
+    s5l_tvout_reset(&m.tvout, m.tb_hz);
+    s5l_tvout_write(&m.tvout, S5L_TVOUT_BANK_CTRL, 0, TVOUT_RUN, 4);
+    s5l_tvout_write(&m.tvout, S5L_TVOUT_BANK_MIXER, 0, 5u, 4);
+    s5l_tvout_write(&m.tvout, S5L_TVOUT_BANK_SDO, 0, TVOUT_RUN, 4);
+    (void)s5l_tvout_tick(&m.tvout, m.tvout.frame_ticks);
+    s5l_tvout_write(&m.tvout, S5L_TVOUT_BANK_SDO, 0, 0u, 4);
+    CHECK(snapshot_save_mem(&m, &buf, &len) == SNAP_OK && buf != NULL,
+          "stopped-but-latched TV-out state was rejected");
+    free(buf);
+    s5l8900_free(&m);
 }
 
 /* The stub windows are honest storage for peripherals we have not modelled.
@@ -842,6 +917,7 @@ int main(void) {
     printf("iOS3-VM snapshot tests\n");
     test_cpu_state_round_trips();
     test_device_state_round_trips();
+    test_tvout_snapshot_invariants();
     test_stub_windows_round_trip();
     test_ram_round_trips();
     test_nor_round_trips();

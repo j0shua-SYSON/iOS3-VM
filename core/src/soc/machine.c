@@ -27,6 +27,9 @@
 static const s5l_window_t DEVICE_WINDOWS[] = {
     { S5L8900_NOR_BASE,   S5L8900_NOR_SIZE,   "nor"   },
     { S5L8900_CLCD_BASE,  S5L8900_DEV_SIZE,   "clcd"  },
+    { S5L8900_TVOUT_CTRL_BASE,  S5L_TVOUT_BANK_SIZE, "tvout-control" },
+    { S5L8900_TVOUT_MIXER_BASE, S5L_TVOUT_BANK_SIZE, "tvout-mixer"   },
+    { S5L8900_TVOUT_SDO_BASE,   S5L_TVOUT_BANK_SIZE, "tvout-sdo"     },
     { S5L8900_I2C0_BASE,  S5L8900_DEV_SIZE,   "i2c0"  },
     { S5L8900_I2C1_BASE,  S5L8900_DEV_SIZE,   "i2c1"  },
     { S5L8900_VIC0_BASE,  S5L8900_DEV_SIZE,   "vic0"  },
@@ -247,6 +250,21 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         else                     v = s5l_vic_read(&m->vic[1], off);
     } else if (mmio_word(addr, bytes, S5L8900_CLCD_BASE, S5L8900_DEV_SIZE)) {
         v = s5l_clcd_read(&m->clcd, addr - S5L8900_CLCD_BASE);
+    } else if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+               in_window(addr, bytes, S5L8900_TVOUT_CTRL_BASE,
+                         S5L_TVOUT_BANK_SIZE)) {
+        v = s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_CTRL,
+                           addr - S5L8900_TVOUT_CTRL_BASE, bytes);
+    } else if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+               in_window(addr, bytes, S5L8900_TVOUT_MIXER_BASE,
+                         S5L_TVOUT_BANK_SIZE)) {
+        v = s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_MIXER,
+                           addr - S5L8900_TVOUT_MIXER_BASE, bytes);
+    } else if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+               in_window(addr, bytes, S5L8900_TVOUT_SDO_BASE,
+                         S5L_TVOUT_BANK_SIZE)) {
+        v = s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_SDO,
+                           addr - S5L8900_TVOUT_SDO_BASE, bytes);
     } else if (in_timer(addr, bytes)) {
         v = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
     } else if (in_power(addr, bytes)) {
@@ -297,6 +315,30 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
     if (mmio_word(addr, bytes, S5L8900_CLCD_BASE, S5L8900_DEV_SIZE)) {
         note_device(m, addr, val, true);
         s5l_clcd_write(&m->clcd, addr - S5L8900_CLCD_BASE, val);
+        return;
+    }
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+        in_window(addr, bytes, S5L8900_TVOUT_CTRL_BASE,
+                  S5L_TVOUT_BANK_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_tvout_write(&m->tvout, S5L_TVOUT_BANK_CTRL,
+                        addr - S5L8900_TVOUT_CTRL_BASE, val, bytes);
+        return;
+    }
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+        in_window(addr, bytes, S5L8900_TVOUT_MIXER_BASE,
+                  S5L_TVOUT_BANK_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_tvout_write(&m->tvout, S5L_TVOUT_BANK_MIXER,
+                        addr - S5L8900_TVOUT_MIXER_BASE, val, bytes);
+        return;
+    }
+    if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
+        in_window(addr, bytes, S5L8900_TVOUT_SDO_BASE,
+                  S5L_TVOUT_BANK_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_tvout_write(&m->tvout, S5L_TVOUT_BANK_SDO,
+                        addr - S5L8900_TVOUT_SDO_BASE, val, bytes);
         return;
     }
     if (in_timer(addr, bytes)) {
@@ -352,8 +394,8 @@ static void w8 (void *c, uint32_t a, uint8_t  v) { bus_write(c, a, v, 1); }
 
 /*
  * Complete one ARM1176 Wait For Interrupt operation without manufacturing CPU
- * work.  Only the timer and CLCD currently advance autonomously, so the first
- * edge either can route through the VIC is the earliest point at which this
+ * work.  Only the timer, CLCD and TV-out currently advance autonomously, so the
+ * first edge any can route through the VIC is the earliest point at which this
  * model can wake the core.  Advancing farther would coalesce guest-visible
  * work across an interrupt; advancing less would merely replace the kernel's
  * idle loop with a host idle loop.
@@ -377,6 +419,7 @@ static bool machine_wait_for_interrupt(void *ctx) {
     uint32_t edge_tb = 0;
     const uint32_t timer_bit = 1u << S5L8900_IRQ_TIMER;
     const uint32_t clcd_bit  = 1u << S5L8900_IRQ_CLCD;
+    const uint32_t tvout_bit = 1u << S5L8900_IRQ_TVOUT;
 
     if ((m->vic[0].enable & timer_bit) != 0u &&
         (m->timer.t4_state & TIMER4_STATE_START) != 0u) {
@@ -399,6 +442,14 @@ static bool machine_wait_for_interrupt(void *ctx) {
                              : 1u;
         if (!have_edge || until_frame < edge_tb) {
             edge_tb = until_frame;
+            have_edge = true;
+        }
+    }
+
+    if ((m->vic[0].enable & tvout_bit) != 0u) {
+        uint32_t until_vsync = s5l_tvout_ticks_to_vsync(&m->tvout);
+        if (until_vsync != 0u && (!have_edge || until_vsync < edge_tb)) {
+            edge_tb = until_vsync;
             have_edge = true;
         }
     }
@@ -465,6 +516,7 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
     s5l_timer_reset(&m->timer);
     s5l_power_reset(&m->power);
     s5l_clcd_reset(&m->clcd);
+    s5l_tvout_reset(&m->tvout, m->tb_hz);
     for (unsigned i = 0; i < S5L8900_I2C_COUNT; i++)
         s5l_i2c_reset(&m->i2c[i]);
     s5l_pcf50635_reset(&m->pmu, m->tb_hz);
@@ -565,6 +617,9 @@ void s5l8900_tick(s5l8900_t *m, uint32_t ticks) {
 
     bool clcd_irq = s5l_clcd_tick(&m->clcd, tb);
     s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_CLCD, clcd_irq);
+
+    bool tvout_irq = s5l_tvout_tick(&m->tvout, tb);
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_TVOUT, tvout_irq);
 
     /* I2C transfers complete synchronously with their command store, then
      * remain level-asserted until the driver's W1C acknowledge. A zero-tick

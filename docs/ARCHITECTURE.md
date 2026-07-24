@@ -357,8 +357,8 @@ instruction-entry coverage rose to 10,803 observations in
 `AppleH1DisplayDrivers` and 948 in `AppleMerlotLCD`. The CLCD page received 795
 reads and 32 writes, including guest changes to the control and interrupt-mask
 state. The display-adjacent pages at `0x39100000`, `0x39200000`, and
-`0x39300000` also received traffic but remain unmodelled fidelity risks; their
-use is not evidence that any one of them is the current blocker.
+`0x39300000` also received traffic but were still unmodelled at that checkpoint;
+their use alone was not evidence that any one of them was the current blocker.
 
 The process and display contracts remain separate. Run15 recorded zero
 exact-process or live-scanout framebuffer mutations; the CLCD state and PPM
@@ -377,7 +377,7 @@ bytes were non-zero. The low-flow evidence reached SpringBoard's
 `+[SpringBoard rendersLocally]` at `0x324a5b88`. It did not reach
 `-[SpringBoard applicationDidFinishLaunching:]` at `0xa6f4`.
 
-That narrows the current boundary to UIKit's local CAWindowServer/display
+That narrowed the run17 boundary to UIKit's local CAWindowServer/display
 startup before SpringBoard's launch callback. Run17 reached
 `_IOMobileFramebufferGetDisplaySize+0x18` at `0x3110d024` with LR
 `0x3123ef50`, inside
@@ -391,17 +391,51 @@ do not identify the task-local port or connection, the userspace caller, or a
 particular CLCD versus TV-out object. They also do not distinguish additional
 latency from an emulation defect.
 
-The next-run instrumentation is implemented but has not produced a long-run
-result yet. It adds exact, post-retirement SETEXEC-thread checkpoints across
-UIKit, CAWindowServer, and IOMobileFramebuffer with register and bounded stack
-snapshots; a newest-retaining Mach-message ring with live request headers,
-selected kernel-path milestones, resolved returns, and bounded receive
-snapshots; and a newest-retaining H1/Merlot outside-to-inside edge ring so late
-driver activity is not hidden by the older first-N list. Exact
-IOMobileFramebuffer finalizer and `IOServiceClose` call/return checkpoints are
-included to test the candidate correlation without assigning a port identity
-in advance. The separate targeted unpatched-IORTC experiment also remains
-open.
+Run18 exercised that instrumentation in a normal display-enabled
+2,500,000,000-instruction cold boot and stopped at the configured cap with
+`OK`; it did not panic or enter the kernel debugger. The exact SETEXEC result
+epilogue returned `r0=0` at 609,608,299, and the replacement process first
+retired an identity-validated instruction at 609,722,091. It called
+`UIApplicationMain` at 1,828,280,094, returned `YES` from
+`+[SpringBoard rendersLocally]` at 1,852,111,473, and entered
+`CAWindowServer` display discovery. SpringBoard's
+`applicationDidFinishLaunching:` was still not observed.
+
+The primary `AppleH1CLCD` display completed its open, framebuffer update,
+layer-surface, constructor, and `new_server` paths. Display discovery then
+opened a second, optional 720x480 `AppleH1TVOut` object. Its selector path
+legitimately leaves the generic IOMobileFramebuffer surface ID at zero; that
+zero is not evidence that primary CLCD setup failed. The optional object's
+finalizer was reached at 1,873,357,991 and called `IOServiceClose` at
+1,873,358,007. Exact message episode 2267 began at 1,873,358,082 with message ID
+2816, asserted its wait at 1,873,361,179, and switched the SpringBoard thread
+out at 1,873,362,063. No close return was observed. Other guest threads
+continued normally to the 2.5 B cap, so this is a task-local wait rather than a
+whole-emulator deadlock.
+
+Static control flow and the run18 bus trace establish causality for that exact
+wait. The TV-out close sleeps while queued or active swap work remains; only
+the TV-out IRQ 30 filter/action clears that work and wakes the gate. Run18
+recorded every access to its then-unmapped control, mixer, and SDO pages:
+`0x39100000` had 86 reads and 201 writes, `0x39200000` had 105 reads and 45
+writes, and `0x39300000` had 94 reads and 181 writes. VIC0 line 30 was enabled
+in `0xc006269f`, but raw IRQ 30 never asserted because no device model supplied
+the SDO VSYNC completion. This proves the cause of the observed close wait; it
+does not prove that TV-out is the only remaining boot blocker.
+
+The post-run18 TV-out model is implemented and focused-unit-tested, but it has
+not yet been exercised by a fresh real-firmware boot. It maps three independent,
+byte-lane-safe 4 KiB banks, retains unknown registers, derives each bank's ready
+bit from its run state, and emits a 60 Hz level IRQ on VIC0 line 30 only while
+all three run gates are active and VSYNC is unmasked. SDO `+0x280` bit 0 is a
+latched write-one-to-clear pending bit and `+0x284` bit 0 is its mask; mixer
+`+0x4c` is a nonasserting write-one-to-clear acknowledgement. IRQ 38, hotplug,
+TV signal, IOSurface, framebuffer, and pixel synthesis are deliberately absent.
+Snapshot v4 persists the three banks, phase, and frame counter, and WFI may
+advance to the next deliverable TV-out IRQ under the same run/mask contract.
+A real-firmware rerun must still observe IRQ 30, the shipped filter/action,
+gate wake, `IOServiceClose` return, and subsequent SpringBoard progress.
+The separate targeted unpatched-IORTC experiment also remains open.
 
 In the planned shared-session design, host services cross explicit non-blocking
 seams: frame descriptors out; bounded touch, PCM and network queues in/out;
@@ -422,6 +456,22 @@ direct RAM disk, external-md bounce reservation, and framebuffer ranges are
 contained and pairwise disjoint before execution. Firmware-specific edits are
 made only to the loaded kernel and device-tree copies; the exact-gated source
 files remain original and immutable.
+
+The current external-md planner puts the 320x480x4 framebuffer immediately
+after the aligned static/raw-bounce reserve at
+`[0x0885c000, 0x088f2000)` and advances physical `topOfKernelData` to the next
+16 KiB boundary, `0x088f4000`, while preserving at least `0x11000` bytes of
+bootstrap headroom. A firmware-free startup self-check pins those addresses.
+Run18 predates this unified planner: its framebuffer was still at
+`0x0ff6a000`, above its physical `topOfKernelData` of `0x0885c000`, so the
+run18 pixel result does not validate the corrected placement.
+
+The CLCD handoff now validates the page-rounded physical mapping requested by
+`AppleH1CLCD`: `stride * height` and its 4 KiB round-up must fit the driver's
+32-bit allocation-size argument, and the complete mapping must end at or below
+4 GiB. Invalid geometry fails atomically without partially changing window
+state. This bounds host reads and frame publication, but it is memory-safety
+hardening rather than evidence that SpringBoard rendered.
 
 ARM1176 idle is modelled as a device-time operation rather than a fake CPU loop.
 The exact CP15 wait-for-interrupt form used by XNU invokes a machine callback

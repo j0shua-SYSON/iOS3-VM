@@ -20,10 +20,11 @@ function(expect_rejected name expected)
 endfunction()
 
 # Unlike the parser-only cases below, this reaches bootkernel's invariant
-# self-checks before the expected missing-kernel open failure. It keeps the
-# context-aware PC classifier and SpringBoard target-transition truth tables
-# exercised in public CI without requiring Apple firmware.
-expect_rejected(diagnostic_pc_classifier "open"
+# self-checks before the expected missing-kernel open failure. In particular,
+# the external-md layout check requires framebuffer PA 0x0885c000 and
+# topOfKernelData 0x088f4000, while the diagnostic classifiers keep their truth
+# tables exercised in public CI without requiring Apple firmware.
+expect_rejected(startup_selfchecks "open"
     absent-kernel)
 expect_rejected(requires_tree "--external-md requires -d"
     absent-kernel --external-md absent-source new-work)

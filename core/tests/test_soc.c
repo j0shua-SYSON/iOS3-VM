@@ -958,6 +958,226 @@ static void test_vic1_is_mapped_and_drives_the_cpu(void) {
 }
 
 /*
+ * AppleH1DisplayDrivers maps three separate pages, not one monolithic TV
+ * device.  Unknown words are retained as byte-addressable storage, while the
+ * first word's ready bit is hardware-owned.  Exercise both properties here:
+ * an unaligned halfword crosses backing words, and mixer bit 2 survives the
+ * run/ready handshake (the real start path writes mixer control = 5).
+ */
+static void test_tvout_register_lanes_and_idle_handshake(void) {
+    s5l_tvout_t t;
+    s5l_tvout_reset(&t, S5L8900_TB_HZ);
+
+    for (unsigned bank = 0; bank < S5L_TVOUT_BANK_COUNT; bank++)
+        CHECK(s5l_tvout_read(&t, (s5l_tvout_bank_t)bank, 0, 4) ==
+              TVOUT_READY,
+              "TV-out bank %u did not reset idle/ready", bank);
+    CHECK((s5l_tvout_read(&t, S5L_TVOUT_BANK_SDO,
+                           TVOUT_SDO_IRQMASK, 4) &
+           TVOUT_SDO_MASK_VSYNC) != 0u,
+          "SDO VSYNC must reset masked");
+    CHECK(t.frame_ticks == S5L8900_TB_HZ / S5L_TVOUT_REFRESH_HZ,
+          "TV-out period=%u expect %u", t.frame_ticks,
+          S5L8900_TB_HZ / S5L_TVOUT_REFRESH_HZ);
+
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_CTRL, 0x100u,
+                     0x11223344u, 4);
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_CTRL, 0x103u, 0xbeefu, 2);
+    CHECK(s5l_tvout_read(&t, S5L_TVOUT_BANK_CTRL, 0x100u, 4) ==
+          0xef223344u,
+          "unaligned TV-out write updated the wrong byte lanes");
+    CHECK(s5l_tvout_read(&t, S5L_TVOUT_BANK_CTRL, 0x103u, 2) ==
+          0xbeefu,
+          "cross-word TV-out halfword did not round-trip");
+    CHECK(s5l_tvout_read(&t, S5L_TVOUT_BANK_CTRL,
+                         S5L_TVOUT_BANK_SIZE - 1u, 2) == 0u,
+          "cross-bank direct read was accepted");
+
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_MIXER, 0, 5u, 4);
+    CHECK(s5l_tvout_read(&t, S5L_TVOUT_BANK_MIXER, 0, 4) == 5u,
+          "mixer start lost bit 2 or exposed ready early");
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_CTRL, 0, TVOUT_RUN, 1);
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_SDO, 0, TVOUT_RUN, 2);
+    CHECK(s5l_tvout_running(&t), "all three run gates did not start TV-out");
+
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_MIXER, 0, 4u, 4);
+    CHECK(!s5l_tvout_running(&t) &&
+          s5l_tvout_read(&t, S5L_TVOUT_BANK_MIXER, 0, 4) == 6u,
+          "mixer stop must derive ready bit 1 and preserve bit 2");
+
+    /* IRQ38's mixer source is deliberately nonasserting.  Guest ACK writes
+     * are W1C and must not read back as a made-up hotplug event. */
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_MIXER,
+                     TVOUT_MIXER_STATUS, 3u, 4);
+    CHECK(s5l_tvout_read(&t, S5L_TVOUT_BANK_MIXER,
+                         TVOUT_MIXER_STATUS, 4) == 0u,
+          "mixer W1C ACK fabricated status");
+}
+
+/*
+ * SDO +0x280 is the swap-completion latch and +0x284 masks it.  The IRQ action
+ * in AppleH1DisplayDrivers writes bit 0 back to +0x280 before dequeuing the
+ * pending swap, so W1C behavior and level deassertion are boot-critical.
+ */
+static void test_tvout_vsync_w1c_mask_and_phase(void) {
+    s5l_tvout_t t;
+    s5l_tvout_reset(&t, 600u);
+    CHECK(t.frame_ticks == 10u, "600 Hz timebase should give a 10-tick frame");
+
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_CTRL, 0, TVOUT_RUN, 4);
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_MIXER, 0, 5u, 4);
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_SDO, 0, TVOUT_RUN, 4);
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_SDO,
+                     TVOUT_SDO_IRQMASK, 0u, 4);
+
+    CHECK(!s5l_tvout_tick(&t, 9u) && t.frames == 0u,
+          "TV-out raised VSYNC before one complete frame");
+    CHECK(s5l_tvout_tick(&t, 1u) && t.frames == 1u &&
+          (s5l_tvout_read(&t, S5L_TVOUT_BANK_SDO,
+                           TVOUT_SDO_IRQ, 4) & TVOUT_SDO_VSYNC) != 0u,
+          "one full frame did not latch VSYNC");
+
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_SDO,
+                     TVOUT_SDO_IRQMASK, TVOUT_SDO_MASK_VSYNC, 1);
+    CHECK(!s5l_tvout_irq(&t) &&
+          (s5l_tvout_read(&t, S5L_TVOUT_BANK_SDO,
+                           TVOUT_SDO_IRQ, 4) & TVOUT_SDO_VSYNC) != 0u,
+          "masking must gate the line without destroying pending status");
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_SDO,
+                     TVOUT_SDO_IRQMASK, 0u, 1);
+    CHECK(s5l_tvout_irq(&t), "unmasking a pending VSYNC did not assert");
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_SDO,
+                     TVOUT_SDO_IRQ, TVOUT_SDO_VSYNC, 1);
+    CHECK(!s5l_tvout_irq(&t) &&
+          s5l_tvout_read(&t, S5L_TVOUT_BANK_SDO,
+                          TVOUT_SDO_IRQ, 4) == 0u,
+          "byte W1C did not clear/deassert VSYNC");
+
+    CHECK(s5l_tvout_tick(&t, 25u) && t.frames == 3u &&
+          t.frame_accum == 5u,
+          "large TV-out tick lost boundaries or residual phase");
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_SDO, 0, 0u, 1);
+    CHECK(!s5l_tvout_irq(&t) && t.frame_accum == 0u,
+          "stopping TV-out did not gate IRQ/reset phase");
+    CHECK((s5l_tvout_read(&t, S5L_TVOUT_BANK_SDO,
+                           TVOUT_SDO_IRQ, 4) & TVOUT_SDO_VSYNC) != 0u,
+          "a run-gate transition silently ate latched VSYNC");
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_SDO,
+                     TVOUT_SDO_IRQ, TVOUT_SDO_VSYNC, 1);
+    s5l_tvout_write(&t, S5L_TVOUT_BANK_SDO, 0, TVOUT_RUN, 1);
+    CHECK(!s5l_tvout_tick(&t, 0u) && t.frame_accum == 0u,
+          "restart manufactured an immediate stale VBlank");
+}
+
+/*
+ * End-to-end: all three physical pages route through the machine, a generated
+ * VSYNC reaches VIC0 line 30, and the guest's narrow W1C store drops it.
+ */
+static void test_tvout_machine_routing_and_irq30(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+
+    s5l_window_t windows[S5L_WINDOW_MAX];
+    unsigned nw = s5l8900_windows(&m, windows, S5L_WINDOW_MAX);
+    CHECK(nw == m.stub_count + 12u,
+          "fixed device-window count=%u expect 12 (+%u stubs)",
+          nw - m.stub_count, m.stub_count);
+    bool have_ctrl = false, have_mixer = false, have_sdo = false;
+    for (unsigned i = 0; i < nw && i < S5L_WINDOW_MAX; i++) {
+        if (windows[i].base == S5L8900_TVOUT_CTRL_BASE)
+            have_ctrl = windows[i].size == S5L_TVOUT_BANK_SIZE &&
+                        strcmp(windows[i].name, "tvout-control") == 0;
+        if (windows[i].base == S5L8900_TVOUT_MIXER_BASE)
+            have_mixer = windows[i].size == S5L_TVOUT_BANK_SIZE &&
+                         strcmp(windows[i].name, "tvout-mixer") == 0;
+        if (windows[i].base == S5L8900_TVOUT_SDO_BASE)
+            have_sdo = windows[i].size == S5L_TVOUT_BANK_SIZE &&
+                       strcmp(windows[i].name, "tvout-sdo") == 0;
+    }
+    CHECK(have_ctrl && have_mixer && have_sdo,
+          "machine window table is missing or mis-sizing a TV-out bank");
+
+    /* Byte-safe bus routing, including an unaligned write crossing words. */
+    m.bus.write32(m.bus.ctx, S5L8900_TVOUT_CTRL_BASE + 0x100u,
+                  0x11223344u);
+    m.bus.write16(m.bus.ctx, S5L8900_TVOUT_CTRL_BASE + 0x103u, 0xbeefu);
+    CHECK(m.bus.read16(m.bus.ctx,
+                       S5L8900_TVOUT_CTRL_BASE + 0x103u) == 0xbeefu,
+          "TV-out narrow bus routing lost byte lanes");
+    uint64_t unmapped = m.unmapped_reads;
+    (void)m.bus.read16(m.bus.ctx,
+                       S5L8900_TVOUT_CTRL_BASE +
+                       S5L_TVOUT_BANK_SIZE - 1u);
+    CHECK(m.unmapped_reads == unmapped + 1u,
+          "TV-out access crossing its 4 KiB page was mapped");
+
+    m.cpu_hz = m.tb_hz = 1u;
+    m.tvout.frame_ticks = 4u;
+    m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE,
+                  1u << S5L8900_IRQ_TVOUT);
+    m.bus.write8(m.bus.ctx, S5L8900_TVOUT_CTRL_BASE, TVOUT_RUN);
+    m.bus.write32(m.bus.ctx, S5L8900_TVOUT_MIXER_BASE, 5u);
+    m.bus.write16(m.bus.ctx, S5L8900_TVOUT_SDO_BASE, TVOUT_RUN);
+    m.bus.write8(m.bus.ctx,
+                  S5L8900_TVOUT_SDO_BASE + TVOUT_SDO_IRQMASK, 0u);
+
+    s5l8900_tick(&m, 4u);
+    CHECK(m.cpu.irq_line &&
+          (m.bus.read32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_RAWINTR) &
+           (1u << S5L8900_IRQ_TVOUT)) != 0u,
+          "TV-out VSYNC did not reach VIC0 line 30");
+    m.bus.write8(m.bus.ctx,
+                  S5L8900_TVOUT_SDO_BASE + TVOUT_SDO_IRQ,
+                  TVOUT_SDO_VSYNC);
+    s5l8900_tick(&m, 0u);
+    CHECK(!m.cpu.irq_line,
+          "guest byte W1C did not deassert machine IRQ30");
+
+    /* A mixer ACK must never create IRQ38 (VIC1 local line 6). */
+    m.bus.write32(m.bus.ctx,
+                  S5L8900_TVOUT_MIXER_BASE + TVOUT_MIXER_STATUS, 3u);
+    s5l8900_tick(&m, 0u);
+    CHECK((m.vic[1].raw & (1u << (38u - 32u))) == 0u,
+          "mixer ACK fabricated IRQ38");
+
+    s5l8900_free(&m);
+}
+
+static void test_tvout_wfi_fast_forwards_to_vsync(void) {
+    s5l8900_t m;
+    CHECK(s5l8900_init(&m, 0, 1u << 20), "machine init failed");
+    const uint32_t wfi = 0xee070f90u;
+    s5l8900_load(&m, 0, &wfi, sizeof wfi);
+
+    m.cpu_hz = m.tb_hz = 1u;
+    m.tvout.frame_ticks = 7u;
+    m.tvout.frame_accum = 5u;
+    m.bus.write32(m.bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE,
+                  1u << S5L8900_IRQ_TVOUT);
+    m.bus.write32(m.bus.ctx, S5L8900_TVOUT_CTRL_BASE, TVOUT_RUN);
+    m.bus.write32(m.bus.ctx, S5L8900_TVOUT_MIXER_BASE, 5u);
+    m.bus.write32(m.bus.ctx, S5L8900_TVOUT_SDO_BASE, TVOUT_RUN);
+    /* Final run transition deliberately resets phase; position it two ticks
+     * before VSYNC only after all gates are live. */
+    m.tvout.frame_accum = 5u;
+    m.bus.write32(m.bus.ctx,
+                  S5L8900_TVOUT_SDO_BASE + TVOUT_SDO_IRQMASK, 0u);
+    m.cpu.cpsr = ARM_MODE_SYS | ARM_CPSR_I;
+
+    arm_status_t st = arm_step(&m.cpu);
+    CHECK(st == ARM_OK && m.cpu.r[15] == 4u && m.cpu.cycles == 1u,
+          "TV-out WFI status=%d pc=%08x cycles=%llu",
+          (int)st, m.cpu.r[15], (unsigned long long)m.cpu.cycles);
+    CHECK(m.tvout.frames == 1u && m.tvout.frame_accum == 0u &&
+          m.cpu.irq_line,
+          "WFI did not stop exactly at TV-out VSYNC: frames=%llu phase=%u irq=%d",
+          (unsigned long long)m.tvout.frames, m.tvout.frame_accum,
+          (int)m.cpu.irq_line);
+
+    s5l8900_free(&m);
+}
+
+/*
  * The CLCD's reason to be a device model rather than a stub.
  *
  * AppleH1CLCD submits a framebuffer swap, sets bit 0 of the interrupt mask at
@@ -1227,6 +1447,14 @@ static void test_clcd_seed_rejects_invalid_layouts_atomically(void) {
           "format field overflow" },
         { 0x0ff00000u, 320u,    480u, 1280u, CLCD_FMT_32BPP, CLCD_ORDER_MASK + 1u,
           "order field overflow" },
+        { 0xfffffff0u, 4u,        1u,   16u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+          "page-rounded physical span overflow" },
+        { 0xffffe800u, 4u,        2u, 0x1000u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+          "padded final stride outside the physical address space" },
+        { 0x00000000u, 1u,        2u, 0x80000000u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+          "stride-height multiplication overflow" },
+        { 0x00000000u, 1u,        1u, 0xfffff004u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
+          "page alignment overflow" },
         { 0xfffffff1u, 4u,        1u,   16u, CLCD_FMT_32BPP, CLCD_ORDER_BGRA,
           "physical address wrap" },
     };
@@ -1244,9 +1472,9 @@ static void test_clcd_seed_rejects_invalid_layouts_atomically(void) {
     }
 
     s5l_clcd_t edge; s5l_clcd_reset(&edge);
-    CHECK(s5l_clcd_seed_window0(&edge, 0xfffffff0u, 4u, 1u, 16u,
+    CHECK(s5l_clcd_seed_window0(&edge, 0xfffff000u, 4u, 1u, 16u,
                                 CLCD_FMT_32BPP, CLCD_ORDER_BGRA),
-          "a framebuffer ending exactly at 4 GiB was rejected");
+          "a page-rounded framebuffer ending exactly at 4 GiB was rejected");
     CHECK(s5l_clcd_read(&edge, CLCD_VIDTCON2) == 0x00030000u,
           "non-native seed exposed fixed 320x480 active timing: %08x",
           s5l_clcd_read(&edge, CLCD_VIDTCON2));
@@ -1609,6 +1837,10 @@ int main(void) {
     test_vic_vectaddr_reports_tagged_source();
     test_vic_masks_and_routes();
     test_vic1_is_mapped_and_drives_the_cpu();
+    test_tvout_register_lanes_and_idle_handshake();
+    test_tvout_vsync_w1c_mask_and_phase();
+    test_tvout_machine_routing_and_irq30();
+    test_tvout_wfi_fast_forwards_to_vsync();
     test_clcd_raises_the_frame_interrupt();
     test_clcd_large_tick_preserves_phase();
     test_clcd_line_is_gated_by_the_mask();

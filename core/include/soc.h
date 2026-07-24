@@ -556,7 +556,9 @@ bool     s5l_clcd_running(const s5l_clcd_t *c);
  * `format` is a CLCD_FMT_* value and `order` a CLCD_ORDER_* value; `stride` is
  * in bytes. This is a host-side call, not a guest-visible register: a boot stub
  * standing in for iBoot calls it before the guest runs. Returns false without
- * changing the controller if the geometry cannot be represented safely.
+ * changing the controller if the geometry cannot be represented safely or if
+ * AppleH1CLCD's page-rounded `stride * height` physical mapping would overflow
+ * its 32-bit size/address space.
  */
 bool     s5l_clcd_seed_window0(s5l_clcd_t *c, uint32_t fb_phys,
                                uint32_t width, uint32_t height,
@@ -598,6 +600,72 @@ bool     s5l_clcd_scanout(const s5l_clcd_t *c, unsigned k,
                           const uint8_t *ram, uint32_t ram_base, size_t ram_len,
                           uint8_t *rgb, size_t rgb_len,
                           uint32_t *out_w, uint32_t *out_h);
+
+/* ---------------------------------------------------------- TV-out path ---
+ *
+ * The shipped iPhone1,2 7E18 device tree names one /arm-io/tv-out service with
+ * three 4 KiB register ranges.  Resolving those child addresses through the
+ * arm-io ranges gives, in the order AppleH1DisplayDrivers maps them:
+ *
+ *   0x39100000  TV control / clock gate
+ *   0x39200000  mixer
+ *   0x39300000  SDO (standard-definition output)
+ *
+ * The same node gives interrupt lines {30,38}.  AppleH1DisplayDrivers uses
+ * line 30 for SDO VSYNC/swap completion: its filter tests SDO_IRQ bit 0 and
+ * its action writes that bit back (W1C) before dequeuing the swap.  Line 38 is
+ * a separate mixer status source; this minimal model preserves its W1C status
+ * register but does not invent a cable/hotplug event.
+ *
+ * Unknown registers remain byte-addressable backing storage.  That is
+ * intentional: the model supplies only the side effects established by the
+ * shipped driver while retaining every other guest write for later evidence.
+ */
+#define S5L8900_TVOUT_CTRL_BASE  0x39100000u
+#define S5L8900_TVOUT_MIXER_BASE 0x39200000u
+#define S5L8900_TVOUT_SDO_BASE   0x39300000u
+#define S5L8900_IRQ_TVOUT        30u
+
+#define S5L_TVOUT_BANK_SIZE      0x1000u
+#define S5L_TVOUT_BANK_WORDS     (S5L_TVOUT_BANK_SIZE / 4u)
+#define S5L_TVOUT_REFRESH_HZ     60u
+
+#define TVOUT_CTRL_ENABLE        0x000u
+#define TVOUT_MIXER_STATUS       0x04cu
+#define TVOUT_SDO_CLKCON         0x000u
+#define TVOUT_SDO_IRQ            0x280u
+#define TVOUT_SDO_IRQMASK        0x284u
+
+#define TVOUT_RUN                0x00000001u
+#define TVOUT_READY              0x00000002u
+#define TVOUT_SDO_VSYNC          0x00000001u
+#define TVOUT_SDO_MASK_VSYNC     0x00000001u
+
+typedef enum {
+    S5L_TVOUT_BANK_CTRL = 0,
+    S5L_TVOUT_BANK_MIXER,
+    S5L_TVOUT_BANK_SDO,
+    S5L_TVOUT_BANK_COUNT
+} s5l_tvout_bank_t;
+
+typedef struct {
+    uint32_t regs[S5L_TVOUT_BANK_COUNT][S5L_TVOUT_BANK_WORDS];
+    uint32_t frame_ticks;      /* guest timebase ticks per generated VSYNC */
+    uint32_t frame_accum;
+    uint64_t frames;           /* elapsed boundaries, even while pending */
+} s5l_tvout_t;
+
+void     s5l_tvout_reset(s5l_tvout_t *t, uint32_t tb_hz);
+uint32_t s5l_tvout_read(const s5l_tvout_t *t, s5l_tvout_bank_t bank,
+                        uint32_t off, unsigned bytes);
+void     s5l_tvout_write(s5l_tvout_t *t, s5l_tvout_bank_t bank,
+                         uint32_t off, uint32_t val, unsigned bytes);
+bool     s5l_tvout_running(const s5l_tvout_t *t);
+bool     s5l_tvout_irq(const s5l_tvout_t *t);
+/* Advance guest time and return the current level of interrupt line 30. */
+bool     s5l_tvout_tick(s5l_tvout_t *t, uint32_t ticks);
+/* Distance to the next deliverable VSYNC, or zero if none can wake WFI. */
+uint32_t s5l_tvout_ticks_to_vsync(const s5l_tvout_t *t);
 
 /* ----------------------------------------------------------------- I2C ---
  * The two S5L8900 I2C controllers.  The physical windows and interrupt lines
@@ -755,6 +823,7 @@ typedef struct {
     s5l_timer_t timer;
     s5l_power_t power;
     s5l_clcd_t  clcd;
+    s5l_tvout_t tvout;
     s5l_i2c_t   i2c[S5L8900_I2C_COUNT];
     s5l_pcf50635_t pmu;
     s5l_nor_t   nor;
@@ -842,7 +911,7 @@ typedef struct {
 } s5l_window_t;
 
 /* Enough for every fixed device window plus every stub. */
-#define S5L_WINDOW_MAX (S5L_STUB_MAX + 10u)
+#define S5L_WINDOW_MAX (S5L_STUB_MAX + 13u)
 
 /*
  * Every window this machine decodes: the modelled devices first, then the

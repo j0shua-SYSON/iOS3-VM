@@ -28,7 +28,7 @@ proof that no private or unindexed implementation exists.
 | **M2** | SoC bring-up | A bare-metal payload prints over the emulated UART; a timer IRQ is taken and returned from | ✅ done and covered by host tests |
 | **M3** | Firmware containers + LLB execution | Real IMG3s parse and decrypt; an extracted real Apple LLB payload executes; the kernelcache is extracted | ✅ done; SecureROM/iBoot execution remains future full-chain work |
 | **M4** | XNU boots and logs | The kernel reaches `bsd_init`, prints, and Apple's own kexts match and start | ✅ **done** — plus the real root filesystem mounts |
-| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress.** Run17 repeats exact SETEXEC success in a full 2 B run with the I2C/PMU model, reaches `rendersLocally == YES` and IOMobileFramebuffer's display-size query, but not SpringBoard's launch callback. The active 320x480 CLCD capture remains byte-identical to the seed-only frame, and no touch path exists yet; the app is still a demo host. |
+| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress.** Run18 repeats exact SETEXEC success through a normal 2.5 B cap, reaches `UIApplicationMain` and `rendersLocally == YES`, completes the primary H1CLCD construction, and proves the exact SpringBoard-thread wait belongs to the optional TV-out swap/close path whose IRQ 30 source was absent. The guest continued globally, but the close did not return, `applicationDidFinishLaunching:` and live scanout were not reached, the post-run18 TV-out model has only unit validation, and no touch path exists yet. |
 | **D** | Dynarec (parallel) | SpringBoard at interactive frame rates on the phone | 🔵 emitter + ARM/Thumb translator and host execution tests exist (off by default); no code cache or dispatcher calls them |
 | **N** | Guest networking (parallel) | The guest resolves a name and fetches a URL | ⚪ designed, not built |
 | **A** | Guest audio (first-device track) | Guest PCM reaches the host speaker without blocking the CPU thread | ⚪ priority, not designed or built |
@@ -269,11 +269,16 @@ it hid.
    panicking. Fixing it produced the first console output this project ever
    made: `iBoot version: `.
 
-2. **The framebuffer was in the wrong place.** It sat immediately after
-   `boot_args`, and `topOfKernelData` was then advanced past it — which moved
-   where the kernel places its own page tables, and turned into a prefetch abort
-   39,767 instructions in. Real iBoot puts the framebuffer near the top of DRAM.
-   So do we now, and `topOfKernelData` describes only the kernel's data again.
+2. **The framebuffer reserve and `topOfKernelData` were planned separately.**
+   The first post-`boot_args` placement left `topOfKernelData` only page-aligned,
+   so XNU's 16 KiB L1 table and TTBR0 disagreed and the kernel prefetched-aborted
+   39,767 instructions in. The later top-of-DRAM workaround fixed that symptom
+   but put Boot_Video above `topOfKernelData`, where XNU could allocate and
+   overwrite its pages. The unified planner now places the framebuffer directly
+   after the static/raw-bounce reserve, includes it below the 16 KiB-aligned
+   `topOfKernelData`, and requires `0x11000` bytes of remaining bootstrap
+   headroom. External-md therefore uses framebuffer `0x0885c000` and
+   `topOfKernelData 0x088f4000`; a firmware-free startup self-check pins both.
 
 3. **Exception returns word-aligned Thumb resume addresses.** Writing PC with S
    set copies SPSR into CPSR — restoring the interrupted mode *and* its T bit —
@@ -518,12 +523,13 @@ The revalidated replacement process retired 37,134,545 attributed user
 instructions, reached stock SpringBoard's `LC_UNIXTHREAD`/exported `start` at
 `0x34e8`, and later executed SpringBoard Objective-C methods. It never entered
 exact-process `_exit1` and ended scheduled out in a validated `mach_msg` trap.
-Run17 repeated the exact SETEXEC success in a fresh 2 B display-enabled run with
-the I2C/PMU model. Its exact process reached `UIApplicationMain`,
-`registerForSystemEvents`, `rendersLocally == YES`, and
-`_IOMobileFramebufferGetDisplaySize`, but not
-`applicationDidFinishLaunching:`. Its active 320x480 CLCD capture remained
-byte-identical to the seed-only run15/run16 PPM. A current checkpoint chain
+Run18 repeated the exact SETEXEC success in a fresh 2.5 B display-enabled run
+with the I2C/PMU model. Its exact process reached `UIApplicationMain`,
+`registerForSystemEvents`, `rendersLocally == YES`, completed the primary H1CLCD
+construction, and then waited while closing the optional AppleH1TVOut object.
+The missing TV-out VSYNC/IRQ 30 completion is proved for that exact close chain,
+but `applicationDidFinishLaunching:` was not reached. Its active 320x480 CLCD
+capture remained the seed-only 8x16 block. A current checkpoint chain
 restored at 2.2 B retired instructions,
 crossed the former
 `SMULBB` stop and wrote a 2.4 B checkpoint. The 2.4 B → 2.8 B interval wrote a
@@ -710,8 +716,8 @@ success, `AppleH1DisplayDrivers` accumulated 10,803 exact instruction-entry
 observations, and `AppleMerlotLCD` accumulated 948. The guest performed 795
 reads and 32 writes on the CLCD page and changed the controller and interrupt
 mask. The display-adjacent `0x39100000`, `0x39200000`, and `0x39300000` pages
-remain unmodelled fidelity risks, but their traffic does not prove that they
-block rendering.
+were still unmodelled fidelity risks at the run16 checkpoint, but their traffic
+alone did not prove that they blocked rendering.
 
 The final PPM still contained only the seed 8x16 white block. This is expected
 at an early cap with no userspace, and it prevents a false claim that successful
@@ -735,11 +741,11 @@ and `+[SpringBoard rendersLocally]` returned `YES` at `0x324a5b88`.
 `-[SpringBoard applicationDidFinishLaunching:]` at `0xa6f4` was not reached.
 Run17 also reached `_IOMobileFramebufferGetDisplaySize+0x18` at `0x3110d024`
 with LR `0x3123ef50`, in
-`CA::WindowServer::IOMFBDisplay::update_framebuffer`. The current observed
-boundary is therefore inside UIKit's local CAWindowServer/IOMobileFramebuffer
-startup before the SpringBoard launch callback. The difference from run15,
-which did reach that callback, is not yet classified as extra latency or a
-model defect.
+`CA::WindowServer::IOMFBDisplay::update_framebuffer`. At the run17 checkpoint,
+the observed boundary was therefore inside UIKit's local
+CAWindowServer/IOMobileFramebuffer startup before the SpringBoard launch
+callback. Run17 alone did not classify the difference from run15, which had
+reached that callback, as extra latency or a model defect.
 
 The latest exact-process Mach episode carried message ID 2816, the
 `io_service_close` routine ID. The target switched out while the receive path
@@ -747,12 +753,12 @@ waited. H1 display-driver instruction entries occurred inside the episode
 through instruction 1,873,360,702, before `_wait_queue_assert_wait` at
 1,873,361,179. This does not assign the task-local port or connection to a
 specific object, prove that the IOMobileFramebuffer finalizer was the caller,
-or distinguish CLCD from TV-out. Static analysis makes that finalizer a
-candidate because it calls `IOServiceClose` at `0x3110dc1c`; it is not yet a
-dynamic correlation.
+or distinguish CLCD from TV-out. Static analysis made that finalizer a
+candidate because it calls `IOServiceClose` at `0x3110dc1c`; run18 supplied
+the later dynamic correlation.
 
-Firmware-specific static mapping identifies the exact path that the next trace
-must split. UIKit's `+[UIApplication _startWindowServerIfNecessary]` at
+Firmware-specific static mapping identified the exact path that run18 needed
+to split. UIKit's `+[UIApplication _startWindowServerIfNecessary]` at
 `0x324a5b70` obtains the local `CAWindowServer`, sets renderer flags, requests
 the display array and first display bounds, then calls `_GSSetMainScreenInfo`.
 QuartzCore's `-[CAWindowServer _detectDisplays]` at `0x3125408c` tries the
@@ -764,17 +770,63 @@ geometry, and requests layer zero's default surface. The adjacent
 their run16 traffic remains a fidelity concern but is not evidence of the
 internal-LCD boundary.
 
-Instrumentation for the next run is implemented; no long-run result in this
-document comes from it yet. Exact post-retirement checkpoints cover the
+Instrumentation for the next run was implemented at `9bab56c`. Exact
+post-retirement checkpoints cover the
 SETEXEC thread's UIKit/CAWindowServer/IOMobileFramebuffer call-and-return
 ladder and retain
-registers plus a bounded user-stack snapshot. A newest-retaining Mach ring will
-capture live request headers, selected in-kernel receive/wait milestones,
+registers plus a bounded user-stack snapshot. A newest-retaining Mach ring
+captures live request headers, selected in-kernel receive/wait milestones,
 authoritative returns when observed, bounded receive-buffer bytes, and the most
 recent UI checkpoint without treating a task-local name as a port identity.
 Exact IOMobileFramebuffer finalizer/`IOServiceClose` checkpoints are included.
-A separate newest-retaining H1/Merlot outside-to-inside edge ring will preserve
+A separate newest-retaining H1/Merlot outside-to-inside edge ring preserves
 late display-driver entries that the existing saturated first-N list can lose.
+Run18 exercised that instrumentation and supersedes the candidate-only boundary
+above.
+
+### Run18 proved the optional TV-out swap/close blocker
+
+Run18 reached its normal **2,500,000,000**-instruction cap with `OK` and empty
+stderr. The exact-gated source kernel, device tree and rootfs retained their
+documented SHA-256 identities; runtime kernel/device-tree edits were in guest
+RAM and all filesystem writes stayed in the fresh work image.
+
+The primary H1CLCD object completed IOMFB open, geometry update, layer-surface
+lookup, constructor return and QuartzCore server construction. The second
+display object reported 720x480 and entered TV-out-specific setters, identifying
+it as optional `AppleH1TVOut`. Its shipped selector path leaves the generic
+surface ID at zero, so the observed zero lookup is expected for this object and
+does not indict the primary CLCD surface.
+
+The second object's IOMFB finalizer called `IOServiceClose` at instruction
+1,873,358,007. Its ID-2816 request entered `_wait_queue_assert_wait` at
+1,873,361,179 and switched the exact SpringBoard thread out at 1,873,362,063
+without a close return. Other userspace continued through the 2.5 B cap. Static
+control flow proves that this close sleeps while TV-out swap work is active and
+that only the TV-out IRQ 30 action clears the work and wakes the gate.
+
+Run18 had no such source: `0x39100000`, `0x39200000`, and `0x39300000` were
+unmapped despite 287, 150, and 275 accesses respectively, and VIC0 line 30
+never became raw/pending. That is the root cause of the exact observed close
+wait, not proof that no later boot blocker exists.
+
+The implemented post-run18 model is bounded to the evidence: storage for the
+three byte-lane-safe 4 KiB register banks, observed run/ready and W1C
+status/mask behavior, and a 60 Hz VSYNC level on VIC0 IRQ 30 only when all run
+gates are active and SDO VSYNC is unmasked. It does not synthesize an IOSurface,
+framebuffer, pixels, TV hotplug/signal, or IRQ 38. Focused device,
+machine-routing, snapshot-v4 and WFI tests pass. The milestone advances only
+after a real run reaches the driver's IRQ filter/action, clears the swap, wakes
+the gate, returns from close, and proceeds beyond the current SpringBoard
+checkpoint.
+
+Post-run18 framebuffer work is similarly gated on revalidation. Boot_Video is
+now reserved below `topOfKernelData` at
+`0x0885c000..0x088f2000` in external-md mode, with TOKD aligned to
+`0x088f4000` and `0x11000` bytes of mandatory bootstrap headroom. CLCD seed
+validation now covers the page-rounded `stride * height` physical mapping used
+by AppleH1CLCD and rejects 32-bit size/address overflow atomically. Run18 used
+the old top-of-DRAM framebuffer and predates both hardening changes.
 
 For chronology, this is the much earlier pre-VFP measurement from
 `bootkernel`'s milestone probes:
@@ -868,11 +920,11 @@ path.
   shared-cache, stack, and low-image regions. A read-only HFSX/Mach-O/Objective-C
   audit mapped run15's SpringBoard entry and retained low PCs, but the harness
   does not yet carry a general userspace image/symbol map. Bounded low-image
-  control-flow now places run17 after `rendersLocally == YES` and inside the
-  IOMobileFramebuffer display path, before `applicationDidFinishLaunching:`.
-  The exact UI/Mach checkpoint set described above is implemented to split
-  that interval and correlate the latest `io_service_close` request; it has not
-  produced a trace yet.
+  control-flow now places run18 after `rendersLocally == YES`, through the
+  primary H1CLCD construction, and inside the optional TV-out IOMFB finalizer,
+  before `applicationDidFinishLaunching:`. The exact UI/Mach checkpoint set
+  dynamically correlates that finalizer to the unresolved `io_service_close`;
+  the remaining attribution gap is what executes after the TV-out IRQ wakes it.
 - **The display path** — the CLCD model now separates `VIDTCON0..3` timing from
   the `0x0d8..0x0ec` window configuration, seeds an iBoot-compatible N82
   handoff, and gates frame publication and WFI edges on genuinely live scanout.
@@ -880,13 +932,15 @@ path.
   those gates are live. Run15 proved the exact SpringBoard process executing
   application methods through 2 B. Run16 then proved both observed Merlot
   starts and H1 `start_hardware` returned success, with 795 CLCD reads and 32
-  writes, but stopped before userspace. Run17 reached local CAWindowServer and
-  IOMobileFramebuffer setup with an active 320x480 CLCD, yet its PPM remained
-  byte-identical to the seed-only capture and the SpringBoard launch callback
-  was not reached. The `0x39100000`–`0x39300000` pages are H1 TV-out blocks and
-  remain fidelity risks rather than proven internal-LCD blockers. The next step
-  is the instrumented UI/Mach/H1 trace described above. The app still needs the
-  shared real-guest session; Metal is optional and not implemented.
+  writes, but stopped before userspace. Run18 then completed the primary H1CLCD
+  object and proved its exact SpringBoard-thread wait belongs to the optional
+  TV-out swap close. The unmapped `0x39100000`–`0x39300000` banks and missing
+  VIC0 IRQ 30 are causal for that close path, not a claim that TV-out is the
+  only remaining boot issue. The bounded TV-out model is now focused-unit-tested
+  but must pass the real-firmware filter/action/wake/close-return rerun;
+  framebuffer/TOKD and CLCD allocation bounds also need real-firmware
+  revalidation. The app still needs the shared real-guest session; Metal is
+  optional and not implemented.
 - **Multitouch**, mapped from the host touchscreen to the guest's controller.
   `AppleMultitouchZ2SPI` already starts and reports "using DMA for bootloading",
   which proves that the recorded boot reached that request. Device, DMA and

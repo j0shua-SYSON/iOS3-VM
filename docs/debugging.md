@@ -569,9 +569,10 @@ still the seed-only 8x16 white block. Successful observed Merlot `start` and H1
 SpringBoard frame.
 
 The driver also accessed display-adjacent physical pages `0x39100000`,
-`0x39200000`, and `0x39300000`. They remain unmodelled fidelity risks. Do not
-promote them to blockers merely because they appear in the bus report: only a
-targeted semantic experiment or the longer trace can establish causality.
+`0x39200000`, and `0x39300000`. At the run16 checkpoint they were unmodelled
+fidelity risks, and the accesses alone did not establish a blocker. Run18's
+exact close/wait trace and the shipped interrupt path later supplied the
+missing causal evidence for the optional TV-out chain, as recorded below.
 
 Run17 kept this model and performed the full 2,000,000,000-instruction
 experiment. Its later userspace/display boundary is recorded below. Run the
@@ -601,10 +602,10 @@ The return from `rendersLocally` carried `r0=1`. Run17 also reached
 `r0=0x0021c8c0` and LR `0x3123ef50`. Static disassembly resolves that LR to
 `CA::WindowServer::IOMFBDisplay::update_framebuffer+0xbc`; the containing
 constructor had advanced through its accepted `IOMobileFramebufferOpen` path.
-This places the current observed interval after local-window-server selection
-and inside IOMobileFramebuffer setup, but before SpringBoard's launch callback.
-Run15 reached the callback while run17 did not; the evidence does not yet
-distinguish timing from a model defect.
+At the run17 checkpoint, this placed the observed interval after
+local-window-server selection and inside IOMobileFramebuffer setup, but before
+SpringBoard's launch callback. Run15 reached the callback while run17 did not;
+run17 alone did not distinguish timing from a model defect.
 
 The most recent exact-process Mach episode carried request message ID 2816,
 the IOKit `io_service_close` routine ID. The target switched out while the
@@ -618,10 +619,10 @@ strict:
 - the H1 code-range observation does not distinguish CLCD from TV-out or prove
   which userspace call initiated the episode;
 - IOMobileFramebuffer's finalizer calls `IOServiceClose` at `0x3110dc1c`, but
-  that is a static candidate correlation until an exact run observes its
-  call/return ladder around the Mach episode.
+  that was only a static candidate correlation until run18 observed its exact
+  call/wait ladder around the Mach episode.
 
-The exact 7E18 userspace map for that next split is:
+The exact 7E18 userspace map used for that run18 split is:
 
 - UIKit `+[UIApplication _startWindowServerIfNecessary]` starts at
   `0x324a5b70`. After `rendersLocally`, it calls
@@ -662,31 +663,92 @@ caller correlation.
 
 The three display-adjacent pages are no longer anonymous: `0x39100000` is the
 H1 TV-out control/coefficient/DAC block, `0x39200000` is its mixer, and
-`0x39300000` is its SDO block. They remain unmodelled fidelity risks, but that
-mapping gives no evidence that one blocks the internal CLCD path.
+`0x39300000` is its SDO block. Their relationship to the optional TV-out close
+path is now exact; it does not make them a blocker for the already completed
+primary CLCD construction.
 
-#### Instrumentation implemented for the next run
+#### Run18 result: optional TV-out close/swap wait
 
-This instrumentation has not produced a run result yet:
+Run18 exercised the post-retirement UI checkpoints, newest-retaining Mach ring,
+and late H1/Merlot edge ring in a normal display-enabled
+2,500,000,000-instruction cold boot. It stopped at the configured cap with
+`OK`, empty stderr, and no kernel panic/debugger entry. The source artifacts
+were reverified after the run:
 
-1. Exact UI checkpoints are recorded only after an `ARM_OK` step retires in
-   User mode with the SETEXEC target thread still on CPU and its identity still
-   valid. Each checkpoint retains first/last `r0`-`r12`, SP, LR, CPSR, thread,
-   and 32 bytes from the live user stack. This avoids counting a demand-fault
-   retry as a completed call/return and preserves the bounds/result stack slots
-   listed above.
-2. A 256-entry newest-retaining exact-target Mach ring captures the live
-   `mach_msg` arguments, request header, entry translation state, selected
-   receive/wait kernel milestones, resolution and authoritative raw result when
-   observed, and at most 64 bytes from the receive buffer after a validated
-   return. It records the most recent UI checkpoint for chronology; it does not
-   translate task-local names into service identities.
-3. The old display-driver edge list retains the first 1,024 outside-to-inside
-   entries. Run17 filled it and dropped 44 later H1 edges; its exact-PC table
-   also dropped 11,849 unretained H1 instruction-entry observations after
-   saturation. A separate 128-entry newest-retaining H1/Merlot edge ring is
-   therefore implemented alongside the historical list. Until a run exercises
-   it, absence from the old late-edge or PC tables is not negative evidence.
+```text
+kernelcache.release.s5l8900x  0D8CDB339D37CF37A1DB2638FFF79272ECD63A17764BF7666EFA1618725DF70C
+DeviceTree.n82ap             4867C95FEDF544BDA2ECAA2626AE14C01A60D7771DC53FFE6FD3A6AAC8B8BA57
+018-6494-014.dmg             C3251E7F092C939D5818E92086CB47680981CFB03731DE7B55D238C942EB5E82
+```
+
+Those are the immutable original source artifacts. Kernel and device-tree
+compatibility edits apply only to loaded guest copies; the writable filesystem
+is a fresh work-image copy, never the source DMG.
+
+The exact target chronology is:
+
+```text
+SETEXEC result epilogue, r0=0                         609,608,299
+first identity-validated replacement instruction     609,722,091
+SpringBoard UIApplicationMain call                 1,828,280,094
+[SpringBoard rendersLocally] returns YES           1,852,111,473
+optional IOMFB finalizer                            1,873,357,991
+IOServiceClose call                                 1,873,358,007
+Mach episode 2267 begins, message ID 2816           1,873,358,082
+wait_queue_assert_wait                              1,873,361,179
+SpringBoard thread switches out                     1,873,362,063
+```
+
+Before that finalizer, the primary `AppleH1CLCD` object completed open,
+framebuffer update, layer-surface lookup, construction, and `new_server`.
+Display discovery then opened a second 720x480 object and called its TV-out
+setters, identifying it as optional `AppleH1TVOut`. Its shipped selector path
+does not assign generic IOMobileFramebuffer's surface-ID field, so surface ID
+zero is expected for that optional object; it is not a primary-CLCD failure.
+The close did not return, but other guest threads continued to the 2.5 B cap.
+This is a SpringBoard-thread wait, not a whole-emulator deadlock.
+
+The bus report and shipped driver close the causal chain for this exact wait:
+
+```text
+TV-out control  0x39100000   86 reads / 201 writes
+TV-out mixer    0x39200000  105 reads /  45 writes
+TV-out SDO      0x39300000   94 reads / 181 writes
+```
+
+All three pages were unmapped in run18. VIC0 line 30 was enabled in
+`0xc006269f`, but its raw bit never asserted because no device supplied SDO
+VSYNC. The close path sleeps while a swap is queued or active; the TV-out IRQ
+30 filter/action is the only observed path that clears that work and wakes the
+gate. This proves why this close slept. It does not prove that TV-out is the
+only remaining boot issue.
+
+The post-run18 implementation maps three independent byte-lane-safe 4 KiB
+banks, retains unknown registers, derives ready from each bank's run state,
+and generates a 60 Hz level IRQ 30 only when all three run gates are active and
+SDO VSYNC is unmasked. SDO `+0x280` bit 0 is latched and write-one-to-clear;
+`+0x284` bit 0 masks it. Mixer `+0x4c` is a deliberately nonasserting
+write-one-to-clear acknowledgement. It does not fabricate IRQ 38, hotplug, an
+IOSurface, framebuffer pixels, or a TV signal. Snapshot v4 persists its banks,
+phase, and frame counter, and WFI can advance to the next deliverable IRQ 30.
+Focused unit tests pass, but no post-run18 real-firmware trace has validated
+the model yet.
+
+For the next firmware run, require this sequence before advancing the claim:
+
+1. the three TV-out pages route through the model rather than the unmapped bus;
+2. SDO VSYNC asserts raw VIC0 IRQ 30 under the shipped run/mask state;
+3. the shipped IRQ 30 filter/action executes and acknowledges the pending bit;
+4. the swap gate wakes and the exact `IOServiceClose` call returns;
+5. the target resumes beyond CAWindowServer setup and reaches a later exact
+   SpringBoard checkpoint, ideally `applicationDidFinishLaunching:`.
+
+Do not infer a boot or synthesize a return if any link is absent. Run18 also
+predates the unified framebuffer planner and stricter CLCD allocation bounds:
+the current external-md layout reserves `0x0885c000..0x088f2000`, advances
+physical `topOfKernelData` to `0x088f4000`, and validates the page-rounded
+`stride * height` mapping through the 4 GiB boundary. A fresh run must
+revalidate both hardening changes alongside the TV-out path.
 
 ### WFI changes elapsed device time, not the instruction coordinate
 

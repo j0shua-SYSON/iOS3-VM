@@ -14,6 +14,7 @@ add_library(emucore STATIC
     src/soc/timer.c
     src/soc/power.c
     src/soc/clcd.c
+    src/soc/tvout.c
     src/soc/i2c.c
     src/soc/pcf50635.c
     src/soc/nor.c

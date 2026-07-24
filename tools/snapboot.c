@@ -267,6 +267,18 @@ static void report(const s5l8900_t *m, arm_status_t st) {
     printf("  clcd          : ctrl=%08x status=%08x mask=%08x scanning=%d frames=%llu\n",
            m->clcd.ctrl, m->clcd.intstatus, m->clcd.intmask, m->clcd.scanning,
            (unsigned long long)m->clcd.frames);
+    printf("  tvout        : running=%d irq30=%d frame=%u/%u frames=%llu "
+           "ctrl=%08x mixer=%08x sdo=%08x pending/mask=%08x/%08x\n",
+           s5l_tvout_running(&m->tvout), s5l_tvout_irq(&m->tvout),
+           m->tvout.frame_accum, m->tvout.frame_ticks,
+           (unsigned long long)m->tvout.frames,
+           s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_CTRL, 0u, 4u),
+           s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_MIXER, 0u, 4u),
+           s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_SDO, 0u, 4u),
+           s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_SDO,
+                          TVOUT_SDO_IRQ, 4u),
+           s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_SDO,
+                          TVOUT_SDO_IRQMASK, 4u));
     printf("  unmapped      : reads=%llu writes=%llu pages=%u\n",
            (unsigned long long)m->unmapped_reads,
            (unsigned long long)m->unmapped_writes, m->unmapped_addr_count);

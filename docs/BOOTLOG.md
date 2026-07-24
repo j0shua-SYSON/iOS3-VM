@@ -13,28 +13,27 @@ device behind each stage.
 > (`0xe6cf3073`) in user mode. The complete paired-extend implementation then
 > replayed through that stop, wrote a 2.97 B checkpoint and reached a clean
 > 2.98 B cap. Free pages dipped to 97 and ended at 214 against a target of 250.
-> The strongest current SpringBoard evidence is run17: a fresh display-enabled
-> 128 MiB cold boot of `0bc18ea` reached its 2 B cap with `OK`, exit status 0,
-> and empty stderr. It repeated exact SETEXEC success and attributed 36,379,165
-> user instructions to the revalidated SpringBoard process without an
-> exact-process `_exit1`. The stock image entered at `0x34e8`, and exact
-> low-image control flow now directly proves its call to `UIApplicationMain`.
-> UIKit asked SpringBoard to `registerForSystemEvents` and whether it
-> `rendersLocally`, then entered the local CAWindowServer, QuartzCore, and
-> IOMobileFramebuffer display path enabled by run16's PMU/I2C progress.
+> The strongest current SpringBoard evidence is run18: a fresh display-enabled
+> 128 MiB cold boot of `9bab56c` reached its 2.5 B cap with `OK` and empty
+> stderr. It repeated exact SETEXEC success and attributed 36,379,165 user
+> instructions to the revalidated SpringBoard process without an exact-process
+> `_exit1`. The stock image entered at `0x34e8`, called `UIApplicationMain`, and
+> returned `YES` from `rendersLocally`. UIKit/QuartzCore completed the primary
+> H1CLCD construction before opening the optional AppleH1TVOut display.
 >
 > This is a partial display handoff, not a rendered home screen.
-> `applicationDidFinishLaunching:` and the tether call were not reached. A late
-> exception in `IOMobileFramebufferGetDisplaySize` was a normal lazy VFP-enable
-> trap and returned; it was not a crash. The target eventually switched out in
-> an unresolved IOKit `io_service_close` episode while H1 code was also active.
-> The task-local port does not prove a server identity, and the unresolved
-> request does not by itself prove deadlock. No live-scanout mutation occurred,
-> and the frame remained the same seed-only 8x16 block. The next proof must map
-> the framebuffer open/selector/close results, port provenance, H1 reply path,
-> and IOSurface allocation contract. The installable app still runs a synthetic
-> guest through CoreGraphics and has no real-boot session, touch, audio or guest
-> networking.
+> `applicationDidFinishLaunching:` and the tether call were not reached. The
+> TV-out IOMFB finalizer's exact `io_service_close` entered the swap wait and
+> switched only the SpringBoard thread out; the rest of the guest continued to
+> 2.5 B. Static control flow proves that close needs TV-out VSYNC IRQ 30, while
+> run18's `0x39100000`-`0x39300000` register pages were unmapped and no device
+> asserted that VIC line. Surface ID zero is expected for this optional TV-out
+> path, not a primary-CLCD failure. No live-scanout mutation occurred and the
+> frame remained the same seed-only 8x16 block. The post-run18 TV-out model is
+> implemented and focused-unit-tested, but must still be validated by the real
+> filter/action, wake and close return. The installable app still runs a
+> synthetic guest through CoreGraphics and has no real-boot session, touch,
+> audio or guest networking.
 
 Everything here is from actual historical runs. The command below is the recipe,
 not a promise of byte-identical current output: the stopping point and log are
@@ -1406,6 +1405,92 @@ device-model fix belongs after that trace distinguishes a missing reply or
 invalid surface contract from an ordinary process wait; forcing `mach_msg` to
 return or fabricating framebuffer pixels would destroy the evidence.
 
+### 2026-07-24: run18 proved the optional TV-out swap/close dependency
+
+Run18 exercised the new exact UI, Mach, IOMFB, and late H1 checkpoints from
+commit `9bab56c05514f6cd3dbb5fa96b229a0c7b5146a0`. It was a fresh display-enabled
+128 MiB external-md cold boot with profile window
+`1,750,000,000..2,500,000,000`. The harness stopped normally at the
+**2,500,000,000**-instruction cap with `OK`; stderr was empty, `_panic` and
+`_Debugger` were not reached, and the external bridge completed 12,015 reads
+and 173 writes with zero failures.
+
+The manifest recorded the same exact-gated original inputs still present in
+`firmware/`:
+
+```text
+kernel.macho    0d8cdb339d37cf37a1db2638fff79272ecd63a17764bf7666efa1618725df70c
+devicetree.bin  4867c95fedf544bda2ecaa2626ae14c01a60d7771dc53ffe6fd3a6aac8b8ba57
+rootfs.img      c3251e7f092c939d5818e92086cb47680981cfb03731de7b55d238c942eb5e82
+```
+
+The source firmware was not rewritten. Kernel compatibility patches and
+iBoot-style device-tree edits existed only in the guest-RAM copies. Rootfs
+growth, fstab changes, and guest writes were confined to the fresh
+466,825,216-byte run18 work image.
+
+The SpringBoard timing through the display boundary was deterministic. SETEXEC
+returned `r0=0` at 609,608,299; the first revalidated replacement instruction
+retired at 609,722,091. The exact process called `UIApplicationMain` at
+1,828,280,094, called `registerForSystemEvents`, returned
+`rendersLocally == YES`, and entered CAWindowServer display detection. The
+primary H1CLCD IOMFB open, geometry update, layer-surface lookup and constructor
+all returned; QuartzCore's first display server construction also returned.
+
+Display detection then opened a second IOMFB object. Run18 observed its 720x480
+geometry and TV-out setter calls. Static vtable and selector resolution identify
+that optional object as `AppleH1TVOut`. Its selector-3 path never assigns the
+generic IOMFB surface-ID field, so zero is the expected surface ID. The resulting
+zero `CoreSurfaceBufferLookup` is not evidence that the primary 320x480 CLCD
+surface failed.
+
+The second object entered the exact IOMFB finalizer at 1,873,357,991 and called
+`IOServiceClose` at 1,873,358,007. The resulting ID-2816 Mach episode reached
+`_wait_queue_assert_wait` at 1,873,361,179 and switched the exact SpringBoard
+thread out at 1,873,362,063. `IOServiceClose` did not return. Other guest
+userspace continued to the normal 2.5 B cap, so this is a per-thread swap wait,
+not a whole-emulator deadlock.
+
+The shipped driver closes the causal chain. Closing with queued or active TV-out
+work sleeps on the swap gate. The TV-out IRQ 30 filter/action clears that work
+and wakes the same gate. The 7E18 device tree maps its control, mixer and SDO
+registers to `0x39100000`, `0x39200000`, and `0x39300000`; run18 sent all three
+pages to the unmapped path:
+
+```text
+0x39100000  86 reads / 201 writes
+0x39200000  105 reads / 45 writes
+0x39300000  94 reads / 181 writes
+VIC0 line 30 enabled, raw/pending never asserted
+```
+
+The driver had programmed the run gates and unmasked SDO VSYNC, but no model
+could set the SDO pending bit or assert IRQ 30. Missing TV-out
+register/VSYNC/IRQ semantics are therefore a proved blocker for this exact
+close chain. They are not proved to be the only remaining blocker after the
+thread wakes.
+
+The implemented post-run18 model follows only measured semantics:
+byte-lane-safe storage for the three pages; stopped/ready and run-state
+handling; SDO VSYNC pending as W1C with its mask bit; and a 60 Hz level on VIC0
+IRQ 30 only while all run gates are active and VSYNC is unmasked. IRQ
+acknowledgement drops the level. The model must not fabricate an IOSurface,
+framebuffer, TV signal, cable/hotplug state, IRQ 38, or pixels. Focused device,
+machine-routing, snapshot-v4, and WFI tests pass. A real-firmware rerun must
+still observe the filter/action, active-swap clear, gate wake, close return, and
+subsequent SpringBoard control flow before this changes the boot claim.
+
+Run18 also exposed two independent safety issues outside that wait. Its
+historical Boot_Video address `0x0ff6a000` lay above physical
+`topOfKernelData 0x0885c000`, so XNU could treat the scanout pages as free.
+Current planning instead reserves framebuffer
+`0x0885c000..0x088f2000`, advances TOKD to the 16 KiB-aligned `0x088f4000`,
+and requires `0x11000` bytes of bootstrap headroom. CLCD handoff validation now
+checks AppleH1CLCD's page-rounded `stride * height` allocation and rejects
+32-bit multiplication, rounding, or physical-end overflow without changing
+controller state. Both changes postdate run18 and need the same fresh
+real-firmware validation; they do not make its seed-only frame a rendered one.
+
 The earlier checkpoint-continuation chain is stronger evidence for sustained
 userspace and snapshot
 repeatability. It is **not** evidence that SpringBoard rendered. The bounded
@@ -1467,11 +1552,17 @@ Fewer lines than the serial stream carries — the two consoles do not receive t
 same messages — and it ends on a live cursor block.
 
 The framebuffer's placement matters more than it looks. It originally sat
-immediately after `boot_args`, with `topOfKernelData` advanced past it — which
-moved where the kernel builds its page tables and produced a prefetch abort at
-`__start+0x170`, 39,767 instructions in. Real iBoot puts the framebuffer near
-the top of DRAM, so we do too, and `topOfKernelData` again describes only the
-kernel's data.
+immediately after `boot_args`, with an insufficiently aligned
+`topOfKernelData`; XNU then built its 16 KiB L1 table at an address different
+from the one encoded in TTBR0 and prefetched-aborted at `__start+0x170`, 39,767
+instructions in. Moving the framebuffer near the top of DRAM avoided that
+alignment symptom but left its pages above `topOfKernelData`, inside XNU's free
+page pool. The corrected planner instead places Boot_Video immediately after
+the conservative static/raw-bounce reserve, includes its end in
+`topOfKernelData`, aligns that line to 16 KiB, and retains at least `0x11000`
+bytes for bootstrap allocations. In the exact 128 MiB external-md layout this
+means framebuffer `0x0885c000..0x088f2000` and `topOfKernelData 0x088f4000`;
+recognized snapshots carrying the old unsafe relationship are rejected.
 
 What was *not active in this recorded run*: `AppleH1CLCD`, the display
 controller at `/device-tree/arm-io/clcd` (physical 0x38900000, interrupt 13),

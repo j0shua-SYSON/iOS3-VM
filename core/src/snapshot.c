@@ -113,6 +113,7 @@ SNAP_SIZE_GUARD(s5l_timer_t,       40,    "snap_timer");
 SNAP_SIZE_GUARD(s5l_power_t,       24,    "snap_power");
 SNAP_SIZE_GUARD(s5l_clcd_window_t, 24,    "snap_clcd");
 SNAP_SIZE_GUARD(s5l_clcd_t,        3360,  "snap_clcd");
+SNAP_SIZE_GUARD(s5l_tvout_t,       12304, "snap_tvout");
 /* I2C/PMU guards are intentionally adjacent to their visitors. These values
  * describe host ABI layout only; the file format remains field-by-field. */
 SNAP_SIZE_GUARD(s5l_i2c_t,         320,   "snap_i2c");
@@ -125,7 +126,7 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * are deliberately excluded from MACH for the same reason as every other bus
  * callback; snapshot_load preserves the live machine's hooks and dedicated
  * privileged-SVC context. The byte format therefore does not change. */
-SNAP_SIZE_GUARD(s5l8900_t,         17032, "snap_mach");
+SNAP_SIZE_GUARD(s5l8900_t,         29336, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
@@ -453,6 +454,37 @@ static void snap_clcd(sn_io_t *io, s5l_clcd_t *c) {
     F64(c->frames);
 }
 
+static bool tvout_state_valid(const s5l_tvout_t *t) {
+    if (!t || (t->frame_ticks == 0u
+                   ? t->frame_accum != 0u
+                   : t->frame_accum >= t->frame_ticks))
+        return false;
+    for (unsigned bank = 0; bank < S5L_TVOUT_BANK_COUNT; bank++)
+        if ((t->regs[bank][0] & TVOUT_READY) != 0u) return false;
+    /* tick() and every aggregate run->stop transition reset the phase.  A
+     * stopped controller with residual phase cannot be produced by the model
+     * and would silently normalize on the first post-restore zero tick. */
+    if (!s5l_tvout_running(t) && t->frame_accum != 0u) return false;
+
+    /* These are status latches, not guest storage.  The model can only
+     * generate SDO VSYNC bit 0 and deliberately generates no mixer event. */
+    if ((t->regs[S5L_TVOUT_BANK_SDO][TVOUT_SDO_IRQ / 4u] &
+         ~TVOUT_SDO_VSYNC) != 0u ||
+        t->regs[S5L_TVOUT_BANK_MIXER][TVOUT_MIXER_STATUS / 4u] != 0u)
+        return false;
+    return true;
+}
+
+static void snap_tvout(sn_io_t *io, s5l_tvout_t *t) {
+    FA32(&t->regs[0][0],
+         (size_t)S5L_TVOUT_BANK_COUNT * S5L_TVOUT_BANK_WORDS);
+    F32(t->frame_ticks);
+    F32(t->frame_accum);
+    F64(t->frames);
+    if (sn_reading(io) && io->err == SNAP_OK && !tvout_state_valid(t))
+        io->err = SNAP_ERR_CORRUPT;
+}
+
 /*
  * NOR. The contents are saved as well as the scanned directory: a guest
  * payload can program the flash (that is how an untethered jailbreak persists
@@ -501,6 +533,7 @@ static void snap_mach(sn_io_t *io, s5l8900_t *m) {
     snap_timer(io, &m->timer);
     snap_power(io, &m->power);
     snap_clcd (io, &m->clcd);
+    snap_tvout(io, &m->tvout);
     for (unsigned i = 0; i < S5L8900_I2C_COUNT; i++)
         snap_i2c(io, &m->i2c[i]);
     snap_pmu(io, &m->pmu);
@@ -755,6 +788,7 @@ static bool snap_machine_valid(const s5l8900_t *m) {
     for (unsigned i = 0; i < S5L8900_I2C_COUNT; i++)
         if (!i2c_state_valid(&m->i2c[i])) return false;
     if (!pmu_state_valid(&m->pmu)) return false;
+    if (!tvout_state_valid(&m->tvout)) return false;
     /* Slave callbacks are host wiring, not file bytes. Requiring the board's
      * exact wiring on both save and load makes that omission safe: a snapshot
      * can never be applied to a differently wired machine. */

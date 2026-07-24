@@ -59,6 +59,8 @@
     (EXTERNAL_MD_RAW_SLOT_COUNT * MD_RAW_BRIDGE_MAX_TRANSFER)
 #define IOS3_ROOTFS_FILE_SIZE  UINT64_C(433274880)
 #define IOS3_DEVICETREE_FILE_SIZE ((size_t)40544u)
+#define BOOT_TOKD_ALIGNMENT          UINT64_C(0x4000)
+#define BOOT_MIN_BOOTSTRAP_HEADROOM  UINT64_C(0x11000)
 
 static const uint8_t IOS3_ROOTFS_SHA256[IOS3_SHA256_DIGEST_SIZE] = {
     0xc3, 0x25, 0x1e, 0x7f, 0x09, 0x2c, 0x93, 0x9d,
@@ -461,6 +463,65 @@ static bool boot_layout_validate(const boot_range_t *dram,
             return false;
         }
     }
+    return true;
+}
+
+/*
+ * Plan the boot-owned framebuffer immediately after the conservative static
+ * reserve.  The reserve is 16 KiB aligned because XNU derives its L1 table
+ * base from topOfKernelData and an ARMv6 L1 table has that alignment.
+ *
+ * This helper deliberately does not decide whether the resulting range lies
+ * in DRAM or overlaps another input.  boot_layout_validate() owns those checks
+ * and their precise diagnostics; keeping range creation separate prevents an
+ * overflow from being mistaken for a merely out-of-bounds placement.
+ */
+static bool boot_framebuffer_plan(uint64_t static_input_end,
+                                  uint64_t framebuffer_length,
+                                  bool framebuffer_enabled,
+                                  uint64_t *planned_static_end,
+                                  boot_range_t *framebuffer) {
+    uint64_t aligned_end;
+    if (!planned_static_end || !framebuffer ||
+        !align_u64(static_input_end, BOOT_TOKD_ALIGNMENT, &aligned_end) ||
+        !boot_range_make(framebuffer, "framebuffer",
+                         framebuffer_enabled ? aligned_end : 0u,
+                         framebuffer_enabled ? framebuffer_length : 0u,
+                         framebuffer_enabled))
+        return false;
+    *planned_static_end = aligned_end;
+    return true;
+}
+
+/*
+ * Finalize topOfKernelData from what was actually loaded and every boot-owned
+ * range that must remain outside XNU's free-page pool.  The 0x11000-byte floor
+ * is the measured early-bootstrap demand above TOKD: a 16 KiB L1 table plus
+ * the immediately following bootstrap allocations.  Check it with subtraction
+ * only after proving TOKD is inside DRAM, so no end-address addition can wrap.
+ */
+static bool boot_static_top_finalize(const boot_range_t *dram,
+                                     uint64_t actual_static_end,
+                                     const boot_range_t *framebuffer,
+                                     uint64_t *top_of_kernel_data) {
+    if (!dram || !dram->active || !framebuffer || !top_of_kernel_data ||
+        actual_static_end < dram->begin || actual_static_end > dram->end)
+        return false;
+
+    uint64_t final_static_end = actual_static_end;
+    if (framebuffer->active) {
+        if (framebuffer->begin < dram->begin || framebuffer->end > dram->end)
+            return false;
+        if (framebuffer->end > final_static_end)
+            final_static_end = framebuffer->end;
+    }
+
+    uint64_t aligned_end;
+    if (!align_u64(final_static_end, BOOT_TOKD_ALIGNMENT, &aligned_end) ||
+        aligned_end > UINT32_MAX || aligned_end > dram->end ||
+        dram->end - aligned_end < BOOT_MIN_BOOTSTRAP_HEADROOM)
+        return false;
+    *top_of_kernel_data = aligned_end;
     return true;
 }
 
@@ -1474,6 +1535,158 @@ static bool dt_memmap_matches_once(uint8_t *b, size_t len, const char *key,
 #define N82_FB_BPP       4u
 #define N82_FB_BYTES     (N82_FB_WIDTH * N82_FB_HEIGHT * N82_FB_BPP)
 
+static uint16_t boot_args_get_le16(const uint8_t *bytes, size_t offset) {
+    return (uint16_t)bytes[offset] |
+           (uint16_t)((uint16_t)bytes[offset + 1u] << 8);
+}
+
+static uint32_t boot_args_get_le32(const uint8_t *bytes, size_t offset) {
+    return (uint32_t)bytes[offset] |
+           ((uint32_t)bytes[offset + 1u] << 8) |
+           ((uint32_t)bytes[offset + 2u] << 16) |
+           ((uint32_t)bytes[offset + 3u] << 24);
+}
+
+static void boot_args_put_le16(uint8_t *bytes, size_t offset, uint16_t value) {
+    bytes[offset] = (uint8_t)value;
+    bytes[offset + 1u] = (uint8_t)(value >> 8);
+}
+
+static void boot_args_put_le32(uint8_t *bytes, size_t offset, uint32_t value) {
+    bytes[offset] = (uint8_t)value;
+    bytes[offset + 1u] = (uint8_t)(value >> 8);
+    bytes[offset + 2u] = (uint8_t)(value >> 16);
+    bytes[offset + 3u] = (uint8_t)(value >> 24);
+}
+
+/*
+ * Old -F snapshots can contain the pre-fix handoff: Boot_Video points near the
+ * top of DRAM while topOfKernelData stops below it.  XNU therefore owns those
+ * framebuffer pages as ordinary free memory and can overwrite scanout before
+ * IOMobileFramebuffer adopts it.  Recognize only this exact boot_args family;
+ * an arbitrary late-boot byte sequence must never be rejected as a snapshot
+ * merely because four words happen to resemble addresses.
+ */
+static bool boot_args_video_layout_unsafe(
+        const uint8_t *boot_args, size_t length,
+        uint32_t expected_virt_base, uint32_t expected_phys_base,
+        uint32_t expected_ram_size, uint32_t *framebuffer_begin_out,
+        uint64_t *framebuffer_end_out, uint32_t *top_out) {
+    if (!boot_args || length < 0x2cu ||
+        boot_args_get_le16(boot_args, 0x02u) != 6u ||
+        boot_args_get_le32(boot_args, 0x04u) != expected_virt_base ||
+        boot_args_get_le32(boot_args, 0x08u) != expected_phys_base ||
+        boot_args_get_le32(boot_args, 0x0cu) != expected_ram_size)
+        return false;
+
+    uint32_t top = boot_args_get_le32(boot_args, 0x10u);
+    uint32_t framebuffer_begin = boot_args_get_le32(boot_args, 0x14u);
+    if (!framebuffer_begin ||
+        boot_args_get_le32(boot_args, 0x1cu) !=
+            N82_FB_WIDTH * N82_FB_BPP ||
+        boot_args_get_le32(boot_args, 0x20u) != N82_FB_WIDTH ||
+        boot_args_get_le32(boot_args, 0x24u) != N82_FB_HEIGHT ||
+        boot_args_get_le32(boot_args, 0x28u) != N82_FB_BPP * 8u)
+        return false;
+
+    uint64_t framebuffer_end;
+    uint64_t dram_end;
+    if (!add_u64(framebuffer_begin, N82_FB_BYTES, &framebuffer_end) ||
+        !add_u64(expected_phys_base, expected_ram_size, &dram_end))
+        return false;
+    if (framebuffer_begin_out) *framebuffer_begin_out = framebuffer_begin;
+    if (framebuffer_end_out) *framebuffer_end_out = framebuffer_end;
+    if (top_out) *top_out = top;
+
+    if ((top & (uint32_t)(BOOT_TOKD_ALIGNMENT - 1u)) != 0u ||
+        top < expected_phys_base || (uint64_t)top > dram_end)
+        return true;
+    return dram_end - top < BOOT_MIN_BOOTSTRAP_HEADROOM ||
+           framebuffer_begin < expected_phys_base ||
+           framebuffer_end > dram_end || framebuffer_end > top;
+}
+
+static bool restored_boot_video_layout_unsafe(
+        const s5l8900_t *mach, uint32_t boot_args_pa,
+        uint32_t expected_virt_base, uint32_t *framebuffer_begin_out,
+        uint64_t *framebuffer_end_out, uint32_t *top_out) {
+    uint64_t ram_end;
+    uint64_t boot_args_end;
+    if (!mach || !mach->ram ||
+        !add_u64(mach->ram_base, mach->ram_size, &ram_end) ||
+        !add_u64(boot_args_pa, 0x2cu, &boot_args_end) ||
+        boot_args_pa < mach->ram_base || boot_args_end > ram_end)
+        return false;
+
+    size_t offset = (size_t)((uint64_t)boot_args_pa - mach->ram_base);
+    return boot_args_video_layout_unsafe(
+        mach->ram + offset, (size_t)(ram_end - boot_args_pa),
+        expected_virt_base, mach->ram_base, mach->ram_size,
+        framebuffer_begin_out, framebuffer_end_out, top_out);
+}
+
+/*
+ * Firmware-free startup coverage for the placement arithmetic.  In the exact
+ * 128 MiB external-md layout, the four raw-I/O slots end at 0x0885c000.  -F
+ * must begin there, end at 0x088f2000, and raise the 16 KiB-aligned TOKD to
+ * 0x088f4000.  Public CI reaches this before its intentional missing-firmware
+ * rejection, so these constants cannot drift behind an Apple-only test.
+ */
+static bool boot_memory_layout_selfcheck(void) {
+    boot_range_t dram;
+    boot_range_t framebuffer;
+    uint64_t planned_static_end;
+    uint64_t top;
+    if (!boot_range_make(&dram, "selfcheck DRAM", UINT64_C(0x08000000),
+                         UINT64_C(0x08000000), true) ||
+        !boot_framebuffer_plan(UINT64_C(0x0885c000), N82_FB_BYTES, true,
+                               &planned_static_end, &framebuffer) ||
+        planned_static_end != UINT64_C(0x0885c000) ||
+        framebuffer.begin != UINT64_C(0x0885c000) ||
+        framebuffer.end != UINT64_C(0x088f2000) ||
+        !boot_layout_validate(&dram, &framebuffer, 1u) ||
+        !boot_static_top_finalize(&dram, UINT64_C(0x0885c000),
+                                  &framebuffer, &top) ||
+        top != UINT64_C(0x088f4000))
+        return false;
+
+    if (!boot_framebuffer_plan(UINT64_C(0x0885c000), N82_FB_BYTES, false,
+                               &planned_static_end, &framebuffer) ||
+        framebuffer.active ||
+        !boot_static_top_finalize(&dram, UINT64_C(0x0885c000),
+                                  &framebuffer, &top) ||
+        top != UINT64_C(0x0885c000))
+        return false;
+
+    if (boot_static_top_finalize(&dram, UINT64_C(0x0fff0000),
+                                 &framebuffer, &top) ||
+        boot_framebuffer_plan(UINT64_MAX, N82_FB_BYTES, true,
+                              &planned_static_end, &framebuffer))
+        return false;
+
+    uint8_t boot_args[0x2c] = {0};
+    boot_args_put_le16(boot_args, 0x02u, 6u);
+    boot_args_put_le32(boot_args, 0x04u, UINT32_C(0xc0000000));
+    boot_args_put_le32(boot_args, 0x08u, UINT32_C(0x08000000));
+    boot_args_put_le32(boot_args, 0x0cu, UINT32_C(0x08000000));
+    boot_args_put_le32(boot_args, 0x10u, UINT32_C(0x0885c000));
+    boot_args_put_le32(boot_args, 0x14u, UINT32_C(0x0ff6a000));
+    boot_args_put_le32(boot_args, 0x1cu, N82_FB_WIDTH * N82_FB_BPP);
+    boot_args_put_le32(boot_args, 0x20u, N82_FB_WIDTH);
+    boot_args_put_le32(boot_args, 0x24u, N82_FB_HEIGHT);
+    boot_args_put_le32(boot_args, 0x28u, N82_FB_BPP * 8u);
+    if (!boot_args_video_layout_unsafe(
+            boot_args, sizeof boot_args, UINT32_C(0xc0000000),
+            UINT32_C(0x08000000), UINT32_C(0x08000000), NULL, NULL, NULL))
+        return false;
+
+    boot_args_put_le32(boot_args, 0x10u, UINT32_C(0x088f4000));
+    boot_args_put_le32(boot_args, 0x14u, UINT32_C(0x0885c000));
+    return !boot_args_video_layout_unsafe(
+        boot_args, sizeof boot_args, UINT32_C(0xc0000000),
+        UINT32_C(0x08000000), UINT32_C(0x08000000), NULL, NULL, NULL);
+}
+
 /* Applied in order; later entries win, and -D on the command line wins over
  * all of them. Nothing here changes firmware/devicetree.bin on disk — this
  * runs on the copy that is about to be loaded into guest RAM. */
@@ -2021,6 +2234,9 @@ static unsigned    NM;
 #define DISPLAY_PC_HASH_CAP 2048u
 #define DISPLAY_ENTRY_EDGE_CAP 1024u
 #define DISPLAY_RECENT_EDGE_CAP 128u
+#define TVOUT_MMIO_PAGE_COUNT 3u
+#define TVOUT_MMIO_REGISTER_COUNT 7u
+#define TVOUT_OBJECT_FIELD_COUNT 14u
 #define SPRINGBOARD_RETURN_CAP 32u
 #define SPRINGBOARD_PHASE_COUNT 6u
 #define SPRINGBOARD_TRAP_CAP 128u
@@ -2932,6 +3148,146 @@ typedef struct {
 } display_checkpoint_observation_t;
 
 /*
+ * Exact checkpoints for the AppleH1TVOut completion chain implicated by the
+ * stock 7E18 close wait.  They are deliberately read-only observations: the
+ * table does not synthesize an interrupt, complete a transaction, or alter an
+ * IOMFB queue.  The existing exact-target userspace observer owns the final
+ * 0x3110dc20 IOServiceClose return, so this kernel table stops at
+ * _is_io_service_close's clientClose return.
+ */
+typedef struct {
+    const char *name;
+    uint32_t va;
+    uint8_t object_reg;
+} tvout_chain_checkpoint_t;
+
+static const tvout_chain_checkpoint_t TVOUT_CHAIN_CHECKPOINTS[] = {
+    { "TVout:program-entry",              UINT32_C(0xc070756c), 0u },
+    { "TVout:irq-filter-entry",           UINT32_C(0xc07085cc), 0u },
+    { "TVout:irq-filter-accepted",        UINT32_C(0xc070861c), 2u },
+    { "TVout:irq-action-entry",           UINT32_C(0xc07084a0), 0u },
+    { "TVout:irq-completion-dispatch-if", UINT32_C(0xc0708550), 5u },
+    { "IOMFB:completion-entry",           UINT32_C(0xc0630064), 0u },
+    { "IOMFB:active-clear",               UINT32_C(0xc0630188), 4u },
+    { "IOMFB:wakeupGate-call",            UINT32_C(0xc0630290), 4u },
+    { "IOMFB:close-sleepGate-call",       UINT32_C(0xc062f130), 4u },
+    { "IOMFB:close-sleepGate-return",     UINT32_C(0xc062f134), 4u },
+    { "IOMFB:close-after-gated-work",     UINT32_C(0xc0630ae8), 4u },
+    { "IOMFB:close-epilogue",             UINT32_C(0xc0630b20), 4u },
+    { "IOKit:io-service-close-return",    UINT32_C(0xc019b57e), UINT8_MAX },
+};
+#define TVOUT_CHAIN_CHECKPOINT_COUNT \
+    ((unsigned)(sizeof TVOUT_CHAIN_CHECKPOINTS / \
+                sizeof TVOUT_CHAIN_CHECKPOINTS[0]))
+#define TVOUT_USER_CLOSE_RETURN_VA UINT32_C(0x3110dc20)
+
+static const uint32_t
+TVOUT_OBJECT_FIELD_OFFSETS[TVOUT_OBJECT_FIELD_COUNT] = {
+    UINT32_C(0x058), UINT32_C(0x060),
+    UINT32_C(0x16c), UINT32_C(0x170), UINT32_C(0x174),
+    UINT32_C(0x1a0), UINT32_C(0x1c4),
+    UINT32_C(0x1d0), UINT32_C(0x1d4),
+    UINT32_C(0x200), UINT32_C(0x204), UINT32_C(0x208),
+    UINT32_C(0x214), UINT32_C(0x23c)
+};
+
+typedef struct {
+    const char *name;
+    uint32_t addr;
+} tvout_mmio_register_t;
+
+/*
+ * The IRQ-30 filter reads these exact words.  The base words for all three
+ * device-tree ranges are also retained so a report distinguishes "never
+ * touched" from an all-zero, currently unmodelled register page.
+ */
+static const tvout_mmio_register_t
+TVOUT_MMIO_REGISTERS[TVOUT_MMIO_REGISTER_COUNT] = {
+    { "clk+000",        UINT32_C(0x39100000) },
+    { "out+000",        UINT32_C(0x39200000) },
+    { "out+004",        UINT32_C(0x39200004) },
+    { "enc+000",        UINT32_C(0x39300000) },
+    { "enc+040",        UINT32_C(0x39300040) },
+    { "enc+280-status", UINT32_C(0x39300280) },
+    { "enc+284-mask",   UINT32_C(0x39300284) },
+};
+
+static const uint32_t
+TVOUT_MMIO_PAGES[TVOUT_MMIO_PAGE_COUNT] = {
+    UINT32_C(0x39100000),
+    UINT32_C(0x39200000),
+    UINT32_C(0x39300000)
+};
+
+typedef struct {
+    uint64_t reads;
+    uint64_t writes;
+} tvout_mmio_page_state_t;
+
+typedef struct {
+    uint64_t reads;
+    uint64_t writes;
+    uint32_t last_read;
+    uint32_t last_write;
+    uint8_t last_read_bytes;
+    uint8_t last_write_bytes;
+    bool read_seen;
+    bool write_seen;
+} tvout_mmio_register_state_t;
+
+typedef struct {
+    uint32_t object;
+    uint32_t object_fields[TVOUT_OBJECT_FIELD_COUNT];
+    uint32_t object_failure_va;
+    uint32_t object_failure_fsr;
+    uint16_t object_readable_mask;
+
+    tvout_mmio_page_state_t mmio_pages[TVOUT_MMIO_PAGE_COUNT];
+    tvout_mmio_register_state_t
+        mmio_registers[TVOUT_MMIO_REGISTER_COUNT];
+    uint64_t unmapped_reads;
+    uint64_t unmapped_writes;
+
+    uint32_t vic_raw;
+    uint32_t vic_soft;
+    uint32_t vic_enable;
+    uint32_t vic_select;
+    bool vic_irq;
+    bool vic_fiq;
+    bool cpu_irq;
+    bool cpu_fiq;
+
+    uint64_t mach_sequence;
+    uint64_t mach_episode;
+    uint64_t mach_entry_at;
+    uint32_t mach_message_va;
+    uint32_t mach_options;
+    uint32_t mach_thread;
+    int32_t mach_request_id;
+    bool mach_active;
+    bool mach_request_readable;
+} tvout_chain_snapshot_t;
+
+typedef struct {
+    uint64_t at;
+    uint32_t r[13];
+    uint32_t sp;
+    uint32_t lr;
+    uint32_t cpsr;
+    uint32_t thread;
+    tvout_chain_snapshot_t snapshot;
+} tvout_chain_record_t;
+
+typedef struct {
+    uint64_t hits;
+    tvout_chain_record_t first;
+    tvout_chain_record_t last;
+    uint64_t active_mach_hits;
+    tvout_chain_record_t first_active_mach;
+    tvout_chain_record_t last_active_mach;
+} tvout_chain_observation_t;
+
+/*
  * Exact iPhone OS 3.1.3 PMU/I2C instruction-entry checkpoints.  These
  * addresses are deliberately diagnostic rather than emulation policy: the
  * external-md firmware gate already identifies the one kernel they describe,
@@ -3107,6 +3463,12 @@ static struct {
     display_exec_diag_t merlot_exec;
     display_checkpoint_observation_t
                 display_checkpoint[DISPLAY_CHECKPOINT_COUNT];
+    tvout_chain_observation_t
+                tvout_chain[TVOUT_CHAIN_CHECKPOINT_COUNT];
+    tvout_mmio_page_state_t
+                tvout_mmio_pages[TVOUT_MMIO_PAGE_COUNT];
+    tvout_mmio_register_state_t
+                tvout_mmio_registers[TVOUT_MMIO_REGISTER_COUNT];
     pmu_checkpoint_observation_t
                 pmu_checkpoint[PMU_CHECKPOINT_COUNT];
 
@@ -4335,6 +4697,26 @@ static springboard_mach_event_t *springboard_target_mach_active(
         trace->target_mach_active = false;
         return NULL;
     }
+    return event;
+}
+
+/*
+ * Passive diagnostics must never repair or invalidate the target tracker.
+ * This const variant verifies the same ring invariants as the state-owning
+ * helper above, but a TV-out checkpoint can only observe the result.
+ */
+static const springboard_mach_event_t *
+springboard_target_mach_active_const(
+        const springboard_exec_trace_t *trace) {
+    if (!trace || !trace->target_mach_active) return NULL;
+    const springboard_mach_event_t *event =
+        &trace->target_mach[
+            trace->target_mach_active_sequence %
+                SPRINGBOARD_MACH_EVENT_CAP];
+    if (!event->valid || !event->open ||
+        event->sequence != trace->target_mach_active_sequence ||
+        event->episode != trace->target_episode)
+        return NULL;
     return event;
 }
 
@@ -7032,12 +7414,67 @@ static BOOTKERNEL_NOINLINE void note_framebuffer_write(
     }
 }
 
+static inline unsigned tvout_mmio_page_index(uint32_t addr) {
+    switch (addr & ~UINT32_C(0xfff)) {
+        case UINT32_C(0x39100000): return 0u;
+        case UINT32_C(0x39200000): return 1u;
+        case UINT32_C(0x39300000): return 2u;
+        default: break;
+    }
+    return TVOUT_MMIO_PAGE_COUNT;
+}
+
+static inline unsigned tvout_mmio_register_index(uint32_t addr) {
+    switch (addr) {
+        case UINT32_C(0x39100000): return 0u;
+        case UINT32_C(0x39200000): return 1u;
+        case UINT32_C(0x39200004): return 2u;
+        case UINT32_C(0x39300000): return 3u;
+        case UINT32_C(0x39300040): return 4u;
+        case UINT32_C(0x39300280): return 5u;
+        case UINT32_C(0x39300284): return 6u;
+        default: break;
+    }
+    return TVOUT_MMIO_REGISTER_COUNT;
+}
+
+/*
+ * Preserve only values already returned to or written by the guest.  Issuing a
+ * diagnostic MMIO read here would be wrong for both W1C and read-to-clear
+ * registers, and would make the observer capable of completing its own test.
+ */
+static inline void tvout_mmio_note(
+        uint32_t addr, uint32_t val, unsigned bytes, bool wr) {
+    unsigned page = tvout_mmio_page_index(addr);
+    if (page < TVOUT_MMIO_PAGE_COUNT) {
+        if (wr) G.tvout_mmio_pages[page].writes++;
+        else G.tvout_mmio_pages[page].reads++;
+    }
+
+    unsigned reg = tvout_mmio_register_index(addr);
+    if (reg >= TVOUT_MMIO_REGISTER_COUNT) return;
+    tvout_mmio_register_state_t *state =
+        &G.tvout_mmio_registers[reg];
+    if (wr) {
+        state->writes++;
+        state->last_write = val;
+        state->last_write_bytes = (uint8_t)bytes;
+        state->write_seen = true;
+    } else {
+        state->reads++;
+        state->last_read = val;
+        state->last_read_bytes = (uint8_t)bytes;
+        state->read_seen = true;
+    }
+}
+
 static void spy_nonram(
         uint32_t addr, uint32_t val, unsigned bytes, bool wr) {
     uint32_t pc = G.mach->cpu.r[15];
     uint32_t cpsr = G.mach->cpu.cpsr;
     bool mmu_enabled =
         (G.mach->cpu.cp15.sctlr & ARM_SCTLR_M) != 0u;
+    tvout_mmio_note(addr, val, bytes, wr);
     note_dev_page(addr, pc, cpsr, mmu_enabled, wr);
     if ((addr & ~0xfffu) == G.hot_page) note_hot(addr, val, bytes, wr);
     if ((addr & ~0xfffu) == UARTPG) {
@@ -9229,7 +9666,175 @@ static void display_driver_exec_report(const char *name, uint32_t vm_base,
     }
 }
 
+static inline unsigned tvout_chain_checkpoint_index(uint32_t pc) {
+    if (pc >= UINT32_C(0xc062f130) &&
+        pc <= UINT32_C(0xc0630b20)) {
+        switch (pc) {
+            case UINT32_C(0xc0630064): return 5u;
+            case UINT32_C(0xc0630188): return 6u;
+            case UINT32_C(0xc0630290): return 7u;
+            case UINT32_C(0xc062f130): return 8u;
+            case UINT32_C(0xc062f134): return 9u;
+            case UINT32_C(0xc0630ae8): return 10u;
+            case UINT32_C(0xc0630b20): return 11u;
+            default: break;
+        }
+    } else if (pc >= UINT32_C(0xc070756c) &&
+               pc <= UINT32_C(0xc070861c)) {
+        switch (pc) {
+            case UINT32_C(0xc070756c): return 0u;
+            case UINT32_C(0xc07085cc): return 1u;
+            case UINT32_C(0xc070861c): return 2u;
+            case UINT32_C(0xc07084a0): return 3u;
+            case UINT32_C(0xc0708550): return 4u;
+            default: break;
+        }
+    } else if (pc == UINT32_C(0xc019b57e)) {
+        return 12u;
+    }
+    return TVOUT_CHAIN_CHECKPOINT_COUNT;
+}
+
+static void tvout_chain_snapshot_capture(
+        tvout_chain_snapshot_t *snapshot,
+        const tvout_chain_checkpoint_t *checkpoint,
+        arm_cpu_t *cpu) {
+    if (!snapshot || !checkpoint || !cpu) return;
+    memset(snapshot, 0, sizeof *snapshot);
+
+    if (checkpoint->object_reg < 13u) {
+        snapshot->object = cpu->r[checkpoint->object_reg];
+        for (unsigned i = 0; i < TVOUT_OBJECT_FIELD_COUNT; i++) {
+            uint32_t failure_va = 0, failure_fsr = 0;
+            if (springboard_child_read_field(
+                    cpu, snapshot->object,
+                    TVOUT_OBJECT_FIELD_OFFSETS[i],
+                    &snapshot->object_fields[i],
+                    &failure_va, &failure_fsr)) {
+                snapshot->object_readable_mask |=
+                    (uint16_t)(UINT16_C(1) << i);
+            } else if (!snapshot->object_failure_va) {
+                snapshot->object_failure_va =
+                    failure_va ? failure_va : snapshot->object;
+                snapshot->object_failure_fsr = failure_fsr;
+            }
+        }
+    }
+
+    memcpy(snapshot->mmio_pages, G.tvout_mmio_pages,
+           sizeof snapshot->mmio_pages);
+    memcpy(snapshot->mmio_registers, G.tvout_mmio_registers,
+           sizeof snapshot->mmio_registers);
+    if (G.mach) {
+        const s5l_vic_t *vic = &G.mach->vic[0];
+        snapshot->unmapped_reads = G.mach->unmapped_reads;
+        snapshot->unmapped_writes = G.mach->unmapped_writes;
+        snapshot->vic_raw = vic->raw;
+        snapshot->vic_soft = vic->soft;
+        snapshot->vic_enable = vic->enable;
+        snapshot->vic_select = vic->select;
+        snapshot->vic_irq = s5l_vic_irq(vic);
+        snapshot->vic_fiq = s5l_vic_fiq(vic);
+    }
+    snapshot->cpu_irq = cpu->irq_line != 0;
+    snapshot->cpu_fiq = cpu->fiq_line != 0;
+
+    const springboard_mach_event_t *event =
+        springboard_target_mach_active_const(
+            &G.springboard_exec_trace);
+    if (event) {
+        snapshot->mach_sequence = event->sequence;
+        snapshot->mach_episode = event->episode;
+        snapshot->mach_entry_at = event->entry_at;
+        snapshot->mach_message_va = event->args[0];
+        snapshot->mach_options = event->args[1];
+        snapshot->mach_thread = event->thread;
+        snapshot->mach_request_id = event->request_header.id;
+        snapshot->mach_active = true;
+        snapshot->mach_request_readable =
+            event->request_header.readable;
+    }
+}
+
+static void tvout_chain_record_capture(
+        tvout_chain_record_t *record, uint64_t at,
+        const tvout_chain_checkpoint_t *checkpoint,
+        arm_cpu_t *cpu) {
+    if (!record || !checkpoint || !cpu) return;
+    memset(record, 0, sizeof *record);
+    record->at = at;
+    memcpy(record->r, cpu->r, sizeof record->r);
+    record->sp = cpu->r[13];
+    record->lr = cpu->r[14];
+    record->cpsr = cpu->cpsr;
+    record->thread = cpu->cp15.tpidrprw;
+    tvout_chain_snapshot_capture(
+        &record->snapshot, checkpoint, cpu);
+}
+
+static void tvout_chain_checkpoint_note(
+        unsigned index, uint64_t at, arm_cpu_t *cpu) {
+    if (index >= TVOUT_CHAIN_CHECKPOINT_COUNT || !cpu) return;
+    tvout_chain_observation_t *observation =
+        &G.tvout_chain[index];
+    tvout_chain_record_t record;
+    tvout_chain_record_capture(
+        &record, at, &TVOUT_CHAIN_CHECKPOINTS[index], cpu);
+
+    if (!observation->hits) observation->first = record;
+    observation->hits++;
+    observation->last = record;
+    if (record.snapshot.mach_active) {
+        if (!observation->active_mach_hits)
+            observation->first_active_mach = record;
+        observation->active_mach_hits++;
+        observation->last_active_mach = record;
+    }
+}
+
+static inline void tvout_chain_checkpoint_observe(
+        uint32_t pc, uint64_t at, arm_cpu_t *cpu) {
+    unsigned index = tvout_chain_checkpoint_index(pc);
+    if (index < TVOUT_CHAIN_CHECKPOINT_COUNT)
+        tvout_chain_checkpoint_note(index, at, cpu);
+}
+
+static bool tvout_chain_classifier_selfcheck(void) {
+    for (unsigned i = 0; i < TVOUT_CHAIN_CHECKPOINT_COUNT; i++) {
+        uint32_t pc = TVOUT_CHAIN_CHECKPOINTS[i].va;
+        if (tvout_chain_checkpoint_index(pc) != i ||
+            tvout_chain_checkpoint_index(pc - 2u) !=
+                TVOUT_CHAIN_CHECKPOINT_COUNT ||
+            tvout_chain_checkpoint_index(pc + 2u) !=
+                TVOUT_CHAIN_CHECKPOINT_COUNT)
+            return false;
+    }
+    for (unsigned i = 0; i < TVOUT_MMIO_REGISTER_COUNT; i++) {
+        uint32_t addr = TVOUT_MMIO_REGISTERS[i].addr;
+        if (tvout_mmio_register_index(addr) != i ||
+            tvout_mmio_register_index(addr + 1u) !=
+                TVOUT_MMIO_REGISTER_COUNT)
+            return false;
+    }
+    for (unsigned i = 0; i < TVOUT_MMIO_PAGE_COUNT; i++) {
+        uint32_t page = TVOUT_MMIO_PAGES[i];
+        if (tvout_mmio_page_index(page) != i ||
+            tvout_mmio_page_index(page + UINT32_C(0xfff)) != i)
+            return false;
+    }
+    return tvout_chain_checkpoint_index(0u) ==
+               TVOUT_CHAIN_CHECKPOINT_COUNT &&
+           tvout_chain_checkpoint_index(UINT32_MAX) ==
+               TVOUT_CHAIN_CHECKPOINT_COUNT &&
+           tvout_mmio_register_index(0u) ==
+               TVOUT_MMIO_REGISTER_COUNT &&
+           tvout_mmio_page_index(0u) == TVOUT_MMIO_PAGE_COUNT &&
+           springboard_ui_checkpoint_index(
+               TVOUT_USER_CLOSE_RETURN_VA) >= 0;
+}
+
 static void display_checkpoint_report(void);
+static void tvout_chain_report(void);
 
 static void display_exec_report(uint32_t virt_base, uint32_t phys_base,
                                 uint32_t ram_size) {
@@ -9253,6 +9858,7 @@ static void display_exec_report(uint32_t virt_base, uint32_t phys_base,
         "AppleMerlotLCD      ", MERLOT_LCD_VM_BASE, MERLOT_LCD_VM_SIZE,
         merlot_alias, merlot_pa, &G.merlot_exec);
     display_checkpoint_report();
+    tvout_chain_report();
     printf("    IMPORTANT: these are instruction-entry observations only; "
            "they do not prove retirement,\n"
            "               successful driver start, framebuffer rendering, "
@@ -9440,6 +10046,258 @@ static void display_checkpoint_report(void) {
             "first", &observation->first_surface);
         display_surface_snapshot_report(
             "last ", &observation->last_surface);
+    }
+}
+
+static void tvout_chain_record_report(
+        const char *label, const tvout_chain_record_t *record) {
+    if (!label || !record) return;
+    const tvout_chain_snapshot_t *snapshot = &record->snapshot;
+    printf("            %-12s @%-11" PRIu64
+           " r0-r3=%08x/%08x/%08x/%08x"
+           " r4/r5/r8/r12=%08x/%08x/%08x/%08x\n"
+           "                         sp/lr=%08x/%08x"
+           " cpsr=%08x thread=%08x\n",
+           label, record->at,
+           record->r[0], record->r[1],
+           record->r[2], record->r[3],
+           record->r[4], record->r[5],
+           record->r[8], record->r[12],
+           record->sp, record->lr,
+           record->cpsr, record->thread);
+
+    if (snapshot->object) {
+        printf("                         object=%08x fields",
+               snapshot->object);
+        for (unsigned i = 0; i < TVOUT_OBJECT_FIELD_COUNT; i++) {
+            if (snapshot->object_readable_mask &
+                    (uint16_t)(UINT16_C(1) << i))
+                printf(" +%03x=%08x",
+                       TVOUT_OBJECT_FIELD_OFFSETS[i],
+                       snapshot->object_fields[i]);
+        }
+        if (snapshot->object_failure_va)
+            printf(" first-unreadable-va/fsr=%08x/%08x",
+                   snapshot->object_failure_va,
+                   snapshot->object_failure_fsr);
+        printf("\n");
+    }
+
+    const uint32_t irq30 = UINT32_C(1) << 30;
+    printf("                         VIC0 raw/soft/en/sel="
+           "%08x/%08x/%08x/%08x irq/fiq=%u/%u"
+           " CPU=%u/%u IRQ30 raw/en/fiq=%u/%u/%u\n",
+           snapshot->vic_raw, snapshot->vic_soft,
+           snapshot->vic_enable, snapshot->vic_select,
+           snapshot->vic_irq ? 1u : 0u,
+           snapshot->vic_fiq ? 1u : 0u,
+           snapshot->cpu_irq ? 1u : 0u,
+           snapshot->cpu_fiq ? 1u : 0u,
+           (snapshot->vic_raw & irq30) ? 1u : 0u,
+           (snapshot->vic_enable & irq30) ? 1u : 0u,
+           (snapshot->vic_select & irq30) ? 1u : 0u);
+    printf("                         passive MMIO pages"
+           " 391 r/w=%" PRIu64 "/%" PRIu64
+           " 392=%" PRIu64 "/%" PRIu64
+           " 393=%" PRIu64 "/%" PRIu64
+           " all-unmapped=%" PRIu64 "/%" PRIu64 "\n",
+           snapshot->mmio_pages[0].reads,
+           snapshot->mmio_pages[0].writes,
+           snapshot->mmio_pages[1].reads,
+           snapshot->mmio_pages[1].writes,
+           snapshot->mmio_pages[2].reads,
+           snapshot->mmio_pages[2].writes,
+           snapshot->unmapped_reads, snapshot->unmapped_writes);
+    printf("                         passive last MMIO:");
+    bool any_mmio = false;
+    for (unsigned i = 0; i < TVOUT_MMIO_REGISTER_COUNT; i++) {
+        const tvout_mmio_register_state_t *state =
+            &snapshot->mmio_registers[i];
+        if (!state->read_seen && !state->write_seen) continue;
+        any_mmio = true;
+        printf(" %s", TVOUT_MMIO_REGISTERS[i].name);
+        if (state->read_seen)
+            printf(" R%u=%08x(%" PRIu64 ")",
+                   state->last_read_bytes, state->last_read,
+                   state->reads);
+        if (state->write_seen)
+            printf(" W%u=%08x(%" PRIu64 ")",
+                   state->last_write_bytes, state->last_write,
+                   state->writes);
+    }
+    printf("%s\n", any_mmio ? "" : " none");
+
+    if (snapshot->mach_active) {
+        printf("                         active Mach #%" PRIu64
+               " episode=%" PRIu64 " entry@%" PRIu64
+               " msg/options=%08x/%08x thread=%08x request-id=",
+               snapshot->mach_sequence, snapshot->mach_episode,
+               snapshot->mach_entry_at,
+               snapshot->mach_message_va, snapshot->mach_options,
+               snapshot->mach_thread);
+        if (snapshot->mach_request_readable)
+            printf("%d (0x%08x)\n",
+                   snapshot->mach_request_id,
+                   (uint32_t)snapshot->mach_request_id);
+        else
+            printf("unreadable\n");
+    }
+}
+
+static const springboard_mach_event_t *tvout_chain_retained_mach_event(
+        uint64_t sequence) {
+    const springboard_exec_trace_t *trace =
+        &G.springboard_exec_trace;
+    const springboard_mach_event_t *event =
+        &trace->target_mach[
+            sequence % SPRINGBOARD_MACH_EVENT_CAP];
+    return event->valid && event->sequence == sequence
+        ? event : NULL;
+}
+
+static void tvout_chain_report(void) {
+    printf("        exact AppleH1TVOut completion/close chain"
+           " (all state is pre-instruction):\n"
+           "          MMIO values below are passive last bus transactions;"
+           " this observer performs no device reads.\n");
+    if (G.mach) {
+        const s5l_tvout_t *tvout = &G.mach->tvout;
+        const s5l_vic_t *vic = &G.mach->vic[0];
+        printf("          current non-invasive model state:"
+               " running=%u frame-ticks/phase/frames=%u/%u/%" PRIu64
+               " irq30-level=%u\n"
+               "            stored 391+000=%08x"
+               " 392+000/+004/+04c=%08x/%08x/%08x\n"
+               "                   393+000/+040/+280/+284="
+               "%08x/%08x/%08x/%08x\n"
+               "            VIC0 raw/en/sel=%08x/%08x/%08x"
+               " CPU irq/fiq=%u/%u\n",
+               s5l_tvout_running(tvout) ? 1u : 0u,
+               tvout->frame_ticks, tvout->frame_accum,
+               tvout->frames, s5l_tvout_irq(tvout) ? 1u : 0u,
+               tvout->regs[S5L_TVOUT_BANK_CTRL][0],
+               tvout->regs[S5L_TVOUT_BANK_MIXER][0],
+               tvout->regs[S5L_TVOUT_BANK_MIXER][1],
+               tvout->regs[S5L_TVOUT_BANK_MIXER][
+                   TVOUT_MIXER_STATUS / 4u],
+               tvout->regs[S5L_TVOUT_BANK_SDO][0],
+               tvout->regs[S5L_TVOUT_BANK_SDO][
+                   UINT32_C(0x40) / 4u],
+               tvout->regs[S5L_TVOUT_BANK_SDO][
+                   TVOUT_SDO_IRQ / 4u],
+               tvout->regs[S5L_TVOUT_BANK_SDO][
+                   TVOUT_SDO_IRQMASK / 4u],
+               vic->raw, vic->enable, vic->select,
+               G.mach->cpu.irq_line ? 1u : 0u,
+               G.mach->cpu.fiq_line ? 1u : 0u);
+    }
+    for (unsigned i = 0; i < TVOUT_CHAIN_CHECKPOINT_COUNT; i++) {
+        const tvout_chain_observation_t *observation =
+            &G.tvout_chain[i];
+        printf("          %-32s pc=%08x hits=%" PRIu64
+               " active-Mach=%" PRIu64 "\n",
+               TVOUT_CHAIN_CHECKPOINTS[i].name,
+               TVOUT_CHAIN_CHECKPOINTS[i].va,
+               observation->hits,
+               observation->active_mach_hits);
+        if (!observation->hits) continue;
+        tvout_chain_record_report("first", &observation->first);
+        if (observation->last.at != observation->first.at)
+            tvout_chain_record_report("last", &observation->last);
+        if (observation->active_mach_hits &&
+            observation->first_active_mach.at !=
+                observation->first.at &&
+            observation->first_active_mach.at !=
+                observation->last.at)
+            tvout_chain_record_report(
+                "first-active", &observation->first_active_mach);
+        if (observation->active_mach_hits &&
+            observation->last_active_mach.at !=
+                observation->first.at &&
+            observation->last_active_mach.at !=
+                observation->last.at &&
+            observation->last_active_mach.at !=
+                observation->first_active_mach.at)
+            tvout_chain_record_report(
+                "last-active", &observation->last_active_mach);
+    }
+
+    const tvout_chain_record_t *anchor = NULL;
+    static const uint8_t anchor_priority[] = {
+        8u, 9u, 10u, 11u, 12u, 0u, 1u, 3u, 5u, 6u, 7u
+    };
+    for (unsigned i = 0;
+         i < sizeof anchor_priority / sizeof anchor_priority[0]; i++) {
+        const tvout_chain_observation_t *observation =
+            &G.tvout_chain[anchor_priority[i]];
+        if (observation->active_mach_hits) {
+            anchor = &observation->last_active_mach;
+            break;
+        }
+    }
+
+    int user_index =
+        springboard_ui_checkpoint_index(TVOUT_USER_CLOSE_RETURN_VA);
+    const springboard_ui_checkpoint_observation_t *user_return =
+        user_index >= 0
+            ? &G.springboard_exec_trace
+                 .ui_checkpoints[(unsigned)user_index]
+            : NULL;
+    printf("          close correlation: user return pc=%08x hits=%" PRIu64,
+           TVOUT_USER_CLOSE_RETURN_VA,
+           user_return ? user_return->hits : UINT64_C(0));
+    if (user_return && user_return->hits)
+        printf(" last@%" PRIu64 " r0=%08x thread=%08x",
+               user_return->last_at, user_return->last_r[0],
+               user_return->last_thread);
+    printf("\n");
+
+    if (anchor) {
+        const tvout_chain_snapshot_t *snapshot = &anchor->snapshot;
+        const springboard_mach_event_t *event =
+            tvout_chain_retained_mach_event(
+                snapshot->mach_sequence);
+        printf("            checkpoint anchor @%" PRIu64
+               " Mach #%" PRIu64 " request-id=",
+               anchor->at, snapshot->mach_sequence);
+        if (snapshot->mach_request_readable)
+            printf("%d", snapshot->mach_request_id);
+        else
+            printf("unreadable");
+        printf(" request-thread=%08x retained=%s",
+               snapshot->mach_thread, event ? "yes" : "no");
+        if (event) {
+            printf(" open=%u resolution=%s result=%s%08x",
+                   event->open ? 1u : 0u,
+                   springboard_mach_resolution_name(
+                       event->resolution_kind),
+                   event->result_observed ? "" : "unobserved/",
+                   event->raw_result);
+            if (user_return && user_return->hits) {
+                bool same_thread =
+                    user_return->last_thread ==
+                        snapshot->mach_thread;
+                bool same_return_boundary =
+                    event->resolution_seen &&
+                    (user_return->last_at == event->resolution_at ||
+                     (event->resolution_at != UINT64_MAX &&
+                      user_return->last_at ==
+                          event->resolution_at + UINT64_C(1)));
+                printf(" resolution@%" PRIu64
+                       " same-request-user-return=%s",
+                       event->resolution_at,
+                       same_thread && same_return_boundary
+                           ? "yes" : "NO");
+            }
+        } else if (user_return && user_return->hits) {
+            printf(" same-user-thread=%s",
+                   user_return->last_thread == snapshot->mach_thread
+                       ? "yes" : "NO");
+        }
+        printf("\n");
+    } else {
+        printf("            no chain checkpoint overlapped an exact-target"
+               " active Mach request\n");
     }
 }
 
@@ -9879,7 +10737,9 @@ int main(int argc, char **argv) {
             "      same-size RAM at the same base. -c and the kernel image do not\n"
             "      change geometry, but pass the same ones anyway — the report\n"
             "      header echoes them and a mismatched header describes a machine\n"
-            "      that is not the one being run.\n"
+            "      that is not the one being run. Recognized old -F snapshots\n"
+            "      whose Boot_Video buffer lies above topOfKernelData are unsafe\n"
+            "      and rejected; recreate them from a corrected cold boot.\n"
             "      NOTE the host-side diagnostics below (trace ring, milestone\n"
             "      hit counts, sampled profile, hot-page log) are NOT machine\n"
             "      state and are not restored; they start fresh and therefore\n"
@@ -9937,9 +10797,10 @@ int main(int argc, char **argv) {
             "  -b  boot_args Revision field (default 1)\n"
             "  -M  do not synthesise /memory reg from the RAM layout\n"
             "  -F  reserve a 320x480x32 Boot_Video buffer, seed an iBoot-\n"
-            "      compatible N82 CLCD handoff, and patch the Merlot panel\n"
-            "      ID when -d is present. v_display stays 0 so the kernel can\n"
-            "      draw boot text; remove serial=1 from -c to route it there.\n"
+            "      compatible N82 CLCD handoff, protect the buffer below\n"
+            "      topOfKernelData, and patch the Merlot panel ID when -d is\n"
+            "      present. v_display stays 0 so the kernel can draw boot text;\n"
+            "      remove serial=1 from -c to route it there.\n"
             "  -g  graphics experiment: implies -F, sets v_display=1, and\n"
             "      leaves the unmodelled MBX driver matched (it may stall).\n"
             "  -W  <lo>[:<hi>] restrict the sampled profile / hot-PC table /\n"
@@ -9962,9 +10823,8 @@ int main(int argc, char **argv) {
     const char *dtpath = NULL;
     const char *cmdline = "debug=0x8 serial=1";
     bool stop_on_abort = false;
-    /* Advertising a framebuffer moves topOfKernelData and therefore where the
-     * kernel places its page tables; that regressed the boot, so it is opt-in
-     * until the interaction is understood. */
+    /* The boot framebuffer is reserved below topOfKernelData. It remains
+     * opt-in because headless diagnostics do not need display scanout. */
     bool want_fb = false;
     uint32_t v_display = 0;   /* 0 = kernel text console draws; 1 = defer to IOMFB */
     bool want_mbx = false;    /* -g keeps the (unmodelled, hang-prone) MBX GPU driver */
@@ -10414,6 +11274,11 @@ int main(int argc, char **argv) {
     g_virt_base = virt_base;
     g_phys_base = phys_base;
     g_ram_size = ram_size;
+    if (!boot_memory_layout_selfcheck()) {
+        fprintf(stderr,
+                "internal error: boot memory layout self-check failed\n");
+        return 2;
+    }
     if (!diagnostic_pc_classifier_selfcheck()) {
         fprintf(stderr,
                 "internal error: diagnostic PC classifier self-check failed\n");
@@ -10427,6 +11292,12 @@ int main(int argc, char **argv) {
     if (!display_checkpoint_classifier_selfcheck()) {
         fprintf(stderr,
                 "internal error: display checkpoint classifier"
+                " self-check failed\n");
+        return 2;
+    }
+    if (!tvout_chain_classifier_selfcheck()) {
+        fprintf(stderr,
+                "internal error: TV-out completion-chain classifier"
                 " self-check failed\n");
         return 2;
     }
@@ -10863,21 +11734,20 @@ int main(int argc, char **argv) {
     }
     uint32_t raw_bounce_pa = (uint32_t)raw_bounce_pa64;
 
-    uint64_t fb_start64 = 0, planned_static_end64 = 0;
+    uint64_t static_input_end64 = external_md
+                                ? raw_bounce_range.end
+                                : (legacy_ramdisk && !rd_low)
+                                      ? rd_range.end : ba_range.end;
+    uint64_t planned_static_end64 = 0;
+    uint64_t planned_top_of_kernel_data64 = 0;
     boot_range_t fb_range;
-    if (want_fb) {
-        if ((uint64_t)ram_size < fb_bytes) {
-            fprintf(stderr,
-                    "framebuffer: %u bytes do not fit in %u bytes of DRAM\n",
-                    fb_bytes, ram_size);
-            streamed_file_close(&rd_source);
-            return 1;
-        }
-        fb_start64 = (dram_range.end - fb_bytes) & ~UINT64_C(0xfff);
-    }
-    if (!boot_range_make(&fb_range, "framebuffer", fb_start64, fb_bytes,
-                         want_fb)) {
-        fprintf(stderr, "framebuffer: physical span overflow\n");
+    if ((want_fb && (uint64_t)ram_size < fb_bytes) ||
+        !boot_framebuffer_plan(static_input_end64, fb_bytes, want_fb,
+                               &planned_static_end64, &fb_range)) {
+        fprintf(stderr,
+                "framebuffer: %u-byte boot reserve cannot be placed safely "
+                "after the static layout\n",
+                fb_bytes);
         streamed_file_close(&rd_source);
         return 1;
     }
@@ -10886,21 +11756,23 @@ int main(int argc, char **argv) {
         kernel_range, dt_range, ba_range, rd_range, raw_bounce_range, fb_range
     };
     if (!boot_layout_validate(&dram_range, layout_ranges,
-                              sizeof layout_ranges / sizeof layout_ranges[0])) {
+                               sizeof layout_ranges / sizeof layout_ranges[0])) {
         streamed_file_close(&rd_source);
         return 1;
     }
-    uint64_t static_input_end64 = external_md
-                                ? raw_bounce_range.end
-                                : (legacy_ramdisk && !rd_low)
-                                      ? rd_range.end : ba_range.end;
-    if (!align_u64(static_input_end64, 0x4000u, &planned_static_end64) ||
-        planned_static_end64 > dram_range.end ||
-        (want_fb && planned_static_end64 > fb_range.begin)) {
+    if (fb_range.active && fb_range.begin > UINT32_MAX) {
         fprintf(stderr,
-                "layout: static boot reserve ending at 0x%llx reaches the "
-                "framebuffer or leaves DRAM\n",
-                (unsigned long long)planned_static_end64);
+                "framebuffer: physical base exceeds the 32-bit CLCD field\n");
+        streamed_file_close(&rd_source);
+        return 1;
+    }
+    if (!boot_static_top_finalize(&dram_range, planned_static_end64,
+                                  &fb_range,
+                                  &planned_top_of_kernel_data64)) {
+        fprintf(stderr,
+                "layout: static boot reserve cannot leave the required "
+                "0x%llx bytes of bootstrap headroom in DRAM\n",
+                (unsigned long long)BOOT_MIN_BOOTSTRAP_HEADROOM);
         streamed_file_close(&rd_source);
         return 1;
     }
@@ -10948,15 +11820,12 @@ int main(int argc, char **argv) {
     uint32_t rd_len = (uint32_t)rd_len64;
 
     /*
-     * topOfKernelData is where the kernel starts placing its own page tables,
-     * so anything counted below it moves them. Placing the framebuffer here
-     * and then advancing topOfKernelData past it is what made -F regress into
-     * a prefetch abort: the buffer itself was fine, but every table the kernel
-     * built afterwards landed somewhere else.
-     *
-     * Real iBoot does not put the framebuffer immediately after the kernel; it
-     * sits near the top of DRAM, far above the kernel's data. Do the same, and
-     * leave topOfKernelData describing only the kernel's own data.
+     * Boot_Video is boot-owned memory, just like the device tree, boot_args and
+     * raw-I/O bounce slots. Leaving it near the top of DRAM while TOKD stopped
+     * below it advertised the scanout pages to XNU's free-page allocator. Put
+     * it immediately after the conservative static reserve and include its end
+     * in TOKD; otherwise an allocator write can corrupt the handoff before
+     * IOMobileFramebuffer adopts it.
      */
     /*
      * MEASURED, and the thing that cost the most time here: topOfKernelData
@@ -10973,19 +11842,22 @@ int main(int argc, char **argv) {
      *   FIRST exception entry at instruction 39767: mode 13 -> 17,
      *     caused by pc 0x080691b0, vectored to 0xffff000c  (IFSR 0x05)
      *
-     * With no RAM disk the sum happened to land 16 KB aligned, which is why
-     * this never showed up before — and why the framebuffer regression noted
-     * above looked like a framebuffer problem.
+     * With no RAM disk the sum happened to land 16 KB aligned. Every storage
+     * and framebuffer mode now reaches this value through the same finalizer.
      */
     uint64_t top_of_kernel_data64;
     uint64_t actual_static_end64 = external_md
                                  ? raw_bounce_range.end
                                  : (legacy_ramdisk && !rd_low)
                                        ? rd_actual_end64 : ba_range.end;
-    if (!align_u64(actual_static_end64, 0x4000u, &top_of_kernel_data64) ||
-        top_of_kernel_data64 > planned_static_end64 ||
-        top_of_kernel_data64 > UINT32_MAX) {
-        fprintf(stderr, "layout: final topOfKernelData exceeds its checked reserve\n");
+    if (actual_static_end64 > planned_static_end64 ||
+        !boot_static_top_finalize(&dram_range, actual_static_end64,
+                                  &fb_range, &top_of_kernel_data64) ||
+        top_of_kernel_data64 > planned_top_of_kernel_data64) {
+        fprintf(stderr,
+                "layout: final topOfKernelData exceeds its checked reserve or "
+                "leaves less than 0x%llx bytes of bootstrap headroom\n",
+                (unsigned long long)BOOT_MIN_BOOTSTRAP_HEADROOM);
         return 1;
     }
     uint32_t top_of_kernel_data = (uint32_t)top_of_kernel_data64;
@@ -11006,42 +11878,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    const uint64_t dram_end64 = dram_range.end;
-    uint32_t fb_pa = top_of_kernel_data;
-
-    /* Do all placement arithmetic in 64 bits. A wrapped subtraction here used
-     * to turn a too-small RAM aperture into a plausible high physical address,
-     * and the final framebuffer scan then indexed outside mach.ram. */
-    if ((uint64_t)top_of_kernel_data < phys_base ||
-        (uint64_t)top_of_kernel_data > dram_end64) {
-        fprintf(stderr,
-                "layout: topOfKernelData 0x%08x is outside DRAM "
-                "[0x%08x,0x%llx) — reduce the RAM disk or raise -R\n",
-                top_of_kernel_data, phys_base,
-                (unsigned long long)dram_end64);
-        return 1;
-    }
-    if (want_fb) {
-        if ((uint64_t)ram_size < fb_bytes) {
-            fprintf(stderr,
-                    "framebuffer: %u bytes do not fit in %u bytes of DRAM\n",
-                    fb_bytes, ram_size);
-            return 1;
-        }
-        uint64_t start = (dram_end64 - fb_bytes) & ~UINT64_C(0xfff);
-        uint64_t end = start + fb_bytes;
-        if (start < phys_base || start > UINT32_MAX || end > dram_end64 ||
-            (uint64_t)top_of_kernel_data > start) {
-            fprintf(stderr,
-                    "framebuffer: 0x%llx..0x%llx overlaps the static boot "
-                    "layout ending at 0x%08x or lies outside DRAM — "
-                    "reduce the RAM disk or raise -R\n",
-                    (unsigned long long)start, (unsigned long long)end,
-                    top_of_kernel_data);
-            return 1;
-        }
-        fb_pa = (uint32_t)start;
-    }
+    uint32_t fb_pa = want_fb ? (uint32_t)fb_range.begin : 0u;
 
     /*
      * The address to publish in /chosen/memory-map:RAMDisk.
@@ -11471,6 +12308,20 @@ int main(int argc, char **argv) {
         }
         printf("restored   : %s at %llu retired instructions  (pc 0x%08x)\n\n",
                restore_path, (unsigned long long)mach.cpu.cycles, mach.cpu.r[15]);
+        uint32_t restored_fb_begin = 0;
+        uint32_t restored_top = 0;
+        uint64_t restored_fb_end = 0;
+        if (restored_boot_video_layout_unsafe(
+                &mach, ba_pa, virt_base, &restored_fb_begin,
+                &restored_fb_end, &restored_top)) {
+            fprintf(stderr,
+                    "restore: snapshot Boot_Video [0x%08x,0x%llx) is not "
+                    "reserved below topOfKernelData 0x%08x; recreate this "
+                    "old -F snapshot from a corrected cold boot\n",
+                    restored_fb_begin,
+                    (unsigned long long)restored_fb_end, restored_top);
+            return 3;
+        }
         if (want_fb && s5l_clcd_active_window(&mach.clcd) == CLCD_WIN_NONE) {
             fprintf(stderr,
                     "restore: -F was requested but the snapshot has no active "
@@ -11610,6 +12461,7 @@ int main(int argc, char **argv) {
             uint32_t p = last_pc & ~1u;
             pmu_checkpoint_observe(p, n, &mach.cpu);
             display_checkpoint_observe(p, n, &mach.cpu);
+            tvout_chain_checkpoint_observe(p, n, &mach.cpu);
             for (unsigned i = 0; i < NM; i++) {
                 if (!pc_matches_vm_or_pre_mmu_alias(
                         &mach.cpu, p, MILE[i].va, G.mile_pa[i])) continue;
