@@ -2030,6 +2030,8 @@ static unsigned    NM;
 #define SPRINGBOARD_TARGET_USER_RETRY_CAP 4u
 #define SPRINGBOARD_MACH_HEADER_SIZE 24u
 #define SPRINGBOARD_MACH_PATH_COUNT 6u
+#define SPRINGBOARD_TETHER_CALL_PC UINT32_C(0x0009679a)
+#define SPRINGBOARD_TETHER_CONTINUATION_PC UINT32_C(0x0009679e)
 #define DIAGNOSTIC_MACH_SEND_MSG UINT32_C(0x00000001)
 #define DIAGNOSTIC_MACH_RCV_MSG  UINT32_C(0x00000002)
 #define FRAMEBUFFER_WRITE_LOG_CAP 64u
@@ -2490,6 +2492,12 @@ typedef struct {
         target_low_flow[SPRINGBOARD_LOW_FLOW_CAP];
     uint64_t first_low_user_at;
     uint64_t first_outside_dyld_at;
+    uint64_t tether_call_hits;
+    uint64_t tether_call_first_at;
+    uint64_t tether_call_last_at;
+    uint64_t tether_continuation_hits;
+    uint64_t tether_continuation_first_at;
+    uint64_t tether_continuation_last_at;
     uint64_t user_nonretired_deferrals;
     uint64_t user_status_rejects;
     uint64_t user_pending_stale;
@@ -4587,6 +4595,17 @@ static void springboard_exec_trace_commit_user(
     if (first_region_hit && region == SPRINGBOARD_USER_LOW_IMAGE) {
         trace->first_low_user_at = at;
         trace->first_low_user_pc = pc;
+    }
+    if (pc == SPRINGBOARD_TETHER_CALL_PC) {
+        if (!trace->tether_call_hits)
+            trace->tether_call_first_at = at;
+        trace->tether_call_hits++;
+        trace->tether_call_last_at = at;
+    } else if (pc == SPRINGBOARD_TETHER_CONTINUATION_PC) {
+        if (!trace->tether_continuation_hits)
+            trace->tether_continuation_first_at = at;
+        trace->tether_continuation_hits++;
+        trace->tether_continuation_last_at = at;
     }
     if (!trace->first_outside_dyld_at &&
         region != SPRINGBOARD_USER_DYLD) {
@@ -7001,6 +7020,23 @@ static void springboard_exec_trace_report(void) {
     else
         printf("    first instruction outside fixed dyld range:"
                " NOT OBSERVED\n");
+    printf("    exact stock SBTetherController scalar-call site %08x:"
+           " %" PRIu64 " retired",
+           SPRINGBOARD_TETHER_CALL_PC, trace->tether_call_hits);
+    if (trace->tether_call_hits)
+        printf(" (first/last @%" PRIu64 "/%" PRIu64 ")",
+               trace->tether_call_first_at,
+               trace->tether_call_last_at);
+    printf("\n");
+    printf("    exact post-IOConnectCallScalarMethod continuation %08x:"
+           " %" PRIu64 " retired",
+           SPRINGBOARD_TETHER_CONTINUATION_PC,
+           trace->tether_continuation_hits);
+    if (trace->tether_continuation_hits)
+        printf(" (first/last @%" PRIu64 "/%" PRIu64 ")",
+               trace->tether_continuation_first_at,
+               trace->tether_continuation_last_at);
+    printf("\n");
     printf("    IMPORTANT: dyld execution is not SpringBoard main;"
            " low-image execution is app-image activity, not UI proof.\n");
     printf("    Attribution contract: each region's first retired hit"
@@ -8420,6 +8456,65 @@ static void i2c_pmu_state_report(const s5l8900_t *mach) {
             printf(" %02x", pmu->unknown_reg[i]);
         printf("\n");
     }
+}
+
+static void clcd_state_report(s5l8900_t *mach) {
+    if (!mach) return;
+    s5l_clcd_t *clcd = &mach->clcd;
+
+    printf("\n=== CLCD LIVE REGISTER STATE ===\n");
+    printf("    enable/disable=%08x/%08x ctrl/fifo=%08x/%08x "
+           "preenable/backdrop=%08x/%08x\n",
+           clcd->enable, clcd->disable, clcd->ctrl, clcd->fifo,
+           clcd->preenable, clcd->backdrop);
+    printf("    irq mask/status=%08x/%08x reg1c=%08x "
+           "update/update2=%08x/%08x\n",
+           clcd->intmask, clcd->intstatus, clcd->reg1c,
+           clcd->update, clcd->update2);
+    printf("    VIDCON0/1=%08x/%08x unknown208=%08x "
+           "VIDTCON0/1/2/3=%08x/%08x/%08x/%08x\n",
+           clcd->gate, s5l_clcd_read(clcd, CLCD_STATUS),
+           clcd->opaque[0], clcd->opaque[1], clcd->opaque[2],
+           clcd->opaque[3], clcd->opaque[4]);
+    printf("    window auxiliaries d8/dc/e0/e4/e8/ec="
+           "%08x/%08x/%08x/%08x/%08x/%08x\n",
+           clcd->wincfg_aux[0], clcd->wincfg_aux[1],
+           clcd->wincfg_aux[2], clcd->wincfg_aux[3],
+           clcd->update2, clcd->wincfg_aux[4]);
+
+    for (unsigned k = 0; k < CLCD_WIN_COUNT; k++) {
+        const s5l_clcd_window_t *window = &clcd->win[k];
+        uint32_t fb = 0, width = 0, height = 0;
+        uint32_t stride = 0, format = 0, order = 0;
+        bool decoded = s5l_clcd_window(
+            clcd, k, &fb, &width, &height, &stride, &format, &order);
+        printf("    window%u raw: pitch=%08x control=%08x fb=%08x "
+               "geometry=%08x linewords=%08x position=%08x\n",
+               k, window->stride, window->control, window->fbaddr,
+               window->geometry, window->linewords, window->position);
+        if (decoded)
+            printf("            decoded: %ux%u stride=%u fb=%08x "
+                   "format=%u order=%u\n",
+                   width, height, stride, fb, format, order);
+        else
+            printf("            decoded: disabled\n");
+    }
+
+    unsigned video_nonzero = 0, csc_nonzero = 0, gamma_nonzero = 0;
+    for (unsigned i = 0;
+         i < sizeof clcd->video / sizeof clcd->video[0]; i++)
+        if (clcd->video[i]) video_nonzero++;
+    for (unsigned i = 0;
+         i < sizeof clcd->csc / sizeof clcd->csc[0]; i++)
+        if (clcd->csc[i]) csc_nonzero++;
+    for (unsigned bank = 0; bank < 3u; bank++)
+        for (unsigned i = 0; i < 256u; i++)
+            if (clcd->gamma[bank][i]) gamma_nonzero++;
+    printf("    nonzero overlay/CSC/gamma words=%u/%u/%u; "
+           "scanning/running=%u/%u frames=%" PRIu64 "\n",
+           video_nonzero, csc_nonzero, gamma_nonzero,
+           clcd->scanning ? 1u : 0u,
+           s5l_clcd_running(clcd) ? 1u : 0u, clcd->frames);
 }
 
 /*
@@ -11008,6 +11103,7 @@ int main(int argc, char **argv) {
     display_exec_report(virt_base, phys_base, ram_size);
     pmu_checkpoint_report();
     i2c_pmu_state_report(&mach);
+    clcd_state_report(&mach);
     mode_report(win_lo, win_hi);
     syscall_report(virt_base, phys_base);
     lifecycle_report();
