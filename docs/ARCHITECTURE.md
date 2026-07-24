@@ -314,7 +314,22 @@ SPI0 saw only 13 early platform writes, and the guest still made no recorded
 CLCD MMIO access. Seeded scanout advanced to 589 frames, but its final PPM was
 byte-identical to run08: one 8x16 white block, exactly 128 white pixels, on
 black. The architecture has therefore reached the SpringBoard launch request,
-not a proved SpringBoard process or display handoff.
+not, in run09 alone, a proved SpringBoard process or display handoff.
+
+Run15 supplied the missing process proof. Its exact SETEXEC trace followed
+image activation and `_load_machfile`, observed the kernel result epilogue at
+`r0=0`, and committed user execution only after task/uthread/proc/PID
+revalidation. That replacement address space retired 37,134,545 attributed user
+instructions, including the untouched stock SpringBoard executable's
+`LC_UNIXTHREAD`/exported `start` at `0x34e8` and later genuine SpringBoard
+Objective-C methods. It took 882 exact traps, never entered exact-process
+`_exit1`, and ended merely scheduled out in a validated `mach_msg` episode.
+
+The process and display contracts remain separate. Run15 recorded zero
+exact-process or live-scanout framebuffer mutations; the CLCD state and PPM
+remained seed-only. The architecture therefore supports a running SpringBoard
+process but has not demonstrated the display-driver/window-server handoff or a
+rendered home screen.
 
 In the planned shared-session design, host services cross explicit non-blocking
 seams: frame descriptors out; bounded touch, PCM and network queues in/out;

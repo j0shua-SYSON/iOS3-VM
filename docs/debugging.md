@@ -455,7 +455,7 @@ with a null PID output. Exact local disassembly is the authority for the shipped
 xnu-1357.5.30 binary; [Apple's older public XNU control-flow
 analogue](https://github.com/apple-oss-distributions/xnu/blob/xnu-1228.15.4/bsd/kern/kern_exec.c)
 helps interpret it. Run11's one-to-one fork/spawn trace strongly predicts the
-same SETEXEC shape, but the next run must confirm flag `0x0040`. If confirmed,
+same SETEXEC shape; run15 later confirmed flag `0x0040`.
 SETEXEC bypasses vfork. On success the fork child is
 exec-replaced and enters the new image rather than returning to launchd's old
 wrapper; on failure it returns an errno. The lifecycle ring's 19 late forks and
@@ -463,7 +463,7 @@ wrapper; on failure it returns an errno. The lifecycle ring's 19 late forks and
 address spaces explain the repeated wrapper PC and argument virtual addresses,
 but run11 did not record enough identity to assign either process directly.
 
-The current bounded probe is fail-closed:
+The bounded probe used by run15 is fail-closed:
 
 1. At the exact SpringBoard pathname SWI, it re-walks
    `thread+0x34c → task`, `task+0x1c4 → proc`, `proc+8 → PID`, and
@@ -488,9 +488,41 @@ The current bounded probe is fail-closed:
 The vfork child-resume probe remains available for non-SETEXEC calls, where
 `_thread_resume` is identity/lifetime evidence rather than success authority.
 Run11 predates the new identity and epilogue fields, so its late
-`_exit1(proc=e0381ca8)` remains unattributed. None of this passive
-instrumentation proves a rendered frame; the next real-firmware run must retain
-the lifecycle, SPI0, CLCD, and PPM checks.
+`_exit1(proc=e0381ca8)` remains unattributed.
+
+### Run15 exact SpringBoard execution diagnostic
+
+Run15 completed a fresh 2,000,000,000-instruction display-enabled cold boot
+with `OK` and empty stderr. It confirmed live `POSIX_SPAWN_SETEXEC`, exact
+image-activation and `_load_machfile` phases, and result `r0=0`. The replacement
+process first retired an identity-validated instruction at 636,114,681 and
+accumulated 37,134,545 address-space-keyed user instructions through
+1,851,355,734. The exact process took 882 traced traps, never entered `_exit1`,
+and ended scheduled out during a validated `mach_msg` SVC.
+
+The first low-image PC was `0x34e8` at 1,519,973,164. A read-only HFSX/Mach-O
+audit resolves it to the untouched stock SpringBoard binary's
+`LC_UNIXTHREAD`/exported `start`; later low PCs resolve through Objective-C
+metadata to genuine SpringBoard methods. The image's 291 embedded code-page
+hashes all verify. This proves executable entry and subsequent application-code
+execution, not a directly retained `UIApplicationMain` call or UI readiness.
+
+Keep the evidence contracts separate:
+
+- A committed exact-target user step proves instruction retirement under the
+  revalidated process key; it does not prove a frame.
+- A target/live-scanout mutation proves pixel-memory activity, not a
+  recognizable screen; the PPM remains the visual authority.
+- A task-local Mach port name or message ID is not a server identity without an
+  independently established IPC mapping.
+- Profiles produced before the context-aware classifier in `9e2bc3f` may have
+  misclassified user PCs by applying a synthetic high alias. Use run15 or a
+  newer trace for userspace-region claims.
+
+Run15 retained the lifecycle, SPI0, CLCD, exact-process mutation, and PPM checks.
+All framebuffer mutation counts were zero and the PPM remained the seed-only
+8x16 white block. The next trace must localize the message/service wait and
+display-driver/window-server handoff, not re-prove the spawn request.
 
 ### WFI changes elapsed device time, not the instruction coordinate
 

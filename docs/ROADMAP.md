@@ -28,7 +28,7 @@ proof that no private or unindexed implementation exists.
 | **M2** | SoC bring-up | A bare-metal payload prints over the emulated UART; a timer IRQ is taken and returned from | ✅ done and covered by host tests |
 | **M3** | Firmware containers + LLB execution | Real IMG3s parse and decrypt; an extracted real Apple LLB payload executes; the kernelcache is extracted | ✅ done; SecureROM/iBoot execution remains future full-chain work |
 | **M4** | XNU boots and logs | The kernel reaches `bsd_init`, prints, and Apple's own kexts match and start | ✅ **done** — plus the real root filesystem mounts |
-| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress.** Run09/run11 reproducibly reached the exact stock SpringBoard `posix_spawn` request at 635,280,837. Matching-era launchd plus the one-to-one fork/spawn trace predict SETEXEC, under which the missing old-wrapper return and `_thread_resume` are expected; run11 did not decode flag `0x0040`, so those absences prove neither success nor failure. Exact flag/outcome/user-step instrumentation is built but still needs a fresh trace. No CLCD MMIO or SpringBoard frame exists yet; the app is still a demo host. |
+| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress.** Run15 proves exact SETEXEC activation success, stock SpringBoard's exported entry, and later SpringBoard Objective-C method execution with no exact-process `_exit1`. It still produced zero guest-driven live-scanout mutations and no recognizable frame; the app is still a demo host. |
 | **D** | Dynarec (parallel) | SpringBoard at interactive frame rates on the phone | 🔵 emitter + ARM/Thumb translator and host execution tests exist (off by default); no code cache or dispatcher calls them |
 | **N** | Guest networking (parallel) | The guest resolves a name and fetches a URL | ⚪ designed, not built |
 | **A** | Guest audio (first-device track) | Guest PCM reaches the host speaker without blocking the CPU thread | ⚪ priority, not designed or built |
@@ -498,19 +498,19 @@ later.
 3. SpringBoard renders the home screen into the framebuffer.
 4. A touch delivered from the host's screen moves something on the guest's.
 
-**Last demonstrated boundary:** criterion 1 is met and criterion 2 is partially
-observable in the CLI harness. The real HFSX root filesystem mounted as `md0`,
-`launchd` executed user-mode code, `mDNSResponder` ran as pid 14, and run09 plus
-focused run11 recorded the exact stock SpringBoard `posix_spawn` pathname at
-635,280,837. Run11 then recorded BTServer at 637,448,889. The matching-era
-launchd control flow and the one-to-one fork/spawn trace strongly predict that
-these calls come from separate fork children using `POSIX_SPAWN_SETEXEC`.
-Exact shipped-kernel disassembly shows that, if flag `0x0040` is confirmed, a successful call
-enters the replacement image instead of returning to launchd's old wrapper and
-does not use the vfork `_thread_resume` path. Run11 predates the exact epilogue
-result and identity-validated user-step probe, so it still does not prove
-SpringBoard activation or execution. A
-current checkpoint chain restored at 2.2 B retired instructions, crossed the former
+**Last demonstrated boundary:** criteria 1 and 2 are met for the recorded CLI
+path, and SpringBoard now executes real application code, but criterion 3 is not
+met. The HFSX root filesystem mounted as `md0`, `launchd` executed user code,
+and `mDNSResponder` ran as pid 14. Run15 then decoded the exact stock
+SpringBoard request's `POSIX_SPAWN_SETEXEC` flag, followed image activation and
+`_load_machfile`, and observed the shipped-kernel result epilogue return `r0=0`.
+The revalidated replacement process retired 37,134,545 attributed user
+instructions, reached stock SpringBoard's `LC_UNIXTHREAD`/exported `start` at
+`0x34e8`, and later executed SpringBoard Objective-C methods. It never entered
+exact-process `_exit1` and ended scheduled out in a validated `mach_msg` trap.
+Run15 still recorded zero exact-process or live-scanout mutations and no useful
+frame. A current checkpoint chain restored at 2.2 B retired instructions,
+crossed the former
 `SMULBB` stop and wrote a 2.4 B checkpoint. The 2.4 B → 2.8 B interval wrote a
 2.7 B checkpoint, observed one new `_execve` first at 2,605,595,575, and ended
 with `systemShutdown false`. Restoring 2.7 B wrote a 2.85 B checkpoint and
@@ -652,13 +652,21 @@ recorded.
 Run11's raw old-wrapper return remained pending and it observed no associated
 `_thread_resume`. Those are expected if the predicted SETEXEC flag is confirmed,
 but run11 did not decode it; the absences are neither failure nor success proof.
-The harness now reads the live spawn attribute descriptor, exact-gates the
-shipped kernel's `_posix_spawn` result epilogue, validates the
-`exec_activate_image`/`_load_machfile` branch while excluding vfork phases, and
-requires a successfully stepped user instruction with revalidated
-task/uthread/proc/PID identity. A fresh trace must populate that probe before
-the frontier can advance beyond “launchd requested the stock path.” Criterion
-3 still requires a recognizable framebuffer and touch.
+
+Run15 populated the replacement-process probe. It read live flag `0x0040`,
+exact-gated the shipped kernel's `_posix_spawn` result epilogue at `r0=0`,
+validated `exec_activate_image` and `_load_machfile` while excluding vfork
+phases, and committed a successfully stepped user instruction after
+task/uthread/proc/PID revalidation. The exact process then retired 37,134,545
+attributed user instructions and 882 traced traps without an exact-process
+`_exit1`.
+
+The first low-image PC, `0x34e8`, is the untouched stock SpringBoard Mach-O's
+`LC_UNIXTHREAD`/exported `start`; later exact PCs resolve through Objective-C
+metadata to real SpringBoard methods. This advances the frontier from “launchd
+requested the stock path” to “stock SpringBoard application code executed.”
+Criterion 3 still requires a recognizable framebuffer, and criterion 4 requires
+host-to-guest touch.
 
 For chronology, this is the much earlier pre-VFP measurement from
 `bootkernel`'s milestone probes:
@@ -718,9 +726,11 @@ cap normally. The next fail-closed user-mode stop was `0xe6cf3073`, ARMv6
 `UXTB16 r3, r3`, at instruction 2,944,340,624. The complete paired-extend
 family now clears that stop, and the same snapshot reaches the 2.98 B cap.
 
-**This is progress, and it is not M5.** A live daemon and a cap-limited run are
-not SpringBoard. The core now has a CLCD model and panel seed, but the iOS app
-still runs only a synthetic guest and has no touch or audio path.
+**This is SpringBoard execution, and it is not completed M5.** Run15 crossed
+the executable/application-code boundary, but a cap-limited process trace is
+not a rendered, interactive home screen. The core has a CLCD model and panel
+seed; the iOS app still runs only a synthetic guest and has no touch or audio
+path.
 
 ### The M5 work item list, as it now stands
 
@@ -746,19 +756,21 @@ still runs only a synthetic guest and has no touch or audio path.
   `bootkernel` validates the complete layout before direct-streaming the rootfs
   into final guest RAM. The app does not use them yet; it still needs a shared
   session, user-owned file selection and explicit errors.
-- **Nothing symbolizes userspace.** Every diagnostic here resolves against the
-  kernelcache. The instant launchd retires an instruction, the milestone table,
-  the profiler and the kext symbolizer all go quiet — which is exactly the
-  regime we have now entered. This is a known gap, not a solved one.
+- **Userspace attribution is partial.** The exact process trace classifies dyld,
+  shared-cache, stack, and low-image regions. A read-only HFSX/Mach-O/Objective-C
+  audit mapped run15's SpringBoard entry and retained low PCs, but the harness
+  does not yet carry a general userspace image/symbol map. Bounded low-image
+  control-flow and IPC wait tracing are the next diagnostics.
 - **The display path** — the CLCD model now separates `VIDTCON0..3` timing from
   the `0x0d8..0x0ec` window configuration, seeds an iBoot-compatible N82
   handoff, and gates frame publication and WFI edges on genuinely live scanout.
   The app's CoreGraphics bridge follows a validated active window only while
-  those gates are live. Run09 retained the seed through 2 B and captured one
-  exact SpringBoard spawn-path attempt, but observed no CLCD MMIO and only an
-  8x16 white block. The next step is spawn-outcome/child-lifetime tracing and
-  the missing display transaction, not a SpringBoard claim. The app still needs
-  the shared real-guest session; Metal is optional and not implemented.
+  those gates are live. Run15 proved the exact SpringBoard process executing
+  application methods through 2 B, but recorded zero exact-process or
+  live-scanout mutations and only the 8x16 seed block. The next step is the
+  missing display-driver/window-server transaction, correlated with the
+  process's bounded IPC waits. The app still needs the shared real-guest
+  session; Metal is optional and not implemented.
 - **Multitouch**, mapped from the host touchscreen to the guest's controller.
   `AppleMultitouchZ2SPI` already starts and reports "using DMA for bootloading",
   which proves that the recorded boot reached that request. Device, DMA and

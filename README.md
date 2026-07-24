@@ -36,28 +36,29 @@
 > hashes remained unchanged. This serial run explicitly disabled the framebuffer:
 > CLCD status, mask, and scanning were all zero, so it provides absolutely no
 > SpringBoard or display-path proof.
-> Display-enabled run09 then extended the same 128 MiB external-md path through
-> its **2,000,000,000**-instruction cap with harness status `OK` and empty
-> stderr. It recorded one exact stock SpringBoard `posix_spawn` pathname attempt
-> at instruction **635,280,837**. That is materially later lifecycle evidence,
-> but the diagnostic does not yet prove that the syscall succeeded, that a
-> SpringBoard process ran, or that it rendered. The guest still made no recorded
-> CLCD MMIO access; SPI0 saw only 13 early platform writes, and the final frame
-> remained the same 8x16 white block at the top-left of an otherwise black
-> screen.
-> Focused 700 M run11 repeated the SpringBoard request at the same instruction
-> and then recorded a separate BTServer request at 637,448,889, with `OK`,
-> empty stderr, clean storage, and the same non-UI frame. Its older probe saw
-> neither a return to launchd's wrapper nor `_thread_resume`. Matching-era
-> launchd sets `POSIX_SPAWN_SETEXEC` inside each fork child, and the one-to-one
-> fork/spawn trace strongly predicts run11 followed that path. Exact shipped-
-> kernel disassembly confirms what that branch would do: success replaces the
-> child and bypasses vfork resume. Run11 did not decode the runtime flag, so the
-> absences are neither failure nor success evidence until a fresh trace confirms
-> `0x0040`. The current
-> harness decodes the runtime flags, exact-gates the kernel result epilogue,
-> and revalidates task/uthread/proc/PID around the first successfully stepped
-> user instruction; a fresh firmware run is required to populate that evidence.
+> Display-enabled run15 then completed the same **2,000,000,000**-instruction
+> cold path with harness status `OK` and empty stderr. Its exact trace decoded
+> live flag `POSIX_SPAWN_SETEXEC`, followed `exec_activate_image` and
+> `_load_machfile`, and observed the shipped kernel's result epilogue return
+> `r0=0`. The replacement process first retired exact-attributed user code at
+> instruction **636,114,681** and subsequently retired **37,134,545** user
+> instructions under the same task/proc/PID address-space key.
+>
+> At instruction **1,519,973,164**, dyld transferred into low-image PC
+> `0x000034e8`. A read-only HFSX and Mach-O audit resolves that byte to the
+> untouched stock
+> `/System/Library/CoreServices/SpringBoard.app/SpringBoard`: it is both the
+> `LC_UNIXTHREAD` PC and exported `start`, and all 291 embedded code-page hashes
+> verify. Later exact PCs resolve through its Objective-C metadata to genuine
+> `SBTetherController` methods referenced by SpringBoard lifecycle code. The
+> exact process took 882 traced traps, never entered `_exit1`, and ended merely
+> scheduled out in a validated `mach_msg` call. This proves stock SpringBoard
+> executable entry and subsequent SpringBoard application-code execution. It
+> does **not** yet prove UI readiness or rendering.
+>
+> Display evidence remains the hard boundary. The guest made zero exact-process
+> or live-scanout framebuffer mutations, CLCD retained only the host seed, and
+> the final frame was still one 8x16 white block on black.
 > The installable iOS app
 > does **not** run it yet: it runs a small
 > synthetic ARM guest to exercise the CPU, UART and framebuffer bridge. The app
@@ -91,8 +92,8 @@ core portable across hosts. Today the evidence is split deliberately:
 | Capability | CLI / portable core | Installable iOS app |
 |---|---|---|
 | ARM1176 and S5L8900 execution | Real-kernel path recorded | Synthetic demo guest |
-| Apple kernel and root filesystem | Host-backed cold path reached `launchd`; run09 passed fsck, mounted `/dev/md0`, retained `mDNSResponder`, and reached a stable 2 B cap | Not integrated |
-| Display | Run09/run11 reached the exact SpringBoard pathname request and PCs in both Apple display-driver code ranges. SETEXEC-aware outcome/execution instrumentation is now built but awaits a fresh trace; CLCD MMIO stayed untouched and the frame was only one 8x16 white block | CoreGraphics demo bridge |
+| Apple kernel and root filesystem | Host-backed cold path reached `launchd`, mounted `/dev/md0`, retained `mDNSResponder`, and run15 proved successful SETEXEC replacement plus stock SpringBoard executable/application-code execution | Not integrated |
+| Display | Run15 kept the exact SpringBoard process alive through 37.1 M attributed user instructions, but observed zero guest-driven live-scanout mutations; CLCD remained the seed-only 8x16 block | CoreGraphics demo bridge |
 | Touch, audio, guest networking | Not implemented | Not implemented |
 | Dynamic recompiler | Translator tested off-device; inactive in boot | Excluded from target |
 
@@ -108,16 +109,15 @@ can see.** No months in the dark.
 | **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, CLCD and NOR are integrated; standalone raw-NAND/storage primitives are host-tested, with no NAND controller/VFL/FTL |
 | **M3** | Firmware containers + LLB execution | ✅ **done** — parses/decrypts real IMG3 firmware, runs a real LLB payload and extracts the kernel; SecureROM and iBoot execution remain future full-chain work |
 | **M4** | The real **XNU kernel** boots and logs | ✅ **done** — a broad set of prelinked drivers matched or started in a recorded CLI run; the real 413 MiB root filesystem mounted, and that run did not reach `_panic` |
-| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** Run09/run11 reproducibly reached the exact stock SpringBoard `posix_spawn` request at 635,280,837. Matching-era launchd and the one-to-one fork/spawn trace predict SETEXEC, under which the missing old-wrapper return and vfork child-resume would be expected; run11 did not decode the flag. The new exact flag/outcome/user-step probe still needs a real run, and there is still no CLCD MMIO or SpringBoard frame. The iOS app remains a demo host. |
+| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** Run15 proves exact `POSIX_SPAWN_SETEXEC` success, stock SpringBoard's exported `start`, and later SpringBoard Objective-C method execution with no exact-process `_exit1`. It still produced no guest-driven framebuffer mutation or recognizable frame, and the iOS app remains a demo host. |
 
-At `ea92fca`, hosted
-[`core-tests` run 30009684129](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30009684129)
+At `9e2bc3f`, hosted
+[`core-tests` run 30067686376](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30067686376)
 and
-[`ios-build` run 30009684054](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30009684054)
-both completed successfully with the faultable raw bridge and corrected display
-handoff. Hosted CI cannot contain private firmware or prove a SpringBoard boot;
-that runtime evidence comes from the separately recorded run07 through run11
-cold boots.
+[`ios-build` run 30067686404](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30067686404)
+both completed successfully with the hardened exact-target trace. Hosted CI
+cannot contain private firmware or prove a SpringBoard boot; that runtime
+evidence comes from the separately recorded real-firmware cold runs.
 
 ### What it actually does today
 
@@ -311,8 +311,8 @@ hashes remained unchanged.
 The lifecycle ring retained 120 events and observed the exact stock
 SpringBoard pathname once, in a `posix_spawn` attempt at instruction
 635,280,837. Its single pathname-copy failure was a separate later event. The
-attempt is the strongest current SpringBoard-frontier evidence, but entry to
-`posix_spawn` alone does not establish its return value, a child process, or a
+run09 attempt was the strongest evidence available at that commit, but entry to
+`posix_spawn` alone did not establish its return value, a child process, or a
 rendered frame.
 
 Display evidence did not advance with that pathname attempt.
@@ -324,10 +324,19 @@ transaction, and no CLCD MMIO was recorded. Seeded scanout reached 589 frames,
 but the final PPM was byte-identical to run08: exactly 128 white pixels in an
 8x16 top-left block, with every other pixel black.
 
-That is sustained real userspace, not a completed boot. There is still no
-captured SpringBoard frame, no proof that the current userland reached the home
-screen, and no touch, audio, or guest-network path in the app. The CLI evidence
-must not be read as an on-device result.
+Run15 superseded that launch-request boundary. It exact-gated the SETEXEC
+activation result at `r0=0`, revalidated the replacement task/proc/PID, and
+recorded 37,134,545 exact address-space-keyed user instructions. The first
+low-image instruction, `0x34e8`, is the stock SpringBoard Mach-O's
+`LC_UNIXTHREAD`/exported `start`; later exact low PCs are genuine SpringBoard
+Objective-C methods. No exact-process `_exit1` occurred. The terminal target was
+only scheduled out during a validated `mach_msg` trap.
+
+That is running SpringBoard application code, not a completed visual boot.
+Run15 recorded zero exact-process or live-scanout mutations and the frame stayed
+seed-only. There is still no captured SpringBoard home screen and no touch,
+audio, or guest-network path in the app. The CLI evidence must not be read as an
+on-device result.
 
 Getting this far needed one more emulator-shaped bug worth naming, because it
 looked exactly like a corrupt disk. launchd's first text page was failing its

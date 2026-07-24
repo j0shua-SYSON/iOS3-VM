@@ -13,21 +13,21 @@ device behind each stage.
 > (`0xe6cf3073`) in user mode. The complete paired-extend implementation then
 > replayed through that stop, wrote a 2.97 B checkpoint and reached a clean
 > 2.98 B cap. Free pages dipped to 97 and ended at 214 against a target of 250.
-> The longest current memory-safe display-enabled external-md evidence is run09:
-> a fresh 128 MiB cold boot reached a 2 B cap after launchd, fsck, the root
-> mount, `mDNSResponder` Seatbelt setup, and `systemShutdown false`, with a
-> 12,976-page free-memory low (50.69 MiB). It recorded one exact stock
-> SpringBoard `posix_spawn` pathname attempt at instruction 635,280,837, but no
-> populated kernel outcome, running SpringBoard process, or rendered frame.
-> Focused run11 repeated that request and then BTServer after a one-to-one
-> fork/spawn sequence. Matching-era launchd predicts `POSIX_SPAWN_SETEXEC`;
-> run11 did not decode `0x0040`, so its missing old-wrapper return and
-> `_thread_resume` prove neither success nor failure. Run11 predates
-> the new exact epilogue/user-step instrumentation. No CLCD MMIO
-> was recorded, SPI0 saw only 13 early platform writes, and the frame remained
-> one 8x16 white block on black. The installable app runs a synthetic guest
-> through CoreGraphics and has no real-boot session, touch, audio or guest
-> networking.
+> The strongest current display-enabled external-md evidence is run15: a fresh
+> 128 MiB cold boot reached a 2 B cap with `OK` and empty stderr after launchd,
+> fsck, the root mount, `mDNSResponder`, and `systemShutdown false`. The exact
+> SpringBoard attempt at instruction 635,280,837 carried
+> `POSIX_SPAWN_SETEXEC`; image activation and `_load_machfile` ran and the
+> shipped-kernel result epilogue returned `r0=0`. The revalidated replacement
+> process retired 37,134,545 attributed user instructions, first entered the
+> signed stock SpringBoard executable at its `LC_UNIXTHREAD`/exported `start`
+> (`0x34e8`), and later executed genuine SpringBoard Objective-C methods. It
+> never entered exact-process `_exit1` and ended scheduled out in a validated
+> `mach_msg` trap. This proves SpringBoard application-code execution, not a
+> rendered home screen: guest-driven live-scanout mutations remained zero and
+> the frame stayed one 8x16 seed block on black. The installable app still runs
+> a synthetic guest through CoreGraphics and has no real-boot session, touch,
+> audio or guest networking.
 
 Everything here is from actual historical runs. The command below is the recipe,
 not a promise of byte-identical current output: the stopping point and log are
@@ -1216,21 +1216,60 @@ disassembly of the shipped xnu-1357.5.30 kernel confirms what flag `0x0040`
 would do: bypass `_vfork`/`_vfork_return`/`_thread_resume`, exec-replace the
 launchd child on success, and return an errno to the old wrapper on failure.
 Run11 did not read the attribute flag, so the two absences remain neither
-failure nor success evidence until a fresh trace confirms SETEXEC.
+failure nor success evidence in that run; run15 later confirmed SETEXEC.
 
 Run11 also recorded a later `_exit1(proc=e0381ca8)`, but its older trace did not
 capture the SpringBoard and BTServer entry proc/PID identities. The exit is
 therefore deliberately unattributed.
 
-The current probe closes that evidence gap without changing guest behavior. It
+The probe added after run11 closed that evidence gap without changing guest behavior. It
 decodes the 32-bit spawn descriptor and flag `0x0040` from guest memory,
 requires the exact `exec_activate_image` and `_load_machfile` path with no
 vfork-family hit, and samples `r0` at the exact shipped-kernel
 `_posix_spawn` result epilogue. After `r0=0`, it requires a successfully stepped
 user instruction with the same re-walked task, uthread, proc, and PID. Demand
 fetch faults and transiently unreadable identity defer the claim; the first
-attributed `_exit1` closes lifetime tracking. A fresh run is required before
-any of those new fields can be used as SpringBoard activation evidence.
+attributed `_exit1` closes lifetime tracking.
+
+### 2026-07-24: run15 proved stock SpringBoard application-code execution
+
+Run15 populated the exact probe in a fresh display-enabled 128 MiB external-md
+cold boot. It reached 2,000,000,000 retired instructions with harness status
+`OK` and empty stderr. The SpringBoard request at 635,280,837 carried live flag
+`0x0040` (`POSIX_SPAWN_SETEXEC`); exact `exec_activate_image` and
+`_load_machfile` phases followed, with no vfork-family phase, and the exact
+shipped-kernel result epilogue returned `r0=0` at 636,108,374. The first
+identity-validated replacement-process instruction retired at 636,114,681.
+
+The trace revalidated task/proc/PID `c2d8c000/e03820c0/20` and target
+thread/uthread `e0324aa8/c0b9b130`. Through instruction 1,851,355,734 that
+address-space key accumulated 37,134,545 committed user instructions:
+10,039,939 in dyld, 27,093,301 in the shared cache, and 1,305 in the low image.
+The first low-image instruction was PC `0x000034e8` at 1,519,973,164.
+
+A read-only HFSX walk resolves the stock path
+`/System/Library/CoreServices/SpringBoard.app/SpringBoard` to rootfs offset
+`0x0db8f000`, logical size `0x123d30`, and SHA-256
+`b2ca875c968da1917ffe577b708c730c8e59ddfaa3c94efd5510fa57b2d1539d`.
+Its 32-bit ARMv6 Mach-O names `0x34e8` both as `LC_UNIXTHREAD.pc` and exported
+`start`; all 291 embedded SHA-1 code-page hashes verify. Later run15 PCs resolve
+through the image's Objective-C metadata to `SBTetherController` methods,
+including code referenced by SpringBoard lifecycle handling. The last low PC
+`0xdc068` is only the common dyld lazy-binding helper, not a crash site.
+
+The exact process took 882 traced traps and never entered `_exit1`. At the cap,
+its target thread was switched out with an open, validated `mach_msg` SVC
+episode; that is a normal blocking state, not evidence of death. The external
+bridge completed 12,798 reads (52,438,528 bytes), 82 writes (325,120 bytes),
+and zero failures, including two checked raw redirects and completions. Source
+kernel, device-tree, and rootfs hashes remained unchanged.
+
+The display boundary did not move with process execution. There were zero
+exact-process or live-scanout framebuffer mutations, no guest-driven CLCD
+handoff, and the captured PPM remained the seed-only 8x16 white block on black.
+Run15 therefore proves stock SpringBoard executable entry and subsequent
+SpringBoard application-code execution. It does not prove `UIApplicationMain`
+was directly observed, UI readiness, or rendering.
 
 This chain is stronger evidence for sustained userspace and snapshot
 repeatability. It is **not** evidence that SpringBoard rendered. The bounded

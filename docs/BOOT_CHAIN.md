@@ -32,7 +32,7 @@ emulator has reproduced each verification or handoff stage.
 | SecureROM | **Future full-chain work:** reset vector, initial memory map, crypto engines and DFU/recovery behavior. No SecureROM stub or dump is executed today. |
 | LLB / iBoot | The current core/NOR/UART/timer model is sufficient for the recorded standalone LLB run. Executing iBoot and reproducing its signature-verification policy remain future work. |
 | kernelcache | The current direct path provides VICs, timers, ARM1176 WFI wake handling, MMU/TLB maintenance, a device tree and an iBoot-like handoff. Historical mode validates a 512 MiB layout and streams the root filesystem into guest RAM. The current cold path instead exact-gates the 7E18 kernel, device tree, and rootfs, fixes guest DRAM at 128 MiB, and serves a create-only work image through guarded md strategy/raw bridges. The real-firmware-tested raw fix exact-patches `_mdevrw` to `svc #0xe3; svc #0xe4`; `ARM_SVC_REDIRECTED` sends a missing user mapping through exact Thumb `_uiomove64` at `0xc0128d14`, using four 128 KiB SP-and-mode-keyed bounce slots below `topOfKernelData`. A zero-initialized coherent 128 KiB in-memory tail preserves XNU's observed no-EOF-check behavior without growing either disk image. Run07 retained two redirects and two completions with no guest raw error or pending continuation through a clean 2 B cap. NAND-controller/VFL/FTL integration remains a separate hardware-fidelity path. |
-| launchd → SpringBoard | Historical checkpoint evidence reaches a clean 2.98 B cap without a guest panic or emulator undefined stop, but direct-RAM free pages dipped to 97. Fresh display-enabled run09 reached 2 B with 36.5% USR execution, and focused run11 repeated the exact stock SpringBoard `posix_spawn` request at 635,280,837 before a distinct BTServer request. Matching-era launchd plus the one-to-one fork/spawn trace predict `POSIX_SPAWN_SETEXEC`; exact shipped-kernel disassembly shows that this flag would replace the child and bypass vfork resume on success. Run11 did not decode `0x0040`, so its missing wrapper return/`_thread_resume` proves neither success nor failure. No CLCD MMIO was recorded; SPI0 saw only 13 early platform writes, and the frame remained one 8x16 white block on black. Completion still needs populated activation/process evidence, a real display-driver handoff, multitouch, and enough IOKit-backing devices for remaining userland. |
+| launchd → SpringBoard | Display-enabled run15 completed a fresh 2 B cold run with `OK` and empty stderr. It decoded exact `POSIX_SPAWN_SETEXEC`, followed image activation/load, observed result `r0=0`, and revalidated the replacement task/proc/PID. The exact process retired 37,134,545 attributed user instructions, reached stock SpringBoard's `LC_UNIXTHREAD`/exported `start` at `0x34e8`, and later executed genuine SpringBoard Objective-C methods. It never entered exact-process `_exit1` and ended scheduled out in a validated `mach_msg` trap. No guest-driven live-scanout mutation or useful frame followed. Completion still needs the display-driver/window-server handoff, a recognizable home screen, multitouch, and enough IOKit-backed devices for remaining userland. |
 
 The synthesized display handoff is being corrected before that last stage is
 tested. CLCD offsets `0x0d8..0x0ec` are per-window auxiliary configuration, not
@@ -43,16 +43,13 @@ clock divided by five, inverted-VCLK polarity, and porch/sync state.
 and the initial `0x0d8`, `0x0e0`, and `0x0e8` window words are `0x1000`. A
 configured window counts as live scanout only while start state, `CLCD_CTRL`
 global enable, and `VIDCON0` bit 0 are all active. This removes false-positive
-frames and wake events. Run09 confirmed that the corrected seed survives a
-two-billion-instruction real-firmware run and that launchd attempts the exact
-stock SpringBoard path, but the guest made no recorded CLCD MMIO access and
-produced no meaningful frame. Run11 then confirmed that request is repeatable.
-The current diagnostic decodes SETEXEC from guest memory, follows exact
-image-activation/load call edges, records the identity-gated kernel result, and
-commits user execution only after a fetchable interpreter step with
-task/uthread/proc/PID revalidation. Until a new trace populates those fields,
-bundle-range PCs, a launch request, and a retained seed remain frontier
-evidence—not proof of driver start, SpringBoard execution, or rendering.
+frames and wake events. Run15 populated the exact activation diagnostic:
+SETEXEC was present, image activation and `_load_machfile` ran, the kernel
+epilogue returned zero, and the replacement process reached the signed stock
+SpringBoard executable's exported entry plus later application methods. That
+closes the launch-request ambiguity. It does not close the visual boundary:
+guest CLCD programming and exact-process/live-scanout mutations remained zero,
+and the retained seed is not proof of driver start or rendering.
 
 The accepted kernel, device tree, and rootfs source files remain original and
 immutable. Exact firmware-specific patches and device-tree edits touch only
