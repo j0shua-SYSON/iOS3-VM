@@ -18,7 +18,12 @@ device behind each stage.
 > mount, `mDNSResponder` Seatbelt setup, and `systemShutdown false`, with a
 > 12,976-page free-memory low (50.69 MiB). It recorded one exact stock
 > SpringBoard `posix_spawn` pathname attempt at instruction 635,280,837, but no
-> syscall outcome, running SpringBoard process, or rendered frame. No CLCD MMIO
+> populated kernel outcome, running SpringBoard process, or rendered frame.
+> Focused run11 repeated that request and then BTServer after a one-to-one
+> fork/spawn sequence. Matching-era launchd predicts `POSIX_SPAWN_SETEXEC`;
+> run11 did not decode `0x0040`, so its missing old-wrapper return and
+> `_thread_resume` prove neither success nor failure. Run11 predates
+> the new exact epilogue/user-step instrumentation. No CLCD MMIO
 > was recorded, SPI0 saw only 13 early platform writes, and the frame remained
 > one 8x16 white block on black. The installable app runs a synthetic guest
 > through CoreGraphics and has no real-boot session, touch, audio or guest
@@ -1193,6 +1198,39 @@ SpringBoard pathname seen” to “launchd requested the exact stock pathname.�
 It is not evidence that SpringBoard reached user mode or rendered. The next
 diagnostic must capture the spawn return/outcome and any child lifetime while
 retaining display evidence.
+
+### 2026-07-24: run11 exposed the SETEXEC launch shape
+
+Run11 used direct OS-level stdout/stderr files so the report survived wrapper
+timeouts. It reached its 700,000,000-instruction cap with `OK` and empty stderr,
+repeated the exact SpringBoard `posix_spawn` request at 635,280,837, and then
+recorded BTServer at 637,448,889. The external image completed 8,754 reads and
+24 writes with zero failures. The PPM remained byte-identical to run09's seeded
+8x16 white block on black.
+
+The old raw-return probe remained pending and the vfork child probe saw no
+`_thread_resume`. Matching-era launchd forks once per job, sets
+`POSIX_SPAWN_SETEXEC`, and calls `posix_spawn` with no PID output; run11's 19
+forks followed by 19 service spawns strongly predict the same shape. Exact
+disassembly of the shipped xnu-1357.5.30 kernel confirms what flag `0x0040`
+would do: bypass `_vfork`/`_vfork_return`/`_thread_resume`, exec-replace the
+launchd child on success, and return an errno to the old wrapper on failure.
+Run11 did not read the attribute flag, so the two absences remain neither
+failure nor success evidence until a fresh trace confirms SETEXEC.
+
+Run11 also recorded a later `_exit1(proc=e0381ca8)`, but its older trace did not
+capture the SpringBoard and BTServer entry proc/PID identities. The exit is
+therefore deliberately unattributed.
+
+The current probe closes that evidence gap without changing guest behavior. It
+decodes the 32-bit spawn descriptor and flag `0x0040` from guest memory,
+requires the exact `exec_activate_image` and `_load_machfile` path with no
+vfork-family hit, and samples `r0` at the exact shipped-kernel
+`_posix_spawn` result epilogue. After `r0=0`, it requires a successfully stepped
+user instruction with the same re-walked task, uthread, proc, and PID. Demand
+fetch faults and transiently unreadable identity defer the claim; the first
+attributed `_exit1` closes lifetime tracking. A fresh run is required before
+any of those new fields can be used as SpringBoard activation evidence.
 
 This chain is stronger evidence for sustained userspace and snapshot
 repeatability. It is **not** evidence that SpringBoard rendered. The bounded

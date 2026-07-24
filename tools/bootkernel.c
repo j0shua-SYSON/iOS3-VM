@@ -1456,6 +1456,13 @@ static bool decode_thumb_bl_target(uint32_t pc, uint16_t first,
     return true;
 }
 
+static bool kernel_thumb_bl_target(uint32_t callsite,
+                                   uint32_t *target) {
+    const uint8_t *bytes = guest_ptr(callsite, 4u);
+    return bytes && decode_thumb_bl_target(
+        callsite, ld16(bytes), ld16(bytes + 2u), target);
+}
+
 static bool kernel_symbol_bytes(const char *name, const uint8_t *expected,
                                 size_t length, uint32_t *address) {
     uint32_t va = ksym_value(name) & ~1u;
@@ -1516,6 +1523,39 @@ typedef enum {
     LIFECYCLE_PATH_NO_NUL,
     LIFECYCLE_PATH_INTERNAL
 } lifecycle_path_status_t;
+
+static bool guest_read_user_bytes(arm_cpu_t *cpu, uint32_t va,
+                                  uint8_t *out, size_t length,
+                                  uint32_t *failure_va,
+                                  uint32_t *failure_fsr) {
+    if (failure_va) *failure_va = 0;
+    if (failure_fsr) *failure_fsr = 0;
+    if (!cpu || !out || !length || !g_mach || !g_mach->ram || !va)
+        return false;
+    if ((uint64_t)va + length - 1u > UINT32_MAX) {
+        if (failure_va) *failure_va = va;
+        return false;
+    }
+
+    for (size_t i = 0; i < length; i++) {
+        uint32_t current = va + (uint32_t)i;
+        uint32_t pa = 0;
+        uint32_t fsr = arm_mmu_translate(
+            cpu, current, ARM_ACCESS_READ, false, &pa);
+        if (fsr) {
+            if (failure_va) *failure_va = current;
+            if (failure_fsr) *failure_fsr = fsr;
+            return false;
+        }
+        if (pa < g_mach->ram_base ||
+            (uint64_t)pa - g_mach->ram_base >= g_mach->ram_size) {
+            if (failure_va) *failure_va = current;
+            return false;
+        }
+        out[i] = g_mach->ram[pa - g_mach->ram_base];
+    }
+    return true;
+}
 
 static lifecycle_path_status_t
 guest_copy_user_cstr(arm_cpu_t *cpu, uint32_t va,
@@ -1867,12 +1907,36 @@ static unsigned    NM;
 #define DISPLAY_PC_HASH_CAP 2048u
 #define DISPLAY_ENTRY_EDGE_CAP 1024u
 #define SPRINGBOARD_RETURN_CAP 32u
+#define SPRINGBOARD_PHASE_COUNT 6u
+#define DIAGNOSTIC_POSIX_SPAWN_SETEXEC UINT16_C(0x0040)
+#define SETEXEC_IMAGE_REJECT_WRAPPER UINT32_C(0x01)
+#define SETEXEC_IMAGE_REJECT_PHASES  UINT32_C(0x02)
+#define SETEXEC_IMAGE_REJECT_IDENTITY UINT32_C(0x04)
+#define SETEXEC_IMAGE_REJECT_FETCH UINT32_C(0x08)
+#define SETEXEC_IMAGE_REJECT_STEP  UINT32_C(0x10)
+
+static const char *const SPRINGBOARD_PHASE_NAMES[SPRINGBOARD_PHASE_COUNT] = {
+    "_vfork",
+    "_exec_activate_image",
+    "_load_machfile",
+    "_vfork_exit",
+    "_vfork_return",
+    "_thread_resume"
+};
 
 typedef enum {
     LIFECYCLE_SYSCALL = 1,
     LIFECYCLE_EXIT1,
     LIFECYCLE_PSIGNAL
 } lifecycle_kind_t;
+
+typedef enum {
+    LIFECYCLE_IDENTITY_NONE = 0,
+    LIFECYCLE_IDENTITY_THREAD_TO_TASK,
+    LIFECYCLE_IDENTITY_TASK_TO_PROC,
+    LIFECYCLE_IDENTITY_PROC_TO_PID,
+    LIFECYCLE_IDENTITY_COMPLETE
+} lifecycle_identity_stage_t;
 
 typedef struct {
     uint64_t at;
@@ -1887,11 +1951,39 @@ typedef struct {
     uint32_t path_va;
     uint32_t path_failure_va;
     uint32_t path_failure_fsr;
+    uint32_t ttbr0_base;
+    uint32_t context_id;
+    uint32_t current_thread;
+    uint32_t current_task;
+    uint32_t task_proc;
+    uint32_t task_pid;
+    uint32_t current_uthread;
+    uint32_t current_uthread_flags;
+    uint32_t effective_proc;
+    uint32_t effective_pid;
+    uint32_t svc_sp;
+    uint32_t user_sp;
+    uint32_t entry_mode;
+    uint32_t identity_failure_va;
+    uint32_t identity_failure_fsr;
+    uint32_t effective_failure_va;
+    uint32_t effective_failure_fsr;
+    uint32_t spawn_adesc_va;
+    uint32_t spawn_attr_size;
+    uint32_t spawn_attr_va;
+    uint32_t spawn_attr_failure_va;
+    uint32_t spawn_attr_failure_fsr;
+    uint16_t spawn_attr_flags;
     uint16_t path_length;
     uint8_t  path_status;
+    uint8_t  identity_stage;
     bool     springboard_exact;
     bool     indirect;
     bool     user_pc_valid;
+    bool     effective_identity_valid;
+    bool     effective_vfork;
+    bool     spawn_attr_decoded;
+    bool     spawn_setexec;
     char     path[LIFECYCLE_PATH_MAX + 1u];
 } lifecycle_event_t;
 
@@ -1915,6 +2007,31 @@ typedef struct {
     uint64_t resume_pc_candidates;
     uint64_t identity_mismatches;
     uint64_t same_identity_redirects;
+    uint64_t thread_entries;
+    uint64_t thread_user_entries;
+    uint64_t thread_kernel_entries;
+    uint64_t thread_first_at;
+    uint64_t thread_last_at;
+    uint64_t phase_hits[SPRINGBOARD_PHASE_COUNT];
+    uint64_t phase_first_at[SPRINGBOARD_PHASE_COUNT];
+    uint64_t phase_last_at[SPRINGBOARD_PHASE_COUNT];
+    uint64_t phase_identity_rejects[SPRINGBOARD_PHASE_COUNT];
+    uint64_t phase_caller_rejects[SPRINGBOARD_PHASE_COUNT];
+    uint64_t activity_closed_at;
+    uint64_t thread_first_user_at;
+    uint64_t setexec_image_user_at;
+    uint64_t setexec_image_deferrals;
+    uint64_t setexec_exception_deferrals;
+    uint64_t setexec_unvalidated_user_steps;
+    uint64_t setexec_first_unvalidated_user_at;
+    uint64_t kernel_spawn_outcome_at;
+    uint64_t kernel_spawn_outcome_identity_rejects;
+    uint64_t setexec_image_identity_rejects;
+    uint64_t setexec_signal_count;
+    uint64_t setexec_exit_count;
+    uint64_t setexec_first_signal_at;
+    uint64_t setexec_first_exit_at;
+    uint64_t setexec_lifecycle_identity_rejects;
     uint32_t syscall_number;
     uint32_t issuing_pc;
     uint32_t resume_pc;
@@ -1944,10 +2061,63 @@ typedef struct {
     uint32_t return_tpidruro;
     uint32_t return_user_sp;
     uint32_t return_user_lr;
+    uint32_t thread_last_pc;
+    uint32_t thread_last_cpsr;
+    uint32_t thread_last_ttbr0;
+    uint32_t thread_last_context_id;
+    uint32_t thread_first_user_pc;
+    uint32_t thread_first_user_r0;
+    uint32_t thread_first_user_r1;
+    uint32_t thread_first_user_cpsr;
+    uint32_t thread_first_user_ttbr0;
+    uint32_t thread_first_user_context_id;
+    uint32_t thread_first_user_sp;
+    uint32_t thread_first_user_lr;
+    uint32_t entry_task;
+    uint32_t entry_task_proc;
+    uint32_t entry_task_pid;
+    uint32_t entry_uthread;
+    uint32_t entry_effective_proc;
+    uint32_t entry_effective_pid;
+    uint32_t spawn_adesc_va;
+    uint32_t spawn_attr_size;
+    uint32_t spawn_attr_va;
+    uint32_t spawn_attr_failure_va;
+    uint32_t spawn_attr_failure_fsr;
+    uint32_t setexec_image_user_pc;
+    uint32_t setexec_image_user_cpsr;
+    uint32_t setexec_image_ttbr0;
+    uint32_t setexec_image_context_id;
+    uint32_t setexec_image_task;
+    uint32_t setexec_image_proc;
+    uint32_t setexec_image_pid;
+    uint32_t setexec_image_reject_flags;
+    uint32_t setexec_image_fetch_fsr;
+    uint32_t setexec_last_exception_mode;
+    uint32_t setexec_first_unvalidated_user_pc;
+    uint32_t kernel_spawn_outcome_r0;
+    uint32_t setexec_first_signal;
+    uint32_t setexec_first_exit_status;
+    uint32_t setexec_lifecycle_failure_va;
+    uint32_t setexec_lifecycle_failure_fsr;
+    uint16_t spawn_attr_flags;
     bool returned;
     bool redirected;
     bool restarted;
     bool superseded;
+    bool activity_closed;
+    bool thread_first_user_seen;
+    bool entry_task_valid;
+    bool entry_effective_valid;
+    bool spawn_attr_decoded;
+    bool spawn_setexec;
+    bool setexec_image_seen;
+    bool setexec_image_pending;
+    bool setexec_image_pending_identity_retry;
+    bool setexec_image_rejected;
+    bool kernel_spawn_outcome_seen;
+    bool setexec_lifecycle_identity_invalidated;
+    bool setexec_exited;
 } springboard_return_probe_t;
 
 typedef enum {
@@ -1968,6 +2138,14 @@ typedef struct {
     uint32_t thread_task_offset;
     uint32_t task_proc_offset;
     uint32_t proc_pid_offset;
+    uint32_t thread_uthread_offset;
+    uint32_t uthread_flags_offset;
+    uint32_t uthread_proc_offset;
+    uint32_t uthread_vfork_mask;
+    uint32_t phase_va[SPRINGBOARD_PHASE_COUNT];
+    uint32_t phase_expected_lr[SPRINGBOARD_PHASE_COUNT];
+    uint32_t spawn_epilogue_pc;
+    bool phase_is_callsite[SPRINGBOARD_PHASE_COUNT];
     char reason[192];
 } springboard_child_config_t;
 
@@ -2010,6 +2188,24 @@ typedef struct {
     bool identity_invalidated;
     bool exited;
 } springboard_child_probe_t;
+
+typedef struct {
+    uint32_t task;
+    uint32_t task_proc;
+    uint32_t task_pid;
+    uint32_t uthread;
+    uint32_t uthread_flags;
+    uint32_t effective_proc;
+    uint32_t effective_pid;
+    uint32_t failure_va;
+    uint32_t failure_fsr;
+    uint32_t effective_failure_va;
+    uint32_t effective_failure_fsr;
+    uint8_t task_stage;
+    bool task_valid;
+    bool effective_valid;
+    bool effective_vfork;
+} diagnostic_thread_identity_t;
 
 typedef struct {
     uint32_t vm_pc;
@@ -2204,6 +2400,13 @@ static void discover_springboard_child_probe(void) {
         0x03, 0xd0, 0xe2, 0x20, 0x40, 0x00, 0x18, 0x58,
         0x70, 0x47, 0x00, 0x20, 0x70, 0x47
     };
+    static const uint8_t get_bsdthread_shape[] = {
+        0x01, 0x4b, 0xc0, 0x58, 0x70, 0x47, 0x3c, 0x04, 0x00, 0x00
+    };
+    static const uint8_t current_proc_vfork_shape[] = {
+        0xb4, 0x23, 0xc3, 0x58, 0x9a, 0x01, 0x11, 0xd5,
+        0xbc, 0x23, 0xc4, 0x58, 0x00, 0x2c, 0x0d, 0xd0
+    };
     static const uint8_t proc_pid_shape[] = {
         0x80, 0x68, 0x70, 0x47
     };
@@ -2213,6 +2416,21 @@ static void discover_springboard_child_probe(void) {
         0x00, 0x21, 0x1c, 0x60, 0x22, 0x1c, 0x02, 0xf0,
         0xb3, 0xff, 0x9e, 0x98, 0x0c, 0xf7, 0x69, 0xfc
     };
+    static const uint8_t exec_activate_call_window[] = {
+        0x00, 0x2b, 0x05, 0xd0, 0x55, 0x24, 0x82, 0xe7,
+        0xfe, 0xf7, 0x7a, 0xfa
+    };
+    static const uint8_t spawn_epilogue_window[] = {
+        0x9c, 0x4b, 0x20, 0x1c, 0x9d, 0x44, 0x1c, 0xbc,
+        0x90, 0x46, 0x9a, 0x46, 0xa3, 0x46, 0xf0, 0xbd
+    };
+
+    uint32_t current_proc = ksym_value("_current_proc") & ~1u;
+    const uint8_t *current_proc_vfork =
+        current_proc && current_proc <= UINT32_MAX - UINT32_C(0x12)
+        ? guest_ptr(current_proc + UINT32_C(0x12),
+                    (uint32_t)sizeof current_proc_vfork_shape)
+        : NULL;
 
     if (!kernel_symbol_bytes("_current_thread", current_thread_shape,
                              sizeof current_thread_shape, NULL) ||
@@ -2221,8 +2439,14 @@ static void discover_springboard_child_probe(void) {
         !kernel_symbol_bytes("_get_bsdthreadtask_info",
                              get_bsdthreadtask_shape,
                              sizeof get_bsdthreadtask_shape, NULL) ||
+        !kernel_symbol_bytes("_get_bsdthread_info",
+                             get_bsdthread_shape,
+                             sizeof get_bsdthread_shape, NULL) ||
         !kernel_symbol_bytes("_proc_pid", proc_pid_shape,
-                             sizeof proc_pid_shape, NULL)) {
+                             sizeof proc_pid_shape, NULL) ||
+        !current_proc_vfork ||
+        memcmp(current_proc_vfork, current_proc_vfork_shape,
+               sizeof current_proc_vfork_shape) != 0) {
         snprintf(config->reason, sizeof config->reason,
                  "thread/task/proc accessor shape mismatch");
         printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
@@ -2232,6 +2456,9 @@ static void discover_springboard_child_probe(void) {
     config->spawn_start = ksym_value("_posix_spawn") & ~1u;
     config->thread_resume = ksym_value("_thread_resume") & ~1u;
     config->spawn_end = ksym_next_value(config->spawn_start);
+    for (unsigned i = 0; i < SPRINGBOARD_PHASE_COUNT; i++)
+        config->phase_va[i] =
+            ksym_value(SPRINGBOARD_PHASE_NAMES[i]) & ~1u;
     if (!config->spawn_start || !config->thread_resume ||
         !config->spawn_end || config->spawn_end <= config->spawn_start ||
         config->spawn_end - config->spawn_start < 4u ||
@@ -2240,6 +2467,77 @@ static void discover_springboard_child_probe(void) {
                  "posix_spawn/thread_resume symbol range unresolved");
         printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
         return;
+    }
+    if (config->spawn_start > UINT32_MAX - UINT32_C(0x10c) ||
+        config->spawn_start + UINT32_C(0x10c) >= config->spawn_end) {
+        snprintf(config->reason, sizeof config->reason,
+                 "posix_spawn epilogue address overflow");
+        printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
+        return;
+    }
+    config->spawn_epilogue_pc =
+        config->spawn_start + UINT32_C(0x10c);
+    const uint8_t *epilogue = guest_ptr(
+        config->spawn_epilogue_pc - 4u,
+        (uint32_t)sizeof spawn_epilogue_window);
+    if (!epilogue ||
+        memcmp(epilogue, spawn_epilogue_window,
+               sizeof spawn_epilogue_window) != 0) {
+        snprintf(config->reason, sizeof config->reason,
+                 "posix_spawn result epilogue mismatch");
+        printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
+        return;
+    }
+    /*
+     * The shipped symbol table omits static exec_activate_image. Its unique
+     * call is nevertheless exact-gated by the accepted posix_spawn bytes;
+     * record the BL callsite (not a guessed callee address) as that phase.
+     */
+    if (!config->phase_va[1] &&
+        config->spawn_start <= UINT32_MAX - UINT32_C(0x70c)) {
+        uint32_t callsite = config->spawn_start + UINT32_C(0x70c);
+        const uint8_t *window = callsite >= 8u
+            ? guest_ptr(callsite - 8u,
+                        (uint32_t)sizeof exec_activate_call_window)
+            : NULL;
+        if (window &&
+            !memcmp(window, exec_activate_call_window,
+                    sizeof exec_activate_call_window)) {
+            config->phase_va[1] = callsite;
+            config->phase_is_callsite[1] = true;
+        }
+    }
+
+    uint32_t exec_activate_target = 0;
+    if (config->phase_is_callsite[1])
+        (void)kernel_thumb_bl_target(
+            config->phase_va[1], &exec_activate_target);
+    uint32_t load_machfile_callsite =
+        exec_activate_target &&
+        exec_activate_target <= UINT32_MAX - UINT32_C(0x488)
+        ? exec_activate_target + UINT32_C(0x488) : 0u;
+    struct {
+        unsigned phase;
+        uint32_t callsite;
+    } phase_calls[] = {
+        { 0u, config->spawn_start + UINT32_C(0x086) },
+        { 2u, load_machfile_callsite },
+        { 3u, config->spawn_start + UINT32_C(0x13c) },
+        { 4u, config->spawn_start + UINT32_C(0x0fe) },
+        { 5u, config->spawn_start + UINT32_C(0x104) }
+    };
+    for (unsigned i = 0;
+         i < sizeof phase_calls / sizeof phase_calls[0]; i++) {
+        unsigned phase = phase_calls[i].phase;
+        uint32_t target = 0;
+        uint32_t site = phase_calls[i].callsite;
+        if (!site || !config->phase_va[phase] ||
+            !kernel_thumb_bl_target(site, &target) ||
+            target != config->phase_va[phase]) {
+            config->phase_va[phase] = 0;
+            continue;
+        }
+        config->phase_expected_lr[phase] = (site + 4u) | 1u;
     }
 
     unsigned matches = 0;
@@ -2293,9 +2591,20 @@ static void discover_springboard_child_probe(void) {
         (uint32_t)get_bsdthreadtask_shape[10] << 1;
     config->proc_pid_offset =
         (uint32_t)((ld16(proc_pid_shape) >> 6) & 0x1fu) << 2;
+    config->thread_uthread_offset = ld32(get_bsdthread_shape + 6u);
+    config->uthread_flags_offset = current_proc_vfork_shape[0];
+    config->uthread_proc_offset = current_proc_vfork_shape[8];
+    unsigned vfork_shift =
+        (unsigned)((ld16(current_proc_vfork_shape + 4u) >> 6) & 0x1fu);
+    config->uthread_vfork_mask =
+        vfork_shift <= 31u ? UINT32_C(1) << (31u - vfork_shift) : 0;
     if (config->thread_task_offset != UINT32_C(0x34c) ||
         config->task_proc_offset != UINT32_C(0x1c4) ||
-        config->proc_pid_offset != UINT32_C(8)) {
+        config->proc_pid_offset != UINT32_C(8) ||
+        config->thread_uthread_offset != UINT32_C(0x43c) ||
+        config->uthread_flags_offset != UINT32_C(0xb4) ||
+        config->uthread_proc_offset != UINT32_C(0xbc) ||
+        config->uthread_vfork_mask != UINT32_C(0x02000000)) {
         snprintf(config->reason, sizeof config->reason,
                  "decoded object offsets failed consistency check");
         printf("SpringBoard child probe: DISABLED (%s)\n", config->reason);
@@ -2310,6 +2619,12 @@ static void discover_springboard_child_probe(void) {
            config->callsite, config->thread_resume, config->return_pc,
            config->thread_task_offset, config->task_proc_offset,
            config->proc_pid_offset);
+    printf("SpringBoard phase map:");
+    for (unsigned i = 0; i < SPRINGBOARD_PHASE_COUNT; i++)
+        printf(" %s=%08x%s", SPRINGBOARD_PHASE_NAMES[i],
+               config->phase_va[i],
+               config->phase_is_callsite[i] ? "(BL)" : "");
+    printf("\n");
 }
 
 static lifecycle_event_t *lifecycle_begin(uint64_t at,
@@ -2333,7 +2648,7 @@ static bool lifecycle_syscall_tracked(uint32_t number) {
     case 66:                        /* vfork */
     case 173:                       /* waitid */
     case 244:                       /* posix_spawn */
-    case 380:                       /* __mac_execve in xnu-1456.1.26 */
+    case 380:                       /* __mac_execve in shipped xnu-1357.5.30 */
         return true;
     default:
         return false;
@@ -2362,7 +2677,8 @@ static uint32_t diagnostic_ttbr0_base(const arm_cpu_t *cpu) {
 static void springboard_return_arm(const arm_cpu_t *cpu, uint64_t at,
                                    uint32_t syscall_number,
                                    uint32_t issuing_pc, uint32_t resume_pc,
-                                   uint32_t entry_spsr) {
+                                   uint32_t entry_spsr,
+                                   const lifecycle_event_t *event) {
     if (!cpu) return;
     if (G.springboard_return_n >= SPRINGBOARD_RETURN_CAP) {
         G.springboard_return_dropped++;
@@ -2389,6 +2705,28 @@ static void springboard_return_arm(const arm_cpu_t *cpu, uint64_t at,
     probe->entry_tpidruro    = cpu->cp15.tpidruro;
     probe->entry_user_sp     = diagnostic_user_reg(cpu, 13u);
     probe->entry_user_lr     = diagnostic_user_reg(cpu, 14u);
+    if (event) {
+        probe->entry_task = event->current_task;
+        probe->entry_task_proc = event->task_proc;
+        probe->entry_task_pid = event->task_pid;
+        probe->entry_uthread = event->current_uthread;
+        probe->entry_effective_proc = event->effective_proc;
+        probe->entry_effective_pid = event->effective_pid;
+        probe->entry_task_valid =
+            event->identity_stage == LIFECYCLE_IDENTITY_COMPLETE;
+        probe->entry_effective_valid =
+            event->effective_identity_valid;
+        probe->spawn_adesc_va = event->spawn_adesc_va;
+        probe->spawn_attr_size = event->spawn_attr_size;
+        probe->spawn_attr_va = event->spawn_attr_va;
+        probe->spawn_attr_failure_va =
+            event->spawn_attr_failure_va;
+        probe->spawn_attr_failure_fsr =
+            event->spawn_attr_failure_fsr;
+        probe->spawn_attr_flags = event->spawn_attr_flags;
+        probe->spawn_attr_decoded = event->spawn_attr_decoded;
+        probe->spawn_setexec = event->spawn_setexec;
+    }
 
     springboard_child_probe_t *child =
         &G.springboard_child[index];
@@ -2429,10 +2767,11 @@ static void springboard_return_note_swi_entry(const arm_cpu_t *cpu,
     for (unsigned i = 0; i < G.springboard_return_n; i++) {
         springboard_return_probe_t *probe = &G.springboard_return[i];
         if (probe->returned || probe->redirected || probe->restarted ||
-            probe->superseded ||
-            at <= probe->entry_at ||
-            !springboard_return_parent_matches(probe, cpu) ||
-            cpu->r[13] != probe->entry_svc_sp) continue;
+            probe->superseded || probe->setexec_image_seen ||
+            at <= probe->entry_at || !probe->entry_tpidrprw ||
+            cpu->cp15.tpidrprw != probe->entry_tpidrprw) continue;
+        probe->activity_closed = true;
+        probe->activity_closed_at = at;
         probe->superseded = true;
         probe->superseded_at = at;
         probe->superseding_r12 = cpu->r[12];
@@ -2460,8 +2799,23 @@ static void springboard_return_note_transition(const arm_cpu_t *cpu,
         springboard_return_probe_t *probe =
             &G.springboard_return[next - 1u];
         if (probe->returned || probe->redirected || probe->restarted ||
-            probe->superseded)
+            probe->superseded || probe->activity_closed)
             continue;
+
+        /*
+         * POSIX_SPAWN_SETEXEC does not return to the launchd wrapper on
+         * success: exec replaces that fork child and the exception return
+         * enters the new image.  The exact kernel epilogue result, captured
+         * before this transition, is the authority.  Leave the probe open for
+         * the next instruction-entry hook to revalidate and record user entry.
+         */
+        if (probe->spawn_attr_decoded && probe->spawn_setexec &&
+            probe->kernel_spawn_outcome_seen &&
+            probe->kernel_spawn_outcome_r0 == 0 &&
+            probe->entry_tpidrprw &&
+            cpu->cp15.tpidrprw == probe->entry_tpidrprw) {
+            break;
+        }
 
         bool expected_thumb = (probe->entry_spsr & ARM_CPSR_T) != 0;
         bool at_resume = cpu->r[15] == probe->resume_pc &&
@@ -2545,6 +2899,76 @@ static bool springboard_child_read_field(arm_cpu_t *cpu,
     return true;
 }
 
+static void diagnostic_read_thread_identity(
+        arm_cpu_t *cpu, uint32_t thread,
+        diagnostic_thread_identity_t *identity) {
+    if (!identity) return;
+    memset(identity, 0, sizeof *identity);
+    const springboard_child_config_t *config =
+        &G.springboard_child_config;
+    if (!cpu || !config->enabled || !thread) return;
+
+    identity->task_stage = LIFECYCLE_IDENTITY_THREAD_TO_TASK;
+    if (!springboard_child_read_field(
+            cpu, thread, config->thread_task_offset,
+            &identity->task, &identity->failure_va,
+            &identity->failure_fsr)) return;
+
+    identity->task_stage = LIFECYCLE_IDENTITY_TASK_TO_PROC;
+    if (!springboard_child_read_field(
+            cpu, identity->task, config->task_proc_offset,
+            &identity->task_proc, &identity->failure_va,
+            &identity->failure_fsr)) return;
+
+    identity->task_stage = LIFECYCLE_IDENTITY_PROC_TO_PID;
+    if (!springboard_child_read_field(
+            cpu, identity->task_proc, config->proc_pid_offset,
+            &identity->task_pid, &identity->failure_va,
+            &identity->failure_fsr)) return;
+    if (identity->task_pid > INT32_MAX) {
+        identity->failure_va =
+            identity->task_proc + config->proc_pid_offset;
+        return;
+    }
+    identity->task_stage = LIFECYCLE_IDENTITY_COMPLETE;
+    identity->task_valid = true;
+
+    if (!springboard_child_read_field(
+            cpu, thread, config->thread_uthread_offset,
+            &identity->uthread, &identity->effective_failure_va,
+            &identity->effective_failure_fsr) ||
+        !identity->uthread) return;
+    if (!springboard_child_read_field(
+            cpu, identity->uthread, config->uthread_flags_offset,
+            &identity->uthread_flags, &identity->effective_failure_va,
+            &identity->effective_failure_fsr)) return;
+
+    identity->effective_vfork =
+        (identity->uthread_flags & config->uthread_vfork_mask) != 0;
+    if (identity->effective_vfork) {
+        if (!springboard_child_read_field(
+                cpu, identity->uthread, config->uthread_proc_offset,
+                &identity->effective_proc,
+                &identity->effective_failure_va,
+                &identity->effective_failure_fsr) ||
+            !identity->effective_proc) return;
+        if (!springboard_child_read_field(
+                cpu, identity->effective_proc, config->proc_pid_offset,
+                &identity->effective_pid,
+                &identity->effective_failure_va,
+                &identity->effective_failure_fsr)) return;
+    } else {
+        identity->effective_proc = identity->task_proc;
+        identity->effective_pid = identity->task_pid;
+    }
+    if (identity->effective_pid > INT32_MAX) {
+        identity->effective_failure_va =
+            identity->effective_proc + config->proc_pid_offset;
+        return;
+    }
+    identity->effective_valid = true;
+}
+
 static void springboard_child_capture_mapping(
         springboard_child_probe_t *child, arm_cpu_t *cpu, uint64_t at) {
     if (!child || !cpu) return;
@@ -2618,7 +3042,314 @@ static bool springboard_probe_is_active(unsigned index) {
     const springboard_return_probe_t *probe =
         &G.springboard_return[index];
     return !probe->returned && !probe->redirected &&
-           !probe->restarted && !probe->superseded;
+           !probe->restarted && !probe->superseded &&
+           !probe->activity_closed && !probe->setexec_image_seen;
+}
+
+/*
+ * A TPIDRPRW match alone is only bounded pointer continuity: a destroyed
+ * thread object can eventually be reused.  Cheap activity counters use that
+ * bound, but every phase, kernel outcome, and SETEXEC image claim re-walks the
+ * live thread -> task/proc/PID and thread -> uthread identity.  Only the newest
+ * matching generation owns an instruction, and the next same-pointer SWI
+ * closes it.
+ */
+static bool springboard_return_identity_revalidated(
+        const springboard_return_probe_t *probe,
+        const diagnostic_thread_identity_t *identity,
+        bool require_effective) {
+    if (!probe || !identity || !probe->entry_task_valid ||
+        !identity->task_valid || !probe->entry_uthread ||
+        identity->uthread != probe->entry_uthread ||
+        identity->task != probe->entry_task ||
+        identity->task_proc != probe->entry_task_proc ||
+        identity->task_pid != probe->entry_task_pid)
+        return false;
+    if (!require_effective) return true;
+    return probe->entry_effective_valid && identity->effective_valid &&
+           identity->effective_proc == probe->entry_effective_proc &&
+           identity->effective_pid == probe->entry_effective_pid;
+}
+
+static bool springboard_setexec_phase_chain_complete(
+        const springboard_return_probe_t *probe) {
+    const springboard_child_config_t *config =
+        &G.springboard_child_config;
+    if (!probe || !config->enabled ||
+        !config->phase_is_callsite[1] ||
+        !probe->kernel_spawn_outcome_seen)
+        return false;
+    for (unsigned phase = 0; phase < SPRINGBOARD_PHASE_COUNT; phase++) {
+        if (!config->phase_va[phase] ||
+            (!config->phase_is_callsite[phase] &&
+             !config->phase_expected_lr[phase]))
+            return false;
+    }
+    return probe->phase_hits[1] &&
+           probe->phase_hits[2] &&
+           !probe->phase_hits[0] && !probe->phase_hits[3] &&
+           !probe->phase_hits[4] && !probe->phase_hits[5] &&
+           probe->phase_first_at[1] <
+               probe->phase_first_at[2] &&
+           probe->phase_first_at[2] <
+               probe->kernel_spawn_outcome_at;
+}
+
+static void springboard_return_note_thread_activity(
+        arm_cpu_t *cpu, uint64_t at, uint32_t pc) {
+    if (!cpu || !G.springboard_return_n) return;
+    uint32_t aligned_pc = pc & ~1u;
+    uint32_t mode = cpu->cpsr & ARM_CPSR_MODE_MASK;
+    bool thumb = (cpu->cpsr & ARM_CPSR_T) != 0;
+    const springboard_child_config_t *config =
+        &G.springboard_child_config;
+
+    for (unsigned next = G.springboard_return_n; next > 0; next--) {
+        unsigned i = next - 1u;
+        springboard_return_probe_t *probe =
+            &G.springboard_return[i];
+        if (!springboard_probe_is_active(i) || at <= probe->entry_at ||
+            !probe->entry_tpidrprw ||
+            cpu->cp15.tpidrprw != probe->entry_tpidrprw) continue;
+
+        if (!probe->thread_entries) probe->thread_first_at = at;
+        probe->thread_entries++;
+        probe->thread_last_at = at;
+        if (mode == ARM_MODE_USR)
+            probe->thread_user_entries++;
+        else
+            probe->thread_kernel_entries++;
+        probe->thread_last_pc = pc;
+        probe->thread_last_cpsr = cpu->cpsr;
+        probe->thread_last_ttbr0 = cpu->cp15.ttbr0;
+        probe->thread_last_context_id = cpu->cp15.context_id;
+
+        if (mode == ARM_MODE_USR && !probe->thread_first_user_seen) {
+            probe->thread_first_user_seen = true;
+            probe->thread_first_user_at = at;
+            probe->thread_first_user_pc = pc;
+            probe->thread_first_user_r0 = cpu->r[0];
+            probe->thread_first_user_r1 = cpu->r[1];
+            probe->thread_first_user_cpsr = cpu->cpsr;
+            probe->thread_first_user_ttbr0 = cpu->cp15.ttbr0;
+            probe->thread_first_user_context_id = cpu->cp15.context_id;
+            probe->thread_first_user_sp = diagnostic_user_reg(cpu, 13u);
+            probe->thread_first_user_lr = diagnostic_user_reg(cpu, 14u);
+        }
+
+        if (!config->enabled) break;
+
+        int matched_phase = -1;
+        if (thumb && mode == ARM_MODE_SVC) {
+            for (unsigned phase = 0;
+                 phase < SPRINGBOARD_PHASE_COUNT; phase++) {
+                if (config->phase_va[phase] &&
+                    aligned_pc == config->phase_va[phase]) {
+                    matched_phase = (int)phase;
+                    break;
+                }
+            }
+        }
+        bool at_outcome =
+            thumb && mode == ARM_MODE_SVC &&
+            aligned_pc == config->spawn_epilogue_pc;
+        bool image_candidate =
+            probe->spawn_attr_decoded && probe->spawn_setexec &&
+            probe->kernel_spawn_outcome_seen &&
+            probe->kernel_spawn_outcome_r0 == 0 &&
+            at > probe->kernel_spawn_outcome_at &&
+            mode == ARM_MODE_USR;
+        if (matched_phase < 0 && !at_outcome && !image_candidate) break;
+
+        diagnostic_thread_identity_t identity;
+        diagnostic_read_thread_identity(
+            cpu, probe->entry_tpidrprw, &identity);
+
+        if (matched_phase >= 0) {
+            unsigned phase = (unsigned)matched_phase;
+            bool identity_ok = springboard_return_identity_revalidated(
+                probe, &identity, probe->spawn_setexec);
+            if (!identity_ok) {
+                probe->phase_identity_rejects[phase]++;
+            } else if (!config->phase_is_callsite[phase] &&
+                       (!config->phase_expected_lr[phase] ||
+                        cpu->r[14] !=
+                            config->phase_expected_lr[phase])) {
+                probe->phase_caller_rejects[phase]++;
+            } else {
+                if (!probe->phase_hits[phase])
+                    probe->phase_first_at[phase] = at;
+                probe->phase_hits[phase]++;
+                probe->phase_last_at[phase] = at;
+            }
+        }
+
+        if (at_outcome && !probe->kernel_spawn_outcome_seen) {
+            if (springboard_return_identity_revalidated(
+                    probe, &identity, probe->spawn_setexec)) {
+                probe->kernel_spawn_outcome_seen = true;
+                probe->kernel_spawn_outcome_at = at;
+                probe->kernel_spawn_outcome_r0 = cpu->r[0];
+            } else {
+                probe->kernel_spawn_outcome_identity_rejects++;
+            }
+        }
+
+        if (image_candidate && !probe->setexec_image_seen) {
+            uint32_t reject_flags = 0;
+            bool interrupt_deflects =
+                (cpu->fiq_line && !(cpu->cpsr & ARM_CPSR_F)) ||
+                (cpu->irq_line && !(cpu->cpsr & ARM_CPSR_I));
+            if (interrupt_deflects) {
+                probe->setexec_image_deferrals++;
+                break;
+            }
+
+            uint32_t fetch_pa = 0;
+            uint32_t fetch_fsr = arm_mmu_translate(
+                cpu, pc, ARM_ACCESS_FETCH, false, &fetch_pa);
+            (void)fetch_pa;
+            if (fetch_fsr) {
+                probe->setexec_image_fetch_fsr = fetch_fsr;
+                probe->setexec_image_deferrals++;
+                /*
+                 * A freshly activated vnode-backed page may demand-fault.
+                 * Let arm_step raise the prefetch abort and retry after VM
+                 * resolves it; an eventual signal/exit closes the lifetime.
+                 */
+                break;
+            }
+
+            if (pc == probe->issuing_pc || pc == probe->resume_pc)
+                reject_flags |= SETEXEC_IMAGE_REJECT_WRAPPER;
+            if (!springboard_setexec_phase_chain_complete(probe))
+                reject_flags |= SETEXEC_IMAGE_REJECT_PHASES;
+            if (reject_flags) {
+                probe->setexec_image_rejected = true;
+                probe->setexec_image_reject_flags = reject_flags;
+                probe->activity_closed = true;
+                probe->activity_closed_at = at;
+                break;
+            }
+
+            bool identity_incomplete =
+                !identity.task_valid || !identity.effective_valid ||
+                !identity.uthread;
+            if (!identity_incomplete &&
+                !springboard_return_identity_revalidated(
+                    probe, &identity, true)) {
+                reject_flags |= SETEXEC_IMAGE_REJECT_IDENTITY;
+                probe->setexec_image_identity_rejects++;
+            }
+            if (!reject_flags) {
+                /*
+                 * arm_step still samples asynchronous interrupts before fetch.
+                 * The line check and successful fetch translation above make
+                 * this a candidate; commit the execution claim only after the
+                 * corresponding interpreter step returns ARM_OK.
+                 */
+                probe->setexec_image_pending = true;
+                probe->setexec_image_pending_identity_retry =
+                    identity_incomplete;
+                probe->setexec_image_user_at = at;
+                probe->setexec_image_user_pc = pc;
+                probe->setexec_image_user_cpsr = cpu->cpsr;
+                probe->setexec_image_ttbr0 = cpu->cp15.ttbr0;
+                probe->setexec_image_context_id = cpu->cp15.context_id;
+                if (identity_incomplete) {
+                    probe->setexec_image_identity_rejects++;
+                    probe->setexec_image_deferrals++;
+                } else {
+                    probe->setexec_image_task = identity.task;
+                    probe->setexec_image_proc = identity.effective_proc;
+                    probe->setexec_image_pid = identity.effective_pid;
+                }
+            } else {
+                probe->setexec_image_rejected = true;
+                probe->setexec_image_reject_flags = reject_flags;
+                probe->activity_closed = true;
+                probe->activity_closed_at = at;
+            }
+        }
+        break;
+    }
+}
+
+static void springboard_return_note_post_step(
+        arm_cpu_t *cpu, uint64_t at, arm_status_t status) {
+    for (unsigned next = G.springboard_return_n; next > 0; next--) {
+        springboard_return_probe_t *probe =
+            &G.springboard_return[next - 1u];
+        if (!probe->setexec_image_pending ||
+            probe->setexec_image_user_at != at)
+            continue;
+        probe->setexec_image_pending = false;
+        uint32_t post_mode = cpu
+            ? cpu->cpsr & ARM_CPSR_MODE_MASK : 0u;
+        if (status == ARM_OK &&
+            (post_mode == ARM_MODE_ABT ||
+             post_mode == ARM_MODE_UND ||
+             post_mode == ARM_MODE_IRQ ||
+             post_mode == ARM_MODE_FIQ)) {
+            /*
+             * ARM_OK also covers architecturally taken abort/undefined and
+             * interrupt entries.  The user PC was fetchable, but its
+             * instruction did not retire; leave the probe open for retry.
+             * A user SVC is different: that instruction did execute, so SVC
+             * mode remains eligible for the normal proof below.
+             */
+            probe->setexec_image_deferrals++;
+            probe->setexec_exception_deferrals++;
+            probe->setexec_last_exception_mode = post_mode;
+            probe->setexec_image_pending_identity_retry = false;
+            break;
+        }
+        if (status == ARM_OK) {
+            if (probe->setexec_image_pending_identity_retry) {
+                diagnostic_thread_identity_t identity;
+                diagnostic_read_thread_identity(
+                    cpu, probe->entry_tpidrprw, &identity);
+                if (!identity.task_valid || !identity.effective_valid ||
+                    !identity.uthread) {
+                    if (!probe->setexec_unvalidated_user_steps) {
+                        probe->setexec_first_unvalidated_user_at = at;
+                        probe->setexec_first_unvalidated_user_pc =
+                            probe->setexec_image_user_pc;
+                    }
+                    probe->setexec_unvalidated_user_steps++;
+                    probe->setexec_image_pending_identity_retry = false;
+                    break;
+                }
+                if (!springboard_return_identity_revalidated(
+                        probe, &identity, true)) {
+                    probe->setexec_image_rejected = true;
+                    probe->setexec_image_reject_flags |=
+                        SETEXEC_IMAGE_REJECT_IDENTITY;
+                    probe->setexec_image_identity_rejects++;
+                } else {
+                    probe->setexec_image_task = identity.task;
+                    probe->setexec_image_proc =
+                        identity.effective_proc;
+                    probe->setexec_image_pid =
+                        identity.effective_pid;
+                    probe->setexec_image_seen = true;
+                }
+            } else {
+                probe->setexec_image_seen = true;
+            }
+        } else {
+            probe->setexec_image_rejected = true;
+            probe->setexec_image_reject_flags |=
+                SETEXEC_IMAGE_REJECT_STEP;
+        }
+        probe->setexec_image_pending_identity_retry = false;
+        if (!probe->setexec_image_seen &&
+            !probe->setexec_image_rejected)
+            break;
+        probe->activity_closed = true;
+        probe->activity_closed_at = at;
+        break;
+    }
 }
 
 /*
@@ -2641,9 +3372,12 @@ static void springboard_child_note_instruction(arm_cpu_t *cpu,
         cpu->r[14] == (config->return_pc | 1u)) {
         for (unsigned next = G.springboard_return_n; next > 0; next--) {
             unsigned index = next - 1u;
+            const springboard_return_probe_t *parent =
+                &G.springboard_return[index];
             springboard_child_probe_t *child =
                 &G.springboard_child[index];
-            if (!springboard_probe_is_active(index) ||
+            if (parent->spawn_setexec ||
+                !springboard_probe_is_active(index) ||
                 child->resume_entry_seen || at <= child->entry_at ||
                 cpu->cp15.tpidrprw != child->parent_thread) continue;
             springboard_child_capture_mapping(child, cpu, at);
@@ -2655,8 +3389,11 @@ static void springboard_child_note_instruction(arm_cpu_t *cpu,
     if (thumb && svc && aligned_pc == config->return_pc) {
         for (unsigned next = G.springboard_return_n; next > 0; next--) {
             unsigned index = next - 1u;
+            const springboard_return_probe_t *parent =
+                &G.springboard_return[index];
             springboard_child_probe_t *child = &G.springboard_child[index];
-            if (!springboard_probe_is_active(index) ||
+            if (parent->spawn_setexec ||
+                !springboard_probe_is_active(index) ||
                 !child->resume_entry_seen || child->resume_return_seen ||
                 at <= child->resume_entry_at ||
                 cpu->cp15.tpidrprw != child->parent_thread) continue;
@@ -2670,8 +3407,11 @@ static void springboard_child_note_instruction(arm_cpu_t *cpu,
 
     if ((cpu->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR) return;
     for (unsigned i = 0; i < G.springboard_return_n; i++) {
+        const springboard_return_probe_t *parent =
+            &G.springboard_return[i];
         springboard_child_probe_t *child = &G.springboard_child[i];
-        if (child->map_stage != SPRINGBOARD_CHILD_MAP_COMPLETE ||
+        if (parent->spawn_setexec ||
+            child->map_stage != SPRINGBOARD_CHILD_MAP_COMPLETE ||
             child->first_user_seen || child->identity_invalidated ||
             child->exited ||
             cpu->cp15.tpidrprw != child->child_thread) continue;
@@ -2691,7 +3431,66 @@ static void springboard_child_note_kernel_lifecycle(
         return;
     const springboard_child_config_t *config =
         &G.springboard_child_config;
+
+    /*
+     * SETEXEC has no vfork child-resume object to map.  The fork child itself
+     * is replaced, so its proc pointer plus a freshly re-read PID is the
+     * lifetime key.  Require the exact kernel activation result first, scan
+     * newest-first, and make the first _exit1 terminal to prevent object reuse.
+     */
+    for (unsigned next = G.springboard_return_n; next > 0; next--) {
+        springboard_return_probe_t *probe =
+            &G.springboard_return[next - 1u];
+        if (!probe->spawn_attr_decoded || !probe->spawn_setexec ||
+            !probe->entry_task_valid || !probe->entry_effective_valid ||
+            probe->entry_task_proc != probe->entry_effective_proc ||
+            probe->entry_task_pid != probe->entry_effective_pid ||
+            probe->entry_effective_pid <= 1u ||
+            !probe->kernel_spawn_outcome_seen ||
+            probe->kernel_spawn_outcome_r0 != 0 ||
+            at <= probe->kernel_spawn_outcome_at ||
+            probe->setexec_lifecycle_identity_invalidated ||
+            probe->setexec_exited ||
+            cpu->r[0] != probe->entry_effective_proc)
+            continue;
+
+        uint32_t pid = 0, failure_va = 0, failure_fsr = 0;
+        if (!springboard_child_read_field(
+                cpu, cpu->r[0], config->proc_pid_offset, &pid,
+                &failure_va, &failure_fsr) ||
+            pid != probe->entry_effective_pid) {
+            probe->setexec_lifecycle_identity_rejects++;
+            probe->setexec_lifecycle_failure_va =
+                failure_va ? failure_va :
+                probe->entry_effective_proc + config->proc_pid_offset;
+            probe->setexec_lifecycle_failure_fsr = failure_fsr;
+            probe->setexec_lifecycle_identity_invalidated = true;
+            break;
+        }
+
+        if (kind == LIFECYCLE_PSIGNAL) {
+            if (!probe->setexec_signal_count) {
+                probe->setexec_first_signal_at = at;
+                probe->setexec_first_signal = cpu->r[1];
+            }
+            probe->setexec_signal_count++;
+        } else {
+            if (!probe->setexec_exit_count) {
+                probe->setexec_first_exit_at = at;
+                probe->setexec_first_exit_status = cpu->r[1];
+            }
+            probe->setexec_exit_count++;
+            probe->setexec_exited = true;
+            if (!probe->activity_closed) {
+                probe->activity_closed = true;
+                probe->activity_closed_at = at;
+            }
+        }
+        break;
+    }
+
     for (unsigned i = 0; i < G.springboard_return_n; i++) {
+        if (G.springboard_return[i].spawn_setexec) continue;
         springboard_child_probe_t *child = &G.springboard_child[i];
         if (child->map_stage != SPRINGBOARD_CHILD_MAP_COMPLETE ||
             child->identity_invalidated || child->exited ||
@@ -2725,8 +3524,74 @@ static void springboard_child_note_kernel_lifecycle(
     }
 }
 
+static void lifecycle_capture_identity(lifecycle_event_t *event,
+                                       arm_cpu_t *cpu) {
+    if (!event || !cpu) return;
+    event->ttbr0_base = diagnostic_ttbr0_base(cpu);
+    event->context_id = cpu->cp15.context_id;
+    event->current_thread = cpu->cp15.tpidrprw;
+    event->svc_sp = cpu->r[13];
+    event->user_sp = diagnostic_user_reg(cpu, 13u);
+    event->entry_mode = cpu->cpsr & ARM_CPSR_MODE_MASK;
+    diagnostic_thread_identity_t identity;
+    diagnostic_read_thread_identity(
+        cpu, event->current_thread, &identity);
+    event->identity_stage = identity.task_stage;
+    event->current_task = identity.task;
+    event->task_proc = identity.task_proc;
+    event->task_pid = identity.task_pid;
+    event->identity_failure_va = identity.failure_va;
+    event->identity_failure_fsr = identity.failure_fsr;
+    event->current_uthread = identity.uthread;
+    event->current_uthread_flags = identity.uthread_flags;
+    event->effective_proc = identity.effective_proc;
+    event->effective_pid = identity.effective_pid;
+    event->effective_failure_va = identity.effective_failure_va;
+    event->effective_failure_fsr = identity.effective_failure_fsr;
+    event->effective_identity_valid = identity.effective_valid;
+    event->effective_vfork = identity.effective_vfork;
+}
+
+static void lifecycle_decode_spawn_attr(lifecycle_event_t *event,
+                                        arm_cpu_t *cpu) {
+    if (!event || !cpu || event->syscall_number != 244u ||
+        event->arg_count < 3u) return;
+    event->spawn_adesc_va = event->args[2];
+    if (!event->spawn_adesc_va) {
+        /* A null descriptor means the kernel's default, zero flags. */
+        event->spawn_attr_decoded = true;
+        return;
+    }
+    uint8_t descriptor[8];
+    if (!guest_read_user_bytes(
+            cpu, event->spawn_adesc_va, descriptor, sizeof descriptor,
+            &event->spawn_attr_failure_va,
+            &event->spawn_attr_failure_fsr)) return;
+
+    event->spawn_attr_size = ld32(descriptor);
+    event->spawn_attr_va = ld32(descriptor + 4u);
+    if (!event->spawn_attr_size) {
+        event->spawn_attr_decoded = true;
+        return;
+    }
+    if (event->spawn_attr_size < sizeof(uint16_t) ||
+        !event->spawn_attr_va)
+        return;
+
+    uint8_t flags[2];
+    if (!guest_read_user_bytes(
+            cpu, event->spawn_attr_va, flags, sizeof flags,
+            &event->spawn_attr_failure_va,
+            &event->spawn_attr_failure_fsr)) return;
+    event->spawn_attr_flags = ld16(flags);
+    event->spawn_setexec =
+        (event->spawn_attr_flags &
+         DIAGNOSTIC_POSIX_SPAWN_SETEXEC) != 0;
+    event->spawn_attr_decoded = true;
+}
+
 /*
- * xnu-1456.1.26 bsd/kern/syscalls.master defines execve's pathname as arg 0,
+ * The shipped xnu-1357.5.30 syscall ABI defines execve's pathname as arg 0,
  * posix_spawn's pathname as arg 1 (arg 0 is pid_t *), and __mac_execve's as
  * arg 0.  For SYS_syscall (r12 == 0), r0 is the real number and the logical
  * argument array begins at r1.
@@ -2742,6 +3607,7 @@ static void lifecycle_note_syscall(arm_cpu_t *cpu, uint64_t at) {
     if (!lifecycle_syscall_tracked(number)) return;
 
     lifecycle_event_t *event = lifecycle_begin(at, LIFECYCLE_SYSCALL);
+    lifecycle_capture_identity(event, cpu);
     event->syscall_number = number;
     event->raw_r12 = cpu->r[12];
     event->spsr = cpu->spsr[ARM_BANK_SVC];
@@ -2751,6 +3617,7 @@ static void lifecycle_note_syscall(arm_cpu_t *cpu, uint64_t at) {
     event->arg_count = 4u - shift;
     for (unsigned i = 0; i < event->arg_count; i++)
         event->args[i] = cpu->r[i + shift];
+    lifecycle_decode_spawn_attr(event, cpu);
 
     uint32_t return_bytes = (event->spsr & ARM_CPSR_T) ? 2u : 4u;
     event->user_pc_valid = cpu->r[14] >= return_bytes;
@@ -2784,16 +3651,17 @@ static void lifecycle_note_syscall(arm_cpu_t *cpu, uint64_t at) {
         G.springboard_last_at = at;
         G.springboard_attempts++;
         springboard_return_arm(cpu, at, number, event->user_pc,
-                               event->user_lr, event->spsr);
+                               event->user_lr, event->spsr, event);
     }
 }
 
-/* xnu-1456.1.26 kern_exit.c: exit1(proc_t, int rv, int *retval).
+/* Shipped xnu-1357.5.30: exit1(proc_t, int rv, int *retval).
  * kern_sig.c: psignal(proc_t, int signum). */
 static void lifecycle_note_kernel_entry(arm_cpu_t *cpu, uint64_t at,
                                         lifecycle_kind_t kind) {
     if (!cpu || (kind != LIFECYCLE_EXIT1 && kind != LIFECYCLE_PSIGNAL)) return;
     lifecycle_event_t *event = lifecycle_begin(at, kind);
+    lifecycle_capture_identity(event, cpu);
     event->arg_count = kind == LIFECYCLE_EXIT1 ? 3u : 2u;
     for (unsigned i = 0; i < event->arg_count; i++) event->args[i] = cpu->r[i];
 }
@@ -3155,6 +4023,17 @@ static const char *lifecycle_path_status_name(unsigned status) {
     }
 }
 
+static const char *lifecycle_identity_stage_name(unsigned stage) {
+    switch ((lifecycle_identity_stage_t)stage) {
+    case LIFECYCLE_IDENTITY_NONE:           return "not-attempted";
+    case LIFECYCLE_IDENTITY_THREAD_TO_TASK: return "thread-to-task";
+    case LIFECYCLE_IDENTITY_TASK_TO_PROC:   return "task-to-proc";
+    case LIFECYCLE_IDENTITY_PROC_TO_PID:    return "proc-to-pid";
+    case LIFECYCLE_IDENTITY_COMPLETE:       return "complete";
+    default:                                return "unknown";
+    }
+}
+
 static void lifecycle_print_escaped(const char *bytes, size_t length) {
     putchar('"');
     for (size_t i = 0; i < length; i++) {
@@ -3168,6 +4047,79 @@ static void lifecycle_print_escaped(const char *bytes, size_t length) {
         else printf("\\x%02x", c);
     }
     putchar('"');
+}
+
+static void springboard_return_thread_activity_report(
+        const springboard_return_probe_t *probe) {
+    if (!probe) return;
+    if (!probe->thread_entries) {
+        printf("        same-TPIDRPRW pointer activity after SWI entry:"
+               " NONE before stop\n");
+    } else {
+        printf("        bounded same-TPIDRPRW pointer activity: %" PRIu64
+               " entries (%" PRIu64 " USR, %" PRIu64 " privileged),"
+               " first/last @%" PRIu64 "/%" PRIu64 "\n",
+               probe->thread_entries, probe->thread_user_entries,
+               probe->thread_kernel_entries, probe->thread_first_at,
+               probe->thread_last_at);
+        printf("        last same-pointer entry pc/cpsr/TTBR0/context"
+               " %08x/%08x/%08x/%08x\n",
+               probe->thread_last_pc, probe->thread_last_cpsr,
+               probe->thread_last_ttbr0,
+               probe->thread_last_context_id);
+    }
+    if (probe->thread_first_user_seen)
+        printf("        first same-pointer USR entry @%" PRIu64
+               " pc=%08x r0/r1=%08x/%08x cpsr=%08x"
+               " TTBR0/context=%08x/%08x sp/lr=%08x/%08x"
+               " (pointer evidence only)\n",
+               probe->thread_first_user_at, probe->thread_first_user_pc,
+               probe->thread_first_user_r0, probe->thread_first_user_r1,
+               probe->thread_first_user_cpsr,
+               probe->thread_first_user_ttbr0,
+               probe->thread_first_user_context_id,
+               probe->thread_first_user_sp, probe->thread_first_user_lr);
+    if (probe->activity_closed)
+        printf("        same-pointer activity bound closed @%" PRIu64 "%s\n",
+               probe->activity_closed_at,
+               probe->setexec_image_seen
+                   ? " by validated SETEXEC image user entry"
+                   : probe->setexec_image_rejected
+                       ? " by rejected first post-outcome USR entry"
+                       : probe->setexec_exited
+                           ? " by attributed SETEXEC process exit"
+                           : " at the next same-pointer SWI");
+
+    const springboard_child_config_t *config =
+        &G.springboard_child_config;
+    if (!config->enabled) {
+        printf("        exact kernel phases: DISABLED (%s)\n",
+               config->reason[0] ? config->reason : "not discovered");
+        return;
+    }
+    for (unsigned phase = 0; phase < SPRINGBOARD_PHASE_COUNT; phase++) {
+        if (!config->phase_va[phase]) {
+            printf("        identity-gated phase %-20s UNRESOLVED\n",
+                   SPRINGBOARD_PHASE_NAMES[phase]);
+            continue;
+        }
+        printf("        identity-gated phase %-20s %08x%s: %" PRIu64
+               " hits; identity/caller rejects %" PRIu64 "/%" PRIu64,
+               SPRINGBOARD_PHASE_NAMES[phase],
+               config->phase_va[phase],
+               config->phase_is_callsite[phase] ? " (validated BL)" : "",
+               probe->phase_hits[phase],
+               probe->phase_identity_rejects[phase],
+               probe->phase_caller_rejects[phase]);
+        if (!config->phase_is_callsite[phase])
+            printf("; expected lr %08x",
+                   config->phase_expected_lr[phase]);
+        if (probe->phase_hits[phase])
+            printf(" first/last @%" PRIu64 "/%" PRIu64,
+                   probe->phase_first_at[phase],
+                   probe->phase_last_at[phase]);
+        printf("\n");
+    }
 }
 
 static void springboard_return_report(void) {
@@ -3194,6 +4146,153 @@ static void springboard_return_report(void) {
                probe->entry_tpidrurw, probe->entry_tpidruro,
                probe->entry_svc_sp, probe->entry_user_sp,
                probe->entry_user_lr);
+        if (probe->entry_task_valid)
+            printf("        entry task/task-proc/pid %08x/%08x/%u;"
+                   " uthread %08x\n",
+                   probe->entry_task, probe->entry_task_proc,
+                   probe->entry_task_pid, probe->entry_uthread);
+        else
+            printf("        entry task identity: UNAVAILABLE\n");
+        if (probe->entry_effective_valid)
+            printf("        entry effective proc/pid %08x/%u\n",
+                   probe->entry_effective_proc,
+                   probe->entry_effective_pid);
+        else
+            printf("        entry effective proc/PID: UNAVAILABLE\n");
+
+        if (probe->spawn_attr_decoded)
+            printf("        spawn attrs: adesc=%08x size=%u attr=%08x"
+                   " flags=%04x SETEXEC=%s\n",
+                   probe->spawn_adesc_va, probe->spawn_attr_size,
+                   probe->spawn_attr_va, probe->spawn_attr_flags,
+                   probe->spawn_setexec ? "yes" : "no");
+        else
+            printf("        spawn attrs: UNDECODED adesc=%08x size=%u"
+                   " attr=%08x (failed va %08x fsr %08x)\n",
+                   probe->spawn_adesc_va, probe->spawn_attr_size,
+                   probe->spawn_attr_va,
+                   probe->spawn_attr_failure_va,
+                   probe->spawn_attr_failure_fsr);
+
+        springboard_return_thread_activity_report(probe);
+
+        if (probe->kernel_spawn_outcome_seen) {
+            printf("        EXACT _posix_spawn EPILOGUE @%" PRIu64
+                   " r0=%u (0x%08x); identity rejects %" PRIu64 "\n",
+                   probe->kernel_spawn_outcome_at,
+                   probe->kernel_spawn_outcome_r0,
+                   probe->kernel_spawn_outcome_r0,
+                   probe->kernel_spawn_outcome_identity_rejects);
+        } else {
+            printf("        exact _posix_spawn epilogue outcome:"
+                   " NOT OBSERVED; identity rejects %" PRIu64 "\n",
+                   probe->kernel_spawn_outcome_identity_rejects);
+        }
+
+        if (probe->spawn_setexec) {
+            if (probe->setexec_image_seen) {
+                printf("        PROVEN IDENTITY-VALIDATED USER INSTRUCTION"
+                       " EXECUTED AFTER"
+                       " SUCCESSFUL SPRINGBOARD IMAGE ACTIVATION @%" PRIu64
+                       " pc=%08x cpsr=%08x\n",
+                       probe->setexec_image_user_at,
+                       probe->setexec_image_user_pc,
+                       probe->setexec_image_user_cpsr);
+                printf("        revalidated task/proc/pid %08x/%08x/%u;"
+                       " TTBR0/context %08x/%08x\n",
+                       probe->setexec_image_task,
+                       probe->setexec_image_proc,
+                       probe->setexec_image_pid,
+                       probe->setexec_image_ttbr0,
+                       probe->setexec_image_context_id);
+                printf("        IMPORTANT: this may be dyld or another"
+                       " image entry; it does not prove SpringBoard main,"
+                       " survival, or rendering.\n");
+            } else if (probe->setexec_image_rejected) {
+                printf("        FIRST POST-OUTCOME USR ENTRY REJECTED"
+                       " (flags %02x: wrapper=%u phases=%u identity=%u"
+                       " fetch=%u step=%u; identity rejects %" PRIu64
+                       ", deferrals %" PRIu64 ")\n",
+                       probe->setexec_image_reject_flags,
+                       (probe->setexec_image_reject_flags &
+                        SETEXEC_IMAGE_REJECT_WRAPPER) ? 1u : 0u,
+                       (probe->setexec_image_reject_flags &
+                        SETEXEC_IMAGE_REJECT_PHASES) ? 1u : 0u,
+                       (probe->setexec_image_reject_flags &
+                        SETEXEC_IMAGE_REJECT_IDENTITY) ? 1u : 0u,
+                       (probe->setexec_image_reject_flags &
+                        SETEXEC_IMAGE_REJECT_FETCH) ? 1u : 0u,
+                       (probe->setexec_image_reject_flags &
+                        SETEXEC_IMAGE_REJECT_STEP) ? 1u : 0u,
+                       probe->setexec_image_identity_rejects,
+                       probe->setexec_image_deferrals);
+                if (probe->setexec_image_reject_flags &
+                    SETEXEC_IMAGE_REJECT_FETCH)
+                    printf("        user instruction fetch FSR %08x\n",
+                           probe->setexec_image_fetch_fsr);
+            } else {
+                printf("        first identity-validated SETEXEC image"
+                       " user instruction execution: NOT OBSERVED before"
+                       " stop (deferrals %" PRIu64 ")\n",
+                       probe->setexec_image_deferrals);
+                if (probe->setexec_image_fetch_fsr)
+                    printf("        last deferred user fetch FSR %08x"
+                           " (demand-fault retry remained eligible)\n",
+                           probe->setexec_image_fetch_fsr);
+            }
+            if (probe->setexec_unvalidated_user_steps)
+                printf("        same-pointer ARM_OK user steps with"
+                       " unreadable identity: %" PRIu64
+                       " (first @%" PRIu64 " pc=%08x); not accepted as"
+                       " SpringBoard execution proof\n",
+                       probe->setexec_unvalidated_user_steps,
+                       probe->setexec_first_unvalidated_user_at,
+                       probe->setexec_first_unvalidated_user_pc);
+            if (probe->setexec_exception_deferrals)
+                printf("        user-step exception deferrals: %" PRIu64
+                       " (last post-step mode %02x); abort/UND/IRQ/FIQ"
+                       " entries are not accepted as retired user"
+                       " instructions\n",
+                       probe->setexec_exception_deferrals,
+                       probe->setexec_last_exception_mode);
+
+            printf("        post-activation entry-proc/PID"
+                   " _psignal/_exit1 entries: %" PRIu64 "/%" PRIu64,
+                   probe->setexec_signal_count,
+                   probe->setexec_exit_count);
+            if (probe->setexec_signal_count)
+                printf("; first signal %u @%" PRIu64,
+                       probe->setexec_first_signal,
+                       probe->setexec_first_signal_at);
+            if (probe->setexec_exit_count)
+                printf("; first exit status %08x @%" PRIu64,
+                       probe->setexec_first_exit_status,
+                       probe->setexec_first_exit_at);
+            printf("\n");
+            if (probe->setexec_lifecycle_identity_invalidated)
+                printf("        SETEXEC lifetime identity invalidated"
+                       " (failed va %08x fsr %08x; rejects %" PRIu64 ")\n",
+                       probe->setexec_lifecycle_failure_va,
+                       probe->setexec_lifecycle_failure_fsr,
+                       probe->setexec_lifecycle_identity_rejects);
+
+            if (probe->kernel_spawn_outcome_seen &&
+                probe->kernel_spawn_outcome_r0 == 0) {
+                printf("        RESULT: POSIX_SPAWN_SETEXEC kernel image"
+                       " activation SUCCESS (epilogue r0=0); return to the"
+                       " old launchd wrapper is N/A on this path.\n");
+                continue;
+            }
+            if (probe->kernel_spawn_outcome_seen)
+                printf("        RESULT: POSIX_SPAWN_SETEXEC kernel image"
+                       " activation FAILED; errno candidate %u"
+                       " (0x%08x). A return to the old wrapper is expected.\n",
+                       probe->kernel_spawn_outcome_r0,
+                       probe->kernel_spawn_outcome_r0);
+            else
+                printf("        RESULT: POSIX_SPAWN_SETEXEC kernel outcome"
+                       " remains unproved at stop.\n");
+        }
 
         if (probe->restarted) {
             printf("        RESTARTED @%" PRIu64
@@ -3278,7 +4377,11 @@ static const char *springboard_child_map_stage_name(unsigned stage) {
 
 static bool springboard_spawn_return_succeeded(
         const springboard_return_probe_t *probe) {
-    return probe && probe->returned &&
+    if (!probe) return false;
+    if (probe->spawn_attr_decoded && probe->spawn_setexec)
+        return probe->kernel_spawn_outcome_seen &&
+               probe->kernel_spawn_outcome_r0 == 0;
+    return probe->returned &&
            !(probe->return_cpsr & ARM_CPSR_C) &&
            probe->return_r0 == 0;
 }
@@ -3311,6 +4414,21 @@ static void springboard_child_report(void) {
         printf("      attempt #%u entry @%" PRIu64
                " parent thread %08x\n",
                i, child->entry_at, child->parent_thread);
+        if (parent->spawn_attr_decoded && parent->spawn_setexec) {
+            printf("        vfork child mapping/_thread_resume:"
+                   " N/A (POSIX_SPAWN_SETEXEC bypasses the vfork path)\n");
+            if (spawn_succeeded)
+                printf("        CORRELATED KERNEL OUTCOME: IMAGE"
+                       " ACTIVATION SUCCESS (epilogue r0=0)\n");
+            else if (parent->kernel_spawn_outcome_seen)
+                printf("        CORRELATED KERNEL OUTCOME: IMAGE"
+                       " ACTIVATION ERROR (errno=%u/0x%08x)\n",
+                       parent->kernel_spawn_outcome_r0,
+                       parent->kernel_spawn_outcome_r0);
+            else
+                printf("        CORRELATED KERNEL OUTCOME: UNPROVED\n");
+            continue;
+        }
         if (parent->returned) {
             bool carry = (parent->return_cpsr & ARM_CPSR_C) != 0;
             if (spawn_succeeded)
@@ -3465,7 +4583,26 @@ static void lifecycle_report(void) {
             }
             if (event->springboard_exact)
                 printf("             EXACT SPRINGBOARD PATHNAME AT SYSCALL "
-                       "ENTRY: ATTEMPT ONLY; success is NOT inferred\n");
+                        "ENTRY: ATTEMPT ONLY; success is NOT inferred\n");
+            if (event->syscall_number == 244u) {
+                if (event->spawn_attr_decoded)
+                    printf("             spawn attrs adesc=%08x size=%u"
+                           " attr=%08x flags=%04x SETEXEC=%s\n",
+                           event->spawn_adesc_va,
+                           event->spawn_attr_size,
+                           event->spawn_attr_va,
+                           event->spawn_attr_flags,
+                           event->spawn_setexec ? "yes" : "no");
+                else
+                    printf("             spawn attrs UNDECODED"
+                           " adesc=%08x size=%u attr=%08x"
+                           " (failed va %08x fsr %08x)\n",
+                           event->spawn_adesc_va,
+                           event->spawn_attr_size,
+                           event->spawn_attr_va,
+                           event->spawn_attr_failure_va,
+                           event->spawn_attr_failure_fsr);
+            }
         } else if (event->kind == LIFECYCLE_EXIT1) {
             printf("    #%-6" PRIu64 " @%-11" PRIu64
                    " _exit1 proc=%08x rv/status=%08x retval*=%08x\n",
@@ -3480,6 +4617,40 @@ static void lifecycle_report(void) {
             printf("    #%-6" PRIu64 " @%-11" PRIu64
                    " UNKNOWN lifecycle event kind %u\n",
                    sequence, event->at, event->kind);
+        }
+        if (event->current_thread) {
+            printf("             current thread %08x; TTBR0 base/context"
+                   " %08x/%08x; entry mode %02x; current/user sp"
+                   " %08x/%08x\n",
+                   event->current_thread, event->ttbr0_base,
+                   event->context_id, event->entry_mode,
+                   event->svc_sp, event->user_sp);
+            if (event->identity_stage == LIFECYCLE_IDENTITY_COMPLETE)
+                printf("             task/task-proc/pid"
+                       " %08x/%08x/%u (re-walked at entry)\n",
+                       event->current_task, event->task_proc,
+                       event->task_pid);
+            else
+                printf("             task process map %s"
+                       " (failed va %08x fsr %08x)\n",
+                       lifecycle_identity_stage_name(event->identity_stage),
+                       event->identity_failure_va,
+                       event->identity_failure_fsr);
+            if (event->effective_identity_valid)
+                printf("             uthread/flags %08x/%08x;"
+                       " effective proc/pid %08x/%u; UT_VFORK=%s\n",
+                       event->current_uthread,
+                       event->current_uthread_flags,
+                       event->effective_proc, event->effective_pid,
+                       event->effective_vfork ? "yes" : "no");
+            else
+                printf("             effective process map unavailable"
+                       " (uthread %08x flags %08x; failed va %08x"
+                       " fsr %08x)\n",
+                       event->current_uthread,
+                       event->current_uthread_flags,
+                       event->effective_failure_va,
+                       event->effective_failure_fsr);
         }
     }
 
@@ -5543,6 +6714,7 @@ int main(int argc, char **argv) {
         tw = (tw + 1) % KTRACE;
         if (tcount < KTRACE) tcount++;
         trace_last_at = n;
+        springboard_return_note_thread_activity(&mach.cpu, n, last_pc);
         springboard_child_note_instruction(&mach.cpu, n, last_pc);
 
         /* How far down the console-init chain did we get? Each milestone is
@@ -5612,7 +6784,7 @@ int main(int argc, char **argv) {
 
         /* Process-death/signal kernel entries complement the syscall boundary:
          * a process can be killed by another process or by the kernel without
-         * issuing exit itself.  xnu-1456.1.26 passes proc/rv/retval to exit1
+         * issuing exit itself.  Shipped xnu-1357.5.30 passes proc/rv/retval to exit1
          * and proc/signum to psignal in r0/r1/r2 at these entry instructions. */
         {
             uint32_t p = last_pc & ~1u;
@@ -5766,6 +6938,7 @@ int main(int argc, char **argv) {
         }
 
         st = arm_step(&mach.cpu);
+        springboard_return_note_post_step(&mach.cpu, n, st);
         if (st != ARM_OK) {
             /* Some terminal steps still advance the architectural cycle
              * counter. Honor a checkpoint reached by such a step before

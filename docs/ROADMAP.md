@@ -28,7 +28,7 @@ proof that no private or unindexed implementation exists.
 | **M2** | SoC bring-up | A bare-metal payload prints over the emulated UART; a timer IRQ is taken and returned from | ✅ done and covered by host tests |
 | **M3** | Firmware containers + LLB execution | Real IMG3s parse and decrypt; an extracted real Apple LLB payload executes; the kernelcache is extracted | ✅ done; SecureROM/iBoot execution remains future full-chain work |
 | **M4** | XNU boots and logs | The kernel reaches `bsd_init`, prints, and Apple's own kexts match and start | ✅ **done** — plus the real root filesystem mounts |
-| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress.** Display-enabled run09 reached a stable 2 B cap with 36.5% USR execution and one exact stock SpringBoard `posix_spawn` pathname attempt at 635,280,837. Spawn success, a running SpringBoard process, and rendering remain unproved: no CLCD MMIO was recorded and the frame stayed one 8x16 white block on black. The app is still a demo host. |
+| **M5** | Userspace → SpringBoard | `launchd` runs; the home screen renders and takes a tap | 🔵 **in progress.** Run09/run11 reproducibly reached the exact stock SpringBoard `posix_spawn` request at 635,280,837. Matching-era launchd plus the one-to-one fork/spawn trace predict SETEXEC, under which the missing old-wrapper return and `_thread_resume` are expected; run11 did not decode flag `0x0040`, so those absences prove neither success nor failure. Exact flag/outcome/user-step instrumentation is built but still needs a fresh trace. No CLCD MMIO or SpringBoard frame exists yet; the app is still a demo host. |
 | **D** | Dynarec (parallel) | SpringBoard at interactive frame rates on the phone | 🔵 emitter + ARM/Thumb translator and host execution tests exist (off by default); no code cache or dispatcher calls them |
 | **N** | Guest networking (parallel) | The guest resolves a name and fetches a URL | ⚪ designed, not built |
 | **A** | Guest audio (first-device track) | Guest PCM reaches the host speaker without blocking the CPU thread | ⚪ priority, not designed or built |
@@ -500,9 +500,16 @@ later.
 
 **Last demonstrated boundary:** criterion 1 is met and criterion 2 is partially
 observable in the CLI harness. The real HFSX root filesystem mounted as `md0`,
-`launchd` executed user-mode code, `mDNSResponder` ran as pid 14, and run09
-recorded one exact stock SpringBoard `posix_spawn` pathname attempt at
-635,280,837. The attempt does not prove syscall success or a child process. A
+`launchd` executed user-mode code, `mDNSResponder` ran as pid 14, and run09 plus
+focused run11 recorded the exact stock SpringBoard `posix_spawn` pathname at
+635,280,837. Run11 then recorded BTServer at 637,448,889. The matching-era
+launchd control flow and the one-to-one fork/spawn trace strongly predict that
+these calls come from separate fork children using `POSIX_SPAWN_SETEXEC`.
+Exact shipped-kernel disassembly shows that, if flag `0x0040` is confirmed, a successful call
+enters the replacement image instead of returning to launchd's old wrapper and
+does not use the vfork `_thread_resume` path. Run11 predates the exact epilogue
+result and identity-validated user-step probe, so it still does not prove
+SpringBoard activation or execution. A
 current checkpoint chain restored at 2.2 B retired instructions, crossed the former
 `SMULBB` stop and wrote a 2.4 B checkpoint. The 2.4 B → 2.8 B interval wrote a
 2.7 B checkpoint, observed one new `_execve` first at 2,605,595,575, and ended
@@ -624,8 +631,9 @@ firmware hashes remained unchanged.
 
 The lifecycle ring retained 120 events and one exact stock SpringBoard
 `posix_spawn` pathname attempt at 635,280,837. One unrelated later pathname
-copy failed. The probe does not yet capture the spawn outcome, a child process,
-or SpringBoard execution. `AppleH1DisplayDrivers` rose to 687 entry
+copy failed. That run predates the exact spawn-outcome probe and therefore does
+not establish a child image or SpringBoard execution. `AppleH1DisplayDrivers`
+rose to 687 entry
 observations, first at 126,211,220 and last at 1,571,737,384, but the extension
 was only six late two-instruction callbacks. `AppleMerlotLCD` remained frozen
 at 409 observations, last at 211,410,011. SPI0 saw only 13 early platform
@@ -633,11 +641,24 @@ writes, and no CLCD MMIO was recorded. Seeded scanout advanced to 589 frames,
 yet the PPM was byte-identical to run08: exactly 128 white pixels in one 8x16
 top-left block on black.
 
-Run09 therefore advances the verified frontier from “no SpringBoard pathname
-attempt observed” to “launchd requested the exact stock SpringBoard path.” It
-does not meet criterion 3. The immediate blocker is now instrumenting the
-spawn return and child lifetime, then explaining why no panel/CLCD transaction
-or meaningful frame follows.
+Focused run11 used durable direct process redirection and reached a clean
+700,000,000-instruction cap with empty stderr. It repeated the SpringBoard
+request at 635,280,837 and recorded BTServer at 637,448,889. Storage completed
+8,754 reads and 24 writes with zero failures; the final frame remained the same
+seeded 8x16 block. A later `_exit1(proc=e0381ca8)` cannot be assigned to either
+service from that older trace because their entry proc/PID identities were not
+recorded.
+
+Run11's raw old-wrapper return remained pending and it observed no associated
+`_thread_resume`. Those are expected if the predicted SETEXEC flag is confirmed,
+but run11 did not decode it; the absences are neither failure nor success proof.
+The harness now reads the live spawn attribute descriptor, exact-gates the
+shipped kernel's `_posix_spawn` result epilogue, validates the
+`exec_activate_image`/`_load_machfile` branch while excluding vfork phases, and
+requires a successfully stepped user instruction with revalidated
+task/uthread/proc/PID identity. A fresh trace must populate that probe before
+the frontier can advance beyond “launchd requested the stock path.” Criterion
+3 still requires a recognizable framebuffer and touch.
 
 For chronology, this is the much earlier pre-VFP measurement from
 `bootkernel`'s milestone probes:

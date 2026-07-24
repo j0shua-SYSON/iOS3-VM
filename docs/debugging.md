@@ -440,43 +440,57 @@ pixels in an 8x16 top-left block and every other pixel black.
 
 Storage and memory remained stable: 12,798 reads (52,438,528 bytes), 82 writes
 (325,120 bytes), zero bridge failures, and unchanged source-firmware hashes.
-The next diagnostic should capture the `posix_spawn` return/outcome and child
-lifetime while retaining the lifecycle, SPI0, CLCD, and frame checks.
 
-The harness now arms a bounded raw-return probe only when that exact stock
-pathname is copied successfully. It discovers and validates the unique
-`MOVS pc,lr` gate in `_thread_exception_return`, then accepts only the matching
-SVC-to-USR transition with the same TTBR/FCSE/context identity, kernel and user
-thread-ID registers, SVC stack, user stack/link register, ARM/Thumb state, and
-resume PC. A later same-thread SWI closes an unresolved generation so another
-call through the same libc wrapper cannot be misattributed. The report retains
-raw `r0`, `r1`, `CPSR.C`, and separate transition/resume instruction indices.
-Run09 predates this probe; a new real-firmware run is required before it can
-answer whether the recorded spawn returned success or an errno.
+### Run11 and the SETEXEC correction
 
-A second bounded probe derives the exact `_posix_spawn` vfork child-resume
-Thumb callsite from the loaded kernel. It enables only when that call is unique
-and the shipped `_current_thread`, thread-to-task, task-to-proc, and proc-to-PID
-accessor instruction shapes all match. For the accepted 7E18 kernel it decodes
-`thread+0x34c → task`, `task+0x1c4 → proc`, and `proc+8 → PID`.
+Run11 reached a clean 700,000,000-instruction cap with durable direct log
+redirection and empty stderr. It repeated SpringBoard at 635,280,837, then
+recorded BTServer at 637,448,889. The old wrapper-return probe remained pending
+and no associated `_thread_resume` entry appeared. Run11 did not decode the
+spawn flag, so those absences alone are neither failure nor success evidence.
 
-That `_thread_resume` call is **not** success-only. The accepted local byte
-window and [Apple's older public XNU vfork
-path](https://github.com/apple-oss-distributions/xnu/blob/xnu-1228.15.4/bsd/kern/kern_exec.c)
-show error cleanup and successful activation converging through
-`vfork_return` and `_thread_resume`. The probe therefore treats the call only
-as attempt-associated identity/lifetime evidence. Only the paired exact parent
-syscall return with `CPSR.C=0` and `r0=0` is accepted as spawn success;
-carry-set `r0` is an errno, and carry-clear nonzero `r0` is anomalous.
+[Matching-era launchd](https://github.com/apple-oss-distributions/launchd/blob/launchd-329.3/launchd/src/launchd_core_logic.c#L3640-L3836)
+forks one child per job, sets `POSIX_SPAWN_SETEXEC`, and calls `posix_spawn`
+with a null PID output. Exact local disassembly is the authority for the shipped
+xnu-1357.5.30 binary; [Apple's older public XNU control-flow
+analogue](https://github.com/apple-oss-distributions/xnu/blob/xnu-1228.15.4/bsd/kern/kern_exec.c)
+helps interpret it. Run11's one-to-one fork/spawn trace strongly predicts the
+same SETEXEC shape, but the next run must confirm flag `0x0040`. If confirmed,
+SETEXEC bypasses vfork. On success the fork child is
+exec-replaced and enters the new image rather than returning to launchd's old
+wrapper; on failure it returns an errno. The lifecycle ring's 19 late forks and
+19 service spawns are consistent with distinct per-job children. Their cloned
+address spaces explain the repeated wrapper PC and argument virtual addresses,
+but run11 did not record enough identity to assign either process directly.
 
-At the validated `_thread_resume` entry, the probe requires the exact Thumb
-return address and the SpringBoard SWI's parent thread. It records the resume
-result, first associated USR instruction entry, and exact-proc
-`_psignal`/`_exit1` entries. The PID field is re-read at each proc event, so a
-PID or reused proc pointer alone is never accepted. `_psignal` proves a kernel
-call entry, not completed delivery. This passive instrumentation does not
-change the syscall, resume the child itself, or turn lifecycle evidence into
-rendering proof.
+The current bounded probe is fail-closed:
+
+1. At the exact SpringBoard pathname SWI, it re-walks
+   `thread+0x34c → task`, `task+0x1c4 → proc`, `proc+8 → PID`, and
+   `thread+0x43c → uthread`. It decodes the spawn attribute descriptor and
+   requires flag `0x0040` for SETEXEC.
+2. Exact Capstone-verified instruction windows locate the
+   `exec_activate_image` callsite, its `_load_machfile` call, and the
+   `_posix_spawn` result epilogue. Function-entry phases require their exact
+   caller LR. The SETEXEC proof requires image activation/load hits and zero
+   `_vfork`, `_vfork_exit`, `_vfork_return`, or `_thread_resume` hits.
+3. At the result epilogue, the preceding `mov r0,r4` makes `r0` the kernel
+   outcome: zero is activation success and nonzero is the errno candidate.
+   `CPSR.C` and a return to the old wrapper are not authorities for SETEXEC.
+4. After zero, a user PC is only a candidate. Immediate IRQ/FIQ deflection and
+   demand fetch faults defer it. The claim is committed after an `ARM_OK`
+   interpreter step and matching task/uthread/effective-proc/PID identity,
+   including a post-step retry when the new map was initially unreadable.
+5. `_psignal` and `_exit1` match the exact entry proc pointer plus a freshly
+   re-read PID. The first exit is terminal, preventing later proc-object reuse
+   from being credited.
+
+The vfork child-resume probe remains available for non-SETEXEC calls, where
+`_thread_resume` is identity/lifetime evidence rather than success authority.
+Run11 predates the new identity and epilogue fields, so its late
+`_exit1(proc=e0381ca8)` remains unattributed. None of this passive
+instrumentation proves a rendered frame; the next real-firmware run must retain
+the lifecycle, SPI0, CLCD, and PPM checks.
 
 ### WFI changes elapsed device time, not the instruction coordinate
 

@@ -45,6 +45,19 @@
 > CLCD MMIO access; SPI0 saw only 13 early platform writes, and the final frame
 > remained the same 8x16 white block at the top-left of an otherwise black
 > screen.
+> Focused 700 M run11 repeated the SpringBoard request at the same instruction
+> and then recorded a separate BTServer request at 637,448,889, with `OK`,
+> empty stderr, clean storage, and the same non-UI frame. Its older probe saw
+> neither a return to launchd's wrapper nor `_thread_resume`. Matching-era
+> launchd sets `POSIX_SPAWN_SETEXEC` inside each fork child, and the one-to-one
+> fork/spawn trace strongly predicts run11 followed that path. Exact shipped-
+> kernel disassembly confirms what that branch would do: success replaces the
+> child and bypasses vfork resume. Run11 did not decode the runtime flag, so the
+> absences are neither failure nor success evidence until a fresh trace confirms
+> `0x0040`. The current
+> harness decodes the runtime flags, exact-gates the kernel result epilogue,
+> and revalidates task/uthread/proc/PID around the first successfully stepped
+> user instruction; a fresh firmware run is required to populate that evidence.
 > The installable iOS app
 > does **not** run it yet: it runs a small
 > synthetic ARM guest to exercise the CPU, UART and framebuffer bridge. The app
@@ -79,7 +92,7 @@ core portable across hosts. Today the evidence is split deliberately:
 |---|---|---|
 | ARM1176 and S5L8900 execution | Real-kernel path recorded | Synthetic demo guest |
 | Apple kernel and root filesystem | Host-backed cold path reached `launchd`; run09 passed fsck, mounted `/dev/md0`, retained `mDNSResponder`, and reached a stable 2 B cap | Not integrated |
-| Display | Run09 reached one exact SpringBoard spawn-path attempt and PCs in both Apple display-driver code ranges, but syscall success is unproved, CLCD MMIO stayed untouched, and the frame was only one 8x16 white block | CoreGraphics demo bridge |
+| Display | Run09/run11 reached the exact SpringBoard pathname request and PCs in both Apple display-driver code ranges. SETEXEC-aware outcome/execution instrumentation is now built but awaits a fresh trace; CLCD MMIO stayed untouched and the frame was only one 8x16 white block | CoreGraphics demo bridge |
 | Touch, audio, guest networking | Not implemented | Not implemented |
 | Dynamic recompiler | Translator tested off-device; inactive in boot | Excluded from target |
 
@@ -95,7 +108,7 @@ can see.** No months in the dark.
 | **M2** | S5L8900 bring-up: bare-metal payload prints over emulated UART | ✅ **done** — MMU, bus, UART, VIC, timer, power, CLCD and NOR are integrated; standalone raw-NAND/storage primitives are host-tested, with no NAND controller/VFL/FTL |
 | **M3** | Firmware containers + LLB execution | ✅ **done** — parses/decrypts real IMG3 firmware, runs a real LLB payload and extracts the kernel; SecureROM and iBoot execution remain future full-chain work |
 | **M4** | The real **XNU kernel** boots and logs | ✅ **done** — a broad set of prelinked drivers matched or started in a recorded CLI run; the real 413 MiB root filesystem mounted, and that run did not reach `_panic` |
-| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** Display-enabled run09 reached a stable 2 B cap with 36.5% USR execution and one exact stock SpringBoard `posix_spawn` pathname attempt at 635,280,837. It does **not** yet prove spawn success, process execution, or rendering: no CLCD MMIO was recorded and the frame remained an 8x16 white block. The iOS app remains a demo host. |
+| **M5** | `launchd` → **SpringBoard** renders — tap it 🏆 | 🔵 **in progress.** Run09/run11 reproducibly reached the exact stock SpringBoard `posix_spawn` request at 635,280,837. Matching-era launchd and the one-to-one fork/spawn trace predict SETEXEC, under which the missing old-wrapper return and vfork child-resume would be expected; run11 did not decode the flag. The new exact flag/outcome/user-step probe still needs a real run, and there is still no CLCD MMIO or SpringBoard frame. The iOS app remains a demo host. |
 
 At `ea92fca`, hosted
 [`core-tests` run 30009684129](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30009684129)
@@ -103,7 +116,7 @@ and
 [`ios-build` run 30009684054](https://github.com/j0shua-SYSON/iOS3-VM/actions/runs/30009684054)
 both completed successfully with the faultable raw bridge and corrected display
 handoff. Hosted CI cannot contain private firmware or prove a SpringBoard boot;
-that runtime evidence comes from the separately recorded run07 through run09
+that runtime evidence comes from the separately recorded run07 through run11
 cold boots.
 
 ### What it actually does today
