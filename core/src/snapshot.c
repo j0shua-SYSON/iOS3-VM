@@ -113,6 +113,10 @@ SNAP_SIZE_GUARD(s5l_timer_t,       40,    "snap_timer");
 SNAP_SIZE_GUARD(s5l_power_t,       24,    "snap_power");
 SNAP_SIZE_GUARD(s5l_clcd_window_t, 24,    "snap_clcd");
 SNAP_SIZE_GUARD(s5l_clcd_t,        3360,  "snap_clcd");
+/* I2C/PMU guards are intentionally adjacent to their visitors. These values
+ * describe host ABI layout only; the file format remains field-by-field. */
+SNAP_SIZE_GUARD(s5l_i2c_t,         320,   "snap_i2c");
+SNAP_SIZE_GUARD(s5l_pcf50635_t,    600,   "snap_pmu");
 SNAP_SIZE_GUARD(s5l_nor_entry_t,   12,    "snap_nor");
 SNAP_SIZE_GUARD(s5l_nor_t,         208,   "snap_nor");
 SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
@@ -121,7 +125,7 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * are deliberately excluded from MACH for the same reason as every other bus
  * callback; snapshot_load preserves the live machine's hooks and dedicated
  * privileged-SVC context. The byte format therefore does not change. */
-SNAP_SIZE_GUARD(s5l8900_t,         15792, "snap_mach");
+SNAP_SIZE_GUARD(s5l8900_t,         17032, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
@@ -353,6 +357,80 @@ static void snap_power(sn_io_t *io, s5l_power_t *p) {
     F32(p->sram);  F32(p->cfg24); F32(p->cfg28);
 }
 
+static bool i2c_state_valid(const s5l_i2c_t *b) {
+    if (!b || b->slave_count > S5L_I2C_SLAVES ||
+        b->unknown_off_count > S5L_I2C_UNKNOWN_OFF ||
+        b->ds > 0xffu ||
+        (b->stat & I2C_STAT_NAK) != 0u ||
+        (b->intstat & ~(I2C_INT_BYTE | I2C_INT_STOP)) != 0u ||
+        b->sel < -1 ||
+        (b->sel >= 0 && (unsigned)b->sel >= b->slave_count) ||
+        (!b->active && (b->sel != -1 || b->reading)) ||
+        b->active != ((b->stat & I2C_STAT_START) != 0u) ||
+        (b->active &&
+         b->reading !=
+             ((b->stat & I2C_STAT_MODE) == I2C_STAT_MODE_MRX)) ||
+        (b->active && b->sel == -1 && !b->nak))
+        return false;
+    for (unsigned i = 0; i < b->slave_count; i++) {
+        if (b->slaves[i].addr > 0x7fu || !b->slaves[i].start) return false;
+        for (unsigned j = 0; j < i; j++)
+            if (b->slaves[i].addr == b->slaves[j].addr) return false;
+    }
+    return true;
+}
+
+static bool pmu_state_valid(const s5l_pcf50635_t *p) {
+    if (!p || p->seconds < PCF50635_MIN_TIME ||
+        p->seconds > PCF50635_MAX_TIME ||
+        !p->tick_hz || p->tick_accum >= p->tick_hz ||
+        p->unknown_reg_count > PCF50635_UNKNOWN_REGS)
+        return false;
+    for (unsigned i = 0; i < PCF50635_NREG; i++)
+        if (p->written[i] > 1u) return false;
+    return true;
+}
+
+/*
+ * Controller wiring is host state and is deliberately not serialized. `sel`
+ * is guest state because a snapshot may be taken between START and STOP; it
+ * is encoded without aliasing an int32_t through a uint32_t pointer.
+ */
+static void snap_i2c(sn_io_t *io, s5l_i2c_t *b) {
+    F32(b->con); F32(b->stat); F32(b->add); F32(b->ds);
+    F32(b->enable); F32(b->intstat);
+    FB(b->nak); FB(b->active); FB(b->reading);
+
+    uint32_t selected = b->sel < 0 ? UINT32_MAX : (uint32_t)b->sel;
+    F32(selected);
+    if (sn_reading(io) && io->err == SNAP_OK) {
+        if (selected == UINT32_MAX) b->sel = -1;
+        else if (selected > INT32_MAX) io->err = SNAP_ERR_CORRUPT;
+        else b->sel = (int32_t)selected;
+    }
+
+    F64(b->starts); F64(b->bytes_tx); F64(b->bytes_rx); F64(b->naks);
+    F64(b->unknown_reads); F64(b->unknown_writes);
+    FA32(b->unknown_off, S5L_I2C_UNKNOWN_OFF);
+    F32(b->unknown_off_count);
+    if (sn_reading(io) && io->err == SNAP_OK && !i2c_state_valid(b))
+        io->err = SNAP_ERR_CORRUPT;
+}
+
+static void snap_pmu(sn_io_t *io, s5l_pcf50635_t *p) {
+    FBYTES(p->regs, PCF50635_NREG);
+    FBYTES(p->written, PCF50635_NREG);
+    F64(p->seconds);
+    F32(p->tick_hz); F64(p->tick_accum);
+    F8(p->ptr); FB(p->have_ptr); FB(p->reading);
+    F64(p->reg_reads); F64(p->reg_writes);
+    F64(p->unknown_reads); F64(p->unknown_writes);
+    FBYTES(p->unknown_reg, PCF50635_UNKNOWN_REGS);
+    F32(p->unknown_reg_count);
+    if (sn_reading(io) && io->err == SNAP_OK && !pmu_state_valid(p))
+        io->err = SNAP_ERR_CORRUPT;
+}
+
 static void snap_clcd(sn_io_t *io, s5l_clcd_t *c) {
     F32(c->enable); F32(c->disable); F32(c->ctrl); F32(c->fifo);
     F32(c->intmask); F32(c->intstatus); F32(c->reg1c);
@@ -423,6 +501,9 @@ static void snap_mach(sn_io_t *io, s5l8900_t *m) {
     snap_timer(io, &m->timer);
     snap_power(io, &m->power);
     snap_clcd (io, &m->clcd);
+    for (unsigned i = 0; i < S5L8900_I2C_COUNT; i++)
+        snap_i2c(io, &m->i2c[i]);
+    snap_pmu(io, &m->pmu);
 
     F64(m->unmapped_reads);
     F64(m->unmapped_writes);
@@ -443,7 +524,8 @@ static void snap_mach(sn_io_t *io, s5l8900_t *m) {
 
     if (sn_reading(io) && io->err == SNAP_OK &&
         (m->unmapped_addr_count > (unsigned)S5L_UNMAPPED_LOG ||
-         m->dev_count           > (unsigned)S5L_DEVLOG))
+         m->dev_count           > (unsigned)S5L_DEVLOG ||
+         m->pmu.tick_hz         != m->tb_hz))
         io->err = SNAP_ERR_CORRUPT;
 }
 
@@ -669,6 +751,18 @@ static bool snap_machine_valid(const s5l8900_t *m) {
         m->uart0.tx_len >= UART_TX_BUFFER ||
         m->nor.image_count > S5L_NOR_MAX_IMAGES ||
         m->unmapped_addr_count > S5L_UNMAPPED_LOG || m->dev_count > S5L_DEVLOG)
+        return false;
+    for (unsigned i = 0; i < S5L8900_I2C_COUNT; i++)
+        if (!i2c_state_valid(&m->i2c[i])) return false;
+    if (!pmu_state_valid(&m->pmu)) return false;
+    /* Slave callbacks are host wiring, not file bytes. Requiring the board's
+     * exact wiring on both save and load makes that omission safe: a snapshot
+     * can never be applied to a differently wired machine. */
+    if (m->i2c[0].slave_count != 1u ||
+        m->i2c[0].slaves[0].addr != PCF50635_I2C_ADDR ||
+        m->i2c[0].slaves[0].ctx != &m->pmu ||
+        m->i2c[1].slave_count != 0u ||
+        m->pmu.tick_hz != m->tb_hz)
         return false;
     for (unsigned i = 0; i < m->nor.image_count; i++)
         if (m->nor.images[i].size < 20u ||

@@ -599,6 +599,124 @@ bool     s5l_clcd_scanout(const s5l_clcd_t *c, unsigned k,
                           uint8_t *rgb, size_t rgb_len,
                           uint32_t *out_w, uint32_t *out_h);
 
+/* ----------------------------------------------------------------- I2C ---
+ * The two S5L8900 I2C controllers.  The physical windows and interrupt lines
+ * come from the shipped iPhone1,2 device tree:
+ *
+ *   /arm-io/i2c0  reg {0x04600000,0x1000}  interrupts {0x15}
+ *   /arm-io/i2c1  reg {0x04900000,0x1000}  interrupts {0x16}
+ *
+ * /arm-io maps those child addresses at physical +0x38000000.  Register
+ * offsets and bits below are from AppleS5L8900XI2CController's 32-bit MMIO
+ * accessors and transfer state machine in the shipped kernelcache.
+ */
+#define S5L8900_I2C0_BASE 0x3c600000u
+#define S5L8900_I2C1_BASE 0x3c900000u
+#define S5L8900_IRQ_I2C0  21u
+#define S5L8900_IRQ_I2C1  22u
+#define S5L8900_I2C_COUNT 2u
+
+#define I2C_CON     0x00u
+#define I2C_STAT    0x04u
+#define I2C_ADD     0x08u
+#define I2C_DS      0x0cu
+#define I2C_BUSY    0x10u  /* read zero: register writes complete immediately */
+#define I2C_ENABLE  0x14u
+#define I2C_INT     0x20u  /* interrupt status, write-one-to-clear             */
+
+#define I2C_CON_ACKEN     0x80u
+#define I2C_CON_RESUME    0x10u
+#define I2C_STAT_MODE     0xc0u
+#define I2C_STAT_MODE_MRX 0x80u
+#define I2C_STAT_MODE_MTX 0xc0u
+#define I2C_STAT_START    0x20u
+#define I2C_STAT_ENABLE   0x10u
+#define I2C_STAT_NAK      0x01u  /* read-only: last address/byte was not ACKed */
+
+#define I2C_INT_BYTE 0x0100u
+#define I2C_INT_STOP 0x2000u
+#define I2C_INT_ALL  0x3f00u  /* mask used by the stock driver's clear-all */
+
+typedef struct {
+    uint8_t  addr;                         /* seven-bit bus address */
+    void    *ctx;
+    bool   (*start)(void *ctx, bool read);
+    bool   (*write)(void *ctx, uint8_t byte);
+    uint8_t (*read)(void *ctx);
+    void   (*stop)(void *ctx);
+} s5l_i2c_slave_t;
+
+#define S5L_I2C_SLAVES      4u
+#define S5L_I2C_UNKNOWN_OFF 8u
+
+typedef struct {
+    uint32_t con, stat, add, ds, enable, intstat;
+    bool     nak;
+    bool     active;
+    bool     reading;
+    int32_t  sel;             /* selected slave index, or -1 */
+
+    /* Bounded diagnostics: unknown traffic must be visible without allowing
+     * a guest to grow host allocations. */
+    uint64_t starts, bytes_tx, bytes_rx, naks;
+    uint64_t unknown_reads, unknown_writes;
+    uint32_t unknown_off[S5L_I2C_UNKNOWN_OFF];
+    unsigned unknown_off_count;
+
+    /* Host wiring. Snapshot code serializes `sel`, never these callbacks. */
+    s5l_i2c_slave_t slaves[S5L_I2C_SLAVES];
+    unsigned        slave_count;
+} s5l_i2c_t;
+
+/* Reset is total: it is valid on an uninitialized/poisoned object and removes
+ * attached slaves. Callers attach board wiring after reset. */
+void     s5l_i2c_reset(s5l_i2c_t *bus);
+bool     s5l_i2c_attach(s5l_i2c_t *bus, const s5l_i2c_slave_t *slave);
+uint32_t s5l_i2c_read(s5l_i2c_t *bus, uint32_t off);
+void     s5l_i2c_write(s5l_i2c_t *bus, uint32_t off, uint32_t val);
+bool     s5l_i2c_irq(const s5l_i2c_t *bus);
+
+/* ------------------------------------------------- PCF50635 PMU / RTC ---
+ * The device tree names `pmu,pcf50635` at seven-bit address 0x73 on i2c0.
+ * Its register pointer is one byte and auto-increments.  Written registers are
+ * persistent storage; reads of other unmodelled registers return zero but are
+ * counted.  RTC registers 0x59..0x5f are fully defined by the stock driver's
+ * decoder: BCD except for the binary weekday at 0x5c.
+ */
+#define PCF50635_I2C_ADDR 0x73u
+#define PCF50635_NREG     0x100u
+#define PCF50635_RTCSC    0x59u
+#define PCF50635_RTCWD    0x5cu
+#define PCF50635_RTCYR    0x5fu
+#define PCF50635_MIN_TIME 946684800ull  /* 2000-01-01 00:00:00 UTC */
+#define PCF50635_MAX_TIME 4102444799ull /* 2099-12-31 23:59:59 UTC */
+#define PCF50635_DEFAULT_TIME 1262304000ull /* 2010-01-01 00:00:00 UTC */
+#define PCF50635_UNKNOWN_REGS 16u
+
+typedef struct {
+    uint8_t  regs[PCF50635_NREG];
+    uint8_t  written[PCF50635_NREG];
+
+    uint64_t seconds;
+    uint32_t tick_hz;
+    uint64_t tick_accum;
+
+    uint8_t  ptr;
+    bool     have_ptr;
+    bool     reading;
+
+    uint64_t reg_reads, reg_writes, unknown_reads, unknown_writes;
+    uint8_t  unknown_reg[PCF50635_UNKNOWN_REGS];
+    unsigned unknown_reg_count;
+} s5l_pcf50635_t;
+
+void s5l_pcf50635_reset(s5l_pcf50635_t *pmu, uint32_t tick_hz);
+void s5l_pcf50635_set_time(s5l_pcf50635_t *pmu, uint64_t unix_seconds);
+void s5l_pcf50635_tick(s5l_pcf50635_t *pmu, uint32_t ticks);
+void s5l_pcf50635_bind(s5l_pcf50635_t *pmu, s5l_i2c_slave_t *slave);
+void s5l_pcf50635_civil(uint64_t unix_seconds, int *year, int *month, int *day,
+                        int *hour, int *minute, int *second, int *weekday);
+
 #define S5L_STUB_MAX      16
 
 typedef struct {
@@ -637,6 +755,8 @@ typedef struct {
     s5l_timer_t timer;
     s5l_power_t power;
     s5l_clcd_t  clcd;
+    s5l_i2c_t   i2c[S5L8900_I2C_COUNT];
+    s5l_pcf50635_t pmu;
     s5l_nor_t   nor;
     uint64_t   unmapped_reads;   /* visibility: accesses outside the map */
     uint64_t   unmapped_writes;
@@ -722,7 +842,7 @@ typedef struct {
 } s5l_window_t;
 
 /* Enough for every fixed device window plus every stub. */
-#define S5L_WINDOW_MAX (S5L_STUB_MAX + 8u)
+#define S5L_WINDOW_MAX (S5L_STUB_MAX + 10u)
 
 /*
  * Every window this machine decodes: the modelled devices first, then the

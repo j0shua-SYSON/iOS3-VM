@@ -14,6 +14,8 @@ add_library(emucore STATIC
     src/soc/timer.c
     src/soc/power.c
     src/soc/clcd.c
+    src/soc/i2c.c
+    src/soc/pcf50635.c
     src/soc/nor.c
     src/soc/nand.c
     src/soc/storage.c
@@ -103,6 +105,10 @@ add_test(NAME vfp COMMAND test_vfp)
 add_executable(test_soc tests/test_soc.c)
 target_link_libraries(test_soc PRIVATE emucore)
 add_test(NAME s5l8900_machine COMMAND test_soc)
+
+add_executable(test_i2c tests/test_i2c.c)
+target_link_libraries(test_i2c PRIVATE emucore)
+add_test(NAME s5l8900_i2c_pmu COMMAND test_i2c)
 
 add_executable(test_img3 tests/test_img3.c)
 target_link_libraries(test_img3 PRIVATE emucore)

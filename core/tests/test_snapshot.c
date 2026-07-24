@@ -220,6 +220,41 @@ static void test_device_state_round_trips(void) {
     a->power.state = 0x000012fcu; a->power.cfg0 = 1; a->power.cfg1 = 2;
     a->power.sram  = 3; a->power.cfg24 = 4; a->power.cfg28 = 5;
 
+    /* I2C0 mid-write to the attached PMU; I2C1 mid-transfer to an unknown
+     * slave. Callback wiring is host state and is checked separately below. */
+    a->i2c[0].con = I2C_CON_ACKEN; a->i2c[0].stat = 0xf0u;
+    a->i2c[0].add = 0x12u; a->i2c[0].ds = 0x86u;
+    a->i2c[0].enable = 1u; a->i2c[0].intstat = I2C_INT_BYTE;
+    a->i2c[0].active = true; a->i2c[0].reading = false;
+    a->i2c[0].nak = false; a->i2c[0].sel = 0;
+    a->i2c[0].starts = 11; a->i2c[0].bytes_tx = 12;
+    a->i2c[0].bytes_rx = 13; a->i2c[0].naks = 14;
+    a->i2c[0].unknown_reads = 15; a->i2c[0].unknown_writes = 16;
+    a->i2c[0].unknown_off[0] = 0x18u;
+    a->i2c[0].unknown_off[1] = 0x24u;
+    a->i2c[0].unknown_off_count = 2;
+
+    a->i2c[1].con = I2C_CON_RESUME; a->i2c[1].stat = 0xf0u;
+    a->i2c[1].ds = 0x36u; a->i2c[1].enable = 1u;
+    a->i2c[1].intstat = I2C_INT_BYTE;
+    a->i2c[1].nak = true; a->i2c[1].active = true;
+    a->i2c[1].reading = false; a->i2c[1].sel = -1;
+    a->i2c[1].starts = 21; a->i2c[1].naks = 22;
+
+    memset(a->pmu.regs, 0xa5, sizeof a->pmu.regs);
+    memset(a->pmu.written, 0, sizeof a->pmu.written);
+    a->pmu.regs[0x07] = 0xff; a->pmu.written[0x07] = 1;
+    a->pmu.regs[0x08] = 0xbf; a->pmu.written[0x08] = 1;
+    a->pmu.seconds = 1444396723ull;
+    a->pmu.tick_hz = S5L8900_TB_HZ;
+    a->pmu.tick_accum = 123456u;
+    a->pmu.ptr = 0x09u; a->pmu.have_ptr = true; a->pmu.reading = false;
+    a->pmu.reg_reads = 31; a->pmu.reg_writes = 32;
+    a->pmu.unknown_reads = 33; a->pmu.unknown_writes = 34;
+    a->pmu.unknown_reg[0] = 0x1a;
+    a->pmu.unknown_reg[1] = 0x22;
+    a->pmu.unknown_reg_count = 2;
+
     /* CLCD, every array included. */
     a->clcd.enable = 1; a->clcd.disable = 0; a->clcd.ctrl = CLCD_CTRL_WIN0 | CLCD_CTRL_ENABLE;
     a->clcd.fifo = 0x20202020u;
@@ -283,6 +318,39 @@ static void test_device_state_round_trips(void) {
 
     SAME(power.state); SAME(power.cfg0); SAME(power.cfg1);
     SAME(power.sram);  SAME(power.cfg24); SAME(power.cfg28);
+
+    for (unsigned i = 0; i < S5L8900_I2C_COUNT; i++) {
+        SAME(i2c[i].con); SAME(i2c[i].stat); SAME(i2c[i].add);
+        SAME(i2c[i].ds); SAME(i2c[i].enable); SAME(i2c[i].intstat);
+        SAME(i2c[i].nak); SAME(i2c[i].active); SAME(i2c[i].reading);
+        SAME(i2c[i].sel);
+        SAME(i2c[i].starts); SAME(i2c[i].bytes_tx); SAME(i2c[i].bytes_rx);
+        SAME(i2c[i].naks); SAME(i2c[i].unknown_reads);
+        SAME(i2c[i].unknown_writes); SAME(i2c[i].unknown_off_count);
+        CHECK(memcmp(a->i2c[i].unknown_off, b->i2c[i].unknown_off,
+                     sizeof a->i2c[i].unknown_off) == 0,
+              "i2c%u unknown offsets did not survive", i);
+        /* Board wiring must be the destination machine's own wiring, never
+         * callback pointers copied out of the source snapshot. */
+        SAME(i2c[i].slave_count);
+    }
+    CHECK(b->i2c[0].slaves[0].ctx == &b->pmu,
+          "restored i2c0 callback must target the destination PMU");
+    CHECK(b->i2c[0].slaves[0].ctx != &a->pmu,
+          "restored i2c0 callback retained the source PMU pointer");
+
+    CHECK(memcmp(a->pmu.regs, b->pmu.regs, sizeof a->pmu.regs) == 0,
+          "PMU register bank did not survive");
+    CHECK(memcmp(a->pmu.written, b->pmu.written, sizeof a->pmu.written) == 0,
+          "PMU written map did not survive");
+    SAME(pmu.seconds); SAME(pmu.tick_hz); SAME(pmu.tick_accum);
+    SAME(pmu.ptr); SAME(pmu.have_ptr); SAME(pmu.reading);
+    SAME(pmu.reg_reads); SAME(pmu.reg_writes);
+    SAME(pmu.unknown_reads); SAME(pmu.unknown_writes);
+    SAME(pmu.unknown_reg_count);
+    CHECK(memcmp(a->pmu.unknown_reg, b->pmu.unknown_reg,
+                 sizeof a->pmu.unknown_reg) == 0,
+          "PMU unknown-register set did not survive");
 
     SAME(clcd.enable); SAME(clcd.disable); SAME(clcd.ctrl); SAME(clcd.fifo);
     SAME(clcd.intmask); SAME(clcd.intstatus); SAME(clcd.reg1c);
@@ -680,6 +748,10 @@ static void build_irq_machine(s5l8900_t *m) {
     s5l8900_load(m, 0x100, loop, sizeof loop);
 
     m->cpu_hz = m->tb_hz = 1;      /* one timebase tick per instruction */
+    /* The PMU RTC consumes the same guest timebase. Keep the board invariant
+     * true when this test deliberately replaces the production clock ratio. */
+    m->pmu.tick_hz = m->tb_hz;
+    m->pmu.tick_accum = 0;
     m->bus.write32(m->bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE, 1u << S5L8900_IRQ_TIMER);
     m->bus.write32(m->bus.ctx, S5L8900_TIMER_BASE + TIMER4_COUNTBUF, 7);
     m->bus.write32(m->bus.ctx, S5L8900_TIMER_BASE + TIMER4_STATE,

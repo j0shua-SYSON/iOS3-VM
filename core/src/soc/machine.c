@@ -27,6 +27,8 @@
 static const s5l_window_t DEVICE_WINDOWS[] = {
     { S5L8900_NOR_BASE,   S5L8900_NOR_SIZE,   "nor"   },
     { S5L8900_CLCD_BASE,  S5L8900_DEV_SIZE,   "clcd"  },
+    { S5L8900_I2C0_BASE,  S5L8900_DEV_SIZE,   "i2c0"  },
+    { S5L8900_I2C1_BASE,  S5L8900_DEV_SIZE,   "i2c1"  },
     { S5L8900_VIC0_BASE,  S5L8900_DEV_SIZE,   "vic0"  },
     { S5L8900_VIC1_BASE,  S5L8900_DEV_SIZE,   "vic1"  },
     { S5L8900_POWER_BASE, S5L8900_POWER_SIZE, "power" },
@@ -249,6 +251,10 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         v = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
     } else if (in_power(addr, bytes)) {
         v = s5l_power_read(&m->power, addr - S5L8900_POWER_BASE);
+    } else if (mmio_word(addr, bytes, S5L8900_I2C0_BASE, S5L8900_DEV_SIZE)) {
+        v = s5l_i2c_read(&m->i2c[0], addr - S5L8900_I2C0_BASE);
+    } else if (mmio_word(addr, bytes, S5L8900_I2C1_BASE, S5L8900_DEV_SIZE)) {
+        v = s5l_i2c_read(&m->i2c[1], addr - S5L8900_I2C1_BASE);
     } else if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
                in_window(addr, bytes, S5L8900_NOR_BASE, m->nor.size)) {
         v = s5l_nor_read(&m->nor, addr - S5L8900_NOR_BASE, bytes);
@@ -300,6 +306,16 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
     if (in_power(addr, bytes)) {
         note_device(m, addr, val, true);
         s5l_power_write(&m->power, addr - S5L8900_POWER_BASE, val);
+        return;
+    }
+    if (mmio_word(addr, bytes, S5L8900_I2C0_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_i2c_write(&m->i2c[0], addr - S5L8900_I2C0_BASE, val);
+        return;
+    }
+    if (mmio_word(addr, bytes, S5L8900_I2C1_BASE, S5L8900_DEV_SIZE)) {
+        note_device(m, addr, val, true);
+        s5l_i2c_write(&m->i2c[1], addr - S5L8900_I2C1_BASE, val);
         return;
     }
     if ((bytes == 1u || bytes == 2u || bytes == 4u) &&
@@ -449,6 +465,18 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
     s5l_timer_reset(&m->timer);
     s5l_power_reset(&m->power);
     s5l_clcd_reset(&m->clcd);
+    for (unsigned i = 0; i < S5L8900_I2C_COUNT; i++)
+        s5l_i2c_reset(&m->i2c[i]);
+    s5l_pcf50635_reset(&m->pmu, m->tb_hz);
+    {
+        s5l_i2c_slave_t pmu;
+        s5l_pcf50635_bind(&m->pmu, &pmu);
+        if (!s5l_i2c_attach(&m->i2c[0], &pmu)) {
+            free(m->ram);
+            m->ram = NULL;
+            return false;
+        }
+    }
     /* Refresh in the guest's own time: the CLCD is ticked with timebase ticks,
      * so the period is expressed in them. */
     m->clcd.frame_ticks = m->tb_hz / S5L_CLCD_REFRESH_HZ;
@@ -537,6 +565,16 @@ void s5l8900_tick(s5l8900_t *m, uint32_t ticks) {
 
     bool clcd_irq = s5l_clcd_tick(&m->clcd, tb);
     s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_CLCD, clcd_irq);
+
+    /* I2C transfers complete synchronously with their command store, then
+     * remain level-asserted until the driver's W1C acknowledge. A zero-tick
+     * refresh is therefore enough for WFI to observe both assertion and
+     * deassertion without advancing guest time. */
+    s5l_pcf50635_tick(&m->pmu, tb);
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_I2C0,
+                     s5l_i2c_irq(&m->i2c[0]));
+    s5l_vic_set_line(&m->vic[0], S5L8900_IRQ_I2C1,
+                     s5l_i2c_irq(&m->i2c[1]));
 
     /*
      * BOTH VICs drive the CPU.

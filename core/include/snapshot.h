@@ -51,7 +51,9 @@
  */
 /* v2: the VFP register file (arm_cpu_t.vfp_s, s0-s31 aliasing d0-d15) joined
  *     the CPU section when real VFPv2 arithmetic was implemented. */
-#define SNAPSHOT_VERSION   2u
+/* v3: both I2C controllers and the PCF50635 PMU/RTC joined MACH. Old
+ *     checkpoints cannot safely invent an in-flight transfer or RTC state. */
+#define SNAPSHOT_VERSION   3u
 
 typedef enum {
     SNAP_OK = 0,

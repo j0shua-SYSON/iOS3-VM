@@ -2016,6 +2016,7 @@ static unsigned    NM;
 #define H1_DISPLAY_VM_SIZE UINT32_C(0x0000a000)
 #define MERLOT_LCD_VM_BASE UINT32_C(0xc0650000)
 #define MERLOT_LCD_VM_SIZE UINT32_C(0x00004000)
+#define PMU_CHECKPOINT_COUNT 9u
 #define DISPLAY_PC_CAP 1024u
 #define DISPLAY_PC_HASH_CAP 2048u
 #define DISPLAY_ENTRY_EDGE_CAP 1024u
@@ -2654,6 +2655,46 @@ typedef struct {
     display_entry_edge_t edges[DISPLAY_ENTRY_EDGE_CAP];
 } display_exec_diag_t;
 
+/*
+ * Exact iPhone OS 3.1.3 PMU/I2C instruction-entry checkpoints.  These
+ * addresses are deliberately diagnostic rather than emulation policy: the
+ * external-md firmware gate already identifies the one kernel they describe,
+ * while another kernel merely reports zero hits.
+ *
+ * The first four distinguish an ApplePCF50635PMU start failure while resolving
+ * its provider's InterruptControllerName from a later I2C transaction wait.
+ * The final five establish whether execution reached parent publication, the
+ * first transfer, the controller's blocking wait/condition check, and the
+ * instruction after that wait loop.
+ */
+static const milestone_t PMU_CHECKPOINTS[PMU_CHECKPOINT_COUNT] = {
+    { "pmu:interrupt-provider",    UINT32_C(0xc06379ec) },
+    { "pmu:interrupt-name-result", UINT32_C(0xc0637a10) },
+    { "pmu:interrupt-name-test",   UINT32_C(0xc0637a18) },
+    { "pmu:start-failure",         UINT32_C(0xc0637f50) },
+    { "pmu:pre-i2c-parent",        UINT32_C(0xc0637c08) },
+    { "pmu:first-i2c-call",        UINT32_C(0xc0637c44) },
+    { "i2c:wait-state",            UINT32_C(0xc05a5ef8) },
+    { "i2c:wait-condition",        UINT32_C(0xc05a5f10) },
+    { "i2c:wait-complete",         UINT32_C(0xc05a5f1c) },
+};
+
+typedef struct {
+    uint64_t hits;
+    uint64_t first_at;
+    uint64_t last_at;
+    uint32_t first_r[4];
+    uint32_t last_r[4];
+    uint32_t first_sp;
+    uint32_t first_lr;
+    uint32_t first_cpsr;
+    uint32_t first_thread;
+    uint32_t last_sp;
+    uint32_t last_lr;
+    uint32_t last_cpsr;
+    uint32_t last_thread;
+} pmu_checkpoint_observation_t;
+
 typedef struct {
     uint64_t at;
     uint32_t addr;
@@ -2788,6 +2829,8 @@ static struct {
      * PCs are normalized only after the alias-aware range check accepts them. */
     display_exec_diag_t h1_display_exec;
     display_exec_diag_t merlot_exec;
+    pmu_checkpoint_observation_t
+                pmu_checkpoint[PMU_CHECKPOINT_COUNT];
 
     /* IRQ entries, for the same reason FIQ entries are counted. */
     uint64_t    irq_n;
@@ -8191,6 +8234,194 @@ static void display_exec_report(uint32_t virt_base, uint32_t phys_base,
            "or SpringBoard reach.\n");
 }
 
+static void pmu_checkpoint_note(unsigned index, uint64_t at,
+                                const arm_cpu_t *cpu) {
+    if (index >= PMU_CHECKPOINT_COUNT || !cpu) return;
+    pmu_checkpoint_observation_t *observation =
+        &G.pmu_checkpoint[index];
+
+    if (!observation->hits) {
+        observation->first_at = at;
+        for (unsigned r = 0; r < 4u; r++)
+            observation->first_r[r] = cpu->r[r];
+        observation->first_sp = cpu->r[13];
+        observation->first_lr = cpu->r[14];
+        observation->first_cpsr = cpu->cpsr;
+        observation->first_thread = cpu->cp15.tpidrprw;
+    }
+
+    observation->hits++;
+    observation->last_at = at;
+    for (unsigned r = 0; r < 4u; r++)
+        observation->last_r[r] = cpu->r[r];
+    observation->last_sp = cpu->r[13];
+    observation->last_lr = cpu->r[14];
+    observation->last_cpsr = cpu->cpsr;
+    observation->last_thread = cpu->cp15.tpidrprw;
+}
+
+static inline unsigned pmu_checkpoint_index(uint32_t pc) {
+    /*
+     * Reject almost every instruction with two compact range checks before
+     * entering the exact-PC switch.  This diagnostic remains active during
+     * multi-billion-instruction boots, so its negative path matters.
+     */
+    if (pc >= UINT32_C(0xc06379ec) &&
+        pc <= UINT32_C(0xc0637f50)) {
+        switch (pc) {
+            case UINT32_C(0xc06379ec):
+                return 0u;
+            case UINT32_C(0xc0637a10):
+                return 1u;
+            case UINT32_C(0xc0637a18):
+                return 2u;
+            case UINT32_C(0xc0637f50):
+                return 3u;
+            case UINT32_C(0xc0637c08):
+                return 4u;
+            case UINT32_C(0xc0637c44):
+                return 5u;
+            default:
+                break;
+        }
+    } else if (pc >= UINT32_C(0xc05a5ef8) &&
+               pc <= UINT32_C(0xc05a5f1c)) {
+        switch (pc) {
+            case UINT32_C(0xc05a5ef8):
+                return 6u;
+            case UINT32_C(0xc05a5f10):
+                return 7u;
+            case UINT32_C(0xc05a5f1c):
+                return 8u;
+            default:
+                break;
+        }
+    }
+    return PMU_CHECKPOINT_COUNT;
+}
+
+static inline void pmu_checkpoint_observe(uint32_t pc, uint64_t at,
+                                          const arm_cpu_t *cpu) {
+    unsigned index = pmu_checkpoint_index(pc);
+    if (index < PMU_CHECKPOINT_COUNT)
+        pmu_checkpoint_note(index, at, cpu);
+}
+
+static bool pmu_checkpoint_classifier_selfcheck(void) {
+    for (unsigned i = 0; i < PMU_CHECKPOINT_COUNT; i++) {
+        uint32_t pc = PMU_CHECKPOINTS[i].va;
+        if (pmu_checkpoint_index(pc) != i ||
+            pmu_checkpoint_index(pc - 2u) != PMU_CHECKPOINT_COUNT ||
+            pmu_checkpoint_index(pc + 2u) != PMU_CHECKPOINT_COUNT)
+            return false;
+    }
+    return pmu_checkpoint_index(0u) == PMU_CHECKPOINT_COUNT &&
+           pmu_checkpoint_index(UINT32_MAX) == PMU_CHECKPOINT_COUNT;
+}
+
+static void pmu_checkpoint_report(void) {
+    printf("\n=== PMU / I2C EXACT CHECKPOINTS (iPhone OS 3.1.3 7E18) ===\n");
+    printf("    Registers are captured before the named instruction executes; "
+           "a hit proves entry, not retirement.\n");
+    for (unsigned i = 0; i < PMU_CHECKPOINT_COUNT; i++) {
+        const pmu_checkpoint_observation_t *observation =
+            &G.pmu_checkpoint[i];
+        if (!observation->hits) {
+            printf("    %-27s pc=%08x NEVER REACHED\n",
+                   PMU_CHECKPOINTS[i].name, PMU_CHECKPOINTS[i].va);
+            continue;
+        }
+        printf("    %-27s pc=%08x hits=%" PRIu64
+               " first=@%" PRIu64 " last=@%" PRIu64 "\n",
+               PMU_CHECKPOINTS[i].name, PMU_CHECKPOINTS[i].va,
+               observation->hits, observation->first_at,
+               observation->last_at);
+        printf("      first r0-r3=%08x/%08x/%08x/%08x "
+               "sp/lr=%08x/%08x cpsr=%08x thread=%08x\n",
+               observation->first_r[0], observation->first_r[1],
+               observation->first_r[2], observation->first_r[3],
+               observation->first_sp, observation->first_lr,
+               observation->first_cpsr, observation->first_thread);
+        if (observation->hits > 1u)
+            printf("      last  r0-r3=%08x/%08x/%08x/%08x "
+                   "sp/lr=%08x/%08x cpsr=%08x thread=%08x\n",
+                   observation->last_r[0], observation->last_r[1],
+                   observation->last_r[2], observation->last_r[3],
+                   observation->last_sp, observation->last_lr,
+                   observation->last_cpsr, observation->last_thread);
+    }
+
+    const pmu_checkpoint_observation_t *failure =
+        &G.pmu_checkpoint[3];
+    const pmu_checkpoint_observation_t *first_i2c =
+        &G.pmu_checkpoint[5];
+    const pmu_checkpoint_observation_t *wait_state =
+        &G.pmu_checkpoint[6];
+    const pmu_checkpoint_observation_t *wait_complete =
+        &G.pmu_checkpoint[8];
+    if (failure->hits && !first_i2c->hits)
+        printf("    observed path: PMU start-failure entry preceded any "
+               "observed first-I2C-call entry.\n");
+    else if (first_i2c->hits && wait_state->hits && !wait_complete->hits)
+        printf("    observed path: first I2C call and wait-loop entry were "
+               "reached, but the instruction after that loop was not "
+               "observed.\n");
+    else if (first_i2c->hits && wait_complete->hits)
+        printf("    observed path: the first I2C call reached the instruction "
+               "after the controller wait loop.\n");
+    else
+        printf("    observed path: insufficient checkpoint coverage to choose "
+               "the early-provider or I2C branch.\n");
+}
+
+static void i2c_pmu_state_report(const s5l8900_t *mach) {
+    if (!mach) return;
+
+    printf("\n=== I2C / PCF50635 LIVE STATE ===\n");
+    for (unsigned i = 0; i < S5L8900_I2C_COUNT; i++) {
+        const s5l_i2c_t *bus = &mach->i2c[i];
+        printf("    i2c%u: starts=%" PRIu64 " tx=%" PRIu64
+               " rx=%" PRIu64 " naks=%" PRIu64
+               " active=%u reading=%u sel=%" PRId32 " irq=%u\n",
+               i, bus->starts, bus->bytes_tx, bus->bytes_rx, bus->naks,
+               bus->active ? 1u : 0u, bus->reading ? 1u : 0u, bus->sel,
+               s5l_i2c_irq(bus) ? 1u : 0u);
+        printf("          con=%08x stat=%08x add=%08x ds=%02x "
+               "enable=%08x int=%08x unknown-r/w=%" PRIu64 "/%" PRIu64
+               "\n",
+               bus->con, bus->stat, bus->add, bus->ds, bus->enable,
+               bus->intstat, bus->unknown_reads, bus->unknown_writes);
+        if (bus->unknown_off_count) {
+            printf("          unknown offsets:");
+            for (unsigned k = 0; k < bus->unknown_off_count; k++)
+                printf(" %03x", bus->unknown_off[k]);
+            printf("\n");
+        }
+    }
+
+    const s5l_pcf50635_t *pmu = &mach->pmu;
+    int year = 0, month = 0, day = 0;
+    int hour = 0, minute = 0, second = 0, weekday = 0;
+    s5l_pcf50635_civil(pmu->seconds, &year, &month, &day,
+                       &hour, &minute, &second, &weekday);
+    printf("    pcf50635: time=%04d-%02d-%02dT%02d:%02d:%02dZ "
+           "weekday=%d ticks=%" PRIu64 "/%u ptr=%02x have-ptr=%u "
+           "reading=%u\n",
+           year, month, day, hour, minute, second, weekday,
+           pmu->tick_accum, pmu->tick_hz, pmu->ptr,
+           pmu->have_ptr ? 1u : 0u, pmu->reading ? 1u : 0u);
+    printf("               register-r/w=%" PRIu64 "/%" PRIu64
+           " unknown-r/w=%" PRIu64 "/%" PRIu64 "\n",
+           pmu->reg_reads, pmu->reg_writes,
+           pmu->unknown_reads, pmu->unknown_writes);
+    if (pmu->unknown_reg_count) {
+        printf("               unknown registers:");
+        for (unsigned i = 0; i < pmu->unknown_reg_count; i++)
+            printf(" %02x", pmu->unknown_reg[i]);
+        printf("\n");
+    }
+}
+
 /*
  * Which privilege mode the guest spent its instructions in.
  *
@@ -8897,6 +9128,11 @@ int main(int argc, char **argv) {
                 "internal error: SpringBoard target trace self-check failed\n");
         return 2;
     }
+    if (!pmu_checkpoint_classifier_selfcheck()) {
+        fprintf(stderr,
+                "internal error: PMU checkpoint classifier self-check failed\n");
+        return 2;
+    }
 
     size_t len = 0;
     uint8_t *img = slurp(argv[1], &len);
@@ -8995,15 +9231,14 @@ int main(int argc, char **argv) {
      * IORTC wait: bsd_init calls IOKitInitializeTime, which does
      *   waitForService(resourceMatching("IORTC"), &{tv_sec=30}) before
      *   vfsinit / IOFindBSDRoot. The resource is published only by
-     *   ApplePCF50635PMURTC, and we do not model the PCF50635 PMU on I2C, so it
-     *   is never published and the boot thread sleeps the full 30 s. At our
-     *   timebase that is ~12.4 billion instructions, and running it out does not
-     *   even help (the config threads block permanently in driver start()s
-     *   awaiting unmodelled hardware, so the post-timeout path re-stalls). Zero
-     *   the tv_sec immediate (movs r3,#0x1e -> movs r3,#0) so the wait returns
-     *   at once; the boot then reaches IOFindBSDRoot and mounts md0.
-     *   The proper fix is to model the PMU RTC so it publishes IORTC; until then
-     *   this one byte is the difference between "idle forever" and "BSD root".
+     *   ApplePCF50635PMURTC. The VM now models both S5L I2C controllers and the
+     *   PCF50635 PMU/RTC, but a real cold run has not yet proved that the PMU
+     *   driver's earlier InterruptControllerName dependency is satisfied and
+     *   that IORTC is published. Keep the zero-timeout gate until live evidence
+     *   proves the complete unpatched path; removing it earlier would turn a
+     *   provider-property failure into a 30-second guest-time stall. Zero the
+     *   tv_sec immediate (movs r3,#0x1e -> movs r3,#0) so that any such failure
+     *   remains observable without hiding the later boot path.
      */
     if (external_md) {
         ios3_kernel_patch_request_t request;
@@ -10061,6 +10296,7 @@ int main(int argc, char **argv) {
          * matched at its virtual address and at its pre-MMU physical alias. */
         {
             uint32_t p = last_pc & ~1u;
+            pmu_checkpoint_observe(p, n, &mach.cpu);
             for (unsigned i = 0; i < NM; i++) {
                 if (!pc_matches_vm_or_pre_mmu_alias(
                         &mach.cpu, p, MILE[i].va, G.mile_pa[i])) continue;
@@ -10770,6 +11006,8 @@ int main(int argc, char **argv) {
                    (unsigned long long)G.mile_hits[i], G.mile_first[i]);
 
     display_exec_report(virt_base, phys_base, ram_size);
+    pmu_checkpoint_report();
+    i2c_pmu_state_report(&mach);
     mode_report(win_lo, win_hi);
     syscall_report(virt_base, phys_base);
     lifecycle_report();
