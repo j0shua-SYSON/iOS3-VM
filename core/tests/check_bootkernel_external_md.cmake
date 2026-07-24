@@ -19,6 +19,12 @@ function(expect_rejected name expected)
     endif()
 endfunction()
 
+# Unlike the parser-only cases below, this reaches bootkernel's invariant
+# self-checks before the expected missing-kernel open failure. It keeps the
+# context-aware PC classifier and SpringBoard target-transition truth tables
+# exercised in public CI without requiring Apple firmware.
+expect_rejected(diagnostic_pc_classifier "open"
+    absent-kernel)
 expect_rejected(requires_tree "--external-md requires -d"
     absent-kernel --external-md absent-source new-work)
 expect_rejected(legacy_ramdisk "cannot be combined with -r"

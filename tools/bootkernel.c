@@ -929,8 +929,9 @@ static bool rd_grow_volume(uint8_t *img, size_t *rd_np, size_t capacity,
  * __PRELINK_INFO — live in core/src/firmware/ksyms.c so that machoinfo can
  * print the same map without booting anything. Everything here is the thin
  * layer above it: a rotating buffer so several names can appear in one printf,
- * and the physical/virtual normalisation, because before the MMU comes on the
- * guest executes at the physical alias of every symbol.
+ * plus context-aware physical/virtual normalization. A raw low PC is never
+ * normalized without the observed MMU state because the DRAM aperture overlaps
+ * ordinary userspace.
  *
  * The point of the kext half: a hot PC at 0xc0778123 used to be reported as an
  * unsymbolized address and cost a whole diagnosis cycle to attribute. It is
@@ -939,7 +940,13 @@ static bool rd_grow_volume(uint8_t *img, size_t *rd_np, size_t capacity,
 #define DTNAME 32                 /* device-tree property names are char[32] */
 
 static ksyms_t  KS;
-static uint32_t g_virt_base, g_phys_base;
+static uint32_t g_virt_base, g_phys_base, g_ram_size;
+
+typedef enum {
+    DIAGNOSTIC_PC_KERNEL,
+    DIAGNOSTIC_PC_USER,
+    DIAGNOSTIC_PC_UNPROVEN
+} diagnostic_pc_space_t;
 
 static uint16_t ld16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -950,20 +957,118 @@ static uint32_t ld32(const uint8_t *p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-/* Kernel virtual form of a PC we caught. Idempotent: an address that is
- * already virtual is above virt_base and passes straight through, so call
- * sites that convert by hand are harmless. */
-static uint32_t to_va(uint32_t a) {
-    if (g_virt_base && a >= g_phys_base && a < g_virt_base)
-        return a - g_phys_base + g_virt_base;
-    return a;
-}
-
+/* Resolve an address already proven to be in kernel virtual form. */
 static const char *ksym_at(uint32_t addr) {
     static char buf[4][192];
     static unsigned turn;
     char *out = buf[turn++ & 3];
-    return ksyms_resolve(&KS, to_va(addr), out, sizeof buf[0]);
+    return ksyms_resolve(&KS, addr, out, sizeof buf[0]);
+}
+
+/*
+ * Classify an observed PC before symbolizing it.  The numerical DRAM aperture
+ * overlaps ordinary 32-bit userspace, so a low PC is a kernel physical alias
+ * only while the MMU is off.  User mode wins even in that state: diagnostics
+ * must fail closed rather than manufacture kernel/kext evidence.
+ */
+static diagnostic_pc_space_t diagnostic_pc_observe(
+        uint32_t pc, uint32_t cpsr, bool mmu_enabled,
+        uint32_t *reported_pc) {
+    uint32_t address = pc & ~1u;
+    if ((cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR) {
+        if (reported_pc) *reported_pc = address;
+        return DIAGNOSTIC_PC_USER;
+    }
+    uint64_t dram_end = (uint64_t)g_phys_base + g_ram_size;
+    if (!mmu_enabled && g_virt_base && g_ram_size &&
+        address >= g_phys_base && (uint64_t)address < dram_end) {
+        uint64_t candidate = (uint64_t)g_virt_base +
+                             (address - g_phys_base);
+        if (candidate <= UINT32_MAX) {
+            address = (uint32_t)candidate;
+            if (reported_pc) *reported_pc = address;
+            return DIAGNOSTIC_PC_KERNEL;
+        }
+    }
+    if (reported_pc) *reported_pc = address;
+    return mmu_enabled && g_virt_base && address >= g_virt_base
+        ? DIAGNOSTIC_PC_KERNEL : DIAGNOSTIC_PC_UNPROVEN;
+}
+
+static const char *diagnostic_pc_name(diagnostic_pc_space_t space,
+                                      uint32_t reported_pc) {
+    switch (space) {
+        case DIAGNOSTIC_PC_KERNEL:
+            return ksym_at(reported_pc);
+        case DIAGNOSTIC_PC_USER:
+            return "[userspace]";
+        case DIAGNOSTIC_PC_UNPROVEN:
+            return "[address not proven as kernel]";
+        default:
+            return "[invalid diagnostic PC class]";
+    }
+}
+
+static const char *diagnostic_pc_context_name(
+        uint32_t pc, uint32_t cpsr, bool mmu_enabled,
+        uint32_t *reported_pc) {
+    uint32_t normalized = pc & ~1u;
+    diagnostic_pc_space_t space = diagnostic_pc_observe(
+        pc, cpsr, mmu_enabled, &normalized);
+    if (reported_pc) *reported_pc = normalized;
+    return diagnostic_pc_name(space, normalized);
+}
+
+static bool diagnostic_pc_classifier_selfcheck(void) {
+    uint32_t saved_virt_base = g_virt_base;
+    uint32_t saved_phys_base = g_phys_base;
+    uint32_t saved_ram_size = g_ram_size;
+    uint32_t observed = 0;
+    bool ok = true;
+
+    /* Fixed non-overlapping geometry keeps this truth table independent of
+     * the probeable -P/-V mapping selected by the caller. */
+    g_virt_base = UINT32_C(0xc0000000);
+    g_phys_base = UINT32_C(0x08000000);
+    g_ram_size = UINT32_C(0x08000000);
+
+    ok = ok && diagnostic_pc_observe(
+            UINT32_C(0x2fe20e3c), ARM_MODE_USR, true, &observed) ==
+            DIAGNOSTIC_PC_USER &&
+         observed == UINT32_C(0x2fe20e3c);
+    ok = ok && diagnostic_pc_observe(
+            UINT32_C(0x08069040), ARM_MODE_SVC, false, &observed) ==
+            DIAGNOSTIC_PC_KERNEL &&
+         observed == UINT32_C(0xc0069040);
+    ok = ok && diagnostic_pc_observe(
+            UINT32_C(0x08069040), ARM_MODE_SVC, true, &observed) ==
+            DIAGNOSTIC_PC_UNPROVEN &&
+         observed == UINT32_C(0x08069040);
+    ok = ok && diagnostic_pc_observe(
+            UINT32_C(0xc0069040), ARM_MODE_USR, true, &observed) ==
+            DIAGNOSTIC_PC_USER &&
+         observed == UINT32_C(0xc0069040);
+    ok = ok && diagnostic_pc_observe(
+            UINT32_C(0xc0069040), ARM_MODE_SVC, true, &observed) ==
+            DIAGNOSTIC_PC_KERNEL &&
+         observed == UINT32_C(0xc0069040);
+    ok = ok && diagnostic_pc_observe(
+            UINT32_C(0xc0069040), ARM_MODE_SVC, false, &observed) ==
+            DIAGNOSTIC_PC_UNPROVEN &&
+         observed == UINT32_C(0xc0069040);
+
+    g_virt_base = UINT32_C(0xfffff800);
+    g_phys_base = UINT32_C(0x00001000);
+    g_ram_size = UINT32_C(0x00001000);
+    diagnostic_pc_space_t overflow_space = diagnostic_pc_observe(
+        UINT32_C(0x00001800), ARM_MODE_SVC, false, &observed);
+    ok = ok && overflow_space == DIAGNOSTIC_PC_UNPROVEN &&
+         observed == UINT32_C(0x00001800);
+
+    g_virt_base = saved_virt_base;
+    g_phys_base = saved_phys_base;
+    g_ram_size = saved_ram_size;
+    return ok;
 }
 
 static uint32_t ksym_value(const char *name) { return ksyms_value(&KS, name); }
@@ -1919,6 +2024,8 @@ static unsigned    NM;
 #define SPRINGBOARD_TRAP_CAP 128u
 #define SPRINGBOARD_REGION_EDGE_CAP 64u
 #define SPRINGBOARD_REGION_IDENTITY_ATTEMPT_CAP 4u
+#define SPRINGBOARD_TARGET_EVENT_CAP 64u
+#define SPRINGBOARD_TARGET_USER_RETRY_CAP 4u
 #define FRAMEBUFFER_WRITE_LOG_CAP 64u
 #define DIAGNOSTIC_POSIX_SPAWN_SETEXEC UINT16_C(0x0040)
 #define SETEXEC_IMAGE_REJECT_WRAPPER UINT32_C(0x01)
@@ -2194,11 +2301,107 @@ typedef struct {
     uint64_t generation;
     uint64_t at;
     uint32_t pc;
+    uint32_t cpsr;
     uint32_t thread;
+    uint32_t r[13];
+    uint32_t user_sp;
+    uint32_t user_lr;
     uint8_t region;
     bool valid;
     bool first_identity_valid;
+    bool process_commit_eligible;
+    bool target_registers_valid;
+    bool target_registers_tentative;
+    bool mmu_enabled;
 } springboard_pending_user_t;
+
+typedef enum {
+    SPRINGBOARD_TARGET_USER_EXCEPTION = 1,
+    SPRINGBOARD_TARGET_SWITCH_OUT,
+    SPRINGBOARD_TARGET_RESUME,
+    SPRINGBOARD_TARGET_RESUME_REJECT,
+    SPRINGBOARD_TARGET_RETURN_RESOLUTION,
+    SPRINGBOARD_TARGET_RETURN_REJECT,
+    SPRINGBOARD_TARGET_PROCESS_EXIT_ENTRY
+} springboard_target_event_kind_t;
+
+typedef enum {
+    SPRINGBOARD_TARGET_IDENTITY_NONE = 0,
+    SPRINGBOARD_TARGET_IDENTITY_CONTINUITY,
+    SPRINGBOARD_TARGET_IDENTITY_REVALIDATED,
+    SPRINGBOARD_TARGET_IDENTITY_PROCESS_REVALIDATED,
+    SPRINGBOARD_TARGET_IDENTITY_UNREADABLE,
+    SPRINGBOARD_TARGET_IDENTITY_THREAD_MISMATCH,
+    SPRINGBOARD_TARGET_IDENTITY_PROCESS_MISMATCH
+} springboard_target_identity_t;
+
+typedef enum {
+    SPRINGBOARD_TARGET_OUTCOME_NONE = 0,
+    SPRINGBOARD_TARGET_OUTCOME_NORMAL,
+    SPRINGBOARD_TARGET_OUTCOME_RETRY,
+    SPRINGBOARD_TARGET_OUTCOME_RESTART,
+    SPRINGBOARD_TARGET_OUTCOME_REDIRECTED,
+    SPRINGBOARD_TARGET_OUTCOME_FRAME_UNVERIFIED,
+    SPRINGBOARD_TARGET_OUTCOME_ATTRIBUTION_LOST,
+    SPRINGBOARD_TARGET_OUTCOME_USER_OBSERVED,
+    SPRINGBOARD_TARGET_OUTCOME_PROCESS_EXIT_ENTRY
+} springboard_target_outcome_t;
+
+/*
+ * Newest-retaining evidence for the exact thread that performed SpringBoard's
+ * validated SETEXEC handoff.  The global post-step hot path compares bounded
+ * mode/thread state; exact-target user pre-steps additionally snapshot the
+ * register file so a fault cannot destroy its operands. Object identity is
+ * re-walked at target resume/user-return boundaries, exact user-trap entries,
+ * and the first hit in a process-wide user-region bucket.
+ */
+typedef struct {
+    uint64_t at;
+    uint64_t episode;
+    uint32_t pc_from;
+    uint32_t pc_to;
+    uint32_t origin_pc;
+    uint32_t expected_pc;
+    uint32_t cpsr_from;
+    uint32_t cpsr_to;
+    uint32_t thread_from;
+    uint32_t thread_to;
+    uint32_t lr;
+    uint32_t sp;
+    uint32_t r0;
+    uint32_t r1;
+    uint32_t user_r[13];
+    uint32_t user_sp;
+    uint32_t user_lr;
+    uint32_t raw_r12;
+    uint32_t trap_number;
+    uint32_t entry_spsr;
+    uint32_t entry_svc_sp;
+    uint32_t entry_user_sp;
+    uint32_t entry_user_lr;
+    uint32_t ifsr;
+    uint32_t ifar;
+    uint32_t dfsr;
+    uint32_t dfar;
+    uint32_t ttbr0;
+    uint32_t ttbcr;
+    uint32_t fcse_pid;
+    uint32_t context_id;
+    uint8_t kind;
+    uint8_t episode_mode;
+    uint8_t identity;
+    uint8_t outcome;
+    bool from_state_valid;
+    bool to_state_valid;
+    bool mmu_enabled_from;
+    bool mmu_enabled_to;
+    bool expected_pc_valid;
+    bool return_gate;
+    bool user_registers_valid;
+    bool svc_entry_frame_valid;
+    bool svc_return_frame_valid;
+    bool raw_result_authoritative;
+} springboard_target_event_t;
 
 typedef struct {
     bool armed;
@@ -2243,6 +2446,41 @@ typedef struct {
     uint8_t last_region;
     bool last_region_valid;
     springboard_pending_user_t pending_user;
+    uint32_t target_thread;
+    uint32_t target_uthread;
+    uint32_t target_episode_mode;
+    uint32_t target_episode_origin_pc;
+    uint32_t target_episode_origin_cpsr;
+    uint32_t target_episode_expected_pc;
+    uint32_t target_episode_raw_r12;
+    uint32_t target_episode_number;
+    uint32_t target_episode_entry_spsr;
+    uint32_t target_episode_entry_svc_sp;
+    uint32_t target_episode_entry_user_sp;
+    uint32_t target_episode_entry_user_lr;
+    uint64_t target_event_total;
+    uint64_t target_episode_total;
+    uint64_t target_episode;
+    uint64_t target_episode_resolved_at;
+    uint64_t target_last_transition_at;
+    uint64_t target_first_fault_sequence;
+    bool target_on_cpu;
+    bool target_episode_open;
+    bool target_tracker_invalidated;
+    bool target_resume_unverified;
+    bool target_unreadable_user_capped;
+    bool target_switch_out_unverified;
+    bool target_initial_exception_unobserved;
+    bool target_initial_exception_reconstructed;
+    bool target_episode_expected_valid;
+    bool target_episode_svc_frame_valid;
+    uint8_t target_episode_last_outcome;
+    uint8_t target_unreadable_user_attempts;
+    bool target_first_fault_valid;
+    springboard_target_event_t target_first_fault;
+    uint64_t target_key_changes;
+    springboard_target_event_t
+        target_events[SPRINGBOARD_TARGET_EVENT_CAP];
 } springboard_exec_trace_t;
 
 typedef enum {
@@ -2386,11 +2624,19 @@ static struct {
     s5l8900_t  *mach;
     uint64_t    uart_hits;
     unsigned    uart_log_n;
-    struct { uint32_t addr, val, pc; bool wr; unsigned bytes; } uart_log[64];
+    struct {
+        uint32_t addr, val, pc, cpsr;
+        bool mmu_enabled, wr;
+        unsigned bytes;
+    } uart_log[64];
 
     /* every distinct non-RAM page the guest reached, with the first PC */
     unsigned    dev_page_n;
-    struct { uint32_t page, first_pc; uint64_t reads, writes; } dev_page[64];
+    struct {
+        uint32_t page, first_pc, first_cpsr;
+        uint64_t reads, writes;
+        bool first_mmu_enabled;
+    } dev_page[64];
 
     /* milestones */
     uint32_t    mile_pa[NMILE_MAX];
@@ -2490,7 +2736,11 @@ static struct {
     /* distinct MMU faults */
     unsigned    fault_n;
     uint64_t    fault_dropped;
-    struct { uint32_t far_, fsr, pc; bool prefetch; uint64_t first_at, n; } fault[48];
+    struct {
+        uint32_t far_, fsr, pc, cpsr;
+        bool prefetch, mmu_enabled;
+        uint64_t first_at, n;
+    } fault[48];
 
     /* --- DIAGNOSTIC: exception returns that resume in Thumb state ---------
      * A "MOVS pc,lr" / "LDM ^" leaving an ARM handler for Thumb code must
@@ -2501,12 +2751,20 @@ static struct {
      * split roughly evenly between +0 and +2 mod 4. */
     uint64_t    exret_thumb, exret_thumb_aligned4, exret_mismatch;
     unsigned    exret_log_n;
-    struct { uint64_t at; uint32_t from_pc, lr, to_pc, mode_from, mode_to; } exret_log[24];
+    struct {
+        uint64_t at;
+        uint32_t from_pc, lr, to_pc, mode_from, mode_to;
+        bool mmu_enabled;
+    } exret_log[24];
 
     /* --- DIAGNOSTIC: failed STREX/STREXD/STREXB/STREXH -------------------- */
     uint64_t    strex_total, strex_failed;
     unsigned    strex_log_n;
-    struct { uint64_t at; uint32_t pc, addr; } strex_log[32];
+    struct {
+        uint64_t at;
+        uint32_t pc, addr, cpsr;
+        bool mmu_enabled;
+    } strex_log[32];
 
     /* --- DIAGNOSTIC: FIQ arrival rate and the timer latch ------------------ */
     uint64_t    fiq_n;
@@ -2536,7 +2794,11 @@ static struct {
 #define PCHASH 8192u
     unsigned    pc_n;
     uint64_t    pc_dropped;
-    struct { uint32_t va; uint64_t hits; } pc_hist[PCHASH];
+    struct {
+        uint32_t va;
+        diagnostic_pc_space_t space;
+        uint64_t hits;
+    } pc_hist[PCHASH];
 
     /* --- DIAGNOSTIC: the single hottest unmodelled MMIO page ---------------
      * One physical page absorbs ~2% of every instruction in a 200M boot. This
@@ -2937,10 +3199,13 @@ static bool lifecycle_syscall_tracked(uint32_t number) {
 
 static uint32_t diagnostic_user_reg(const arm_cpu_t *cpu, unsigned reg) {
     if (!cpu || reg > 14u) return 0;
-    if (arm_bank_of_mode(cpu->cpsr) == ARM_BANK_USR) return cpu->r[reg];
+    unsigned bank = arm_bank_of_mode(cpu->cpsr);
+    if (bank == ARM_BANK_USR) return cpu->r[reg];
+    if (bank == ARM_BANK_FIQ && reg >= 8u && reg <= 12u)
+        return cpu->usr_r8_12[reg - 8u];
     if (reg == 13u) return cpu->bank_r13[ARM_BANK_USR];
     if (reg == 14u) return cpu->bank_r14[ARM_BANK_USR];
-    return cpu->r[reg];             /* r0-r12 are not banked outside FIQ */
+    return cpu->r[reg];             /* r0-r12 are shared outside FIQ */
 }
 
 /*
@@ -2948,8 +3213,15 @@ static uint32_t diagnostic_user_reg(const arm_cpu_t *cpu, unsigned reg) {
  * The low bits carry cache/share attributes and are reported but must not turn
  * a stable address space into a false mismatch.
  */
+/* N[2:0] selects the split; PD0/PD1[4:5] can suppress either table walk. */
+#define DIAGNOSTIC_TTBCR_KEY_MASK UINT32_C(0x37)
+
+static uint32_t diagnostic_ttbcr_key(uint32_t ttbcr) {
+    return ttbcr & DIAGNOSTIC_TTBCR_KEY_MASK;
+}
+
 static uint32_t diagnostic_ttbr0_base_value(uint32_t ttbr0,
-                                            uint32_t ttbcr) {
+                                             uint32_t ttbcr) {
     unsigned n = ttbcr & 7u;
     return ttbr0 & (UINT32_MAX << (14u - n));
 }
@@ -3026,7 +3298,8 @@ static bool springboard_return_parent_matches(
         const springboard_return_probe_t *probe, const arm_cpu_t *cpu) {
     if (!probe || !cpu) return false;
     return diagnostic_ttbr0_base(cpu) == probe->entry_ttbr0_base &&
-           (cpu->cp15.ttbcr & 7u) == (probe->entry_ttbcr & 7u) &&
+           diagnostic_ttbcr_key(cpu->cp15.ttbcr) ==
+               diagnostic_ttbcr_key(probe->entry_ttbcr) &&
            cpu->cp15.fcse_pid == probe->entry_fcse_pid &&
            cpu->cp15.context_id == probe->entry_context_id &&
            cpu->cp15.tpidrprw == probe->entry_tpidrprw &&
@@ -3393,10 +3666,381 @@ static bool springboard_exec_trace_address_space_matches(
     return cpu && trace && trace->armed && !trace->exited &&
            !trace->identity_invalidated &&
            diagnostic_ttbr0_base(cpu) == trace->ttbr0_base &&
-           (cpu->cp15.ttbcr & 7u) == (trace->ttbcr & 7u) &&
+           diagnostic_ttbcr_key(cpu->cp15.ttbcr) ==
+               diagnostic_ttbcr_key(trace->ttbcr) &&
            cpu->cp15.fcse_pid == trace->fcse_pid &&
            (cpu->cp15.context_id & UINT32_C(0xff)) ==
                (trace->context_id & UINT32_C(0xff));
+}
+
+static bool springboard_target_trace_active(
+        const springboard_exec_trace_t *trace) {
+    return trace && trace->armed && !trace->exited &&
+           !trace->identity_invalidated && trace->target_thread &&
+           trace->target_uthread &&
+           !trace->target_tracker_invalidated;
+}
+
+static springboard_target_event_t *springboard_target_event_begin(
+        springboard_exec_trace_t *trace, uint64_t at,
+        springboard_target_event_kind_t kind) {
+    uint64_t sequence = trace->target_event_total++;
+    springboard_target_event_t *event =
+        &trace->target_events[
+            sequence % SPRINGBOARD_TARGET_EVENT_CAP];
+    memset(event, 0, sizeof *event);
+    event->at = at;
+    event->kind = (uint8_t)kind;
+    if (trace->target_episode_open) {
+        event->episode = trace->target_episode;
+        event->episode_mode =
+            (uint8_t)trace->target_episode_mode;
+        event->origin_pc = trace->target_episode_origin_pc;
+        event->expected_pc = trace->target_episode_expected_pc;
+        event->expected_pc_valid =
+            trace->target_episode_expected_valid;
+        event->raw_r12 = trace->target_episode_raw_r12;
+        event->trap_number = trace->target_episode_number;
+        event->entry_spsr =
+            trace->target_episode_entry_spsr;
+        event->entry_svc_sp =
+            trace->target_episode_entry_svc_sp;
+        event->entry_user_sp =
+            trace->target_episode_entry_user_sp;
+        event->entry_user_lr =
+            trace->target_episode_entry_user_lr;
+        event->svc_entry_frame_valid =
+            trace->target_episode_svc_frame_valid;
+    }
+    return event;
+}
+
+static void springboard_target_event_note_context(
+        springboard_target_event_t *event, const arm_cpu_t *cpu) {
+    if (!event || !cpu) return;
+    event->ttbr0 = cpu->cp15.ttbr0;
+    event->ttbcr = cpu->cp15.ttbcr;
+    event->fcse_pid = cpu->cp15.fcse_pid;
+    event->context_id = cpu->cp15.context_id;
+    event->mmu_enabled_to =
+        (cpu->cp15.sctlr & ARM_SCTLR_M) != 0u;
+    event->to_state_valid = true;
+}
+
+static void springboard_target_event_note_user_registers(
+        springboard_target_event_t *event, const arm_cpu_t *cpu) {
+    if (!event || !cpu ||
+        (cpu->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR)
+        return;
+    for (unsigned reg = 0; reg < 13u; reg++)
+        event->user_r[reg] = cpu->r[reg];
+    event->user_sp = cpu->r[13];
+    event->user_lr = cpu->r[14];
+    event->r0 = cpu->r[0];
+    event->r1 = cpu->r[1];
+    event->user_registers_valid = true;
+}
+
+static bool springboard_target_expected_pc(
+        uint32_t origin_pc, uint32_t origin_cpsr,
+        uint32_t exception_mode, uint32_t *expected_pc) {
+    if (!expected_pc) return false;
+    if (exception_mode != ARM_MODE_SVC) {
+        *expected_pc = origin_pc;
+        return true;
+    }
+    uint32_t advance = (origin_cpsr & ARM_CPSR_T) ? 2u : 4u;
+    if (origin_pc > UINT32_MAX - advance) {
+        *expected_pc = 0;
+        return false;
+    }
+    *expected_pc = origin_pc + advance;
+    return true;
+}
+
+static springboard_target_outcome_t springboard_target_return_outcome(
+        bool episode_open, uint32_t episode_mode,
+        uint32_t origin_pc, uint32_t origin_cpsr,
+        uint32_t expected_pc, bool expected_pc_valid,
+        uint32_t actual_pc, uint32_t actual_cpsr,
+        bool svc_return_frame_valid) {
+    if (!episode_open)
+        return SPRINGBOARD_TARGET_OUTCOME_USER_OBSERVED;
+    if ((actual_cpsr & ARM_CPSR_T) !=
+        (origin_cpsr & ARM_CPSR_T))
+        return SPRINGBOARD_TARGET_OUTCOME_REDIRECTED;
+    if (episode_mode == ARM_MODE_SVC) {
+        bool expected_path =
+            expected_pc_valid && actual_pc == expected_pc;
+        bool restart_path = actual_pc == origin_pc;
+        if (!expected_path && !restart_path)
+            return SPRINGBOARD_TARGET_OUTCOME_REDIRECTED;
+        if (!svc_return_frame_valid)
+            return SPRINGBOARD_TARGET_OUTCOME_FRAME_UNVERIFIED;
+        return expected_path
+            ? SPRINGBOARD_TARGET_OUTCOME_NORMAL
+            : SPRINGBOARD_TARGET_OUTCOME_RESTART;
+    }
+    if (expected_pc_valid && actual_pc == expected_pc)
+        return SPRINGBOARD_TARGET_OUTCOME_RETRY;
+    return SPRINGBOARD_TARGET_OUTCOME_REDIRECTED;
+}
+
+static springboard_target_identity_t
+springboard_target_identity_revalidate(
+        arm_cpu_t *cpu, const springboard_exec_trace_t *trace) {
+    if (!cpu || !trace || !trace->target_thread ||
+        !trace->target_uthread)
+        return SPRINGBOARD_TARGET_IDENTITY_UNREADABLE;
+    if (cpu->cp15.tpidrprw != trace->target_thread)
+        return SPRINGBOARD_TARGET_IDENTITY_THREAD_MISMATCH;
+
+    diagnostic_thread_identity_t identity;
+    diagnostic_read_thread_identity(
+        cpu, trace->target_thread, &identity);
+    if (!identity.task_valid || !identity.effective_valid ||
+        !identity.uthread)
+        return SPRINGBOARD_TARGET_IDENTITY_UNREADABLE;
+    if (identity.task != trace->task ||
+        identity.task_proc != trace->proc ||
+        identity.task_pid != trace->pid ||
+        identity.effective_proc != trace->proc ||
+        identity.effective_pid != trace->pid)
+        return SPRINGBOARD_TARGET_IDENTITY_PROCESS_MISMATCH;
+    if (identity.uthread != trace->target_uthread)
+        return SPRINGBOARD_TARGET_IDENTITY_THREAD_MISMATCH;
+    return SPRINGBOARD_TARGET_IDENTITY_REVALIDATED;
+}
+
+static bool springboard_target_identity_is_mismatch(
+        springboard_target_identity_t identity) {
+    return identity == SPRINGBOARD_TARGET_IDENTITY_THREAD_MISMATCH ||
+           identity == SPRINGBOARD_TARGET_IDENTITY_PROCESS_MISMATCH;
+}
+
+static void springboard_target_note_identity_failure(
+        springboard_exec_trace_t *trace,
+        springboard_target_identity_t identity,
+        uint64_t at, uint32_t pc) {
+    if (!trace || !springboard_target_identity_is_mismatch(identity)) return;
+    trace->target_tracker_invalidated = true;
+    trace->target_resume_unverified = false;
+    trace->target_unreadable_user_capped = false;
+    trace->target_on_cpu = false;
+    if (trace->target_episode_open) {
+        trace->target_episode_open = false;
+        trace->target_episode_resolved_at = at;
+        trace->target_episode_last_outcome =
+            SPRINGBOARD_TARGET_OUTCOME_ATTRIBUTION_LOST;
+    }
+    if (identity != SPRINGBOARD_TARGET_IDENTITY_PROCESS_MISMATCH) return;
+
+    /* A readable process-tuple contradiction under the stored mapping key
+     * invalidates process-wide attribution too; a different uthread in the
+     * same process invalidates only this exact-thread tracker. */
+    trace->identity_invalidated = true;
+    trace->identity_invalidation_unreadable = false;
+    trace->identity_invalidated_at = at;
+    trace->identity_invalidated_pc = pc;
+    trace->last_region_valid = false;
+    trace->pending_user.valid = false;
+}
+
+static void springboard_target_note_process_exit_entry(
+        springboard_exec_trace_t *trace,
+        const arm_cpu_t *cpu, uint64_t at) {
+    if (!trace || !cpu || trace->exited) return;
+    springboard_target_event_t *event =
+        springboard_target_event_begin(
+            trace, at, SPRINGBOARD_TARGET_PROCESS_EXIT_ENTRY);
+    event->pc_from = cpu->r[15];
+    event->pc_to = cpu->r[15];
+    event->cpsr_from = cpu->cpsr;
+    event->cpsr_to = cpu->cpsr;
+    event->thread_from = cpu->cp15.tpidrprw;
+    event->thread_to = cpu->cp15.tpidrprw;
+    event->r0 = cpu->r[0];
+    event->r1 = cpu->r[1];
+    event->from_state_valid = true;
+    event->mmu_enabled_from =
+        (cpu->cp15.sctlr & ARM_SCTLR_M) != 0u;
+    event->identity =
+        SPRINGBOARD_TARGET_IDENTITY_PROCESS_REVALIDATED;
+    event->outcome =
+        SPRINGBOARD_TARGET_OUTCOME_PROCESS_EXIT_ENTRY;
+    springboard_target_event_note_context(event, cpu);
+
+    if (trace->target_episode_open) {
+        trace->target_episode_open = false;
+        trace->target_episode_resolved_at = at;
+        trace->target_episode_last_outcome =
+            SPRINGBOARD_TARGET_OUTCOME_PROCESS_EXIT_ENTRY;
+    }
+    trace->target_on_cpu = false;
+    trace->target_resume_unverified = false;
+    trace->target_unreadable_user_capped = false;
+    trace->pending_user.valid = false;
+    trace->last_region_valid = false;
+    trace->target_last_transition_at = at;
+    /*
+     * This hook is at _exit1 instruction entry.  It makes attribution
+     * terminal because _exit1 is a non-returning process teardown path, but it
+     * is deliberately reported as exit initiation rather than completed
+     * teardown.
+     */
+    trace->exited = true;
+    trace->exited_at = at;
+}
+
+static bool springboard_target_trace_selfcheck(void) {
+    uint32_t expected = 0;
+    bool ok =
+        springboard_target_expected_pc(
+            UINT32_C(0x1000), ARM_MODE_USR,
+            ARM_MODE_SVC, &expected) &&
+        expected == UINT32_C(0x1004);
+    ok = ok &&
+        diagnostic_ttbcr_key(UINT32_C(0x37)) == UINT32_C(0x37) &&
+        diagnostic_ttbcr_key(UINT32_C(0xffffffc8)) == 0u;
+    ok = ok && springboard_target_expected_pc(
+            UINT32_C(0x1000), ARM_MODE_USR | ARM_CPSR_T,
+            ARM_MODE_SVC, &expected) &&
+        expected == UINT32_C(0x1002);
+    ok = ok && !springboard_target_expected_pc(
+            UINT32_C(0xfffffffd), ARM_MODE_USR,
+            ARM_MODE_SVC, &expected) &&
+        expected == 0u;
+    ok = ok && springboard_target_expected_pc(
+            UINT32_C(0x2000), ARM_MODE_USR,
+            ARM_MODE_ABT, &expected) &&
+        expected == UINT32_C(0x2000);
+
+    ok = ok && springboard_target_return_outcome(
+            false, 0u, 0u, 0u, 0u, false,
+            UINT32_C(0x3000), ARM_MODE_USR, false) ==
+        SPRINGBOARD_TARGET_OUTCOME_USER_OBSERVED;
+    ok = ok && springboard_target_return_outcome(
+            true, ARM_MODE_SVC, UINT32_C(0x1000), ARM_MODE_USR,
+            UINT32_C(0x1004), true,
+            UINT32_C(0x1004), ARM_MODE_USR, true) ==
+        SPRINGBOARD_TARGET_OUTCOME_NORMAL;
+    ok = ok && springboard_target_return_outcome(
+            true, ARM_MODE_SVC, UINT32_C(0x1000), ARM_MODE_USR,
+            UINT32_C(0x1004), true,
+            UINT32_C(0x1000), ARM_MODE_USR, true) ==
+        SPRINGBOARD_TARGET_OUTCOME_RESTART;
+    ok = ok && springboard_target_return_outcome(
+            true, ARM_MODE_SVC, UINT32_C(0x1000), ARM_MODE_USR,
+            UINT32_C(0x1004), true,
+            UINT32_C(0x1004), ARM_MODE_USR, false) ==
+        SPRINGBOARD_TARGET_OUTCOME_FRAME_UNVERIFIED;
+    ok = ok && springboard_target_return_outcome(
+            true, ARM_MODE_SVC, UINT32_C(0x1000), ARM_MODE_USR,
+            UINT32_C(0x1004), true,
+            UINT32_C(0x2000), ARM_MODE_USR, false) ==
+        SPRINGBOARD_TARGET_OUTCOME_REDIRECTED;
+    ok = ok && springboard_target_return_outcome(
+            true, ARM_MODE_SVC, UINT32_C(0x1000), ARM_MODE_USR,
+            UINT32_C(0x1004), true,
+            UINT32_C(0x1004), ARM_MODE_USR | ARM_CPSR_T, true) ==
+        SPRINGBOARD_TARGET_OUTCOME_REDIRECTED;
+    ok = ok && springboard_target_return_outcome(
+            true, ARM_MODE_ABT, UINT32_C(0x2000), ARM_MODE_USR,
+            UINT32_C(0x2000), true,
+            UINT32_C(0x2000), ARM_MODE_USR, false) ==
+        SPRINGBOARD_TARGET_OUTCOME_RETRY;
+    ok = ok && springboard_target_identity_is_mismatch(
+            SPRINGBOARD_TARGET_IDENTITY_THREAD_MISMATCH);
+    ok = ok && springboard_target_identity_is_mismatch(
+            SPRINGBOARD_TARGET_IDENTITY_PROCESS_MISMATCH);
+    ok = ok && !springboard_target_identity_is_mismatch(
+            SPRINGBOARD_TARGET_IDENTITY_UNREADABLE);
+
+    springboard_exec_trace_t ring;
+    memset(&ring, 0, sizeof ring);
+    ring.target_episode_open = true;
+    ring.target_episode = UINT64_C(7);
+    ring.target_episode_mode = ARM_MODE_SVC;
+    ring.target_episode_origin_pc = UINT32_C(0x4000);
+    ring.target_episode_expected_pc = UINT32_C(0x4004);
+    ring.target_episode_expected_valid = true;
+    for (uint64_t sequence = 0;
+         sequence <= SPRINGBOARD_TARGET_EVENT_CAP; sequence++)
+        (void)springboard_target_event_begin(
+            &ring, sequence, SPRINGBOARD_TARGET_SWITCH_OUT);
+    ok = ok &&
+        ring.target_event_total == SPRINGBOARD_TARGET_EVENT_CAP + 1u &&
+        ring.target_events[0].at == SPRINGBOARD_TARGET_EVENT_CAP &&
+        ring.target_events[0].episode == UINT64_C(7) &&
+        ring.target_events[0].expected_pc_valid &&
+        ring.target_events[1].at == UINT64_C(1);
+
+    ring.target_episode_open = false;
+    ring.target_episode_mode = ARM_MODE_SVC;
+    ring.target_episode_origin_pc = UINT32_C(0xdeadbeef);
+    ring.target_episode_expected_pc = UINT32_C(0xfeedface);
+    springboard_target_event_t *closed =
+        springboard_target_event_begin(
+            &ring, UINT64_C(100), SPRINGBOARD_TARGET_RESUME);
+    ok = ok && closed->episode == 0u &&
+        closed->episode_mode == 0u &&
+        closed->origin_pc == 0u &&
+        closed->expected_pc == 0u &&
+        !closed->expected_pc_valid &&
+        closed->raw_r12 == 0u &&
+        closed->trap_number == 0u;
+
+    springboard_exec_trace_t exiting;
+    arm_cpu_t cpu;
+    memset(&exiting, 0, sizeof exiting);
+    memset(&cpu, 0, sizeof cpu);
+    cpu.cpsr = ARM_MODE_FIQ;
+    cpu.r[8] = UINT32_C(0xf1f1f1f1);
+    cpu.usr_r8_12[0] = UINT32_C(0x81818181);
+    cpu.bank_r13[ARM_BANK_USR] = UINT32_C(0x13131313);
+    ok = ok &&
+        diagnostic_user_reg(&cpu, 8u) == UINT32_C(0x81818181) &&
+        diagnostic_user_reg(&cpu, 13u) == UINT32_C(0x13131313);
+    memset(&cpu, 0, sizeof cpu);
+    exiting.target_episode_open = true;
+    exiting.target_episode = UINT64_C(3);
+    exiting.target_episode_total = UINT64_C(3);
+    cpu.cpsr = ARM_MODE_SVC;
+    cpu.r[0] = UINT32_C(0x11110000);
+    cpu.r[1] = UINT32_C(0x22);
+    cpu.r[15] = UINT32_C(0xc011f63c);
+    cpu.cp15.tpidrprw = UINT32_C(0x33330000);
+    springboard_target_note_process_exit_entry(
+        &exiting, &cpu, UINT64_C(55));
+    ok = ok && exiting.exited &&
+        exiting.exited_at == UINT64_C(55) &&
+        !exiting.target_episode_open &&
+        exiting.target_episode_last_outcome ==
+            SPRINGBOARD_TARGET_OUTCOME_PROCESS_EXIT_ENTRY &&
+        exiting.target_event_total == UINT64_C(1) &&
+        exiting.target_events[0].kind ==
+            SPRINGBOARD_TARGET_PROCESS_EXIT_ENTRY &&
+        exiting.target_events[0].identity ==
+            SPRINGBOARD_TARGET_IDENTITY_PROCESS_REVALIDATED;
+    return ok;
+}
+
+static void springboard_target_refresh_address_space(
+        springboard_exec_trace_t *trace, const arm_cpu_t *cpu) {
+    if (!trace || !cpu) return;
+    uint32_t current_base = diagnostic_ttbr0_base(cpu);
+    if (current_base != trace->ttbr0_base ||
+        diagnostic_ttbcr_key(cpu->cp15.ttbcr) !=
+            diagnostic_ttbcr_key(trace->ttbcr) ||
+        cpu->cp15.fcse_pid != trace->fcse_pid ||
+        (cpu->cp15.context_id & UINT32_C(0xff)) !=
+            (trace->context_id & UINT32_C(0xff)))
+        trace->target_key_changes++;
+    trace->ttbr0 = cpu->cp15.ttbr0;
+    trace->ttbr0_base = current_base;
+    trace->ttbcr = cpu->cp15.ttbcr;
+    trace->fcse_pid = cpu->cp15.fcse_pid;
+    trace->context_id = cpu->cp15.context_id;
 }
 
 static springboard_user_region_t springboard_exec_user_region(uint32_t pc);
@@ -3429,6 +4073,10 @@ static void springboard_exec_trace_arm(
         trace->ttbr0, trace->ttbcr);
     trace->fcse_pid = probe->setexec_image_fcse_pid;
     trace->context_id = probe->setexec_image_context_id;
+    trace->target_thread = probe->entry_tpidrprw;
+    trace->target_uthread = probe->entry_uthread;
+    trace->target_on_cpu =
+        trace->target_thread != 0u && trace->target_uthread != 0u;
 
     G.framebuffer_surface_cache_valid = false;
     G.framebuffer_surface_active = false;
@@ -3487,25 +4135,23 @@ static void springboard_exec_trace_note_swi(
             cpu, trace, &unreadable)) {
         if (unreadable) trace->trap_identity_unreadable++;
         else trace->trap_identity_mismatches++;
-        if (same_address_space) {
+        if (same_address_space && !unreadable) {
             /*
-             * A full identity failure under the exact stored pmap/FCSE/ASID
-             * key means that key has become unreadable, shared, or reused.
-             * Do not let already-seen-region fast paths outlive that proof.
+             * A readable contradiction under the exact stored pmap/FCSE/ASID
+             * key proves that the key was shared or reused. A transiently
+             * unreadable object is not proof and remains retryable.
              */
-            trace->identity_invalidated = true;
-            trace->identity_invalidation_unreadable = unreadable;
-            trace->identity_invalidated_at = at;
-            trace->identity_invalidated_pc = user_pc;
-            trace->last_region_valid = false;
-            trace->pending_user.valid = false;
+            springboard_target_note_identity_failure(
+                trace, SPRINGBOARD_TARGET_IDENTITY_PROCESS_MISMATCH,
+                at, user_pc);
         }
         return;
     }
 
     uint32_t current_base = diagnostic_ttbr0_base(cpu);
     if (current_base != trace->ttbr0_base ||
-        (cpu->cp15.ttbcr & 7u) != (trace->ttbcr & 7u) ||
+        diagnostic_ttbcr_key(cpu->cp15.ttbcr) !=
+            diagnostic_ttbcr_key(trace->ttbcr) ||
         cpu->cp15.fcse_pid != trace->fcse_pid ||
         (cpu->cp15.context_id & UINT32_C(0xff)) !=
             (trace->context_id & UINT32_C(0xff))) {
@@ -3616,20 +4262,86 @@ static void springboard_exec_trace_commit_user(
     }
 }
 
+static void springboard_target_retry_unverified_user(
+    arm_cpu_t *cpu, springboard_exec_trace_t *trace,
+    uint64_t at, uint32_t pc);
+
 static void springboard_exec_trace_prepare_user(
         arm_cpu_t *cpu, uint64_t at, uint32_t pc) {
     springboard_exec_trace_t *trace = &G.springboard_exec_trace;
     trace->pending_user.valid = false;
+    trace->pending_user.process_commit_eligible = false;
+    trace->pending_user.target_registers_valid = false;
+    trace->pending_user.target_registers_tentative = false;
     if (!cpu || !trace->armed || trace->exited ||
         trace->identity_invalidated ||
-        (cpu->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR ||
-        !springboard_exec_trace_address_space_matches(cpu, trace))
+        (cpu->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR)
+        return;
+
+    /*
+     * An unreadable privileged->USR identity check must be recoverable even if
+     * the resumed target installed a new pmap/ASID key. Retry against the exact
+     * target pointer before applying the old cheap address-space key.
+     */
+    if (trace->target_resume_unverified)
+        springboard_target_retry_unverified_user(cpu, trace, at, pc);
+    if (trace->identity_invalidated)
         return;
 
     springboard_user_region_t region =
         springboard_exec_user_region(pc);
     springboard_user_region_stat_t *stat =
         &trace->user_regions[region];
+    /*
+     * Capture exact-pointer target prestate before applying the old process
+     * address-space key. A resume can install a new pmap/ASID while its object
+     * graph is transiently unreadable; the following exception entry may make
+     * identity readable again. This tentative snapshot is never eligible for
+     * process-wide instruction accounting until the independent gates below
+     * succeed.
+     */
+    bool target_candidate =
+        cpu->cp15.tpidrprw == trace->target_thread &&
+        !trace->target_tracker_invalidated &&
+        (trace->target_on_cpu ||
+         trace->target_resume_unverified);
+    if (target_candidate) {
+        trace->pending_user.generation = trace->generation;
+        trace->pending_user.at = at;
+        trace->pending_user.pc = pc;
+        trace->pending_user.cpsr = cpu->cpsr;
+        trace->pending_user.thread = cpu->cp15.tpidrprw;
+        trace->pending_user.mmu_enabled =
+            (cpu->cp15.sctlr & ARM_SCTLR_M) != 0u;
+        trace->pending_user.region = (uint8_t)region;
+        trace->pending_user.first_identity_valid = false;
+        trace->pending_user.valid = true;
+        for (unsigned i = 0; i < 13u; i++)
+            trace->pending_user.r[i] = cpu->r[i];
+        trace->pending_user.user_sp = cpu->r[13];
+        trace->pending_user.user_lr = cpu->r[14];
+        trace->pending_user.target_registers_valid =
+            trace->target_on_cpu;
+        trace->pending_user.target_registers_tentative =
+            !trace->target_on_cpu &&
+            trace->target_resume_unverified;
+    }
+
+    if (!springboard_exec_trace_address_space_matches(cpu, trace))
+        return;
+    if (!trace->pending_user.valid) {
+        trace->pending_user.generation = trace->generation;
+        trace->pending_user.at = at;
+        trace->pending_user.pc = pc;
+        trace->pending_user.cpsr = cpu->cpsr;
+        trace->pending_user.thread = cpu->cp15.tpidrprw;
+        trace->pending_user.mmu_enabled =
+            (cpu->cp15.sctlr & ARM_SCTLR_M) != 0u;
+        trace->pending_user.region = (uint8_t)region;
+        trace->pending_user.first_identity_valid = false;
+        trace->pending_user.valid = true;
+    }
+
     bool first_identity_valid = false;
     if (!stat->hits) {
         if (stat->first_identity_attempts >=
@@ -3650,25 +4362,297 @@ static void springboard_exec_trace_prepare_user(
                  * address-space key. Treat that as reuse/collision and
                  * permanently stop fast-path attribution for this generation.
                  */
-                trace->identity_invalidated = true;
-                trace->identity_invalidation_unreadable = false;
-                trace->identity_invalidated_at = at;
-                trace->identity_invalidated_pc = pc;
-                trace->last_region_valid = false;
+                springboard_target_note_identity_failure(
+                    trace, SPRINGBOARD_TARGET_IDENTITY_PROCESS_MISMATCH,
+                    at, pc);
             }
             return;
         }
         first_identity_valid = true;
     }
 
-    trace->pending_user.generation = trace->generation;
-    trace->pending_user.at = at;
-    trace->pending_user.pc = pc;
-    trace->pending_user.thread = cpu->cp15.tpidrprw;
-    trace->pending_user.region = (uint8_t)region;
     trace->pending_user.first_identity_valid =
         first_identity_valid;
-    trace->pending_user.valid = true;
+    trace->pending_user.process_commit_eligible = true;
+}
+
+/*
+ * Seeing the exact target execute another user instruction proves that an
+ * older privileged episode returned even if its transition event was missed.
+ * Keep that evidence explicitly non-authoritative for raw syscall results.
+ */
+static void springboard_target_close_implicit_return(
+        springboard_exec_trace_t *trace,
+        const springboard_pending_user_t *pending,
+        const arm_cpu_t *cpu, uint64_t at,
+        springboard_target_identity_t identity) {
+    if (!trace || !pending || !trace->target_episode_open) return;
+    springboard_target_event_t *event =
+        springboard_target_event_begin(
+            trace, at, SPRINGBOARD_TARGET_RETURN_RESOLUTION);
+    event->pc_to = pending->pc;
+    event->cpsr_to = pending->cpsr;
+    event->thread_from = trace->target_thread;
+    event->thread_to = pending->thread;
+    if (pending->target_registers_valid) {
+        memcpy(event->user_r, pending->r, sizeof event->user_r);
+        event->user_sp = pending->user_sp;
+        event->user_lr = pending->user_lr;
+        event->r0 = pending->r[0];
+        event->r1 = pending->r[1];
+        event->user_registers_valid = true;
+    }
+    event->identity = (uint8_t)identity;
+    event->outcome = SPRINGBOARD_TARGET_OUTCOME_USER_OBSERVED;
+    springboard_target_event_note_context(event, cpu);
+    trace->target_episode_open = false;
+    trace->target_episode_resolved_at = at;
+    trace->target_episode_last_outcome = event->outcome;
+    trace->target_last_transition_at = at;
+}
+
+static void springboard_target_retry_unverified_user(
+        arm_cpu_t *cpu, springboard_exec_trace_t *trace,
+        uint64_t at, uint32_t pc) {
+    if (!cpu || !trace || !trace->target_resume_unverified ||
+        trace->target_tracker_invalidated ||
+        trace->target_unreadable_user_capped ||
+        (cpu->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR ||
+        cpu->cp15.tpidrprw != trace->target_thread)
+        return;
+    if (trace->target_unreadable_user_attempts >=
+            SPRINGBOARD_TARGET_USER_RETRY_CAP) {
+        trace->target_unreadable_user_capped = true;
+        return;
+    }
+
+    trace->target_unreadable_user_attempts++;
+    springboard_target_identity_t identity =
+        springboard_target_identity_revalidate(cpu, trace);
+    if (identity == SPRINGBOARD_TARGET_IDENTITY_REVALIDATED) {
+        if (trace->target_episode_open) {
+            springboard_pending_user_t pending;
+            memset(&pending, 0, sizeof pending);
+            pending.pc = pc;
+            pending.cpsr = cpu->cpsr;
+            pending.thread = cpu->cp15.tpidrprw;
+            for (unsigned reg = 0; reg < 13u; reg++)
+                pending.r[reg] = cpu->r[reg];
+            pending.user_sp = cpu->r[13];
+            pending.user_lr = cpu->r[14];
+            pending.target_registers_valid = true;
+            pending.mmu_enabled =
+                (cpu->cp15.sctlr & ARM_SCTLR_M) != 0u;
+            springboard_target_close_implicit_return(
+                trace, &pending, cpu, at, identity);
+        } else {
+            springboard_target_event_t *event =
+                springboard_target_event_begin(
+                    trace, at, SPRINGBOARD_TARGET_RESUME);
+            event->pc_to = pc;
+            event->cpsr_to = cpu->cpsr;
+            event->thread_to = cpu->cp15.tpidrprw;
+            event->identity = (uint8_t)identity;
+            event->outcome = SPRINGBOARD_TARGET_OUTCOME_USER_OBSERVED;
+            springboard_target_event_note_user_registers(event, cpu);
+            springboard_target_event_note_context(event, cpu);
+            trace->target_last_transition_at = at;
+        }
+        springboard_target_refresh_address_space(trace, cpu);
+        trace->target_on_cpu = true;
+        trace->target_resume_unverified = false;
+        trace->target_unreadable_user_capped = false;
+        trace->target_switch_out_unverified = false;
+        trace->target_unreadable_user_attempts = 0;
+        return;
+    }
+
+    springboard_target_event_kind_t reject_kind =
+        trace->target_episode_open
+            ? SPRINGBOARD_TARGET_RETURN_REJECT
+            : SPRINGBOARD_TARGET_RESUME_REJECT;
+    springboard_target_event_t *event =
+        springboard_target_event_begin(
+            trace, at, reject_kind);
+    event->pc_to = pc;
+    event->cpsr_to = cpu->cpsr;
+    event->thread_to = cpu->cp15.tpidrprw;
+    event->identity = (uint8_t)identity;
+    if (springboard_target_identity_is_mismatch(identity))
+        event->outcome =
+            SPRINGBOARD_TARGET_OUTCOME_ATTRIBUTION_LOST;
+    springboard_target_event_note_context(event, cpu);
+    trace->target_last_transition_at = at;
+    if (springboard_target_identity_is_mismatch(identity)) {
+        springboard_target_note_identity_failure(trace, identity, at, pc);
+    } else if (trace->target_unreadable_user_attempts >=
+                   SPRINGBOARD_TARGET_USER_RETRY_CAP) {
+        trace->target_unreadable_user_capped = true;
+    }
+}
+
+static BOOTKERNEL_NOINLINE void springboard_target_note_user_exception(
+        springboard_exec_trace_t *trace,
+        springboard_pending_user_t *pending,
+        arm_cpu_t *cpu, uint64_t at, uint32_t post_mode) {
+    if (!springboard_target_trace_active(trace) || !pending || !cpu ||
+        pending->thread != trace->target_thread ||
+        cpu->cp15.tpidrprw != trace->target_thread ||
+        post_mode == ARM_MODE_USR)
+        return;
+
+    springboard_target_identity_t identity =
+        SPRINGBOARD_TARGET_IDENTITY_CONTINUITY;
+    if (!trace->target_on_cpu) {
+        if (!trace->target_resume_unverified ||
+            trace->target_unreadable_user_capped)
+            return;
+        if (trace->target_unreadable_user_attempts >=
+                SPRINGBOARD_TARGET_USER_RETRY_CAP) {
+            trace->target_unreadable_user_capped = true;
+            return;
+        }
+        trace->target_unreadable_user_attempts++;
+        identity =
+            springboard_target_identity_revalidate(cpu, trace);
+        if (identity != SPRINGBOARD_TARGET_IDENTITY_REVALIDATED) {
+            springboard_target_event_t *rejected =
+                springboard_target_event_begin(
+                    trace, at, SPRINGBOARD_TARGET_RESUME_REJECT);
+            rejected->pc_from = pending->pc;
+            rejected->pc_to = cpu->r[15];
+            rejected->cpsr_from = pending->cpsr;
+            rejected->cpsr_to = cpu->cpsr;
+            rejected->from_state_valid = true;
+            rejected->mmu_enabled_from =
+                pending->mmu_enabled;
+            rejected->thread_from = pending->thread;
+            rejected->thread_to = cpu->cp15.tpidrprw;
+            rejected->identity = (uint8_t)identity;
+            if (springboard_target_identity_is_mismatch(identity))
+                rejected->outcome =
+                    SPRINGBOARD_TARGET_OUTCOME_ATTRIBUTION_LOST;
+            springboard_target_event_note_context(rejected, cpu);
+            trace->target_last_transition_at = at;
+            if (springboard_target_identity_is_mismatch(identity))
+                springboard_target_note_identity_failure(
+                    trace, identity, at, pending->pc);
+            else if (trace->target_unreadable_user_attempts >=
+                         SPRINGBOARD_TARGET_USER_RETRY_CAP)
+                trace->target_unreadable_user_capped = true;
+            return;
+        }
+        trace->target_on_cpu = true;
+        trace->target_resume_unverified = false;
+        trace->target_unreadable_user_capped = false;
+        trace->target_switch_out_unverified = false;
+        trace->target_unreadable_user_attempts = 0;
+        springboard_target_refresh_address_space(trace, cpu);
+    }
+    if (!pending->target_registers_valid &&
+        pending->target_registers_tentative &&
+        identity == SPRINGBOARD_TARGET_IDENTITY_REVALIDATED) {
+        /*
+         * These registers were copied before the instruction while the exact
+         * target pointer was present but its object graph was transiently
+         * unreadable.  The successful post-exception re-walk proves the same
+         * thread/uthread/process tuple, so promote the pre-step snapshot rather
+         * than trying to reconstruct it from potentially modified abort state.
+         */
+        pending->target_registers_valid = true;
+        pending->target_registers_tentative = false;
+    }
+
+    if (trace->target_episode_open)
+        springboard_target_close_implicit_return(
+            trace, pending, cpu, at, identity);
+
+    trace->target_episode = ++trace->target_episode_total;
+    trace->target_episode_open = true;
+    trace->target_episode_mode = post_mode;
+    trace->target_episode_origin_pc = pending->pc;
+    trace->target_episode_origin_cpsr = pending->cpsr;
+    trace->target_episode_expected_valid =
+        springboard_target_expected_pc(
+            pending->pc, pending->cpsr, post_mode,
+            &trace->target_episode_expected_pc);
+    trace->target_episode_raw_r12 = 0;
+    trace->target_episode_number = 0;
+    trace->target_episode_entry_spsr = 0;
+    trace->target_episode_entry_svc_sp = 0;
+    trace->target_episode_entry_user_sp = 0;
+    trace->target_episode_entry_user_lr = 0;
+    trace->target_episode_svc_frame_valid = false;
+    trace->target_episode_last_outcome =
+        SPRINGBOARD_TARGET_OUTCOME_NONE;
+
+    if (post_mode == ARM_MODE_SVC) {
+        trace->target_episode_raw_r12 = cpu->r[12];
+        int32_t raw = (int32_t)cpu->r[12];
+        if (raw < 0)
+            trace->target_episode_number =
+                UINT32_C(0) - cpu->r[12];
+        else if (raw == 0)
+            trace->target_episode_number = cpu->r[0];
+        else
+            trace->target_episode_number = cpu->r[12];
+        trace->target_episode_entry_spsr =
+            cpu->spsr[ARM_BANK_SVC];
+        trace->target_episode_entry_svc_sp = cpu->r[13];
+        trace->target_episode_entry_user_sp = pending->user_sp;
+        trace->target_episode_entry_user_lr = pending->user_lr;
+        uint32_t vector_base =
+            (cpu->cp15.sctlr & ARM_SCTLR_V)
+                ? UINT32_C(0xffff0000) : 0u;
+        trace->target_episode_svc_frame_valid =
+            pending->target_registers_valid &&
+            trace->target_episode_expected_valid &&
+            !(cpu->cpsr & ARM_CPSR_T) &&
+            cpu->r[15] == vector_base + ARM_VEC_SWI &&
+            cpu->r[14] == trace->target_episode_expected_pc &&
+            cpu->spsr[ARM_BANK_SVC] == pending->cpsr;
+    }
+
+    springboard_target_event_t *event =
+        springboard_target_event_begin(
+            trace, at, SPRINGBOARD_TARGET_USER_EXCEPTION);
+    event->pc_from = pending->pc;
+    event->pc_to = cpu->r[15];
+    event->cpsr_from = pending->cpsr;
+    event->cpsr_to = cpu->cpsr;
+    event->from_state_valid = true;
+    event->mmu_enabled_from = pending->mmu_enabled;
+    event->thread_from = pending->thread;
+    event->thread_to = cpu->cp15.tpidrprw;
+    event->lr = cpu->r[14];
+    event->sp = cpu->r[13];
+    event->r0 = pending->target_registers_valid
+        ? pending->r[0] : cpu->r[0];
+    event->r1 = pending->target_registers_valid
+        ? pending->r[1] : cpu->r[1];
+    if (pending->target_registers_valid) {
+        memcpy(event->user_r, pending->r, sizeof event->user_r);
+        event->user_sp = pending->user_sp;
+        event->user_lr = pending->user_lr;
+        event->user_registers_valid = true;
+    }
+    event->identity = (uint8_t)identity;
+    if (post_mode == ARM_MODE_ABT) {
+        event->ifsr = cpu->cp15.ifsr;
+        event->ifar = cpu->cp15.ifar;
+        event->dfsr = cpu->cp15.dfsr;
+        event->dfar = cpu->cp15.dfar;
+    }
+    springboard_target_event_note_context(event, cpu);
+    if (!trace->target_first_fault_valid &&
+        (post_mode == ARM_MODE_ABT ||
+         post_mode == ARM_MODE_UND)) {
+        trace->target_first_fault_valid = true;
+        trace->target_first_fault_sequence =
+            trace->target_event_total - 1u;
+        trace->target_first_fault = *event;
+    }
+    trace->target_last_transition_at = at;
 }
 
 static void springboard_exec_trace_note_user_post_step(
@@ -3690,16 +4674,270 @@ static void springboard_exec_trace_note_user_post_step(
     }
 
     uint32_t post_mode = cpu->cpsr & ARM_CPSR_MODE_MASK;
+    if (post_mode != ARM_MODE_USR)
+        springboard_target_note_user_exception(
+            trace, &pending, cpu, at, post_mode);
     if (post_mode != ARM_MODE_USR && post_mode != ARM_MODE_SVC) {
         trace->user_nonretired_deferrals++;
         trace->user_last_nonretired_mode = post_mode;
         return;
     }
 
-    springboard_exec_trace_commit_user(
-        trace, pending.at, pending.pc, pending.thread,
-        (springboard_user_region_t)pending.region,
-        pending.first_identity_valid);
+    if (pending.process_commit_eligible)
+        springboard_exec_trace_commit_user(
+            trace, pending.at, pending.pc, pending.thread,
+            (springboard_user_region_t)pending.region,
+            pending.first_identity_valid);
+}
+
+/*
+ * Observe only architectural transitions involving the one SETEXEC thread.
+ * The overwhelmingly common path returns after integer comparisons.  Full
+ * task/proc/PID identity is re-read only when the target pointer is switched
+ * back in or the target crosses from privileged mode to user mode.
+ */
+static BOOTKERNEL_NOINLINE void
+springboard_exec_trace_note_target_transition_cold(
+        arm_cpu_t *cpu, uint64_t at, uint32_t cpsr_before,
+        uint32_t pc_before, uint32_t lr_before, uint32_t sp_before,
+        uint32_t thread_before, bool mmu_enabled_before,
+        uint32_t return_gate_pc) {
+    springboard_exec_trace_t *trace = &G.springboard_exec_trace;
+    if (!cpu || !springboard_target_trace_active(trace)) return;
+
+    uint32_t thread_after = cpu->cp15.tpidrprw;
+    uint32_t mode_before = cpsr_before & ARM_CPSR_MODE_MASK;
+    uint32_t mode_after = cpu->cpsr & ARM_CPSR_MODE_MASK;
+    bool before_target = thread_before == trace->target_thread;
+    bool after_target = thread_after == trace->target_thread;
+
+    if (before_target && !after_target) {
+        if (!trace->target_on_cpu &&
+            !trace->target_resume_unverified)
+            return;
+        bool user_mode_anomaly = mode_before == ARM_MODE_USR;
+        springboard_target_event_t *event =
+            springboard_target_event_begin(
+                trace, at, SPRINGBOARD_TARGET_SWITCH_OUT);
+        event->pc_from = pc_before;
+        event->pc_to = cpu->r[15];
+        event->cpsr_from = cpsr_before;
+        event->cpsr_to = cpu->cpsr;
+        event->from_state_valid = true;
+        event->mmu_enabled_from = mmu_enabled_before;
+        event->thread_from = thread_before;
+        event->thread_to = thread_after;
+        event->lr = lr_before;
+        event->sp = sp_before;
+        event->r0 = cpu->r[0];
+        event->r1 = cpu->r[1];
+        event->identity = (uint8_t)(
+            user_mode_anomaly
+                ? SPRINGBOARD_TARGET_IDENTITY_THREAD_MISMATCH
+                : trace->target_on_cpu
+                ? SPRINGBOARD_TARGET_IDENTITY_CONTINUITY
+                : SPRINGBOARD_TARGET_IDENTITY_UNREADABLE);
+        springboard_target_event_note_context(event, cpu);
+        trace->target_switch_out_unverified =
+            trace->target_resume_unverified;
+        trace->target_on_cpu = false;
+        trace->target_resume_unverified = false;
+        trace->target_unreadable_user_attempts = 0;
+        trace->target_unreadable_user_capped = false;
+        trace->target_last_transition_at = at;
+        if (user_mode_anomaly) {
+            event->outcome =
+                SPRINGBOARD_TARGET_OUTCOME_ATTRIBUTION_LOST;
+            springboard_target_note_identity_failure(
+                trace, SPRINGBOARD_TARGET_IDENTITY_THREAD_MISMATCH,
+                at, pc_before);
+        }
+        return;
+    }
+
+    if (!before_target && after_target) {
+        springboard_target_identity_t identity =
+            springboard_target_identity_revalidate(cpu, trace);
+        springboard_target_event_kind_t kind =
+            identity == SPRINGBOARD_TARGET_IDENTITY_REVALIDATED
+                ? SPRINGBOARD_TARGET_RESUME
+                : SPRINGBOARD_TARGET_RESUME_REJECT;
+        springboard_target_event_t *event =
+            springboard_target_event_begin(trace, at, kind);
+        event->pc_from = pc_before;
+        event->pc_to = cpu->r[15];
+        event->cpsr_from = cpsr_before;
+        event->cpsr_to = cpu->cpsr;
+        event->from_state_valid = true;
+        event->mmu_enabled_from = mmu_enabled_before;
+        event->thread_from = thread_before;
+        event->thread_to = thread_after;
+        event->lr = lr_before;
+        event->sp = sp_before;
+        event->r0 = cpu->r[0];
+        event->r1 = cpu->r[1];
+        event->identity = (uint8_t)identity;
+        if (springboard_target_identity_is_mismatch(identity))
+            event->outcome =
+                SPRINGBOARD_TARGET_OUTCOME_ATTRIBUTION_LOST;
+        springboard_target_event_note_context(event, cpu);
+        trace->target_on_cpu =
+            identity == SPRINGBOARD_TARGET_IDENTITY_REVALIDATED;
+        trace->target_resume_unverified =
+            identity == SPRINGBOARD_TARGET_IDENTITY_UNREADABLE;
+        trace->target_unreadable_user_attempts = 0;
+        trace->target_unreadable_user_capped = false;
+        trace->target_switch_out_unverified = false;
+        if (springboard_target_identity_is_mismatch(identity))
+            springboard_target_note_identity_failure(
+                trace, identity, at, pc_before);
+        trace->target_last_transition_at = at;
+
+        /*
+         * A scheduler implementation may install TPIDRPRW and return to user
+         * in one architectural step. The full identity is already proven here;
+         * record the safe user boundary and close any open episode as
+         * user-observed, never as an authoritative raw syscall result.
+         */
+        if (identity == SPRINGBOARD_TARGET_IDENTITY_REVALIDATED &&
+            mode_before != ARM_MODE_USR &&
+            mode_after == ARM_MODE_USR) {
+            event->outcome =
+                SPRINGBOARD_TARGET_OUTCOME_USER_OBSERVED;
+            springboard_target_event_note_user_registers(event, cpu);
+            springboard_target_refresh_address_space(trace, cpu);
+            if (trace->target_episode_open) {
+                springboard_pending_user_t pending;
+                memset(&pending, 0, sizeof pending);
+                pending.pc = cpu->r[15];
+                pending.cpsr = cpu->cpsr;
+                pending.thread = thread_after;
+                for (unsigned reg = 0; reg < 13u; reg++)
+                    pending.r[reg] = cpu->r[reg];
+                pending.user_sp = cpu->r[13];
+                pending.user_lr = cpu->r[14];
+                pending.target_registers_valid = true;
+                pending.mmu_enabled =
+                    (cpu->cp15.sctlr & ARM_SCTLR_M) != 0u;
+                springboard_target_close_implicit_return(
+                    trace, &pending, cpu, at, identity);
+            }
+        }
+        return;
+    }
+
+    if (!before_target || !after_target ||
+        mode_before == ARM_MODE_USR || mode_after != ARM_MODE_USR)
+        return;
+
+    springboard_target_identity_t identity =
+        springboard_target_identity_revalidate(cpu, trace);
+    bool episode_open = trace->target_episode_open;
+    springboard_target_event_kind_t kind =
+        identity == SPRINGBOARD_TARGET_IDENTITY_REVALIDATED
+            ? SPRINGBOARD_TARGET_RETURN_RESOLUTION
+            : SPRINGBOARD_TARGET_RETURN_REJECT;
+    springboard_target_event_t *event =
+        springboard_target_event_begin(trace, at, kind);
+    event->pc_from = pc_before;
+    event->pc_to = cpu->r[15];
+    event->cpsr_from = cpsr_before;
+    event->cpsr_to = cpu->cpsr;
+    event->from_state_valid = true;
+    event->mmu_enabled_from = mmu_enabled_before;
+    event->thread_from = thread_before;
+    event->thread_to = thread_after;
+    event->lr = lr_before;
+    event->sp = sp_before;
+    event->r0 = cpu->r[0];
+    event->r1 = cpu->r[1];
+    event->identity = (uint8_t)identity;
+    event->return_gate =
+        return_gate_pc && mode_before == ARM_MODE_SVC &&
+        !(cpsr_before & ARM_CPSR_T) &&
+        (pc_before & ~1u) == return_gate_pc;
+    bool user_state_matches =
+        !episode_open ||
+        (cpu->cpsr & ARM_CPSR_T) ==
+            (trace->target_episode_origin_cpsr & ARM_CPSR_T);
+    event->svc_return_frame_valid =
+        episode_open &&
+        trace->target_episode_mode == ARM_MODE_SVC &&
+        trace->target_episode_svc_frame_valid &&
+        event->return_gate && user_state_matches &&
+        sp_before == trace->target_episode_entry_svc_sp &&
+        diagnostic_user_reg(cpu, 13u) ==
+            trace->target_episode_entry_user_sp &&
+        diagnostic_user_reg(cpu, 14u) ==
+            trace->target_episode_entry_user_lr;
+    springboard_target_event_note_context(event, cpu);
+
+    if (identity == SPRINGBOARD_TARGET_IDENTITY_REVALIDATED) {
+        springboard_target_event_note_user_registers(event, cpu);
+        event->outcome = (uint8_t)springboard_target_return_outcome(
+            episode_open, trace->target_episode_mode,
+            trace->target_episode_origin_pc,
+            trace->target_episode_origin_cpsr,
+            trace->target_episode_expected_pc,
+            trace->target_episode_expected_valid,
+            event->pc_to, event->cpsr_to,
+            event->svc_return_frame_valid);
+        event->raw_result_authoritative =
+            event->outcome == SPRINGBOARD_TARGET_OUTCOME_NORMAL &&
+            event->svc_return_frame_valid;
+        springboard_target_refresh_address_space(trace, cpu);
+        trace->target_on_cpu = true;
+        trace->target_resume_unverified = false;
+        trace->target_unreadable_user_attempts = 0;
+        trace->target_unreadable_user_capped = false;
+        trace->target_switch_out_unverified = false;
+        if (episode_open) {
+            trace->target_episode_open = false;
+            trace->target_episode_resolved_at = at;
+            trace->target_episode_last_outcome = event->outcome;
+        }
+    } else {
+        if (springboard_target_identity_is_mismatch(identity))
+            event->outcome =
+                SPRINGBOARD_TARGET_OUTCOME_ATTRIBUTION_LOST;
+        trace->target_on_cpu = false;
+        trace->target_resume_unverified =
+            identity == SPRINGBOARD_TARGET_IDENTITY_UNREADABLE;
+        trace->target_unreadable_user_attempts = 0;
+        trace->target_unreadable_user_capped = false;
+        if (springboard_target_identity_is_mismatch(identity))
+            springboard_target_note_identity_failure(
+                trace, identity, at, pc_before);
+    }
+    trace->target_last_transition_at = at;
+}
+
+/*
+ * Keep the multi-billion-step path tiny. The cold observer owns event capture
+ * and identity walks, but is called only when the exact target thread changes
+ * or the target crosses back into user mode.
+ */
+static void springboard_exec_trace_note_target_transition(
+        arm_cpu_t *cpu, uint64_t at, uint32_t cpsr_before,
+        uint32_t pc_before, uint32_t lr_before, uint32_t sp_before,
+        uint32_t thread_before, bool mmu_enabled_before,
+        uint32_t return_gate_pc) {
+    springboard_exec_trace_t *trace = &G.springboard_exec_trace;
+    if (!cpu || !springboard_target_trace_active(trace)) return;
+
+    uint32_t thread_after = cpu->cp15.tpidrprw;
+    bool before_target = thread_before == trace->target_thread;
+    bool after_target = thread_after == trace->target_thread;
+    bool thread_transition = before_target != after_target;
+    bool target_user_return =
+        before_target && after_target &&
+        (cpsr_before & ARM_CPSR_MODE_MASK) != ARM_MODE_USR &&
+        (cpu->cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR;
+    if (!thread_transition && !target_user_return) return;
+
+    springboard_exec_trace_note_target_transition_cold(
+        cpu, at, cpsr_before, pc_before, lr_before, sp_before,
+        thread_before, mmu_enabled_before, return_gate_pc);
 }
 
 static void springboard_framebuffer_note_post_step(
@@ -4017,8 +5255,47 @@ static void springboard_return_note_post_step(
         if (!probe->setexec_image_seen &&
             !probe->setexec_image_rejected)
             break;
-        if (probe->setexec_image_seen)
+        if (probe->setexec_image_seen) {
             springboard_exec_trace_arm(probe, at);
+            if (post_mode == ARM_MODE_SVC) {
+                /*
+                 * The generic pre-step tracer was necessarily unarmed for the
+                 * first proven image instruction.  SVC entry has not executed
+                 * any handler instruction yet: r0-r12 remain the user's, and
+                 * the banked USR SP/LR plus the probe's saved PC/CPSR recover
+                 * the complete entry frame without a one-instruction blind
+                 * spot.
+                 */
+                springboard_pending_user_t pending;
+                memset(&pending, 0, sizeof pending);
+                pending.generation =
+                    G.springboard_exec_trace.generation;
+                pending.at = at;
+                pending.pc = probe->setexec_image_user_pc;
+                pending.cpsr = probe->setexec_image_user_cpsr;
+                pending.thread = probe->entry_tpidrprw;
+                for (unsigned reg = 0; reg < 13u; reg++)
+                    pending.r[reg] = cpu->r[reg];
+                pending.user_sp = diagnostic_user_reg(cpu, 13u);
+                pending.user_lr = diagnostic_user_reg(cpu, 14u);
+                pending.valid = true;
+                pending.target_registers_valid = true;
+                pending.mmu_enabled =
+                    (cpu->cp15.sctlr & ARM_SCTLR_M) != 0u;
+                uint64_t episodes_before =
+                    G.springboard_exec_trace.target_episode_total;
+                springboard_target_note_user_exception(
+                    &G.springboard_exec_trace, &pending,
+                    cpu, at, post_mode);
+                if (G.springboard_exec_trace.target_episode_total >
+                    episodes_before)
+                    G.springboard_exec_trace
+                        .target_initial_exception_reconstructed = true;
+                else
+                    G.springboard_exec_trace
+                        .target_initial_exception_unobserved = true;
+            }
+        }
         probe->activity_closed = true;
         probe->activity_closed_at = at;
         probe->activity_close_reason = probe->setexec_image_seen
@@ -4164,8 +5441,8 @@ static void springboard_child_note_kernel_lifecycle(
                 trace->task == probe->setexec_image_task &&
                 trace->proc == probe->setexec_image_proc &&
                 trace->pid == probe->setexec_image_pid) {
-                trace->exited = true;
-                trace->exited_at = at;
+                springboard_target_note_process_exit_entry(
+                    trace, cpu, at);
             }
             if (!probe->activity_closed) {
                 probe->activity_closed = true;
@@ -4357,14 +5634,21 @@ static void lifecycle_note_kernel_entry(arm_cpu_t *cpu, uint64_t at,
 
 /* Attribute one sample to an exact PC. Cheap: no name is resolved here, only
  * at report time. */
-static void pc_sample(uint32_t va) {
+static void pc_sample(uint32_t va, diagnostic_pc_space_t space) {
     va &= ~1u;
-    uint32_t h = va * 2654435761u;             /* Knuth multiplicative */
+    uint32_t h = va * 2654435761u ^
+                 (uint32_t)space * UINT32_C(2246822519);
     for (unsigned probe = 0; probe < 64; probe++) {
         unsigned i = (h >> 13) + probe;
         i &= PCHASH - 1u;
-        if (G.pc_hist[i].hits && G.pc_hist[i].va != va) continue;
-        if (!G.pc_hist[i].hits) { G.pc_hist[i].va = va; G.pc_n++; }
+        if (G.pc_hist[i].hits &&
+            (G.pc_hist[i].va != va || G.pc_hist[i].space != space))
+            continue;
+        if (!G.pc_hist[i].hits) {
+            G.pc_hist[i].va = va;
+            G.pc_hist[i].space = space;
+            G.pc_n++;
+        }
         G.pc_hist[i].hits++;
         return;
     }
@@ -4386,10 +5670,17 @@ static void upc_sample(uint32_t va) {
     G.upc_dropped++;
 }
 
-/* Attribute one sample to a function, keeping the table small and exact. */
-static void prof_sample(uint32_t va) {
-    pc_sample(va);
-    const char *nm = ksym_at(va);
+/* Attribute one sample to a function, keeping the table small and exact.
+ * User and unproven low PCs remain explicit buckets rather than being
+ * numerically folded into an unrelated high kernel symbol. */
+static void prof_sample(const arm_cpu_t *cpu, uint32_t pc) {
+    uint32_t reported_pc = pc & ~1u;
+    bool mmu_enabled = cpu && (cpu->cp15.sctlr & ARM_SCTLR_M) != 0u;
+    uint32_t cpsr = cpu ? cpu->cpsr : ARM_MODE_USR;
+    diagnostic_pc_space_t space = diagnostic_pc_observe(
+        pc, cpsr, mmu_enabled, &reported_pc);
+    pc_sample(reported_pc, space);
+    const char *nm = diagnostic_pc_name(space, reported_pc);
     const char *bar = strchr(nm, '+');
     static char names[1024][96];
     char base[96];
@@ -4407,7 +5698,8 @@ static void prof_sample(uint32_t va) {
     G.prof_n++;
 }
 
-static void note_dev_page(uint32_t addr, uint32_t pc, bool wr) {
+static void note_dev_page(uint32_t addr, uint32_t pc, uint32_t cpsr,
+                          bool mmu_enabled, bool wr) {
     uint32_t pg = addr & ~0xfffu;
     for (unsigned i = 0; i < G.dev_page_n; i++)
         if (G.dev_page[i].page == pg) {
@@ -4417,6 +5709,8 @@ static void note_dev_page(uint32_t addr, uint32_t pc, bool wr) {
     if (G.dev_page_n < 64) {
         G.dev_page[G.dev_page_n].page = pg;
         G.dev_page[G.dev_page_n].first_pc = pc;
+        G.dev_page[G.dev_page_n].first_cpsr = cpsr;
+        G.dev_page[G.dev_page_n].first_mmu_enabled = mmu_enabled;
         G.dev_page[G.dev_page_n].reads  = wr ? 0 : 1;
         G.dev_page[G.dev_page_n].writes = wr ? 1 : 0;
         G.dev_page_n++;
@@ -4595,10 +5889,13 @@ static BOOTKERNEL_NOINLINE void note_framebuffer_write(
 
     /*
      * Identity re-walks perform bus reads and therefore cannot safely happen
-     * inside this bus callback. Queue the first address-space candidate from
-     * the instruction and validate it immediately after arm_step returns.
+     * inside this bus callback. Until the one sticky exact-process mutation is
+     * proven, queue the first address-space candidate from an instruction and
+     * validate it immediately after arm_step returns. Never re-walk identity
+     * for every pixel once that proof exists.
      */
-    if (!G.framebuffer_pending_target_valid &&
+    if (!G.framebuffer_first_target_mutation_valid &&
+        !G.framebuffer_pending_target_valid &&
         springboard_exec_trace_address_space_matches(
             &G.mach->cpu, trace)) {
         G.framebuffer_pending_target_valid = true;
@@ -4609,7 +5906,10 @@ static BOOTKERNEL_NOINLINE void note_framebuffer_write(
 static void spy_nonram(
         uint32_t addr, uint32_t val, unsigned bytes, bool wr) {
     uint32_t pc = G.mach->cpu.r[15];
-    note_dev_page(addr, pc, wr);
+    uint32_t cpsr = G.mach->cpu.cpsr;
+    bool mmu_enabled =
+        (G.mach->cpu.cp15.sctlr & ARM_SCTLR_M) != 0u;
+    note_dev_page(addr, pc, cpsr, mmu_enabled, wr);
     if ((addr & ~0xfffu) == G.hot_page) note_hot(addr, val, bytes, wr);
     if ((addr & ~0xfffu) == UARTPG) {
         G.uart_hits++;
@@ -4617,6 +5917,8 @@ static void spy_nonram(
             G.uart_log[G.uart_log_n].addr  = addr;
             G.uart_log[G.uart_log_n].val   = val;
             G.uart_log[G.uart_log_n].pc    = pc;
+            G.uart_log[G.uart_log_n].cpsr  = cpsr;
+            G.uart_log[G.uart_log_n].mmu_enabled = mmu_enabled;
             G.uart_log[G.uart_log_n].wr    = wr;
             G.uart_log[G.uart_log_n].bytes = bytes;
             G.uart_log_n++;
@@ -4698,15 +6000,23 @@ static void milestones_build(void) {
     }
 }
 
-static void note_fault(uint32_t far_, uint32_t fsr, uint32_t pc, bool pref,
+static void note_fault(uint32_t far_, uint32_t fsr, uint32_t pc,
+                       uint32_t cpsr, bool mmu_enabled, bool pref,
                        uint64_t at) {
     for (unsigned i = 0; i < G.fault_n; i++)
-        if (G.fault[i].far_ == far_ && G.fault[i].pc == pc && G.fault[i].prefetch == pref) {
+        if (G.fault[i].far_ == far_ && G.fault[i].pc == pc &&
+            G.fault[i].fsr == fsr &&
+            G.fault[i].prefetch == pref &&
+            G.fault[i].mmu_enabled == mmu_enabled &&
+            (G.fault[i].cpsr & ARM_CPSR_MODE_MASK) ==
+                (cpsr & ARM_CPSR_MODE_MASK)) {
             G.fault[i].n++; return;
         }
     if (G.fault_n < 48) {
         G.fault[G.fault_n].far_ = far_; G.fault[G.fault_n].fsr = fsr;
         G.fault[G.fault_n].pc = pc; G.fault[G.fault_n].prefetch = pref;
+        G.fault[G.fault_n].cpsr = cpsr;
+        G.fault[G.fault_n].mmu_enabled = mmu_enabled;
         G.fault[G.fault_n].first_at = at; G.fault[G.fault_n].n = 1;
         G.fault_n++;
     } else {
@@ -4906,7 +6216,268 @@ static void springboard_framebuffer_event_report(
            event->pc, event->lr, event->cpsr, event->thread,
            event->ttbr0, event->context_id,
            event->target_identity_valid
-               ? " (exact SpringBoard process identity revalidated)" : "");
+                ? " (exact SpringBoard process identity revalidated)" : "");
+}
+
+static const char *springboard_target_event_kind_name(unsigned kind) {
+    switch ((springboard_target_event_kind_t)kind) {
+        case SPRINGBOARD_TARGET_USER_EXCEPTION:
+            return "USER_EXCEPTION";
+        case SPRINGBOARD_TARGET_SWITCH_OUT:
+            return "SWITCH_OUT";
+        case SPRINGBOARD_TARGET_RESUME:
+            return "RESUME";
+        case SPRINGBOARD_TARGET_RESUME_REJECT:
+            return "RESUME_REJECT";
+        case SPRINGBOARD_TARGET_RETURN_RESOLUTION:
+            return "RETURN_RESOLUTION";
+        case SPRINGBOARD_TARGET_RETURN_REJECT:
+            return "RETURN_REJECT";
+        case SPRINGBOARD_TARGET_PROCESS_EXIT_ENTRY:
+            return "PROCESS_EXIT_ENTRY";
+    }
+    return "UNKNOWN";
+}
+
+static const char *springboard_target_identity_name(unsigned identity) {
+    switch ((springboard_target_identity_t)identity) {
+        case SPRINGBOARD_TARGET_IDENTITY_NONE:
+            return "none";
+        case SPRINGBOARD_TARGET_IDENTITY_CONTINUITY:
+            return "validated-thread continuity";
+        case SPRINGBOARD_TARGET_IDENTITY_REVALIDATED:
+            return "thread/uthread/task/proc/PID revalidated";
+        case SPRINGBOARD_TARGET_IDENTITY_PROCESS_REVALIDATED:
+            return "process pointer/PID revalidated";
+        case SPRINGBOARD_TARGET_IDENTITY_UNREADABLE:
+            return "identity unreadable";
+        case SPRINGBOARD_TARGET_IDENTITY_THREAD_MISMATCH:
+            return "thread/uthread mismatch";
+        case SPRINGBOARD_TARGET_IDENTITY_PROCESS_MISMATCH:
+            return "task/proc/PID mismatch";
+    }
+    return "unknown";
+}
+
+static const char *springboard_target_outcome_name(unsigned outcome) {
+    switch ((springboard_target_outcome_t)outcome) {
+        case SPRINGBOARD_TARGET_OUTCOME_NONE:
+            return "none";
+        case SPRINGBOARD_TARGET_OUTCOME_NORMAL:
+            return "normal return";
+        case SPRINGBOARD_TARGET_OUTCOME_RETRY:
+            return "fault/interrupt retry";
+        case SPRINGBOARD_TARGET_OUTCOME_RESTART:
+            return "syscall restart";
+        case SPRINGBOARD_TARGET_OUTCOME_REDIRECTED:
+            return "redirected/signal";
+        case SPRINGBOARD_TARGET_OUTCOME_FRAME_UNVERIFIED:
+            return "candidate return with frame proof missing";
+        case SPRINGBOARD_TARGET_OUTCOME_ATTRIBUTION_LOST:
+            return "identity attribution lost";
+        case SPRINGBOARD_TARGET_OUTCOME_USER_OBSERVED:
+            return "later exact user execution (raw result unavailable)";
+        case SPRINGBOARD_TARGET_OUTCOME_PROCESS_EXIT_ENTRY:
+            return "exact-process _exit1 entry";
+    }
+    return "unknown";
+}
+
+static const char *springboard_target_trap_name(
+        const springboard_target_event_t *event,
+        char unknown[48]) {
+    if (!event || event->episode_mode != ARM_MODE_SVC)
+        return NULL;
+    int32_t raw = (int32_t)event->raw_r12;
+    const char *name = raw < 0
+        ? trapname(
+            MACH_TRAP,
+            (unsigned)(sizeof MACH_TRAP / sizeof MACH_TRAP[0]),
+            event->trap_number)
+        : trapname(
+            BSD_SYSCALL,
+            (unsigned)(sizeof BSD_SYSCALL / sizeof BSD_SYSCALL[0]),
+            event->trap_number);
+    if (name) return name;
+    snprintf(unknown, 48, "%s #%u",
+             raw < 0 ? "mach_trap" : "bsd_syscall",
+             event->trap_number);
+    return unknown;
+}
+
+static void springboard_target_user_register_report(
+        const springboard_target_event_t *event) {
+    if (!event || !event->user_registers_valid) {
+        printf("        exact user register file: unavailable\n");
+        return;
+    }
+    printf("        user r0-r3  %08x %08x %08x %08x\n"
+           "             r4-r7  %08x %08x %08x %08x\n"
+           "             r8-r11 %08x %08x %08x %08x\n"
+           "             r12/sp/lr %08x %08x %08x\n",
+           event->user_r[0], event->user_r[1],
+           event->user_r[2], event->user_r[3],
+           event->user_r[4], event->user_r[5],
+           event->user_r[6], event->user_r[7],
+           event->user_r[8], event->user_r[9],
+           event->user_r[10], event->user_r[11],
+           event->user_r[12], event->user_sp, event->user_lr);
+}
+
+static void springboard_target_event_report(
+        uint64_t sequence,
+        const springboard_target_event_t *event) {
+    if (!event) return;
+    const char *from_name = event->from_state_valid
+        ? diagnostic_pc_context_name(
+            event->pc_from, event->cpsr_from,
+            event->mmu_enabled_from, NULL)
+        : "[source state not captured]";
+    const char *to_name = event->to_state_valid
+        ? diagnostic_pc_context_name(
+            event->pc_to, event->cpsr_to,
+            event->mmu_enabled_to, NULL)
+        : "[destination state not captured]";
+    char episode_text[24], from_mode[8], to_mode[8];
+    if (event->episode)
+        snprintf(episode_text, sizeof episode_text,
+                 "%" PRIu64, event->episode);
+    else
+        snprintf(episode_text, sizeof episode_text, "none");
+    if (event->from_state_valid)
+        snprintf(from_mode, sizeof from_mode, "m%02x",
+                 event->cpsr_from & ARM_CPSR_MODE_MASK);
+    else
+        snprintf(from_mode, sizeof from_mode, "m??");
+    if (event->to_state_valid)
+        snprintf(to_mode, sizeof to_mode, "m%02x",
+                 event->cpsr_to & ARM_CPSR_MODE_MASK);
+    else
+        snprintf(to_mode, sizeof to_mode, "m??");
+
+    printf("      #%-4" PRIu64 " @%-11" PRIu64
+           " episode=%-5s %-18s"
+           " %s->%s thread=%08x->%08x\n"
+           "        pc %08x %-34s -> %08x %s\n"
+           "        identity=%s MMU=%s->%s"
+           " TTBR0/TTBCR/FCSE/context=%08x/%08x/%08x/%08x\n",
+           sequence, event->at, episode_text,
+           springboard_target_event_kind_name(event->kind),
+           from_mode, to_mode,
+           event->thread_from, event->thread_to,
+           event->pc_from, from_name, event->pc_to, to_name,
+           springboard_target_identity_name(event->identity),
+           event->from_state_valid
+               ? (event->mmu_enabled_from ? "on" : "off") : "n/a",
+           event->to_state_valid
+               ? (event->mmu_enabled_to ? "on" : "off") : "n/a",
+           event->ttbr0, event->ttbcr,
+           event->fcse_pid, event->context_id);
+
+    if (event->kind == SPRINGBOARD_TARGET_USER_EXCEPTION) {
+        printf("        origin=%08x expected=",
+               event->origin_pc);
+        if (event->expected_pc_valid)
+            printf("%08x", event->expected_pc);
+        else
+            printf("unavailable (overflow)");
+        printf(" handler-lr/sp=%08x/%08x\n",
+               event->lr, event->sp);
+        springboard_target_user_register_report(event);
+        if (event->episode_mode == ARM_MODE_SVC) {
+            char unknown[48];
+            const char *name =
+                springboard_target_trap_name(event, unknown);
+            printf("        SVC r12=%d%s number=%u %s\n"
+                   "        SVC entry frame=%s"
+                   " SPSR/svc-sp/user-sp/user-lr="
+                   "%08x/%08x/%08x/%08x\n",
+                   (int32_t)event->raw_r12,
+                   event->raw_r12 == 0 ? " indirect" : "",
+                   event->trap_number, name ? name : "unknown",
+                   event->svc_entry_frame_valid
+                       ? "VALIDATED" : "UNVERIFIED",
+                   event->entry_spsr, event->entry_svc_sp,
+                   event->entry_user_sp, event->entry_user_lr);
+        }
+        if (event->episode_mode == ARM_MODE_ABT) {
+            const char *abort_kind =
+                (event->pc_to & UINT32_C(0x1f)) ==
+                    UINT32_C(0x0c)
+                    ? "prefetch"
+                    : (event->pc_to & UINT32_C(0x1f)) ==
+                          UINT32_C(0x10)
+                          ? "data" : "unclassified";
+            printf("        %s abort vector=%08x"
+                   " IFSR/IFAR=%08x/%08x"
+                   " DFSR/DFAR=%08x/%08x\n",
+                   abort_kind, event->pc_to,
+                   event->ifsr, event->ifar,
+                   event->dfsr, event->dfar);
+        }
+    } else if (event->kind == SPRINGBOARD_TARGET_RETURN_RESOLUTION ||
+               event->kind == SPRINGBOARD_TARGET_RETURN_REJECT) {
+        if (event->episode) {
+            printf("        origin=%08x expected=",
+                   event->origin_pc);
+            if (event->expected_pc_valid)
+                printf("%08x", event->expected_pc);
+            else
+                printf("unavailable");
+            printf(" actual=%08x\n", event->pc_to);
+        } else {
+            printf("        no captured exception episode;"
+                   " safe target user boundary at %08x\n",
+                   event->pc_to);
+        }
+        printf("        outcome=%s gate=%s"
+               " entry-frame=%s return-frame=%s"
+               " raw-result=%s\n",
+               springboard_target_outcome_name(event->outcome),
+               event->return_gate ? "exact" : "other/implicit",
+               event->svc_entry_frame_valid
+                   ? "validated" : "unverified",
+               event->svc_return_frame_valid
+                   ? "validated" : "unverified",
+               event->raw_result_authoritative
+                   ? "authoritative" : "withheld");
+        springboard_target_user_register_report(event);
+        if (event->raw_result_authoritative) {
+            char unknown[48];
+            const char *name =
+                springboard_target_trap_name(event, unknown);
+            int32_t raw = (int32_t)event->raw_r12;
+            if (raw < 0) {
+                printf("        raw Mach result: %s r0=%u"
+                       " (0x%08x)\n",
+                       name ? name : "unknown",
+                       event->r0, event->r0);
+            } else if (event->cpsr_to & ARM_CPSR_C) {
+                printf("        raw BSD result: %s ERROR"
+                       " errno=%u (0x%08x)\n",
+                       name ? name : "unknown",
+                       event->r0, event->r0);
+            } else {
+                printf("        raw BSD result: %s SUCCESS"
+                       " value=%u (0x%08x)\n",
+                       name ? name : "unknown",
+                       event->r0, event->r0);
+            }
+        } else if (event->episode_mode == ARM_MODE_SVC) {
+            printf("        raw syscall result intentionally withheld;"
+                   " r0=%08x C=%u\n",
+                   event->r0,
+                   (event->cpsr_to & ARM_CPSR_C) ? 1u : 0u);
+        }
+    } else if (event->kind ==
+                   SPRINGBOARD_TARGET_PROCESS_EXIT_ENTRY) {
+        printf("        exact-process _exit1 entry:"
+               " proc=%08x status=%08x;"
+               " teardown completion is not claimed\n",
+               event->r0, event->r1);
+    } else if (event->user_registers_valid) {
+        springboard_target_user_register_report(event);
+    }
 }
 
 static void springboard_exec_trace_report(void) {
@@ -4925,13 +6496,15 @@ static void springboard_exec_trace_report(void) {
            trace->task, trace->proc, trace->pid);
     printf("    address space: TTBR0 %08x (base %08x, TTBCR %08x),"
            " FCSE/context %08x/%08x; mapping changes at exact traps"
+           " %" PRIu64 ", at identity-validated target returns"
            " %" PRIu64 "\n",
            trace->ttbr0, trace->ttbr0_base, trace->ttbcr,
            trace->fcse_pid, trace->context_id,
-           trace->trap_ttbr_changes);
+           trace->trap_ttbr_changes, trace->target_key_changes);
     printf("    lifetime: %s",
-           trace->exited ? "exact process exit observed" :
-                           "no exact process exit observed");
+           trace->exited
+               ? "exact-process _exit1 entry observed"
+               : "no exact-process _exit1 entry observed");
     if (trace->exited) printf(" @%" PRIu64, trace->exited_at);
     printf("\n");
     if (trace->identity_invalidated)
@@ -5085,6 +6658,108 @@ static void springboard_exec_trace_report(void) {
                event->fcse_pid, event->context_id);
     }
 
+    uint64_t target_retained =
+        trace->target_event_total < SPRINGBOARD_TARGET_EVENT_CAP
+            ? trace->target_event_total
+            : SPRINGBOARD_TARGET_EVENT_CAP;
+    uint64_t target_first =
+        trace->target_event_total - target_retained;
+    printf("    exact SETEXEC-target exception/scheduler ring"
+           " plus exact-process lifecycle entry:"
+           " thread/uthread=%08x/%08x, %" PRIu64
+           " total, %" PRIu64
+           " retained, %" PRIu64 " overwritten\n",
+           trace->target_thread, trace->target_uthread,
+           trace->target_event_total,
+           target_retained, target_first);
+    printf("    contract: global post-step work is bounded comparisons;"
+           " exact-target USR pre-steps snapshot registers;"
+           " identity is re-walked at target resume/user-return,"
+           " exact user traps, first process-region hits, and scanout"
+           " candidates only until the first exact-process mutation.\n");
+    if (trace->target_first_fault_valid) {
+        printf("    sticky first target ABT/UND"
+               " (preserved even after ring wrap):\n");
+        springboard_target_event_report(
+            trace->target_first_fault_sequence,
+            &trace->target_first_fault);
+    } else {
+        printf("    sticky first target ABT/UND: NOT OBSERVED\n");
+    }
+    for (uint64_t sequence = target_first;
+         sequence < trace->target_event_total; sequence++) {
+        const springboard_target_event_t *event =
+            &trace->target_events[
+                sequence % SPRINGBOARD_TARGET_EVENT_CAP];
+        springboard_target_event_report(sequence, event);
+    }
+
+    const char *target_state;
+    if (trace->exited)
+        target_state = "EXACT-PROCESS _exit1 PATH ENTERED";
+    else if (trace->identity_invalidated)
+        target_state = "PROCESS ATTRIBUTION CLOSED";
+    else if (trace->target_tracker_invalidated)
+        target_state = "TRACKER INVALIDATED BY READABLE IDENTITY MISMATCH";
+    else if (trace->target_resume_unverified)
+        target_state = "TARGET-POINTER RESUME UNVERIFIED";
+    else if (trace->target_switch_out_unverified)
+        target_state = "SWITCHED OUT AFTER UNVERIFIED RESUME";
+    else if (trace->target_on_cpu)
+        target_state = "ON CPU";
+    else
+        target_state = "SWITCHED OUT";
+    printf("    TERMINAL TARGET STATE: %s", target_state);
+    if (trace->target_last_transition_at)
+        printf(" (last transition @%" PRIu64 ")",
+               trace->target_last_transition_at);
+    else
+        printf(" (no transition after trace arm @%" PRIu64 ")",
+               trace->armed_at);
+    printf("\n");
+    printf("    target resume verification retries: %u/%u;"
+           " cap=%s; switched-out-while-unverified=%s\n",
+           trace->target_unreadable_user_attempts,
+           SPRINGBOARD_TARGET_USER_RETRY_CAP,
+           trace->target_unreadable_user_capped ? "reached" : "not reached",
+           trace->target_switch_out_unverified ? "yes" : "no");
+    if (trace->target_initial_exception_reconstructed)
+        printf("    first proven image instruction entered SVC;"
+               " its exception entry was reconstructed from the saved"
+               " pre-step state and banked user registers.\n");
+    else if (trace->target_initial_exception_unobserved)
+        printf("    WARNING: first proven image instruction entered SVC,"
+               " but its target exception entry could not be reconstructed.\n");
+
+    if (!trace->target_episode_total) {
+        printf("    TERMINAL EPISODE STATE: no fully captured target user"
+               " exception episode\n");
+    } else {
+        printf("    TERMINAL EPISODE STATE: episode %" PRIu64
+               " %s; mode=%02x origin=%08x expected=",
+               trace->target_episode,
+               trace->target_episode_open ? "OPEN/UNRESOLVED" :
+                                             "CLOSED",
+               trace->target_episode_mode,
+               trace->target_episode_origin_pc);
+        if (trace->target_episode_expected_valid)
+            printf("%08x", trace->target_episode_expected_pc);
+        else
+            printf("unavailable");
+        if (!trace->target_episode_open)
+            printf(" resolved @%" PRIu64 " (%s)",
+                   trace->target_episode_resolved_at,
+                   springboard_target_outcome_name(
+                       trace->target_episode_last_outcome));
+        if (trace->target_episode_mode == ARM_MODE_SVC)
+            printf(" SVC r12=%d%s number=%u",
+                   (int32_t)trace->target_episode_raw_r12,
+                   trace->target_episode_raw_r12 == 0
+                       ? " indirect" : "",
+                   trace->target_episode_number);
+        printf("\n");
+    }
+
     printf("    live CLCD scanout after trace arm: %" PRIu64
            " overlapping writes; %" PRIu64 " changed writes,"
            " %" PRIu64 " changed bytes (%" PRIu64 " RGB-visible);"
@@ -5223,9 +6898,9 @@ static void springboard_return_thread_activity_report(
                    : probe->activity_close_reason ==
                              SPRINGBOARD_ACTIVITY_SETEXEC_REJECT
                        ? "by rejected evaluated post-outcome USR candidate"
-                       : probe->activity_close_reason ==
-                                 SPRINGBOARD_ACTIVITY_SETEXEC_EXIT
-                           ? "by attributed SETEXEC process exit"
+                        : probe->activity_close_reason ==
+                                  SPRINGBOARD_ACTIVITY_SETEXEC_EXIT
+                            ? "at attributed SETEXEC-process _exit1 entry"
                            : probe->activity_close_reason ==
                                      SPRINGBOARD_ACTIVITY_NEXT_SWI
                                ? "at the next same-pointer SWI"
@@ -6731,10 +8406,21 @@ int main(int argc, char **argv) {
         ram_size = KERN_MEMSIZE_MAX;
     }
 
-    /* Needed by ksym_at() to fold a pre-MMU physical PC back to its virtual
-     * address, so set them as soon as they are known — before the first name
-     * is ever printed, not after the machine exists. */
-    g_virt_base = virt_base; g_phys_base = phys_base;
+    /* Needed by context-aware diagnostic PC normalization, so set the
+     * validated range before the first observed PC is reported. */
+    g_virt_base = virt_base;
+    g_phys_base = phys_base;
+    g_ram_size = ram_size;
+    if (!diagnostic_pc_classifier_selfcheck()) {
+        fprintf(stderr,
+                "internal error: diagnostic PC classifier self-check failed\n");
+        return 2;
+    }
+    if (!springboard_target_trace_selfcheck()) {
+        fprintf(stderr,
+                "internal error: SpringBoard target trace self-check failed\n");
+        return 2;
+    }
 
     size_t len = 0;
     uint8_t *img = slurp(argv[1], &len);
@@ -6776,7 +8462,10 @@ int main(int argc, char **argv) {
     s5l8900_t mach;
     if (!s5l8900_init(&mach, phys_base, ram_size)) { fprintf(stderr, "init failed\n"); return 1; }
     mach.trace_devices = true;
-    g_mach = &mach; g_virt_base = virt_base; g_phys_base = phys_base;
+    g_mach = &mach;
+    g_virt_base = virt_base;
+    g_phys_base = phys_base;
+    g_ram_size = ram_size;
 
     boot_range_t dram_range, kernel_range;
     uint64_t kernel_begin64, kernel_end64;
@@ -7808,7 +9497,10 @@ int main(int argc, char **argv) {
      * later once it is spinning in a handler.
      */
 #define KTRACE (1u << 18)
-    static struct { uint32_t pc, cpsr, r[16]; } tr[KTRACE];
+    static struct {
+        uint32_t pc, cpsr, r[16];
+        bool mmu_enabled;
+    } tr[KTRACE];
     unsigned tw = 0, tcount = 0;
     uint64_t trace_last_at = 0;
 
@@ -7853,6 +9545,9 @@ int main(int argc, char **argv) {
      */
     uint64_t n = mach.cpu.cycles;
     uint32_t last_pc = restore_path ? mach.cpu.r[15] : entry_pa;
+    uint32_t last_cpsr = mach.cpu.cpsr;
+    bool last_mmu_enabled =
+        (mach.cpu.cp15.sctlr & ARM_SCTLR_M) != 0u;
     uint64_t first_abort_at = 0, first_exc = 0;
     bool have_first_abort = false, have_first_exc = false;
     bool guest_fatal_entry_seen = false;
@@ -7872,8 +9567,12 @@ int main(int argc, char **argv) {
     for (; n < steps; n++) {
         G.hot_now = n;
         last_pc = mach.cpu.r[15];
+        last_cpsr = mach.cpu.cpsr;
+        last_mmu_enabled =
+            (mach.cpu.cp15.sctlr & ARM_SCTLR_M) != 0u;
         tr[tw].pc = last_pc;
-        tr[tw].cpsr = mach.cpu.cpsr;
+        tr[tw].cpsr = last_cpsr;
+        tr[tw].mmu_enabled = last_mmu_enabled;
         memcpy(tr[tw].r, mach.cpu.r, sizeof mach.cpu.r);
         tw = (tw + 1) % KTRACE;
         if (tcount < KTRACE) tcount++;
@@ -7990,11 +9689,11 @@ int main(int argc, char **argv) {
         /* -Z: a heartbeat, so a run that wedges says where without waiting for
          * the final report. */
         if (heartbeat && n && (n % heartbeat) == 0) {
-            uint32_t va = last_pc >= phys_base && last_pc < virt_base
-                        ? last_pc - phys_base + virt_base : last_pc;
             printf("  [@%-11" PRIu64 "] pc %08x m%02x%s  %s\n", n, last_pc,
-                   mach.cpu.cpsr & ARM_CPSR_MODE_MASK,
-                   (mach.cpu.cpsr & ARM_CPSR_T) ? "T" : " ", ksym_at(va));
+                   last_cpsr & ARM_CPSR_MODE_MASK,
+                   (last_cpsr & ARM_CPSR_T) ? "T" : " ",
+                   diagnostic_pc_context_name(
+                       last_pc, last_cpsr, last_mmu_enabled, NULL));
             fflush(stdout);
         }
 
@@ -8011,7 +9710,10 @@ int main(int argc, char **argv) {
                    ") at instruction %" PRIu64 " ===\n",
                    wps[w].name, wps[w].hits, n);
             printf("  called from lr 0x%08x  (%s)\n",
-                   mach.cpu.r[14], ksym_at(mach.cpu.r[14]));
+                   mach.cpu.r[14],
+                   diagnostic_pc_context_name(
+                       mach.cpu.r[14], last_cpsr,
+                       last_mmu_enabled, NULL));
             printf("  r0 %08x  r1 %08x  r2 %08x  r3 %08x  sp %08x\n",
                    mach.cpu.r[0], mach.cpu.r[1], mach.cpu.r[2],
                    mach.cpu.r[3], mach.cpu.r[13]);
@@ -8038,7 +9740,8 @@ int main(int argc, char **argv) {
             char seen[160]; seen[0] = '\0';
             for (unsigned i = tcount > 4096 ? tcount - 4096 : 0; i < tcount; i++) {
                 unsigned k = (start + i) % KTRACE;
-                const char *nm = ksym_at(tr[k].pc);
+                const char *nm = diagnostic_pc_context_name(
+                    tr[k].pc, tr[k].cpsr, tr[k].mmu_enabled, NULL);
                 char base[160];
                 const char *bar = strchr(nm, '+');
                 snprintf(base, sizeof base, "%.*s",
@@ -8068,6 +9771,7 @@ int main(int argc, char **argv) {
         uint32_t t_before    = mach.cpu.cpsr & ARM_CPSR_T;
         uint32_t lr_before   = mach.cpu.r[14];
         uint32_t sp_before   = mach.cpu.r[13];
+        uint32_t thread_before = mach.cpu.cp15.tpidrprw;
 
         /* Pre-decode an ARM STREX* so its success/failure can be read out of
          * Rd after the step. Rd == 15 is unpredictable and never emitted. */
@@ -8088,8 +9792,6 @@ int main(int argc, char **argv) {
         uint32_t strex_addr = strex_rn < 16 ? mach.cpu.r[strex_rn] : 0;
 
         if ((n & 0x3ffu) == 0) {
-            uint32_t va = last_pc >= phys_base && last_pc < virt_base
-                        ? last_pc - phys_base + virt_base : last_pc;
             /*
              * -W gates the PROFILE ONLY, and that is the whole point of it. A
              * whole-run profile of a boot that stalls is dominated by the work
@@ -8098,7 +9800,8 @@ int main(int argc, char **argv) {
              * for a window that starts well after the last milestone and the
              * same machinery characterises what is actually spinning.
              */
-            if (n >= win_lo && n < win_hi) prof_sample(va);
+            if (n >= win_lo && n < win_hi)
+                prof_sample(&mach.cpu, last_pc);
             if ((n & 0xffffu) == 0) vm_sample(n, steps);
         }
 
@@ -8113,6 +9816,10 @@ int main(int argc, char **argv) {
             if (!save_due_snapshots(&mach, snaps, nsnaps)) return 4;
             break;
         }
+        springboard_exec_trace_note_target_transition(
+            &mach.cpu, n, last_cpsr, last_pc, lr_before, sp_before,
+            thread_before, last_mmu_enabled,
+            thread_exception_return_gate_va);
         springboard_return_note_transition(
             &mach.cpu, n, mach.cpu.cycles, mode_before, last_pc,
             thread_exception_return_gate_va, sp_before);
@@ -8127,6 +9834,9 @@ int main(int argc, char **argv) {
                     G.strex_log[G.strex_log_n].at   = n;
                     G.strex_log[G.strex_log_n].pc   = last_pc;
                     G.strex_log[G.strex_log_n].addr = strex_addr;
+                    G.strex_log[G.strex_log_n].cpsr = last_cpsr;
+                    G.strex_log[G.strex_log_n].mmu_enabled =
+                        last_mmu_enabled;
                     G.strex_log_n++;
                 }
             }
@@ -8193,6 +9903,8 @@ int main(int argc, char **argv) {
                         G.exret_log[G.exret_log_n].to_pc     = mach.cpu.r[15];
                         G.exret_log[G.exret_log_n].mode_from = mode_before;
                         G.exret_log[G.exret_log_n].mode_to   = mode_after;
+                        G.exret_log[G.exret_log_n].mmu_enabled =
+                            (mach.cpu.cp15.sctlr & ARM_SCTLR_M) != 0u;
                         G.exret_log_n++;
                     }
                 }
@@ -8213,7 +9925,7 @@ int main(int argc, char **argv) {
                 bool pref = (mach.cpu.r[15] & 0xfffu) == 0x00cu;
                 note_fault(pref ? mach.cpu.cp15.ifar : mach.cpu.cp15.dfar,
                            pref ? mach.cpu.cp15.ifsr : mach.cpu.cp15.dfsr,
-                           last_pc, pref, n);
+                           last_pc, last_cpsr, last_mmu_enabled, pref, n);
             }
             if (!have_first_exc && mode_after != mode_before &&
                 (mode_after == ARM_MODE_ABT || mode_after == ARM_MODE_UND ||
@@ -8326,8 +10038,9 @@ int main(int argc, char **argv) {
                    tr[k].cpsr & ARM_CPSR_MODE_MASK,
                    tr[k].r[0], tr[k].r[5], tr[k].r[6], tr[k].r[11],
                    tr[k].r[12], tr[k].r[13], tr[k].r[14],
-                   ksym_at(tr[k].pc >= phys_base && tr[k].pc < virt_base
-                           ? tr[k].pc - phys_base + virt_base : tr[k].pc));
+                   diagnostic_pc_context_name(
+                       tr[k].pc, tr[k].cpsr,
+                       tr[k].mmu_enabled, NULL));
         }
         unsigned last = (tw + KTRACE - 1) % KTRACE;
         printf("\n  registers at the faulting instruction:\n");
@@ -8353,7 +10066,7 @@ int main(int argc, char **argv) {
         }
         printf("\n=== ABNORMAL STOP: %s ===\n", status_name(st));
         if (ip) {
-            if (mach.cpu.cpsr & ARM_CPSR_T)
+            if (last_cpsr & ARM_CPSR_T)
                 printf("  encoding at pc: %04x %04x (Thumb)\n",
                        (unsigned)(ip[0] | (ip[1] << 8)),
                        (unsigned)(ip[2] | (ip[3] << 8)));
@@ -8364,7 +10077,10 @@ int main(int argc, char **argv) {
         } else {
             printf("  encoding at pc: unavailable (fetch translation failed)\n");
         }
-        printf("  lr 0x%08x (%s)\n", mach.cpu.r[14], ksym_at(mach.cpu.r[14]));
+        printf("  lr 0x%08x (%s)\n", mach.cpu.r[14],
+               diagnostic_pc_context_name(
+                   mach.cpu.r[14], mach.cpu.cpsr,
+                   (mach.cpu.cp15.sctlr & ARM_SCTLR_M) != 0u, NULL));
         for (int i = 0; i < 16; i += 4)
             printf("  r%-2d %08x  r%-2d %08x  r%-2d %08x  r%-2d %08x\n",
                    i, mach.cpu.r[i], i+1, mach.cpu.r[i+1],
@@ -8374,9 +10090,8 @@ int main(int argc, char **argv) {
         char seen[160]; seen[0] = '\0';
         for (unsigned i = tcount > 4096 ? tcount - 4096 : 0; i < tcount; i++) {
             unsigned k = (start + i) % KTRACE;
-            uint32_t va = tr[k].pc >= phys_base && tr[k].pc < virt_base
-                        ? tr[k].pc - phys_base + virt_base : tr[k].pc;
-            const char *nm = ksym_at(va);
+            const char *nm = diagnostic_pc_context_name(
+                tr[k].pc, tr[k].cpsr, tr[k].mmu_enabled, NULL);
             char base[160];
             const char *bar = strchr(nm, '+');
             snprintf(base, sizeof base, "%.*s",
@@ -8392,16 +10107,19 @@ int main(int argc, char **argv) {
     mach.uart0.tx[mach.uart0.tx_len] = '\0';
     printf("stopped after %" PRIu64 " instructions: %s\n",
            mach.cpu.cycles, status_name(st));
+    uint32_t final_reported_pc = last_pc & ~1u;
+    diagnostic_pc_space_t final_pc_space = diagnostic_pc_observe(
+        last_pc, last_cpsr, last_mmu_enabled, &final_reported_pc);
     printf("  pc             : 0x%08x", last_pc);
-    if (last_pc >= phys_base && last_pc < phys_base + ram_size)
-        printf("  (vm 0x%08x)", last_pc - phys_base + virt_base);
-    printf("  %s\n", ksym_at(last_pc >= phys_base && last_pc < virt_base
-                             ? last_pc - phys_base + virt_base : last_pc));
-    printf("  cpsr           : 0x%08x (mode %02x%s)\n", mach.cpu.cpsr,
-           mach.cpu.cpsr & ARM_CPSR_MODE_MASK,
-           (mach.cpu.cpsr & ARM_CPSR_T) ? ", Thumb" : "");
-    printf("  MMU            : %s\n",
-           (mach.cpu.cp15.sctlr & ARM_SCTLR_M) ? "ENABLED BY THE KERNEL" : "off");
+    if (final_pc_space == DIAGNOSTIC_PC_KERNEL &&
+        final_reported_pc != (last_pc & ~1u))
+        printf("  (vm 0x%08x)", final_reported_pc);
+    printf("  %s\n", diagnostic_pc_name(final_pc_space, final_reported_pc));
+    printf("  cpsr at pc     : 0x%08x (mode %02x%s)\n", last_cpsr,
+           last_cpsr & ARM_CPSR_MODE_MASK,
+           (last_cpsr & ARM_CPSR_T) ? ", Thumb" : "");
+    printf("  MMU at pc      : %s\n",
+           last_mmu_enabled ? "ENABLED BY THE KERNEL" : "off");
     if (mach.cpu.cp15.ttbr0) printf("  TTBR0          : 0x%08x\n", mach.cpu.cp15.ttbr0);
     printf("  DFSR/DFAR      : 0x%08x / 0x%08x\n", mach.cpu.cp15.dfsr, mach.cpu.cp15.dfar);
     printf("  IFSR/IFAR      : 0x%08x / 0x%08x\n", mach.cpu.cp15.ifsr, mach.cpu.cp15.ifar);
@@ -8439,17 +10157,18 @@ int main(int argc, char **argv) {
                G.uart_log[i].wr ? "WRITE" : "READ ",
                G.uart_log[i].bytes == 4 ? "w" : G.uart_log[i].bytes == 2 ? "h" : "b",
                G.uart_log[i].addr - UARTPG, G.uart_log[i].val, G.uart_log[i].pc,
-               ksym_at(G.uart_log[i].pc >= phys_base && G.uart_log[i].pc < virt_base
-                       ? G.uart_log[i].pc - phys_base + virt_base : G.uart_log[i].pc));
+               diagnostic_pc_context_name(
+                   G.uart_log[i].pc, G.uart_log[i].cpsr,
+                   G.uart_log[i].mmu_enabled, NULL));
 
     printf("\n=== ALL NON-RAM PHYSICAL PAGES TOUCHED (%u) ===\n", G.dev_page_n);
     for (unsigned i = 0; i < G.dev_page_n; i++)
         printf("    0x%08x  r=%-8llu w=%-8llu first pc 0x%08x %s\n",
                G.dev_page[i].page, (unsigned long long)G.dev_page[i].reads,
                (unsigned long long)G.dev_page[i].writes, G.dev_page[i].first_pc,
-               ksym_at(G.dev_page[i].first_pc >= phys_base && G.dev_page[i].first_pc < virt_base
-                       ? G.dev_page[i].first_pc - phys_base + virt_base
-                       : G.dev_page[i].first_pc));
+               diagnostic_pc_context_name(
+                   G.dev_page[i].first_pc, G.dev_page[i].first_cpsr,
+                   G.dev_page[i].first_mmu_enabled, NULL));
 
     /* ------------------------------------------------ the hot MMIO page --- */
     printf("\n=== HOT PAGE 0x%08x: PER-REGISTER ===\n", G.hot_page);
@@ -8527,9 +10246,8 @@ int main(int argc, char **argv) {
             unsigned from = tcount > 65536 ? tcount - 65536 : 0;
             for (unsigned i = from; i < tcount; i++) {
                 unsigned k = (start + i) % KTRACE;
-                uint32_t va = tr[k].pc >= phys_base && tr[k].pc < virt_base
-                            ? tr[k].pc - phys_base + virt_base : tr[k].pc;
-                const char *nm = ksym_at(va);
+                const char *nm = diagnostic_pc_context_name(
+                    tr[k].pc, tr[k].cpsr, tr[k].mmu_enabled, NULL);
                 char base[160];
                 const char *bar = strchr(nm, '+');
                 snprintf(base, sizeof base, "%.*s",
@@ -8546,15 +10264,16 @@ int main(int argc, char **argv) {
         unsigned skip = tcount > ntail ? tcount - ntail : 0;
         for (unsigned i = skip; i < tcount; i++) {
             unsigned k = (start + i) % KTRACE;
-            uint32_t va = tr[k].pc >= phys_base && tr[k].pc < virt_base
-                        ? tr[k].pc - phys_base + virt_base : tr[k].pc;
             printf("    %-9" PRIu64 " %08x %c m%02x r0=%08x r1=%08x r2=%08x r3=%08x "
                    "sp=%08x lr=%08x  %s\n",
                    trace_last_at - (tcount - 1u - i), tr[k].pc,
                    (tr[k].cpsr & ARM_CPSR_T) ? 'T' : 'A',
                    tr[k].cpsr & ARM_CPSR_MODE_MASK,
                    tr[k].r[0], tr[k].r[1], tr[k].r[2], tr[k].r[3],
-                   tr[k].r[13], tr[k].r[14], ksym_at(va));
+                   tr[k].r[13], tr[k].r[14],
+                   diagnostic_pc_context_name(
+                       tr[k].pc, tr[k].cpsr,
+                       tr[k].mmu_enabled, NULL));
         }
     }
 
@@ -8615,19 +10334,22 @@ int main(int argc, char **argv) {
      */
     if (KS.nkext_exec) {
         static uint64_t per_kext[KSYMS_MAX_KEXTS];
-        uint64_t total = 0, attributed = 0;
+        uint64_t total = 0, kernel = 0, attributed = 0;
         for (unsigned i = 0; i < PCHASH; i++) {
             if (!G.pc_hist[i].hits) continue;
             total += G.pc_hist[i].hits;
+            if (G.pc_hist[i].space != DIAGNOSTIC_PC_KERNEL) continue;
+            kernel += G.pc_hist[i].hits;
             const kext_t *k = ksyms_kext_at(&KS, G.pc_hist[i].va);
             if (!k) continue;
             per_kext[(unsigned)(k - KS.kext)] += G.pc_hist[i].hits;
             attributed += G.pc_hist[i].hits;
         }
         printf("\n=== TIME BY PRELINKED KEXT ===\n");
-        printf("    %.1f%% of samples are inside a prelinked kext; the rest is "
-               "the kernel proper\n",
-               total ? 100.0 * (double)attributed / (double)total : 0.0);
+        printf("    %.1f%% of all samples are inside a prelinked kext; "
+               "%.1f%% are kernel-address samples\n",
+               total ? 100.0 * (double)attributed / (double)total : 0.0,
+               total ? 100.0 * (double)kernel / (double)total : 0.0);
         for (unsigned rank = 0; rank < 10; rank++) {
             uint64_t best = 0;
             unsigned bi = KS.nkext_exec;
@@ -8666,7 +10388,10 @@ int main(int argc, char **argv) {
             if (bi == PCHASH || !best) break;
             printf("    %5.1f%%  0x%08x  %-52s %" PRIu64 " samples\n",
                    total ? 100.0 * (double)best / (double)total : 0.0,
-                   G.pc_hist[bi].va, ksym_at(G.pc_hist[bi].va), best);
+                   G.pc_hist[bi].va,
+                   diagnostic_pc_name(G.pc_hist[bi].space,
+                                      G.pc_hist[bi].va),
+                   best);
             G.pc_hist[bi].hits = 0;   /* consume */
         }
     }
@@ -8689,7 +10414,9 @@ int main(int argc, char **argv) {
         printf("      @%-10" PRIu64 " mode %02x->%02x  handler pc 0x%08x  lr 0x%08x -> resumed 0x%08x  %s\n",
                G.exret_log[i].at, G.exret_log[i].mode_from, G.exret_log[i].mode_to,
                G.exret_log[i].from_pc, G.exret_log[i].lr, G.exret_log[i].to_pc,
-               ksym_at(G.exret_log[i].to_pc));
+               diagnostic_pc_context_name(
+                   G.exret_log[i].to_pc, G.exret_log[i].mode_to,
+                   G.exret_log[i].mmu_enabled, NULL));
 
     printf("\n=== ARM STREX/STREXB/STREXH/STREXD ===\n");
     printf("    executed : %llu\n", (unsigned long long)G.strex_total);
@@ -8697,7 +10424,9 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < G.strex_log_n; i++)
         printf("      @%-10" PRIu64 " pc 0x%08x addr 0x%08x  %s\n",
                G.strex_log[i].at, G.strex_log[i].pc, G.strex_log[i].addr,
-               ksym_at(G.strex_log[i].pc));
+               diagnostic_pc_context_name(
+                   G.strex_log[i].pc, G.strex_log[i].cpsr,
+                   G.strex_log[i].mmu_enabled, NULL));
 
     printf("\n=== DISTINCT ABORT SITES (%u) ===\n", G.fault_n);
     if (G.fault_dropped)
@@ -8708,8 +10437,9 @@ int main(int argc, char **argv) {
         printf("    %s FAR 0x%08x FSR 0x%02x  pc 0x%08x %s  n=%llu first@%" PRIu64 "\n",
                G.fault[i].prefetch ? "IFETCH" : "DATA  ",
                G.fault[i].far_, G.fault[i].fsr & 0xff, G.fault[i].pc,
-               ksym_at(G.fault[i].pc >= phys_base && G.fault[i].pc < virt_base
-                       ? G.fault[i].pc - phys_base + virt_base : G.fault[i].pc),
+               diagnostic_pc_context_name(
+                   G.fault[i].pc, G.fault[i].cpsr,
+                   G.fault[i].mmu_enabled, NULL),
                (unsigned long long)G.fault[i].n, G.fault[i].first_at);
 
     vm_report();
